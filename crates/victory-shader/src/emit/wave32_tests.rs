@@ -173,22 +173,42 @@ fn a_ballot_of_64_lanes_is_two_host_waves_joined() {
 
 #[test]
 fn a_lane_read_across_the_halves_goes_through_group_shared_memory() {
-    for words in [READLANE, BPERMUTE] {
-        let l = host32(words, 64);
-        assert_eq!(l.wave_size, Some(32));
-        assert!(l.exchanges);
-    }
-    assert_eq!(host32(READLANE, 64).barriers, 2);
-    // The permute also ballots the lanes that run (0 from the others).
-    assert_eq!(host32(BPERMUTE, 64).barriers, 4);
+    let l = host32(READLANE, 64);
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.exchanges);
+    assert_eq!(l.barriers, 2);
 }
 
 #[test]
 fn operations_inside_32_lanes_stay_native() {
-    let l = host32(IN_HALF, 64);
-    assert_eq!(l.wave_size, Some(32));
-    assert_eq!(l.barriers, 0);
-    assert!(!l.exchanges);
+    // `ds_bpermute_b32` too: a wave of 64 permutes each half apart (RDNA 2 ISA
+    // 10.4.4), so lane l reading "lane l + 32" reads lane (l + 32) & 31 of its
+    // own half.
+    for words in [IN_HALF, BPERMUTE] {
+        let l = host32(words, 64);
+        assert_eq!(l.wave_size, Some(32));
+        assert_eq!(l.barriers, 0);
+        assert!(!l.exchanges);
+    }
+}
+
+#[test]
+fn a_permute_in_divergent_code_needs_no_exchange() {
+    // ds_bpermute in the lanes below 10 only: refused while it went across
+    // the halves, the host wave's own read now.
+    const DIVERGENT_BPERMUTE: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0x7D88_008A, // v_cmp_gt_u32_e32 vcc, 10, v0
+        0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+        skip_execz(2),
+        0xDACC_0000,
+        0x0200_0001, // ds_bpermute_b32 v2, v1, v0
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x7E0A_0302, // v_mov_b32_e32 v5, v2 (the result is used)
+        S_ENDPGM,
+    ];
+    let l = host32(DIVERGENT_BPERMUTE, 64);
+    assert_eq!((l.barriers, l.exchanges), (0, false));
 }
 
 #[test]

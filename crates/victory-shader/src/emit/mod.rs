@@ -620,7 +620,10 @@ pub fn emit_with(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    // The reduction is bits 7-8 (0x80 comparison, 0x100 minimum, 0x180 maximum): a
+                    // console sampler with a min/max reduction ORed with 0x80 would be a maximum.
+                    // (After ka1qux/victory-ka1qux 93b9b2f.)
+                    s.filter = (s.filter & !0x180) | 0x80;
                 }
                 s
             })
