@@ -6970,6 +6970,10 @@ impl<'a> Lower<'a> {
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
+            // Only image instructions get here (buffer accesses take
+            // `computed_buffer`): `resource` gives every four dwords it
+            // cannot trace this source, a sampler's state words too.
+            Source::BuiltMemory { .. } if sampler => Err("a sampler built from computed words"),
             Source::BuiltMemory { .. } => Err("a computed buffer descriptor used as a view"),
             Source::Built { address, .. } if address.param == MEMORY => {
                 Err("a buffer descriptor built around a computed address")
@@ -8076,6 +8080,42 @@ impl<'a> Lower<'a> {
                 let sh = self.s.m.i32(16);
                 let hi = self.s.m.bin(c, Bin::Shl, hi, sh);
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
+                int(self, r)
+            }
+            "v_cvt_pknorm_u16_f32" | "v_cvt_pknorm_i16_f32" => {
+                // Two floats as 16-bit normalized integers, src0 in the low
+                // half and src1 in the high one: round(clamp(x, lo, 1) * max)
+                // to nearest even, the product rounded as an f32 first, as
+                // Mesa's ACO uses the pair for packUnorm2x16 and
+                // packSnorm2x16 (VOP3 only on GFX10).
+                // Guess: a NaN gives 0 (D3D's float to normalized integer
+                // rule); no public source states what the hardware gives.
+                let signed = name == "v_cvt_pknorm_i16_f32";
+                let (lo, max) = if signed {
+                    (-1.0f32, 32767.0f32)
+                } else {
+                    (0.0, 65535.0)
+                };
+                let mut halves = Vec::new();
+                for k in 0..2 {
+                    let x = f(self, k)?;
+                    let nan = self.s.m.cmp(c, pred::UNO, x, x);
+                    let zero = self.s.m.f32(0);
+                    let x = self.s.m.select(c, nan, zero, x);
+                    let (lo, one) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(1.0f32.to_bits()));
+                    let x = self.binary(35, x, lo);
+                    let x = self.binary(36, x, one);
+                    let max = self.s.m.f32(max.to_bits());
+                    let x = self.s.m.bin(c, Bin::Mul, x, max);
+                    let x = self.unary(26, x);
+                    let op = if signed { Cast::FpToSi } else { Cast::FpToUi };
+                    let x = self.s.m.cast(c, op, x, self.s.t.i32);
+                    let ffff = self.s.m.i32(0xFFFF);
+                    halves.push(self.s.m.bin(c, Bin::And, x, ffff));
+                }
+                let sh = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], sh);
+                let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
             }
             "v_cvt_f16_f32" if v.opsel == 0 => {
@@ -11401,6 +11441,12 @@ impl<'a> Lower<'a> {
         } else {
             None
         };
+        // A typed store's scalar offset register proved to hold 0 (moves of
+        // the constant) is no offset; any other makes `off` computed, which
+        // the typed store below refuses.
+        let so = so.filter(|_| {
+            !(typed && store && self.konst_operand(&HashMap::new(), inst, soffset) == Some(0))
+        });
         let src = self
             .descriptors
             .get(&(site, false))
@@ -11661,12 +11707,10 @@ impl<'a> Lower<'a> {
             // cover (for its marks).
             let (byte, bytes);
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format; one of fewer channels writes 0 to the
-                // rest (right for a view with just those channels, which drops
-                // them).
-                if count == 0 || count > 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // A typed view has no bytes inside an element to address: a
+                // computed offset is refused, as it is not known to be 0.
+                if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
                 let element = index.unwrap_or(self.s.m.i32(0));
@@ -11675,9 +11719,15 @@ impl<'a> Lower<'a> {
                 for x in vals {
                     args.push(self.as_float(x));
                 }
-                for _ in count..4 {
-                    args.push(self.s.m.f32(0));
-                }
+                // A store of fewer channels (`_x`, `_xy`, `_xyz`) still
+                // writes the whole element: the hardware stores 0 in the
+                // channels the instruction does not name (GFX11 and older;
+                // LLVM 88421ea "[AMDGPU] Trim zero components from buffer and
+                // image stores", Mesa 4a6ee2c4833 "aco: shrink buffer stores
+                // with undef/zero components"), so they are not kept. Channels
+                // past the view's format are dropped by the host's store.
+                let zero = self.s.m.f32(0);
+                args.resize(3 + 4, zero);
                 // The element's size is the view's stride (16 bytes at most).
                 (byte, bytes) = match self.s.view_index.get(&h).copied() {
                     Some(at) if self.x.view_marks => {

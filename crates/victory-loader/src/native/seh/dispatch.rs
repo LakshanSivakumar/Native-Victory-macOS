@@ -398,13 +398,12 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                     );
                 }
             }
-            // A breakpoint (the title's asserts), or a write to address 0 (its watchdog's
-            // deliberate crash): with VICTORY_DUMP_THREADS=0, what every thread is doing.
-            if r.code == 0x8000_0003
-                || (r.code == 0xc000_0005 && r.information[0] == 1 && r.information[1] == 0)
-            {
-                super::super::dump::report_at_break();
-            }
+            // VICTORY_DUMP_THREADS=0: at a breakpoint (the title's asserts), or at a write to
+            // address 0 (its watchdog's deliberate crash, fatal by design: dumped before the
+            // crash reporter runs). Other access violations wait for `unhandled`: the title's
+            // handlers take some and go on.
+            let watchdog = r.code == 0xc000_0005 && r.information[0] == 1 && r.information[1] == 0;
+            super::super::dump::report_at_fault(r.code, watchdog);
             // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
             // the faulting image.
             if let (Ok(list), Some(base)) = (
@@ -572,6 +571,8 @@ unsafe fn unhandled(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     let filter = *UNHANDLED.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: valid for the whole dispatch.
     let (code, address) = unsafe { ((*rec).code, (*rec).address) };
+    // Before the filter, which may end the process.
+    super::super::dump::report_at_fault(code, true);
     if let Some(handler) = filter {
         let mut ptrs = ExceptionPointers {
             record: rec,

@@ -85,6 +85,7 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         Format::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
         Format::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
+        Format::Bgra8UnormSrgb => MTLPixelFormat::BGRA8Unorm_sRGB,
         Format::Rgba16Float => MTLPixelFormat::RGBA16Float,
         Format::R32Float => MTLPixelFormat::R32Float,
         Format::D32Float => MTLPixelFormat::Depth32Float,
@@ -117,6 +118,7 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Rg16Uint => MTLPixelFormat::RG16Uint,
         Format::Rg8Unorm => MTLPixelFormat::RG8Unorm,
         Format::Rg8Uint => MTLPixelFormat::RG8Uint,
+        Format::Rg8Snorm => MTLPixelFormat::RG8Snorm,
         Format::R16Float => MTLPixelFormat::R16Float,
         Format::R16Uint => MTLPixelFormat::R16Uint,
         Format::D16Unorm => MTLPixelFormat::Depth16Unorm,
@@ -1044,10 +1046,10 @@ impl Metal {
                 let a = desc.stencilAttachment();
                 a.setTexture(Some(&dp.texture.tex));
                 a.setStoreAction(MTLStoreAction::Store);
-                match dp.clear {
-                    Some(_) => {
+                match dp.clear_stencil {
+                    Some(v) => {
                         a.setLoadAction(MTLLoadAction::Clear);
-                        a.setClearStencil(0);
+                        a.setClearStencil(u32::from(v));
                     }
                     None => a.setLoadAction(MTLLoadAction::Load),
                 }

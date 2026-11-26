@@ -18,6 +18,7 @@ pub enum Format {
     Rgba8Unorm,
     Rgba8UnormSrgb,
     Bgra8Unorm,
+    Bgra8UnormSrgb,
     Rgba16Float,
     R32Float,
     D32Float,
@@ -54,6 +55,7 @@ pub enum Format {
     Rg16Uint,
     Rg8Unorm,
     Rg8Uint,
+    Rg8Snorm,
     R16Float,
     R16Uint,
     D16Unorm,
@@ -70,7 +72,7 @@ impl Format {
     pub fn block(self) -> (usize, usize) {
         use Format::*;
         match self {
-            Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | R32Float | D32Float => (1, 4),
+            Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | Bgra8UnormSrgb | R32Float | D32Float => (1, 4),
             Rgb10a2Unorm | Rg11b10Float | Rgba8Uint | Rg16Float | Rg16Unorm | R32Uint | Rgb9e5Float => (1, 4),
             Rg16Uint => (1, 4),
             D32FloatS8 => (1, 8),
@@ -78,7 +80,7 @@ impl Format {
             Bc1 | Bc1Srgb | Bc4 => (4, 8),
             Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc7 | Bc7Srgb => (4, 16),
             R8Unorm | A8Unorm | R8Uint => (1, 1),
-            R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
+            R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint | Rg8Snorm | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
             Rgba32Float | Rgba32Uint => (1, 16),
         }
     }
@@ -480,6 +482,8 @@ pub struct ColorTarget<'a, B: GraphicsBackend + ?Sized> {
 pub struct DepthTarget<'a, B: GraphicsBackend + ?Sized> {
     pub texture: &'a B::Texture,
     pub clear: Option<f32>,
+    /// Independent stencil load action; `None` preserves the existing plane.
+    pub clear_stencil: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -595,6 +599,12 @@ pub trait PresentBackend: GraphicsBackend {
     /// A surface over the app's drawable layer (`CAMetalLayer` on Metal), passed by address; the
     /// layer must stay alive while the surface does.
     fn create_surface(&self, layer: *mut std::ffi::c_void) -> Result<Self::Surface, String>;
+    /// Attempts presentation without blocking drawable acquisition. False keeps the FIFO head
+    /// pending; callers must retry before submitting later work on this queue.
+    fn try_present(&self, queue: &Self::Queue, surface: &Self::Surface, source: &Self::Texture) -> Result<bool, String> {
+        self.present(queue, surface, source).map(|()| true)
+    }
+
     /// Draws `source` over the surface's next drawable (scaled to it, whatever the formats) and
     /// presents it after the work already submitted to `queue`. Never waits for the GPU.
     fn present(

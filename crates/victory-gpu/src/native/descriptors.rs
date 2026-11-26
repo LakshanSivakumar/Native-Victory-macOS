@@ -64,6 +64,7 @@ pub fn format(dxgi: u32) -> Option<Format> {
         39 => Format::R32Float,
         29 => Format::Rgba8UnormSrgb,
         87 => Format::Bgra8Unorm,
+        91 => Format::Bgra8UnormSrgb,
         10 => Format::Rgba16Float,
         41 => Format::R32Float,
         40 => Format::D32Float,
@@ -95,8 +96,9 @@ pub fn format(dxgi: u32) -> Option<Format> {
         13 => Format::Rgba16Snorm,
         17 => Format::Rg32Uint,
         36 => Format::Rg16Uint,
-        49 | 50 => Format::Rg8Unorm,
-        51 => Format::Rg8Uint,
+        49 => Format::Rg8Unorm,
+        50 => Format::Rg8Uint,
+        51 => Format::Rg8Snorm,
         54 => Format::R16Float,
         // R16_TYPELESS: a depth target when the texture is one (`TextureInfo::desc`).
         53 => Format::R16Unorm,
@@ -234,12 +236,29 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
 mod tests {
     #[test]
     fn host_formats_have_the_title_formats_element_size() {
-        for dxgi in [2, 3, 10, 11, 13, 16, 17, 24, 26, 28, 30, 34, 35, 36, 41, 42, 49, 50, 51, 53, 54, 55, 56, 57, 61, 62, 65, 67, 71, 72, 77, 78, 86, 98, 99, 115] {
+        for dxgi in [2, 3, 10, 11, 13, 16, 17, 24, 26, 28, 30, 34, 35, 36, 41, 42, 49, 50, 51, 53, 54, 55, 56, 57, 61, 62, 65, 67, 71, 72, 77, 78, 86, 91, 98, 99, 115] {
             let f = super::format(dxgi).expect("a host format");
             let (bytes, block) = crate::resource::element(dxgi).expect("a title format");
             assert_eq!(f.block(), (block as usize, bytes as usize), "DXGI {dxgi}");
         }
         assert!(super::format(42).unwrap().is_integer() && !super::format(26).unwrap().is_integer());
+    }
+
+    #[test]
+    fn r8g8_formats_keep_their_numeric_kind() {
+        use victory_backend::resources::Format;
+        assert_eq!(super::format(49), Some(Format::Rg8Unorm));
+        assert_eq!(super::format(50), Some(Format::Rg8Uint));
+        assert_eq!(super::format(51), Some(Format::Rg8Snorm));
+        assert!(super::format(50).unwrap().is_integer());
+        assert!(!super::format(51).unwrap().is_integer());
+    }
+
+    #[test]
+    fn bgra8_srgb_has_a_host_format() {
+        use victory_backend::resources::Format;
+        assert_eq!(super::format(91), Some(Format::Bgra8UnormSrgb));
+        assert!(!super::format(91).unwrap().is_integer());
     }
 
     #[test]

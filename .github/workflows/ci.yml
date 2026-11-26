@@ -16,6 +16,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-scripts:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - name: Cargo target-directory script regressions (Bash 3.2)
+        run: /bin/bash tools/macos/tests/target-directory.sh
+
   check:
     runs-on: windows-latest
     timeout-minutes: 60
