@@ -192,7 +192,7 @@ fn a_submitted_list_runs_and_its_fence_is_signalled() {
     if !available() {
         return;
     }
-    let pool = pool(9001, 4);
+    let pool = pool(9001, 16);
     let (src, dst, done) = (0, 16384, 32768);
     pool.write(src, &(0..N as u32).collect::<Vec<_>>());
     pool.write(dst, &[0xEEEE_EEEEu32; N]);
@@ -219,7 +219,7 @@ fn a_wait_on_a_memory_value_cuts_the_list_and_holds_the_rest() {
     if !available() {
         return;
     }
-    let pool = pool(9002, 4);
+    let pool = pool(9002, 8);
     let (src, a, b, flag) = (0, 8192, 16384, 24576);
     pool.write(src, &(0..N as u32).collect::<Vec<_>>());
     pool.write(a, &[0u32; N]);
@@ -267,7 +267,7 @@ fn a_queue_waits_for_a_fence_the_cpu_signals() {
     if !available() {
         return;
     }
-    let pool = pool(9003, 4);
+    let pool = pool(9003, 8);
     let (src, dst) = (0, 16384);
     pool.write(src, &(0..N as u32).collect::<Vec<_>>());
     pool.write(dst, &[0u32; N]);
@@ -293,7 +293,7 @@ fn buffer_views_in_a_descriptor_heap_reach_the_shader() {
     if !available() {
         return;
     }
-    let pool = pool(9004, 4);
+    let pool = pool(9004, 8);
     let (src, dst) = (0, 16384);
     pool.write(src, &(0..64u32).collect::<Vec<_>>());
     pool.write(dst, &[0u32; 64]);
@@ -338,7 +338,7 @@ fn a_copy_runs_in_order_with_the_dispatch_it_feeds() {
     if !available() {
         return;
     }
-    let pool = pool(9005, 4);
+    let pool = pool(9005, 16);
     let (staged, src, dst) = (0, 16384, 32768);
     pool.write(staged, &(0..N as u32).collect::<Vec<_>>());
     pool.write(dst, &[0u32; N]);
@@ -372,7 +372,7 @@ fn a_refused_pipeline_drops_its_work_and_nothing_else() {
     if !available() {
         return;
     }
-    let pool = pool(9006, 4);
+    let pool = pool(9006, 8);
     let (src, dropped, dst, flag) = (0, 8192, 16384, 24576);
     pool.write(src, &(0..N as u32).collect::<Vec<_>>());
     pool.write(dropped, &[0xAAAA_AAAAu32; N]);

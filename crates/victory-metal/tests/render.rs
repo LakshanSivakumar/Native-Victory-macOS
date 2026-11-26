@@ -96,7 +96,7 @@ impl<'a> Scene<'a> {
         Scene {
             m,
             pipe,
-            arena: Arena::new(m, 2),
+            arena: Arena::new(m, 8),
             res,
             smp,
             color,

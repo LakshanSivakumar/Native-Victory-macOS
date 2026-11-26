@@ -17,7 +17,7 @@ const N: usize = 4096;
 fn srv_and_uav_through_a_descriptor_table() {
     for m in backends() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
-        let a = Arena::new(&m, 2);
+        let a = Arena::new(&m, 8);
         let half = a.region.len / 2;
         a.write(0, &(0..N as u32).collect::<Vec<_>>());
         let heap = m.create_heap(HeapKind::Resource, 16).unwrap();
@@ -390,7 +390,7 @@ fn texture_views_and_sampler_filters() {
 #[test]
 fn texture_over_zero_copy_memory() {
     let Some(m) = backend() else { return };
-    let a = Arena::new(&m, 2);
+    let a = Arena::new(&m, 8);
     let align = m.linear_alignment(Format::Rgba8Unorm);
     let pitch = 16usize.next_multiple_of(align);
     // The texture starts one alignment unit into the arena, like a title resource at an offset.

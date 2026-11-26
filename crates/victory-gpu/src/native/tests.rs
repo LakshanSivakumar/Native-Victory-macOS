@@ -96,7 +96,7 @@ const N: usize = 1024;
 #[test]
 fn compute_dispatch_writes_title_memory() {
     let Some(h) = host() else { return };
-    let pool = Pool::new(&h, 4);
+    let pool = Pool::new(&h, 16);
     let (staged, src, dst) = (0, 16384, 32768);
     pool.write(staged, &(0..N as u32).collect::<Vec<_>>());
     pool.write(dst, &[0xEEEE_EEEEu32; N]);
@@ -135,7 +135,7 @@ fn fixture_affine() -> Vec<u8> {
 #[test]
 fn descriptor_table_buffers_decode_into_metal_heap() {
     let Some(h) = host() else { return };
-    let pool = Pool::new(&h, 4);
+    let pool = Pool::new(&h, 8);
     let (src, dst) = (0, 16384);
     pool.write(src, &(0..64u32).collect::<Vec<_>>());
     let slots = vec![0u32; 8 * 8]; // 8 views of 32 bytes: the title's descriptor memory
@@ -200,7 +200,7 @@ fn descriptor_table_buffers_decode_into_metal_heap() {
 #[test]
 fn table_records_copied_by_the_title_are_mirrored_at_submission() {
     let Some(h) = host() else { return };
-    let pool = Pool::new(&h, 4);
+    let pool = Pool::new(&h, 8);
     let (src, dst) = (0, 16384);
     pool.write(src, &(0..64u32).collect::<Vec<_>>());
     let mut slots = vec![0u32; 8 * 8];
@@ -370,7 +370,7 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
     let off = Host::new(Metal::new().unwrap().with_residency_sets(false));
 
     let work = |h: &Host, queues: usize, submissions: usize| {
-        let pool = Pool::new(h, 4);
+        let pool = Pool::new(h, 8);
         let (src, dst) = (0, 16384);
         pool.write(src, &(0..N as u32).collect::<Vec<_>>());
         let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();

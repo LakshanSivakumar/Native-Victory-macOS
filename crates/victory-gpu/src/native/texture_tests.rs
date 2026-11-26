@@ -138,7 +138,7 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
 /// A block-compressed texture: 16 bytes a 4x4 block, in the console's layout, detiled as blocks.
 #[test]
 fn a_block_compressed_title_texture_is_detiled_as_blocks() {
-    let Some(pool) = pool(9102, 4) else { return };
+    let Some(pool) = pool(9102, 8) else { return };
     // BC7 (98): a 32x16 texture is 8x4 blocks.
     let res = crate::resource::test_texture_at(pool.va(0), (32, 16), 1, 98, Swizzle::SW_64KB_D.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
@@ -165,7 +165,7 @@ fn a_block_compressed_title_texture_is_detiled_as_blocks() {
 /// console's `CreateShaderResourceViewPlaced`): the host makes it when the view is written.
 #[test]
 fn a_placed_texture_view_makes_and_fills_its_texture() {
-    let Some(pool) = pool(9103, 4) else { return };
+    let Some(pool) = pool(9103, 16) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (32, 32), 1, 28, Swizzle::SW_64KB_S.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
     tile(&pool, 0, &info.layout);
@@ -190,7 +190,7 @@ fn a_placed_texture_view_makes_and_fills_its_texture() {
 /// filled from memory.
 #[test]
 fn a_render_target_is_cleared_through_the_titles_view() {
-    let Some(pool) = pool(9104, 4) else { return };
+    let Some(pool) = pool(9104, 8) else { return };
     let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
     pool.write(0, &[0x7Fu8; 64]);
     // An RTV in descriptor memory the title owns.
@@ -238,7 +238,7 @@ fn a_render_target_is_cleared_through_the_titles_view() {
 /// an error that stops the submission.
 #[test]
 fn an_undetilable_layout_is_counted_not_fatal() {
-    let Some(pool) = pool(9105, 4) else { return };
+    let Some(pool) = pool(9105, 8) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::SW_4KB_R_X.0, 0);
     let before = with_title(|t| t.stats.undetilable).unwrap();
     with_title(|t| {
@@ -254,7 +254,7 @@ fn an_undetilable_layout_is_counted_not_fatal() {
 /// window; its last drawable is read back.
 #[test]
 fn present_draws_the_back_buffer_over_the_apps_layer() {
-    let Some(pool) = pool(9106, 4) else { return };
+    let Some(pool) = pool(9106, 8) else { return };
     let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_S.0, 1);
     let heap = crate::descriptor::test_heap(false, 4);
     let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
