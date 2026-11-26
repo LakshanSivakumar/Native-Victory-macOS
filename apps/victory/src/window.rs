@@ -103,6 +103,7 @@ unsafe fn open(layer: *mut std::ffi::c_void) -> Result<Retained<AnyObject>> {
         let _: () = msg_send![layer, setAutoresizingMask: 18u32]; // width and height sizable
         let _: () = msg_send![view, setLayer: layer];
         let _: () = msg_send![view, setWantsLayer: Bool::YES];
+        let _: () = msg_send![&*window, setAcceptsMouseMovedEvents: Bool::YES];
         let _: () = msg_send![&*window, center];
         let _: () = msg_send![&*window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![app, finishLaunching];
@@ -114,6 +115,8 @@ unsafe fn open(layer: *mut std::ffi::c_void) -> Result<Retained<AnyObject>> {
 /// Runs the loop until `finished`, or the window is gone.
 unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
     let mode = NSString::from_str("kCFRunLoopDefaultMode"); // NSDefaultRunLoopMode
+    let mut input = crate::input::Input::default();
+    let mut hud = Hud::default();
     loop {
         let go_on = autoreleasepool(|_| {
             // SAFETY: AppKit calls on the main thread.
@@ -128,9 +131,11 @@ unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
                     inMode: &*mode,
                     dequeue: Bool::YES
                 ];
-                if !event.is_null() {
+                if !event.is_null() && !input.event(window, event) {
                     let _: () = msg_send![app, sendEvent: event];
                 }
+                input.tick(window);
+                hud.tick(window);
                 let _: () = msg_send![app, updateWindows];
                 let shown: Bool = msg_send![window, isVisible];
                 let minimized: Bool = msg_send![window, isMiniaturized];
@@ -150,4 +155,82 @@ unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
             return;
         }
     }
+}
+
+/// The window title's figures, once a second: frame rate, frame time, the GPU's time a frame,
+/// draws a frame, draws dropped and the frame number.
+struct Hud {
+    since: std::time::Instant,
+    last: (u64, u64, u64),
+}
+
+impl Default for Hud {
+    fn default() -> Self {
+        Hud { since: std::time::Instant::now(), last: (0, 0, 0) }
+    }
+}
+
+impl Hud {
+    /// # Safety
+    /// On the main thread, with our window.
+    unsafe fn tick(&mut self, window: &AnyObject) {
+        let elapsed = self.since.elapsed().as_secs_f64();
+        if elapsed < 1.0 {
+            return;
+        }
+        let (frames, draws, dropped, gpu_us) = victory_gpu::native::hud();
+        let n = frames.saturating_sub(self.last.0);
+        let per = |v: u64, was: u64| if n > 0 { v.saturating_sub(was) as f64 / n as f64 } else { 0.0 };
+        let title = if n > 0 {
+            format!(
+                "VIctory — {:.1} fps · {:.1} ms · GPU {:.1} ms · {:.0} draws · {:.0} dropped · frame {frames}",
+                n as f64 / elapsed,
+                elapsed * 1e3 / n as f64,
+                gpu_us as f64 / 1e3 / n as f64,
+                per(draws, self.last.1),
+                per(dropped, self.last.2),
+            )
+        } else {
+            format!("VIctory — no frame in {elapsed:.1} s · frame {frames}")
+        };
+        self.last = (frames, draws, dropped);
+        self.since = std::time::Instant::now();
+        shot();
+        // SAFETY: AppKit setter on the main thread.
+        unsafe {
+            let _: () = msg_send![window, setTitle: &*NSString::from_str(&title)];
+        }
+    }
+}
+
+/// `VICTORY_SHOTS=<dir>,<seconds>`: every that many seconds, the last frame presented, a quarter
+/// of its size, as `<dir>/s<seconds since start>.ppm` (for runs nobody watches).
+fn shot() {
+    use std::sync::{LazyLock, Mutex};
+    static CONF: LazyLock<Option<(String, u64)>> = LazyLock::new(|| {
+        let v = std::env::var("VICTORY_SHOTS").ok()?;
+        let (dir, every) = v.split_once(',')?;
+        let _ = std::fs::create_dir_all(dir);
+        Some((dir.to_owned(), every.trim().parse().ok().filter(|&n| n > 0)?))
+    });
+    static NEXT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    let Some((dir, every)) = CONF.as_ref() else { return };
+    let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if next.is_some_and(|n| now < n) {
+        return;
+    }
+    *next = Some(now + std::time::Duration::from_secs(*every));
+    let Some((w, h, bgra)) = victory_gpu::native::last_frame() else { return };
+    let (sw, sh) = (w / 4, h / 4);
+    let mut out = format!("P6\n{sw} {sh}\n255\n").into_bytes();
+    out.reserve(sw * sh * 3);
+    for y in 0..sh {
+        for x in 0..sw {
+            let i = ((y * 4) * w + x * 4) * 4;
+            out.extend_from_slice(&[bgra[i + 2], bgra[i + 1], bgra[i]]);
+        }
+    }
+    let _ = std::fs::write(format!("{dir}/s{:04}.ppm", START.elapsed().as_secs()), out);
 }

@@ -397,6 +397,17 @@ pub(crate) fn present(queue: This, resource: This) {
 }
 
 /// Frames presented to the layer so far.
+/// For the window's figures: frames presented, draws recorded, draws dropped (no host
+/// pipeline), and the GPU's microseconds since the last call. Atomics only: no lock.
+pub fn hud() -> (u64, u64, u64, u64) {
+    (
+        crate::queue::presented(),
+        RECORDED.load(Ordering::Relaxed),
+        DROPPED.load(Ordering::Relaxed),
+        victory_metal::gfx::take_gpu_us(),
+    )
+}
+
 pub fn frames_presented() -> u64 {
     with_title(|t| t.surface().map_or(0, |s| s.frames())).unwrap_or(0)
 }

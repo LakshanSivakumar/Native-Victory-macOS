@@ -62,8 +62,12 @@ const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. On the macOS host
+/// the mouse is the right stick and its buttons the triggers, and a few keys
+/// sit where a PC player looks for them: Space X (jump), left Shift A
+/// (sprint), R B, G Y (get in), left Control the left stick's click (crouch),
+/// V the right stick's click (camera).
+const FALLBACK_BUTTONS: [(u8, u32); 20] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
@@ -78,6 +82,12 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'E', RIGHT_SHOULDER),
     (b'F', LEFT_STICK),
     (b'H', RIGHT_STICK),
+    (0x20, X),          // Space
+    (0xA0, A),          // left Shift
+    (b'R', B),
+    (b'G', Y),
+    (0xA2, LEFT_STICK), // left Control
+    (b'V', RIGHT_STICK),
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -118,6 +128,17 @@ trait Source: Send {
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The mouse as a pad: the right stick from its motion, the triggers
+    /// from its buttons (macOS host); none without one.
+    fn mouse(&mut self) -> Option<PadState> {
+        None
+    }
+    /// Whether the keyboard (and the mouse) also drive the first host pad,
+    /// so both work at once (macOS host); else they drive the stand-in pad
+    /// only while no host pad is connected.
+    fn keyboard_onto_pads(&self) -> bool {
+        false
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -142,8 +163,8 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
-/// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
+/// Combines `extra` (from `VICTORY_KEYS`, the keyboard or the mouse) onto
+/// `base` (a physical host pad).
 fn merge_pad(base: PadState, extra: PadState) -> PadState {
     PadState {
         buttons: base.buttons | extra.buttons,
@@ -435,7 +456,7 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             #[cfg(any(test, feature = "diagnostics"))]
@@ -443,11 +464,21 @@ impl Hub {
                 let scripted = source.scripted_keys();
                 merge_scripted(&mut pads, &scripted);
             }
-            #[cfg(not(any(test, feature = "diagnostics")))]
-            let _ = &mut pads;
-            (pads, source.keys())
+            let keys = source.keys();
+            let mouse = source.mouse();
+            // Keyboard and mouse onto the first host pad too (macOS).
+            if source.keyboard_onto_pads()
+                && let Some(pad) = pads.iter_mut().flatten().next()
+            {
+                let mut extra = fallback(&keys);
+                if let Some(m) = mouse {
+                    extra = merge_pad(extra, m);
+                }
+                *pad = merge_pad(*pad, extra);
+            }
+            (pads, keys, mouse)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -498,6 +529,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Option<PadState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -505,7 +537,10 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| {
+            let keyboard = fallback(&keys);
+            Value::Pad(mouse.map_or(keyboard, |m| merge_pad(keyboard, m)))
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -603,24 +638,216 @@ fn host() -> Box<dyn Source> {
 
 #[cfg(not(windows))]
 fn host() -> Box<dyn Source> {
-    struct Nothing;
-    impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
-            None
-        }
-        /// Only the scripted keys: this host has no input of its own yet.
-        fn keys(&mut self) -> Vec<KeyState> {
-            scripted()
-                .into_iter()
-                .map(|vk| KeyState {
-                    virtual_key: vk,
-                    ..Default::default()
-                })
-                .collect()
-        }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+    struct Mac {
+        /// The mouse stick, smoothed between polls.
+        stick: (f32, f32),
+        last: Instant,
     }
-    Box::new(Nothing)
+    impl Source for Mac {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            mac::PADS.lock().unwrap_or_else(PoisonError::into_inner)[slot].map(|p| PadState {
+                buttons: p.buttons,
+                left_trigger: p.left_trigger,
+                right_trigger: p.right_trigger,
+                left_x: p.left_x,
+                left_y: p.left_y,
+                right_x: p.right_x,
+                right_y: p.right_y,
+            })
+        }
+        /// Keys held in our window, and the scripted ones.
+        fn keys(&mut self) -> Vec<KeyState> {
+            let mut keys: Vec<KeyState> = mac::KEYS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|k| KeyState {
+                    scan_code: k.scan_code,
+                    code_point: k.code_point,
+                    virtual_key: k.virtual_key,
+                    dead_key: false,
+                })
+                .collect();
+            for vk in scripted() {
+                if !keys.iter().any(|k| k.virtual_key == vk) {
+                    keys.push(KeyState {
+                        virtual_key: vk,
+                        ..Default::default()
+                    });
+                }
+            }
+            keys
+        }
+        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            if let Some(r) = mac::RUMBLE.lock().unwrap_or_else(PoisonError::into_inner).get_mut(slot) {
+                *r = (low, high);
+            }
+        }
+        fn mouse(&mut self) -> Option<PadState> {
+            let (dx, dy, buttons, captured) = mac::take_mouse();
+            let dt = self.last.elapsed().as_secs_f32().max(0.001);
+            self.last = Instant::now();
+            if !captured {
+                self.stick = (0.0, 0.0);
+                return (buttons != 0).then(|| mac::mouse_pad(0.0, 0.0, buttons));
+            }
+            // Points a second for a full turn of the stick.
+            let full = mac::sensitivity();
+            let want = ((dx / dt / full).clamp(-1.0, 1.0), (-dy / dt / full).clamp(-1.0, 1.0));
+            // Half of the way each poll: motion reads as a steady stick.
+            self.stick = (
+                self.stick.0 + (want.0 - self.stick.0) * 0.5,
+                self.stick.1 + (want.1 - self.stick.1) * 0.5,
+            );
+            if self.stick.0.abs() < 0.01 && self.stick.1.abs() < 0.01 {
+                self.stick = (0.0, 0.0);
+            }
+            Some(mac::mouse_pad(self.stick.0, self.stick.1, buttons))
+        }
+        fn keyboard_onto_pads(&self) -> bool {
+            true
+        }
+    }
+    Box::new(Mac {
+        stick: (0.0, 0.0),
+        last: Instant::now(),
+    })
+}
+
+/// Input of the macOS host, written by the app's main thread (the window's
+/// key and mouse events, the Game Controller framework's pads) and read by
+/// the poll thread.
+#[cfg(not(windows))]
+pub mod mac {
+    use std::sync::{Mutex, PoisonError};
+
+    use super::{PADS as SLOTS, PadState};
+
+    /// Gamepad buttons (the bits of `Pad::buttons`), as in `GameInput`.
+    pub const MENU: u32 = super::MENU;
+    pub const VIEW: u32 = super::VIEW;
+    pub const A: u32 = super::A;
+    pub const B: u32 = super::B;
+    pub const X: u32 = super::X;
+    pub const Y: u32 = super::Y;
+    pub const UP: u32 = super::UP;
+    pub const DOWN: u32 = super::DOWN;
+    pub const LEFT: u32 = super::LEFT;
+    pub const RIGHT: u32 = super::RIGHT;
+    pub const LEFT_SHOULDER: u32 = super::LEFT_SHOULDER;
+    pub const RIGHT_SHOULDER: u32 = super::RIGHT_SHOULDER;
+    pub const LEFT_STICK: u32 = super::LEFT_STICK;
+    pub const RIGHT_STICK: u32 = super::RIGHT_STICK;
+
+    /// A pad as the app reads it: buttons (the bits above), triggers 0 to
+    /// 1, sticks -1 to 1 (up positive).
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Pad {
+        pub buttons: u32,
+        pub left_trigger: f32,
+        pub right_trigger: f32,
+        pub left_x: f32,
+        pub left_y: f32,
+        pub right_x: f32,
+        pub right_y: f32,
+    }
+
+    /// A key held down: Windows virtual key, set-1 scan code (0xE0xx when
+    /// extended), character.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Key {
+        pub virtual_key: u8,
+        pub scan_code: u32,
+        pub code_point: u32,
+    }
+
+    pub(super) static PADS: Mutex<[Option<Pad>; SLOTS]> = Mutex::new([None; SLOTS]);
+    pub(super) static KEYS: Mutex<Vec<Key>> = Mutex::new(Vec::new());
+    /// Wanted motor speeds per slot (low, high), for the app to play.
+    pub(super) static RUMBLE: Mutex<[(u16, u16); SLOTS]> = Mutex::new([(0, 0); SLOTS]);
+    /// Motion since the last poll (points, down positive), buttons held
+    /// (bit 0 left, 1 right, 2 middle), whether the mouse is captured.
+    static MOUSE: Mutex<(f32, f32, u8, bool)> = Mutex::new((0.0, 0.0, 0, false));
+
+    /// Pad `slot` (0 to 3) is `pad`, or gone.
+    pub fn set_pad(slot: usize, pad: Option<Pad>) {
+        if let Some(p) = PADS.lock().unwrap_or_else(PoisonError::into_inner).get_mut(slot) {
+            *p = pad;
+        }
+    }
+
+    /// The motor speeds the title asked of pad `slot`.
+    pub fn rumble(slot: usize) -> (u16, u16) {
+        RUMBLE.lock().unwrap_or_else(PoisonError::into_inner).get(slot).copied().unwrap_or_default()
+    }
+
+    /// A key went down or up.
+    pub fn key(key: Key, down: bool) {
+        let mut keys = KEYS.lock().unwrap_or_else(PoisonError::into_inner);
+        keys.retain(|k| k.virtual_key != key.virtual_key);
+        if down {
+            keys.push(key);
+        }
+    }
+
+    /// Every key up (the window lost focus).
+    pub fn release_all() {
+        KEYS.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        let mut m = MOUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        *m = (0.0, 0.0, 0, false);
+    }
+
+    /// The mouse moved by (dx, dy) points (down positive).
+    pub fn mouse_moved(dx: f64, dy: f64) {
+        let mut m = MOUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        m.0 += dx as f32;
+        m.1 += dy as f32;
+    }
+
+    /// Mouse button `button` (0 left, 1 right, 2 middle) went down or up.
+    pub fn mouse_button(button: u8, down: bool) {
+        let mut m = MOUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        if down {
+            m.2 |= 1 << button;
+        } else {
+            m.2 &= !(1 << button);
+        }
+    }
+
+    /// Whether mouse motion turns the right stick (the app hides and holds
+    /// the pointer then).
+    pub fn set_captured(captured: bool) {
+        MOUSE.lock().unwrap_or_else(PoisonError::into_inner).3 = captured;
+    }
+
+    pub(super) fn take_mouse() -> (f32, f32, u8, bool) {
+        let mut m = MOUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        let out = *m;
+        m.0 = 0.0;
+        m.1 = 0.0;
+        out
+    }
+
+    /// Mouse speed (points a second) for a full stick (`VICTORY_MOUSE_SPEED`, 1500).
+    pub(super) fn sensitivity() -> f32 {
+        static S: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_MOUSE_SPEED").ok().and_then(|v| v.parse().ok()).filter(|&v: &f32| v > 0.0).unwrap_or(1500.0)
+        });
+        *S
+    }
+
+    /// The mouse as a pad: right stick, right button aims (left trigger),
+    /// left button fires (right trigger), middle clicks the right stick.
+    pub(super) fn mouse_pad(x: f32, y: f32, buttons: u8) -> PadState {
+        PadState {
+            buttons: if buttons & 4 != 0 { RIGHT_STICK } else { 0 },
+            left_trigger: if buttons & 2 != 0 { 1.0 } else { 0.0 },
+            right_trigger: if buttons & 1 != 0 { 1.0 } else { 0.0 },
+            right_x: x,
+            right_y: y,
+            ..Default::default()
+        }
+    }
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));

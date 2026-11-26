@@ -805,6 +805,11 @@ impl GraphicsBackend for Metal {
             {
                 eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
             }
+            // GPU time, for the window's figures.
+            let secs = done.GPUEndTime() - done.GPUStartTime();
+            if secs > 0.0 && secs < 10.0 {
+                GPU_US.fetch_add((secs * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
@@ -1178,4 +1183,12 @@ fn is_depth(f: MTLPixelFormat) -> bool {
         MTLPixelFormat::Depth32Float_Stencil8,
     ]
     .contains(&f)
+}
+
+/// Microseconds the GPU spent on our command buffers (summed: overlapping ones count twice).
+static GPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`GPU_US`] since the last call.
+pub fn take_gpu_us() -> u64 {
+    GPU_US.swap(0, std::sync::atomic::Ordering::Relaxed)
 }

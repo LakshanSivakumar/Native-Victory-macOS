@@ -31,8 +31,8 @@ pub type Host = host::NativeHost<victory_metal::metal::Metal>;
 
 #[cfg(target_os = "macos")]
 pub use glue::{
-    create_layer, frames_presented, last_frame, pool_observer, pools, set_event_hook, set_layer,
-    shader_stats,
+    create_layer, frames_presented, hud, last_frame, pool_observer, pools, set_event_hook,
+    set_layer, shader_stats,
 };
 
 /// Reads `out.len()` bytes at `at` from this process, false if they cannot be read (unmapped

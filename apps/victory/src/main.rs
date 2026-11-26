@@ -14,6 +14,8 @@ mod shader;
 #[cfg(windows)]
 mod translate;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod input;
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod window;
 
 use std::path::PathBuf;
