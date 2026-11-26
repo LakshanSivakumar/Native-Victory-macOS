@@ -909,6 +909,22 @@ impl Metal {
             e.waitForFence(f);
         }
         for d in dispatches {
+            // An indirect dispatch's counts are checked into a slot of their own first (the
+            // encoder runs its dispatches in order).
+            let checked = match d.indirect {
+                Some((b, title)) => self.clamp_groups().map(|(clamp, slots, at)| {
+                    e.setComputePipelineState(clamp);
+                    // SAFETY: the argument record is three u32s at that offset; the slot is 16 bytes.
+                    unsafe {
+                        e.setBuffer_offset_atIndex(Some(&*b.buf), title as usize - b.base as usize, 0);
+                        e.setBuffer_offset_atIndex(Some(slots), at, 1);
+                    }
+                    let one = size([1, 1, 1]);
+                    e.dispatchThreadgroups_threadsPerThreadgroup(one, one);
+                    (slots, at)
+                }),
+                None => None,
+            };
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
@@ -927,13 +943,23 @@ impl Metal {
                         e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
                     }
                     let off = title as usize - b.base as usize;
-                    // SAFETY: the buffer is live and holds the three counts at `off`.
+                    // SAFETY: the buffer is live and holds the three counts at `off` (or the
+                    // checked slot does).
                     unsafe {
-                        e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
-                            &b.buf,
-                            off,
-                            size(d.threads_per_group),
-                        )
+                        match checked {
+                            Some((slots, at)) => e
+                                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                                    slots,
+                                    at,
+                                    size(d.threads_per_group),
+                                ),
+                            None => e
+                                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                                    &b.buf,
+                                    off,
+                                    size(d.threads_per_group),
+                                ),
+                        }
                     };
                 }
                 None => {
