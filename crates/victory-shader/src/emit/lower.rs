@@ -130,6 +130,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 }
 
 pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, ShaderError> {
+    NEEDS.with_borrow_mut(Vec::clear);
     let mut bad = HashMap::new();
     // Compute programs hold masks the structurisation cannot see into
     // (built from scalars, shifted) only with the console's lanes: asked
@@ -300,6 +301,10 @@ struct Lower<'a> {
     halves: bool,
     /// Blocks each lane runs exactly once ([`once_blocks`]), with `halves`.
     once: Vec<bool>,
+    /// With branches taken wave-wide ([`Structured::wide`]) and `halves`:
+    /// the blocks both halves of a console wave reach together
+    /// ([`together_blocks`]); empty otherwise.
+    together: Vec<bool>,
     /// Why the program cannot run on a 32-lane host.
     refuse: Option<Why>,
     /// The group's lane in console order, made in the entry block.
@@ -317,7 +322,7 @@ struct Lower<'a> {
     no_barrier: Set<usize>,
     /// Group barriers before these instructions (index = length: at the
     /// block's end), for a one-wave group split across host waves
-    /// ([`split_wave_barriers`]).
+    /// ([`split_wave_barriers_in`]).
     split_barriers: Set<(usize, usize)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
@@ -471,6 +476,16 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+
+/// Why a program with branches taken wave-wide has no halves form: a
+/// scalar branch where both halves of a console wave are together tests
+/// what they may hold differently ([`scalar_parting`]), so that they could
+/// part there.
+const SCALAR_APART: Why = "a scalar branch the halves may take apart";
+
+/// Why a cross-lane operation between the halves of a console wave is
+/// refused: they may not both be there.
+const APART: Why = "a cross-lane operation between host waves in divergent code";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -626,6 +641,7 @@ impl<'a> Lower<'a> {
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = console;
         let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
+        let mut together = Vec::new();
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -674,13 +690,30 @@ impl<'a> Lower<'a> {
             // passes between its lanes without a barrier.
             let mut synced = false;
             host32 = x.wave32_host && x.native.wave64;
+            // Branches taken wave-wide (`structure::structure_wide`): both
+            // halves of the console wave go the same way there, so they are
+            // together in more blocks than those each lane runs once.
+            let walked = host32 && one_wave && lanes > 32 && !x.st.wide.is_empty();
+            if walked {
+                together = together_blocks(p, x.st);
+            }
             if (x.narrow_waves || host32) && one_wave && lanes > 32 && s.lds_dwords > 0 {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
-                if let Some(b) = split_wave_barriers(p) {
-                    split_barriers = b;
-                    synced = true;
+                let uniform = if walked {
+                    together.clone()
+                } else {
+                    once_blocks(p)
+                };
+                match split_wave_barriers_in(p, &uniform) {
+                    Ok(b) => {
+                        split_barriers = b;
+                        synced = true;
+                    }
+                    // (where the halves would have to meet: `take_needs`)
+                    Err(apart) if host32 => NEEDS.with_borrow_mut(|n| n.extend(apart)),
+                    Err(_) => {}
                 }
             }
             // A host whose waves are narrower than WaveSize(64) does not run
@@ -691,11 +724,18 @@ impl<'a> Lower<'a> {
                 // Whole-wave sections are reductions over the console's
                 // 64 lanes (`halves.rs`).
                 let sections = (0..p.blocks.len()).any(|b| !super::wave::sections(p, b).is_empty());
-                halves = lanes > 32 && (console_lanes || sections);
+                // (a branch taken wave-wide is a decision the halves exchange)
+                halves = lanes > 32 && (console_lanes || sections || walked);
                 // No host wave is 64 lanes: LDS a wave shares unsynced
                 // cannot run.
                 if one_wave && lanes > 32 && s.lds_dwords > 0 && !synced {
                     refuse = Some("LDS shared in a wave the host splits, in divergent code");
+                }
+                // Branches taken wave-wide: the halves go the same way only
+                // where the scalar branches they meet at test what both
+                // hold alike.
+                if walked && !scalar_parting(p, x.st, &together).is_empty() {
+                    refuse = Some(SCALAR_APART);
                 }
                 console_lanes |= halves;
                 if console_lanes {
@@ -804,6 +844,7 @@ impl<'a> Lower<'a> {
             host32,
             halves,
             once,
+            together,
             console_flat: None,
             refuse,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -3037,7 +3078,42 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+            // (made only where the branch is lowered, `Self::wave_decision`)
+            Atom::Wave(_) => Err("a wave-wide decision as a lane's"),
         }
+    }
+
+    /// The console's decision of the branch closing IR block `b`, which the
+    /// whole wave takes ([`Structured::wide`]): `when` is the lane's own
+    /// bit, and the branch is taken when some lane's holds (`execnz`,
+    /// `vccnz`, SCC of a mask operation set) or when every lane's does
+    /// (`execz`, `vccz`), [`Structured::wave_any`]. Every lane of the wave
+    /// is here, EXEC being a guard: a lane outside it says what it says on
+    /// the console (no set bit for "some lane", no objection to "every
+    /// lane"). Each host wave asks its lanes and the halves exchange the
+    /// answers (`lower/halves.rs`), so both go the same way.
+    fn wave_decision(&mut self, b: usize) -> Result<V, Why> {
+        let any = self.x.st.wave_any[b].ok_or("a wave-wide branch on a scalar condition")?;
+        let &when = self
+            .x
+            .st
+            .lane_when
+            .get(&b)
+            .ok_or("a wave-wide branch without its mask")?;
+        let c = self.cur;
+        let mine = self.boolean(when, c)?;
+        let i1t = self.s.t.i1;
+        self.s.flags |= flags::WAVE_OPS;
+        let (name, code) = if any {
+            ("waveAnyTrue", 113)
+        } else {
+            ("waveAllTrue", 114)
+        };
+        let host = self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]);
+        if !self.halves {
+            return Ok(host);
+        }
+        self.halves_decide(b, host, any)
     }
 
     /// The bit of lane `lane` in the mask `lo`, `hi`.
@@ -9695,7 +9771,7 @@ impl<'a> Lower<'a> {
                     .bools
                     .support(when)
                     .iter()
-                    .all(|a| matches!(a, Atom::Uniform(_))),
+                    .all(|a| matches!(a, Atom::Uniform(_) | Atom::Wave(_))),
                 _ => true,
             })
     }
@@ -11945,6 +12021,10 @@ impl<'a> Lower<'a> {
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
+                    Some((Atom::Wave(_), _, _)) => {
+                        let c = self.wave_decision(b).map_err(|w| unsupported(offset, w))?;
+                        (c, taken, not_taken)
+                    }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
@@ -12200,7 +12280,7 @@ impl<'a> Lower<'a> {
                 | Atom::Phi(v)
                 | Atom::Quad(v)
                 | Atom::Opaque(v) => Some(v),
-                Atom::Constant(_) => None,
+                Atom::Constant(_) | Atom::Wave(_) => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {
                 return true;
@@ -12691,12 +12771,24 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
 /// at its end syncs there when a successor is not one, so divergent code
 /// after it reads clean LDS. `None`: a read in divergent code may see a
 /// write made in divergent code since the last such block.
+#[cfg(test)]
 pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
+    split_wave_barriers_in(p, &once_blocks(p)).ok()
+}
+
+/// [`split_wave_barriers`] with barriers in the blocks `uniform` marks
+/// (those each lane runs once, or with branches taken wave-wide those both
+/// halves reach together: [`together_blocks`]); `Err` with the blocks whose
+/// reads would need one where none can be placed.
+fn split_wave_barriers_in(
+    p: &Program,
+    uniform: &[bool],
+) -> Result<Set<(usize, usize)>, Vec<usize>> {
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let uniform = once_blocks(p);
     let order = crate::ir::reverse_postorder(&p.blocks);
     let mut dirty_out = vec![false; n];
+    let mut apart = Vec::new();
     loop {
         let mut at = Set::default();
         let mut changed = false;
@@ -12714,10 +12806,11 @@ pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
                     continue;
                 }
                 if dirty && !name.starts_with("ds_write") {
-                    if !uniform[b] {
-                        return None;
+                    if uniform[b] {
+                        at.insert((b, i));
+                    } else if !apart.contains(&b) {
+                        apart.push(b);
                     }
-                    at.insert((b, i));
                 }
                 dirty = !name.starts_with("ds_read");
             }
@@ -12728,7 +12821,244 @@ pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
             changed |= std::mem::replace(&mut dirty_out[b], dirty) != dirty;
         }
         if !changed {
-            return Some(at);
+            return if apart.is_empty() { Ok(at) } else { Err(apart) };
+        }
+    }
+}
+
+/// Where a compute group that is one console wave runs in halves with
+/// branches taken wave-wide ([`Structured::wide`]): the blocks both halves
+/// reach together, so that a group barrier can go there. Those each lane
+/// runs once ([`once_blocks`]), and those reached by scalar branches and
+/// branches taken wave-wide alone, on no cycle or on cycles whose every
+/// branch is such a one (both halves go round as often).
+/// [`scalar_parting`] checks that the scalar branches decide alike in both
+/// halves.
+fn together_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+    let n = p.blocks.len();
+    let once = once_blocks(p);
+    let wave_wide = |b: Bool| {
+        st.bools
+            .support(b)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(_) | Atom::Wave(_)))
+    };
+    let succ: Vec<Vec<usize>> = p.blocks.iter().map(|b| b.exit.successors()).collect();
+    let reach = |from: usize| {
+        let mut seen = vec![false; n];
+        let mut stack = succ[from].clone();
+        while let Some(x) = stack.pop() {
+            if !std::mem::replace(&mut seen[x], true) {
+                stack.extend(succ[x].iter().copied());
+            }
+        }
+        seen
+    };
+    let reaches: Vec<Vec<bool>> = (0..n).map(reach).collect();
+    let decided = |q: usize| match st.exits[q] {
+        LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } => taken == not_taken || wave_wide(when),
+        LaneExit::Indirect => false,
+        _ => true,
+    };
+    (0..n)
+        .map(|b| {
+            once[b]
+                || wave_wide(st.reach[b])
+                    && (!reaches[b][b]
+                        || (0..n)
+                            .filter(|&q| reaches[b][q] && reaches[q][b])
+                            .all(decided))
+        })
+        .collect()
+}
+
+/// The scalar values every lane of a console wave holds alike where a
+/// group is one console wave run in halves with branches taken wave-wide
+/// ([`Structured::wide`]): the SGPRs it starts with, what scalar
+/// instructions make of such values, a lane read across the halves (the
+/// console wave's value in both, `lower/halves.rs`), and the joins of such
+/// values where the wave arrives as one (`together`: every predecessor a
+/// block all its lanes run together). A join after a per-lane branch is
+/// each lane's own: the lanes that skipped hold what the other way left. A
+/// first-lane read is each half's own here, so not alike. Joins are all
+/// taken to hold first, then those that do not are taken out until the
+/// rest do (loops).
+fn wave_same(p: &Program, st: &Structured, together: &[bool]) -> Set<Value> {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let scalar = |r: Reg| matches!(r, Reg::S(c) if c <= 105) || r == Reg::Scc;
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let mut joins: Vec<(usize, &Phi)> = order
+        .iter()
+        .flat_map(|&b| p.blocks[b].phis.iter().map(move |phi| (b, phi)))
+        .filter(|(_, phi)| scalar(phi.reg) && !is_mask(phi.value))
+        .collect();
+    loop {
+        let mut same: Set<Value> = joins.iter().map(|j| j.1.value).collect();
+        for &(reg, v) in &p.inputs {
+            if scalar(reg) {
+                same.insert(v);
+            }
+        }
+        // (a mask read as a number is the console's: a ballot of each half,
+        // exchanged)
+        same.extend(st.masks.keys().chain(st.highs.keys()).copied());
+        for &b in &order {
+            for inst in &p.blocks[b].insts {
+                let made = match &inst.fields {
+                    Fields::Sop { .. } | Fields::Smem { .. } => inst
+                        .reads
+                        .iter()
+                        .filter(|r| r.0 != Reg::S(EXEC) && r.0 != Reg::S(EXEC + 1))
+                        .all(|r| same.contains(&r.1)),
+                    Fields::Valu(_) => inst.name() == "v_readlane_b32",
+                    _ => false,
+                };
+                if made {
+                    same.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
+                }
+            }
+        }
+        let before = joins.len();
+        joins.retain(|&(b, phi)| {
+            together[b]
+                && p.blocks[b].preds.iter().all(|&q| together[q])
+                && phi.args.iter().all(|a| same.contains(a))
+        });
+        if joins.len() == before {
+            return same;
+        }
+    }
+}
+
+/// The blocks where the lanes of a console wave run in halves with
+/// branches taken wave-wide may part on a scalar branch: a block both
+/// halves reach together ending in a branch on an SCC that is not
+/// [`wave_same`].
+fn scalar_parting(p: &Program, st: &Structured, together: &[bool]) -> Vec<usize> {
+    let same = wave_same(p, st, together);
+    (0..p.blocks.len())
+        .filter(|&b| together[b])
+        .filter(|&b| match st.exits[b] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => {
+                taken != not_taken
+                    && st
+                        .bools
+                        .support(when)
+                        .iter()
+                        .any(|a| matches!(a, Atom::Uniform(v) if !same.contains(v)))
+            }
+            _ => false,
+        })
+        .collect()
+}
+
+thread_local! {
+    /// The IR blocks where the program last lowered on this thread for a
+    /// 32-lane host found the halves of a console wave apart
+    /// ([`take_needs`]).
+    static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes [`NEEDS`]: the blocks where the halves of a console wave had to
+/// meet (an exchange, an LDS read to sync) and could not, sorted.
+pub(crate) fn take_needs() -> Vec<usize> {
+    let mut n = NEEDS.take();
+    n.sort_unstable();
+    n.dedup();
+    n
+}
+
+/// Whether block `b` only ends the program: nothing but the end in it.
+fn ends(p: &Program, b: usize) -> bool {
+    p.blocks[b].exit.successors().is_empty()
+        && p.blocks[b].insts.iter().all(|i| i.name() == "s_endpgm")
+}
+
+/// The per-lane branches (blocks closed by one, not yet in
+/// [`Structured::wide`]) that decide whether or how often a lane runs one
+/// of the blocks `needs`, directly or through the branches around them: the
+/// branches to take wave-wide ([`crate::structure::structure_wide`]) so
+/// that the halves of a console wave are together there. `ending`: also the
+/// branches whose other way is the program's end (`if (...) return;`).
+pub(crate) fn branches_around(
+    p: &Program,
+    st: &Structured,
+    needs: &[usize],
+    ending: bool,
+) -> Vec<usize> {
+    let n = p.blocks.len();
+    let succ: Vec<Vec<usize>> = p.blocks.iter().map(|b| b.exit.successors()).collect();
+    let pdom = postdominators(p);
+    let depends = |b: usize, q: usize| {
+        succ[q].len() > 1 && succ[q].iter().any(|&s| pdom[s][b]) && (b == q || !pdom[q][b])
+    };
+    // Any branch on a lane mask: one that no lane takes as the per-lane form
+    // has it (a skip around code inside a per-lane branch, `when` false in
+    // every lane there) is taken by the wave once the wave goes on where
+    // some lane does.
+    let per_lane = |q: usize| match st.exits[q] {
+        LaneExit::Branch {
+            taken, not_taken, ..
+        } => {
+            taken != not_taken
+                && !st.wide.contains(&q)
+                && st.wave_any[q].is_some()
+                && (ending || !succ[q].iter().any(|&s| ends(p, s)))
+        }
+        _ => false,
+    };
+    let mut seen = vec![false; n];
+    let mut work: Vec<usize> = needs.iter().copied().filter(|&b| b < n).collect();
+    let mut found = Vec::new();
+    while let Some(b) = work.pop() {
+        if std::mem::replace(&mut seen[b], true) {
+            continue;
+        }
+        for q in 0..n {
+            if depends(b, q) {
+                if per_lane(q) && !found.contains(&q) {
+                    found.push(q);
+                }
+                work.push(q);
+            }
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// Per block, the blocks that postdominate it (itself among them).
+fn postdominators(p: &Program) -> Vec<Vec<bool>> {
+    let n = p.blocks.len();
+    let succ: Vec<Vec<usize>> = p.blocks.iter().map(|b| b.exit.successors()).collect();
+    let mut pdom = vec![vec![true; n]; n];
+    for b in 0..n {
+        if succ[b].is_empty() {
+            pdom[b] = (0..n).map(|q| q == b).collect();
+        }
+    }
+    loop {
+        let mut changed = false;
+        for b in (0..n).rev() {
+            if succ[b].is_empty() {
+                continue;
+            }
+            let new: Vec<bool> = (0..n)
+                .map(|q| q == b || succ[b].iter().all(|&s| pdom[s][q]))
+                .collect();
+            changed |= new != pdom[b];
+            pdom[b] = new;
+        }
+        if !changed {
+            return pdom;
         }
     }
 }

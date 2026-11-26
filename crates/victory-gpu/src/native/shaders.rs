@@ -20,11 +20,16 @@ use std::rc::Rc;
 use victory_backend::resources::*;
 use victory_shader::emit::{HostShader, Options};
 
-/// The translation settings of the native host.
+/// The translation settings of the native host. `VICTORY_WAVE_WALK=0` refuses the wave64 programs
+/// whose halves meet only once the per-lane branches around them are taken by the whole wave
+/// (`Options::no_wave_walk`), as before that walk.
 pub fn options() -> Options {
+    static NO_WALK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     Options {
         wave32_host: true,
         zero_copy_memory: true,
+        no_wave_walk: *NO_WALK
+            .get_or_init(|| std::env::var("VICTORY_WAVE_WALK").as_deref() == Ok("0")),
         ..Options::default()
     }
 }

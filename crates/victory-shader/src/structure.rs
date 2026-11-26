@@ -59,6 +59,10 @@ pub enum Atom {
     Opaque(Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
+    /// The console wave's decision of the branch closing this block, taken
+    /// wave-wide ([`structure_wide`]): the same in every lane of the wave,
+    /// whatever its own bit ([`Structured::lane_when`]).
+    Wave(usize),
 }
 
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
@@ -473,6 +477,18 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: Map<(usize, usize), Bool>,
+    /// Blocks whose closing branch the whole console wave takes together,
+    /// as the console does ([`structure_wide`]). Their exit's `when` is the
+    /// wave's decision ([`Atom::Wave`]), which says nothing of a lane's own
+    /// bit; [`Self::lane_when`] has that.
+    pub wide: Set<usize>,
+    /// Per block of `wide`: the lane's own bit of the branch's mask, which
+    /// the wave goes by as [`Self::wave_any`] says.
+    pub lane_when: Map<usize, Bool>,
+    /// Per block closed by a branch on a lane mask: whether the console
+    /// takes it when some lane's `when` holds (`true`) or when every
+    /// lane's does (`false`). `None` for a branch on a scalar condition.
+    pub wave_any: Vec<Option<bool>>,
 }
 
 impl Structured {
@@ -487,7 +503,20 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, &Set::default())
+}
+
+/// [`structure`], with the branches that close the blocks of `wide` kept as
+/// the console has them: one decision for the whole wave (`execz` and
+/// `vccz`: taken when no lane's bit is set; `execnz` and `vccnz`: when some
+/// lane's is; SCC of a mask operation likewise, [`Structured::wave_any`]),
+/// which every lane follows. A lane then learns nothing about its own bit
+/// from the way it went, so past such a branch EXEC stays a guard on every
+/// vector instruction, as it is on the console. For a console wave run as
+/// two host waves: they exchange that decision and go the same way, so they
+/// can meet (a group barrier) inside the branch.
+pub fn structure_wide(program: &Program, wide: &Set<usize>) -> Result<Structured, ShaderError> {
+    structure_as(program, true, wide)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -495,17 +524,23 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, &Set::default())
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
+fn structure_as(
+    program: &Program,
+    helpers: bool,
+    wide: &Set<usize>,
+) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.wide = wide.clone();
     if !helpers {
         l.kills.clear();
     }
     loop {
         let (execs, kill_lanes) = l.masks_in_order();
         let cond = l.paths()?;
+        l.phi_args();
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
             return l.finish(&execs, kill_lanes, &cond);
@@ -571,6 +606,16 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    /// The SCC values of `scc_lane` set when every lane's bit is (`s_cmp_eq`
+    /// of two masks: "no lane differs"); the others are set when some
+    /// lane's is.
+    scc_every: Set<Value>,
+    /// See [`Structured::wide`].
+    wide: Set<usize>,
+    /// See [`Structured::wave_any`].
+    wave_any: Vec<Option<bool>>,
+    /// The incoming masks of the joins taken as [`Atom::Phi`].
+    phi_joins: Vec<Vec<Key>>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -646,6 +691,10 @@ impl<'a> Lanes<'a> {
             masks: Map::default(),
             other: Map::default(),
             scc_lane: Map::default(),
+            scc_every: Set::default(),
+            wide: Set::default(),
+            wave_any: vec![None; blocks.len()],
+            phi_joins: Vec::new(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
@@ -738,6 +787,9 @@ impl<'a> Lanes<'a> {
         self.masks.clear();
         self.other.clear();
         self.scc_lane.clear();
+        self.scc_every.clear();
+        self.wave_any.fill(None);
+        self.phi_joins.clear();
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
@@ -854,13 +906,39 @@ impl<'a> Lanes<'a> {
                     }
                 }
                 self.when[b] = Some(w);
+                self.wave_any[b] = self.wave_kind(last);
             }
         }
         (execs, kill_lanes)
     }
 
+    /// How the console decides the branch `inst` on a lane mask, in terms
+    /// of the lanes' own `when` ([`Self::branch`]): taken when some lane's
+    /// holds (`true`) or when every lane's does (`false`). `execnz` and
+    /// `vccnz` ask for some set bit, `execz` and `vccz` for none; SCC of a
+    /// mask operation is "some lane's bit is set", SCC of `s_cmp_eq` of two
+    /// masks "every lane's is" ([`Self::scc_every`]), and `scc0` branches
+    /// on the opposite. `None` for a branch on a scalar condition.
+    fn wave_kind(&self, inst: &Inst) -> Option<bool> {
+        match inst.name() {
+            "s_cbranch_execnz" | "s_cbranch_vccnz" => Some(true),
+            "s_cbranch_execz" | "s_cbranch_vccz" => Some(false),
+            n @ ("s_cbranch_scc0" | "s_cbranch_scc1") => {
+                let scc = inst.read(Reg::Scc)?;
+                self.scc_lane.get(&scc)?;
+                let every = self.scc_every.contains(&scc);
+                Some((n == "s_cbranch_scc1") != every)
+            }
+            _ => None,
+        }
+    }
+
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
+        if self.wide.contains(&q) {
+            // The wave's decision says nothing of this lane's own bit.
+            return c;
+        }
         match self.when[q] {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
@@ -933,6 +1011,7 @@ impl<'a> Lanes<'a> {
                     .collect()
             })
             .collect();
+        let mut lane_when = Map::default();
         let exits = blocks
             .iter()
             .enumerate()
@@ -940,6 +1019,14 @@ impl<'a> Lanes<'a> {
                 Exit::Jump(t) => LaneExit::Jump(t),
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
+                Exit::Branch { taken, not_taken } if self.wide.contains(&n) => {
+                    lane_when.insert(n, b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]));
+                    LaneExit::Branch {
+                        when: b.atom(Atom::Wave(n), self.index[n]),
+                        taken,
+                        not_taken,
+                    }
+                }
                 Exit::Branch { taken, not_taken } => LaneExit::Branch {
                     when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
                     taken,
@@ -971,6 +1058,9 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            wide: self.wide,
+            lane_when,
+            wave_any: self.wave_any,
         })
     }
 
@@ -1527,7 +1617,23 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
+        self.phi_joins.push(args);
         Some((self.b.atom(Atom::Phi(id), born), derived))
+    }
+
+    /// The masks every [`Atom::Phi`] join takes in, back edges' too: the
+    /// lowering joins each lane's bit of them. (Where the per-lane form
+    /// resolves a loop's EXEC join as a constant, it never needs the mask
+    /// its back edge brings; with branches taken wave-wide such a join can
+    /// hold lanes outside EXEC, and is joined from its incoming masks.)
+    fn phi_args(&mut self) {
+        let mut i = 0;
+        while i < self.phi_joins.len() {
+            for a in self.phi_joins[i].clone() {
+                self.mask(a);
+            }
+            i += 1;
+        }
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
@@ -1775,6 +1881,11 @@ impl<'a> Lanes<'a> {
                         (self.operand(inst, a), self.operand(inst, c))
                 {
                     let ne = self.b.xor(a, c);
+                    if rest.starts_with("eq") {
+                        self.scc_every.insert(scc);
+                    } else {
+                        self.scc_every.remove(&scc);
+                    }
                     let m = if rest.starts_with("eq") {
                         self.b.not(ne)
                     } else {
@@ -2088,6 +2199,94 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    /// `if (id == 0) v1 = 0;` in wave64, its skip taken wave-wide: the
+    /// branch is the wave's decision ([`Atom::Wave`]), the lane's own bit
+    /// is kept for it, and inside the block, which every lane now enters,
+    /// the write is guarded by EXEC as on the console.
+    #[test]
+    fn a_branch_taken_wave_wide_keeps_exec_a_guard() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+                0xBF88_0001, // s_cbranch_execz -> 16
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xBEFE_0402, // 16: s_mov_b64 exec, s[2:3]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let lane = structure(&p).unwrap();
+        assert_eq!(guarded(&lane), 0, "{:?}", lane.guards);
+        assert!(lane.wide.is_empty() && lane.lane_when.is_empty());
+        let s = structure_wide(&p, &Set::from_iter([0])).unwrap();
+        let LaneExit::Branch {
+            when,
+            taken: 2,
+            not_taken: 1,
+        } = s.exits[0]
+        else {
+            panic!("{:?}", s.exits)
+        };
+        assert_eq!(s.bools.support(when), [Atom::Wave(0)]);
+        // execz: taken when every lane's bit (no EXEC) holds
+        assert_eq!(s.wave_any[0], Some(false));
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        assert_eq!(s.bools.support(s.lane_when[&0]), [Atom::Lane(cmp)]);
+        // the move inside: every lane is there, EXEC its guard
+        assert_eq!(guarded(&s), 1, "{:?}", s.guards);
+        assert!(s.guards[1][0].is_some());
+    }
+
+    /// A loop the wave goes round 4 times (a scalar count), in which lanes
+    /// with v1 = 1 leave EXEC past a per-lane skip: EXEC joined at the
+    /// header is no lane-wide constant, and the mask the back edge brings
+    /// (joined at the latch, which only scalar code reads) is known too,
+    /// so that the lowering can join each lane's bit. Also with the skip
+    /// taken wave-wide.
+    #[test]
+    fn exec_joined_at_a_loop_header_is_known_along_its_back_edge() {
+        let p = build(
+            &[
+                0x7E02_0300, // v_mov_b32 v1, v0
+                0xBE84_0380, // s_mov_b32 s4, 0
+                0x7D8A_0204, // 8: v_cmp_ne_u32 vcc, s4, v1
+                0xBF86_0001, // s_cbranch_vccz -> 20
+                0x7DAA_0281, // v_cmpx_ne_u32 exec, 1, v1
+                0x8104_8104, // 20: s_add_i32 s4, s4, 1
+                0xBF0A_8404, // s_cmp_lt_u32 s4, 4
+                0xBF85_FFFA, // s_cbranch_scc1 -> 8
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let header = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].offset == 8)
+            .unwrap();
+        let exec = p.blocks[header]
+            .phis
+            .iter()
+            .find(|phi| phi.reg == Reg::S(EXEC))
+            .expect("EXEC joined at the header");
+        for wide in [Set::default(), Set::from_iter([header])] {
+            let s = structure_wide(&p, &wide).unwrap();
+            assert!(
+                matches!(
+                    s.bools.node(s.masks[&exec.value]),
+                    Some((Atom::Phi(_), _, _))
+                ),
+                "{:?}",
+                s.bools.node(s.masks[&exec.value])
+            );
+            for &a in &exec.args {
+                assert!(
+                    s.masks.contains_key(&a),
+                    "{a:?} not tracked (wide {wide:?})"
+                );
+            }
+        }
     }
 
     #[test]

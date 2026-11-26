@@ -31,10 +31,21 @@
 //!
 //! LDS that lanes of one console wave share without a barrier (the console
 //! runs the wave in lockstep) gets the group barriers `narrow_waves` adds
-//! ([`split_wave_barriers`](super::split_wave_barriers)), or is refused.
+//! ([`split_wave_barriers_in`](super::split_wave_barriers_in)), or is refused.
+//!
+//! Where the halves of a group of one console wave are apart (an exchange
+//! or an LDS read in a per-lane branch or loop), the program is made again
+//! with the per-lane branches around those places taken by the whole wave,
+//! as the console's scalar unit takes them (`emit::widened`,
+//! [`structure_wide`](crate::structure::structure_wide)): each host wave
+//! asks its lanes, the halves exchange the answers ([`Lower::halves_decide`])
+//! and go the same way, and EXEC stays a guard on every vector instruction
+//! inside. The halves are then together in those blocks
+//! ([`together_blocks`](super::together_blocks)), on loops too when every
+//! branch of the loop is scalar or taken wave-wide.
 
-use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, V, pred};
+use super::{APART, Lower, NEEDS, Why};
+use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
 use crate::emit::wave::Op;
 use crate::structure::Atom;
@@ -51,7 +62,7 @@ impl Lower<'_> {
     /// Whether every thread of the group (both halves of a console wave)
     /// reaches IR block `ir` together.
     fn exchange_site(&self, ir: usize) -> Result<(), Why> {
-        if self.once[ir] {
+        if self.once[ir] || self.together.get(ir) == Some(&true) {
             return Ok(());
         }
         let lanes: u32 = self.s.threads.map_or(0, |t| t.iter().product());
@@ -66,7 +77,40 @@ impl Lower<'_> {
         {
             return Ok(());
         }
-        Err("a cross-lane operation between host waves in divergent code")
+        // (where the halves would have to meet: `take_needs`)
+        NEEDS.with_borrow_mut(|n| n.push(ir));
+        Err(APART)
+    }
+
+    /// The console's decision of a branch the whole wave takes
+    /// ([`Structured::wide`](crate::structure::Structured)), closing IR
+    /// block `ir`, from each host wave's (`mine`): taken when some lane's
+    /// bit holds (`any`) or when every lane's does. Each half's answer goes
+    /// through group-shared memory, so both go the same way and are together
+    /// inside.
+    pub(super) fn halves_decide(&mut self, ir: usize, mine: V, any: bool) -> Result<V, Why> {
+        let at = self.cur;
+        self.exchange_site(ir)?;
+        let i32t = self.s.t.i32;
+        let v = self.s.m.cast(at, Cast::ZExt, mine, i32t);
+        let f = self.console_flat();
+        let (five, six, one) = (self.s.m.i32(5), self.s.m.i32(6), self.s.m.i32(1));
+        let half = self.s.m.bin(at, Bin::LShr, f, five);
+        let slot = self.xchg_slot(at, half);
+        self.s.m.store(at, slot, v);
+        self.xchg_barrier(at);
+        let pair = self.s.m.bin(at, Bin::LShr, f, six);
+        let lo_at = self.s.m.bin(at, Bin::Shl, pair, one);
+        let hi_at = self.s.m.bin(at, Bin::Add, lo_at, one);
+        let (lo_p, hi_p) = (self.xchg_slot(at, lo_at), self.xchg_slot(at, hi_at));
+        let (lo, hi) = (self.s.m.load(at, lo_p), self.s.m.load(at, hi_p));
+        self.xchg_barrier(at);
+        let both = self
+            .s
+            .m
+            .bin(at, if any { Bin::Or } else { Bin::And }, lo, hi);
+        let z = self.s.m.i32(0);
+        Ok(self.s.m.cmp(at, pred::NE, both, z))
     }
 
     /// The group-shared slot `index`.
