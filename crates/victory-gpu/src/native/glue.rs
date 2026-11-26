@@ -1114,12 +1114,13 @@ pub(crate) fn reset_list(this: This) {
     with_list(this, |_, l| l.reset());
 }
 
-/// Drops a list object, whose `Rc`s must be dropped under the lock.
-pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
+/// Drops a list object, whose `Rc`s must be dropped under the lock: `f` gets the host, if there
+/// is one, so that it can retire what the list owned without locking again.
+pub(crate) fn locked<R>(f: impl FnOnce(Option<&mut MetalTitle>) -> R) -> R {
     let mut f = Some(f);
-    match with_title(|_| (f.take().expect("once"))()) {
+    match with_title(|t| (f.take().expect("once"))(Some(t))) {
         Some(r) => r,
-        None => (f.take().expect("not run"))(),
+        None => (f.take().expect("not run"))(None),
     }
 }
 

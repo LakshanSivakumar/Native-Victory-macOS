@@ -497,16 +497,18 @@ extern "system" fn list_release(this: This) -> u32 {
             leave(held, uploads, state);
         }
     }
-    // Its upload memory may still be read by work a queue was given.
+    // Its recording holds `Rc`s of the native host: dropped under the host's lock. Its upload
+    // memory may still be read by work a queue was given: retired by the last release, which
+    // only `release_boxed_before` knows is the last.
     #[cfg(target_os = "macos")]
-    if !this.is_null() && object::refs(this) == 1 {
-        // SAFETY: the title passes one of our lists.
-        let uploads = unsafe { &(*this.cast::<List>()).uploads };
-        retire(std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner())));
-    }
-    // Its recording holds `Rc`s of the native host: dropped under the host's lock.
-    #[cfg(target_os = "macos")]
-    return crate::native::glue::locked(|| object::release_boxed::<List>(this));
+    return crate::native::glue::locked(|t| {
+        object::release_boxed_before::<List>(this, |list| {
+            let uploads = std::mem::take(list.uploads.get_mut().unwrap_or_else(|e| e.into_inner()));
+            if let (Some(t), false) = (t, uploads.is_empty()) {
+                t.retire(Box::new(uploads));
+            }
+        })
+    });
     #[cfg(not(target_os = "macos"))]
     return object::release_boxed::<List>(this);
 }
@@ -2530,6 +2532,68 @@ mod tests {
         }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// Whether the upload memory at `p` is still the list's (retired, not yet given back).
+    #[cfg(target_os = "macos")]
+    fn kept(p: *mut u8) -> bool {
+        crate::native::glue::pools().resolve(p as u64, 1).is_some()
+    }
+
+    /// Two releases at once of a list with two references could both see two references, so
+    /// neither retired its upload memory and the last freed it at once, under queued work. The
+    /// release that frees the list retires it now, whichever thread that is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_list_released_from_two_threads_retires_its_upload_memory() {
+        use crate::native::glue;
+        let null = std::ptr::null();
+        if glue::with_title(|_| ()).is_none() {
+            eprintln!("skipped: no Metal device");
+            return;
+        }
+        let (mut allocator, mut list, mut fence) = (null, null, null);
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        let iid = &crate::fence::FENCE_IIDS[0];
+        assert_eq!(crate::fence::create(null, 0, 0, iid, &mut fence), S_OK);
+        // A queue held behind a wait for the fence: nothing it was given has run.
+        static QUEUE: u8 = 0;
+        let queue: This = (&raw const QUEUE).cast();
+        glue::queue_wait(queue, fence, 1);
+        let p = allocate_upload(list, 64, 16);
+        assert!(kept(p));
+        object::add_ref(list);
+        let barrier = std::sync::Barrier::new(2);
+        let at = list as usize;
+        let left: u32 = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        list_release(at as This)
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        assert_eq!(left, 1, "one release left one reference, the other none");
+        assert!(kept(p), "freed under queued work");
+        glue::fence_signal(fence, 1);
+        let start = std::time::Instant::now();
+        while kept(p) {
+            assert!(start.elapsed().as_secs() < 10, "upload memory kept");
+            glue::with_title(|t| t.drop_retired());
+            std::thread::yield_now();
+        }
+        glue::queue_released(queue);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(fence), 0);
         assert_eq!(release(allocator), 0);
     }
 

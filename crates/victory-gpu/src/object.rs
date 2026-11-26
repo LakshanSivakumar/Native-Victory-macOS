@@ -202,6 +202,13 @@ pub(crate) fn hand_out<T>(
 
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
+    release_boxed_before::<T>(this, |_| {})
+}
+
+/// [`release_boxed`], running `last` on the object just before it is freed. Only the release
+/// whose atomic decrement reaches 0 runs it: a check of [`refs`] before releasing can see 2 in
+/// two threads releasing at once, and then neither would.
+pub(crate) fn release_boxed_before<T>(this: This, last: impl FnOnce(&mut T)) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
     match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
@@ -217,7 +224,9 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
                 }
             }
             // SAFETY: that was the last reference to a `Box<T>`.
-            drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
+            let mut object = unsafe { Box::from_raw(this.cast_mut().cast::<T>()) };
+            last(&mut object);
+            drop(object);
             0
         }
         Ok(n) => n - 1,
