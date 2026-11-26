@@ -201,6 +201,8 @@ struct L<'a> {
     ips: std::collections::HashSet<u64>,
     /// Stack reads that are shared accesses all the same ([`spin_reads`]).
     spin: std::collections::HashSet<u64>,
+    /// The cases of the function's tables of addresses, which its `JT` switch takes.
+    jt: BTreeSet<u64>,
 }
 
 type R<T> = Result<T, String>;
@@ -1054,10 +1056,23 @@ impl L<'_> {
                 }
                 _ => {
                     let t = self.rd(i, 0, 64)?;
-                    self.emit(&format!(
-                        "{{ u64 t = {t}; {}; rt_dispatch(c, t); return; }}",
-                        self.sp()
-                    ));
+                    let cases: Vec<u64> = self
+                        .f
+                        .tables
+                        .get(&i.ip())
+                        .map(|ts| ts.iter().copied().filter(|t| self.ips.contains(t)).collect())
+                        .unwrap_or_default();
+                    if cases.is_empty() {
+                        self.emit(&format!(
+                            "{{ u64 t = {t}; {}; rt_dispatch(c, t); return; }}",
+                            self.sp()
+                        ));
+                    } else {
+                        // `jmp [base + 8*idx]` through a table of addresses: an interpreter's dispatch, at the end of
+                        // each of its handlers. One switch for the function, after its body (`JT`, [`lift_core`]).
+                        self.jt.extend(cases);
+                        self.emit(&format!("{{ jt = {t}; goto JT; }}"));
+                    }
                 }
             },
             _ if i.flow_control() == iced_x86::FlowControl::ConditionalBranch => {
@@ -1237,9 +1252,18 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         y,
         ips: f.ins.iter().map(|i| i.ip()).collect(),
         spin: spin_reads(f.ins),
+        jt: BTreeSet::new(),
     };
     let mut errs = vec![];
-    let prologue = if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" };
+    let mut prologue = String::from(if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" });
+    // A dispatch through a table of addresses (`jmp [base + 8*idx]`) passes the address to the `JT` switch in `jt`.
+    if f.ins.iter().any(|i| {
+        i.code() == iced_x86::Code::Jmp_rm64
+            && i.op0_kind() == OpKind::Memory
+            && f.tables.get(&i.ip()).is_some_and(|ts| ts.iter().any(|t| ipset.contains(t)))
+    }) {
+        prologue.push_str("; u64 jt = 0; (void)jt");
+    }
     let mut body_at = 0;
     if pads.is_empty() {
         let _ = writeln!(l.o, "void {}(Cpu *c) {{ {prologue};", name(f.begin_va, ctx.image_base));
@@ -1281,7 +1305,18 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         }
     }
     // Falling off the end of a function is only legal after a non-returning call.
-    l.o.push_str("rt_trap(\"fell off end of function\"); }\n");
+    if l.jt.is_empty() {
+        l.o.push_str("rt_trap(\"fell off end of function\"); }\n");
+    } else {
+        // The function's dispatch through its tables of addresses (`jt`, the address read); one not among the
+        // cases (no instruction here) goes to the dispatcher, as an untabled jump would.
+        let mut sw = String::from("rt_trap(\"fell off end of function\");\nJT:; switch (jt - (u64)IMG + IMAGE_BASE) { ");
+        for t in &l.jt {
+            let _ = write!(sw, "case {t:#x}ull: goto L_{t:x}; ");
+        }
+        let _ = writeln!(sw, "default: {{ {}; rt_dispatch(c, jt); return; }} }}\n}}", l.sp());
+        l.o.push_str(&sw);
+    }
     if !entries.is_empty() {
         // The same body for each inner entry, entered at its label (the prologue loads every register as at the
         // start; nothing of the body before the label has run, as for the guest).
@@ -1361,6 +1396,41 @@ mod tests {
         let f = FuncIn { entries: vec![entry + 1], ..f };
         let c = lift_function(&ctx, &f).unwrap();
         assert!(c.contains(&format!("void f_{:x}(Cpu *c) {{ (void)c; rt_trap(", entry + 1 - BASE)), "{c}");
+    }
+
+    #[test]
+    fn a_dispatch_through_a_table_of_addresses_goes_to_the_function_switch() {
+        const BASE: u64 = 0x1_4000_0000;
+        let at = BASE + 0x1000;
+        let mut a = CodeAssembler::new(64).unwrap();
+        let (mut dispatch, mut h0, mut h1) = (a.create_label(), a.create_label(), a.create_label());
+        a.set_label(&mut dispatch).unwrap();
+        a.movzx(ebx, byte_ptr(rsi)).unwrap();
+        a.jmp(qword_ptr(r12 + rbx * 8)).unwrap();
+        a.set_label(&mut h0).unwrap();
+        a.jmp(dispatch).unwrap();
+        a.set_label(&mut h1).unwrap();
+        a.ret().unwrap();
+        let r = a.assemble_options(at, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+        let (h0, h1) = (r.label_ip(&h0).unwrap(), r.label_ip(&h1).unwrap());
+        let bytes = r.inner.code_buffer;
+        let ins: Vec<Instruction> = Decoder::with_ip(64, &bytes, at, DecoderOptions::NONE).iter().collect();
+        let jmp = ins[1].ip();
+        let is_func = move |va: u64| va == at;
+        let ctx = Ctx { image_base: BASE, is_func: &is_func };
+        let f = FuncIn {
+            begin_va: at,
+            end_va: at + bytes.len() as u64,
+            ins: &ins,
+            tables: BTreeMap::from([(jmp, vec![h0, h1, BASE + 0x9000])]),
+            extra: vec![],
+            landing_pads: vec![],
+            entries: vec![],
+        };
+        let c = lift_function(&ctx, &f).unwrap();
+        assert!(c.contains("u64 jt = 0;"), "{c}");
+        assert!(c.contains("goto JT;"), "{c}");
+        assert!(c.contains(&format!("JT:; switch (jt - (u64)IMG + IMAGE_BASE) {{ case {h0:#x}ull: goto L_{h0:x}; case {h1:#x}ull: goto L_{h1:x}; default:")), "{c}");
     }
 
     fn lifted(build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> String {

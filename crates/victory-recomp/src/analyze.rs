@@ -158,6 +158,21 @@ pub fn find_jump_tables_ext(
         .collect();
     let mut facts = InstructionInfoFactory::new();
     for (n, j) in ins.iter().enumerate() {
+        if j.code() == Code::Jmp_rm64 && j.op0_kind() == OpKind::Memory {
+            // `jmp qword ptr [base + 8*idx]`: a table of 64-bit addresses (an interpreter's handlers, each ending in
+            // the same dispatch: rva 0x3de2612, 530 of them), its base an `lea base, [rip + table]` of the function,
+            // the last one before (else the first after: the interpreter sets the register once, at its top).
+            let b = j.memory_base();
+            if j.memory_index_scale() == 8 && j.memory_index() != Register::None && b != Register::None && !j.is_ip_rel_memory_operand() {
+                let is_lea = |i: &&Instruction| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.op0_register() == b;
+                if let Some(lea) = ins[..n].iter().rev().find(is_lea).or_else(|| ins[n..].iter().find(is_lea)) {
+                    let lea_rva = (lea.ip_rel_memory_address().wrapping_sub(base)) as u32;
+                    let table_rva = lea_rva.wrapping_add(j.memory_displacement64() as u32);
+                    found.push(((j.ip() - base) as u32, table_rva, lea_rva, Entry::Abs64, None));
+                }
+            }
+            continue;
+        }
         if j.code() != Code::Jmp_rm64 || j.op0_kind() != OpKind::Register {
             continue;
         }
@@ -208,8 +223,8 @@ pub fn find_jump_tables_ext(
         }
         .filter(|b| (1..=65536).contains(b));
         // `movsxd`: offsets from the base; `mov`: RVAs (the base is `__ImageBase`).
-        let relative = !matches!(ld.code(), Code::Mov_r32_rm32 | Code::Mov_r64_rm64);
-        found.push(((j.ip() - base) as u32, table_rva, lea_rva, relative, bound));
+        let entry = if matches!(ld.code(), Code::Mov_r32_rm32 | Code::Mov_r64_rm64) { Entry::Rva32 } else { Entry::Rel32 };
+        found.push(((j.ip() - base) as u32, table_rva, lea_rva, entry, bound));
     }
     // A table ends where the function's next table starts: tables sit side by side in .rdata (and MSVC's byte table
     // right after its offsets), and reading on would take the next one's entries for cases. A range check that
@@ -218,15 +233,28 @@ pub fn find_jump_tables_ext(
     // function.
     let mut starts: Vec<u32> = found.iter().map(|t| t.1).collect();
     starts.sort_unstable();
-    for (jmp_rva, table_rva, lea_rva, relative, bound) in found {
-        let room = starts.iter().find(|&&s| s > table_rva).map(|&next| ((next - table_rva) / 4) as usize);
+    for (jmp_rva, table_rva, lea_rva, entry, bound) in found {
+        let size = if entry == Entry::Abs64 { 8 } else { 4 };
+        let room = starts.iter().find(|&&s| s > table_rva).map(|&next| ((next - table_rva) / size) as usize);
         let sized = bound.is_some() || room.is_some();
         let mut targets = vec![];
         for k in 0..bound.unwrap_or(4096).min(room.unwrap_or(4096)) {
-            let Some(e) = read_u32(table_rva + 4 * k as u32) else {
+            let at = table_rva.wrapping_add(size * k as u32);
+            let Some(e) = read_u32(at) else {
                 break;
             };
-            let t = if relative { lea_rva.wrapping_add(e as i32 as u32) } else { lea_rva.wrapping_add(e) };
+            let t = match entry {
+                Entry::Rel32 => lea_rva.wrapping_add(e as i32 as u32),
+                Entry::Rva32 => lea_rva.wrapping_add(e),
+                // The address at the image's preferred base (the loader's relocations move the table with the image).
+                Entry::Abs64 => {
+                    let Some(hi) = read_u32(at.wrapping_add(4)) else { break };
+                    match (u64::from(hi) << 32 | u64::from(e)).checked_sub(base) {
+                        Some(r) if r <= u64::from(u32::MAX) => r as u32,
+                        _ => break,
+                    }
+                }
+            };
             if (t < f.begin || t >= f.end) && !(sized && is_code(t)) {
                 break;
             }
@@ -237,6 +265,17 @@ pub fn find_jump_tables_ext(
         }
     }
     out
+}
+
+/// How a jump table's entries name their cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    /// 32-bit offsets from the table's base (clang: `movsxd` then `add`).
+    Rel32,
+    /// 32-bit RVAs (MSVC: `mov r32` from `[__ImageBase + 4*idx + table]`, then `add` of the base).
+    Rva32,
+    /// 64-bit addresses (`jmp qword ptr [base + 8*idx]`).
+    Abs64,
 }
 
 fn is_cmp_imm(i: &Instruction) -> bool {
@@ -1148,6 +1187,56 @@ mod tests {
             }
         }
         unreachable!()
+    }
+
+    /// An interpreter's dispatch (rva 0x3de2612): `jmp qword ptr [r12 + 8*rbx]` through a table of the handlers'
+    /// addresses, its base set once at the top. (`entries`, the table's 64-bit words, is filled from the code's layout.)
+    fn interpreter() -> (Vec<u8>, Func, Vec<u32>) {
+        let mut words: Vec<u64> = vec![0; 3];
+        for pass in 0..2 {
+            let mut a = CodeAssembler::new(64).unwrap();
+            let (mut table, mut dispatch, mut h0, mut h1, mut h2) =
+                (a.create_label(), a.create_label(), a.create_label(), a.create_label(), a.create_label());
+            a.lea(r12, ptr(table)).unwrap();
+            a.set_label(&mut dispatch).unwrap();
+            a.movzx(ebx, byte_ptr(rsi)).unwrap();
+            a.inc(rsi).unwrap();
+            a.jmp(qword_ptr(r12 + rbx * 8)).unwrap();
+            for (h, n) in [(&mut h0, 1), (&mut h1, 2)] {
+                a.set_label(h).unwrap();
+                a.add(eax, n).unwrap();
+                a.jmp(dispatch).unwrap();
+            }
+            a.set_label(&mut h2).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut table).unwrap();
+            a.dq(&words).unwrap();
+            let r = a.assemble_options(CODE, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+            let ip = |l: &CodeLabel| r.label_ip(l).unwrap();
+            if pass == 0 {
+                words = vec![ip(&h0), ip(&h1), ip(&h2)];
+            } else {
+                let rva = |x: u64| (x - BASE) as u32;
+                let f = Func { begin: rva(CODE), end: rva(ip(&table)), unwind: 0, chained: false };
+                let handlers = vec![rva(ip(&h0)), rva(ip(&h1)), rva(ip(&h2))];
+                return (r.inner.code_buffer, f, handlers);
+            }
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn a_table_of_addresses_gives_the_dispatch_its_handlers() {
+        let (bytes, f, handlers) = interpreter();
+        let read = |rva: u32| {
+            let o = (rva - f.begin) as usize;
+            bytes.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let ins = decode(&bytes[..(f.end - f.begin) as usize]);
+        let tables = find_jump_tables_with(BASE, &read, &f, &ins);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].targets, handlers);
+        assert!(!tables[0].bounded);
     }
 
     #[test]
