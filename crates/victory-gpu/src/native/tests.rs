@@ -699,7 +699,8 @@ fn a_released_pool_leaves_the_residency_set() {
 }
 
 /// What `Title::retire` keeps (a list's upload blocks after its reset) goes only once the GPU is
-/// past what a queue held when it was retired: here a wait for a fence the CPU signals later.
+/// past what a queue held when it was retired (here a wait for a fence the CPU signals later),
+/// including a queue the title has released since; a queue made after the retire does not count.
 #[test]
 fn retired_memory_outlives_the_work_queued_before_it() {
     use std::sync::Arc;
@@ -737,5 +738,25 @@ fn retired_memory_outlives_the_work_queued_before_it() {
     t.drop_retired();
     assert!(!dropped.load(Ordering::SeqCst), "freed under queued work");
     t.signal_cpu(fence, 0, 1);
+    wait(&mut t, &dropped);
+    // A queue made after the retire does not keep it, even holding work: it runs only lists
+    // submitted later, which cannot name the retired memory.
+    let dropped = Arc::new(AtomicBool::new(false));
+    t.retire(Box::new(Flag(dropped.clone())));
+    let (later, later_fence) = (0x30, 0x40);
+    t.ensure_queue(later).unwrap();
+    t.wait_queue(later, later_fence, 0, 1);
+    wait(&mut t, &dropped);
+    t.signal_cpu(later_fence, 0, 1);
+    // A queue the title released: what it was given still counts.
+    let gone_fence = 0x50;
+    t.wait_queue(queue, gone_fence, 0, 1);
+    t.forget_queue(queue);
+    let dropped = Arc::new(AtomicBool::new(false));
+    t.retire(Box::new(Flag(dropped.clone())));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    t.drop_retired();
+    assert!(!dropped.load(Ordering::SeqCst), "freed under a released queue's work");
+    t.signal_cpu(gone_fence, 0, 1);
     wait(&mut t, &dropped);
 }
