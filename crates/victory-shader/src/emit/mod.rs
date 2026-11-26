@@ -480,7 +480,55 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     )?;
     let io = io::raise_graphics(&p, &native, guessed)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    let made = emit_with(&c, &native, &p, &st, &io, &res, options);
+    // A whole-wave section that a jump splits (two reductions a branch
+    // chooses between that share their end): once more with each such
+    // section in one block ([`ir::whole_sections`]), where the simulation
+    // follows it. The original's result if that does not translate. Tried
+    // for a program that translates too where it permutes lanes outside the
+    // sections followed (`v_permlanex16_b32` before the jump, in a929109552ce1e84):
+    // such a permute lowered on its own reads the lanes the host has as they
+    // are, where the console's section reads every lane, a lane outside the
+    // saved mask with the reduction's identity. After
+    // darkworldhm/victory-fork-darkworldhm.
+    if made.is_ok() && !permutes_outside_sections(&p) {
+        return made;
+    }
+    let mut q = None;
+    for _ in 0..4 {
+        match ir::whole_sections(q.as_ref().unwrap_or(&p)) {
+            Some(next) => q = Some(next),
+            None => break,
+        }
+    }
+    if let Some(q) = q {
+        let again = (|| {
+            let st = structure::structure(&q)?;
+            let res = resource::track_graphics(
+                &q, &native.layout, native.stage, Some(&st), computed_buffers,
+            )?;
+            let io = io::raise_graphics(&q, &native, guessed)?;
+            emit_with(&c, &native, &q, &st, &io, &res, options)
+        })();
+        if again.is_ok() {
+            return again;
+        }
+    }
+    made
+}
+
+/// Whether `p` has a `v_permlane16_b32` or `v_permlanex16_b32` that no
+/// whole-wave section the simulation follows ([`wave::sections`]) holds.
+fn permutes_outside_sections(p: &ir::Program) -> bool {
+    let permute = |inst: &ir::Inst| matches!(inst.name(), "v_permlane16_b32" | "v_permlanex16_b32");
+    p.blocks.iter().enumerate().any(|(b, block)| {
+        if !block.insts.iter().any(permute) {
+            return false;
+        }
+        let sections = wave::sections(p, b);
+        let held = |i: usize| sections.iter().any(|(&start, s)| start < i && i < s.end);
+        block.insts.iter().enumerate().any(|(i, inst)| permute(inst) && !held(i))
+    })
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -806,6 +854,69 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// A branch on s0 picks a wave maximum or minimum, and the two
+    /// reductions share their end: each arm saves EXEC and reduces up to
+    /// the read of lane 32, the join reads lane 0 and restores EXEC (as in
+    /// a929109552ce1e84). Neither block holds a whole section;
+    /// with the join's code in each arm both do. After
+    /// darkworldhm/victory-fork-darkworldhm's test of the paired form.
+    #[test]
+    fn two_reductions_that_share_their_end_become_two_sections() {
+        let arm = |init: u32, op: u32| {
+            let mut w = vec![
+                0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+                0x7E04_02FF,
+                init, // v_mov_b32 v2, init
+                0xD501_0002,
+                0x0032_0902, // v_cndmask_b32 v2, v2, v4, s[12:13]
+            ];
+            for dpp in [0xDE54_C102, 0x9360_1202, 0x0009_2402] {
+                w.extend([op << 25 | 0x0004_04E9, dpp]); // v_<op>_f32 v2, v2, v2 dpp8
+            }
+            w.extend([
+                op << 25 | 0x0004_04FA,
+                0xFF09_4002, // v_<op>_f32 v2, v2, v2 row_mirror bound_ctrl:1
+                0xD778_0003,
+                0x0201_0102,            // v_permlanex16_b32 v3, v2, 0, 0
+                op << 25 | 0x0004_0503, // v_<op>_f32 v2, v3, v2
+                0xD760_000E,
+                0x0001_4102,            // v_readlane_b32 s14, v2, 32
+                op << 25 | 0x0004_040E, // v_<op>_f32 v2, s14, v2
+            ]);
+            w
+        };
+        let mut words = vec![
+            0x7E08_0D00, // v_cvt_f32_u32 v4, v0
+            0x0608_08F2, // v_add_f32 v4, 1.0, v4
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0014, // s_cbranch_scc1 to the minimum
+        ];
+        words.extend(arm(0xFF80_0000, 0x10)); // the maximum from -inf
+        words.push(0xBF82_0013); // s_branch to the join
+        words.extend(arm(0x7F80_0000, 0x0F)); // the minimum from +inf
+        words.extend([
+            0xD760_000E,
+            0x0001_0102, // v_readlane_b32 s14, v2, 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x7E00_020E, // v_mov_b32 v0, s14
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 8).expect("ir::build");
+        let sections = |p: &crate::ir::Program| {
+            (0..p.blocks.len()).map(|b| super::wave::sections(p, b).len()).sum::<usize>()
+        };
+        assert_eq!(sections(&p), 0);
+        assert!(super::permutes_outside_sections(&p));
+        let q = crate::ir::whole_sections(&p).expect("sections to join");
+        assert_eq!(sections(&q), 2);
+        assert!(!super::permutes_outside_sections(&q));
+        assert!(crate::ir::whole_sections(&q).is_none(), "nothing left to join");
+        crate::structure::structure(&q).expect("the joined program structures");
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
