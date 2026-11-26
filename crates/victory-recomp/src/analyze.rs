@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 
 use anyhow::Result;
 use iced_x86::{
-    Code, CpuidFeature, Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind,
-    Register,
+    Code, CpuidFeature, Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic,
+    OpAccess, OpKind, Register,
 };
 
 use crate::image::{Func, Image, SCN_EXEC, SCN_WRITE};
@@ -146,6 +146,17 @@ pub fn find_jump_tables_ext(
     ins: &[Instruction],
 ) -> Vec<JumpTable> {
     let mut out = vec![];
+    let mut found = vec![];
+    // Where other paths join: the targets of the function's direct branches.
+    let labels: HashSet<u64> = ins
+        .iter()
+        .filter(|i| {
+            matches!(i.flow_control(), FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch)
+                && i.op0_kind() == OpKind::NearBranch64
+        })
+        .map(|i| i.near_branch_target())
+        .collect();
+    let mut facts = InstructionInfoFactory::new();
     for (n, j) in ins.iter().enumerate() {
         if j.code() != Code::Jmp_rm64 || j.op0_kind() != OpKind::Register {
             continue;
@@ -181,81 +192,182 @@ pub fn find_jump_tables_ext(
         };
         let lea_rva = (lea.ip_rel_memory_address().wrapping_sub(base)) as u32;
         let table_rva = lea_rva.wrapping_add(ld.memory_displacement64() as u32);
-        // Bound from `cmp idx, N` / `ja default` when present.
-        let is_cmp = |i: &Instruction| {
-            matches!(
-                i.code(),
-                Code::Cmp_rm32_imm8
-                    | Code::Cmp_rm32_imm32
-                    | Code::Cmp_rm64_imm8
-                    | Code::Cmp_rm64_imm32
-                    | Code::Cmp_rm8_imm8
-                    | Code::Cmp_rm16_imm8
-                    | Code::Cmp_rm16_imm16
-                    | Code::Cmp_AL_imm8
-                    | Code::Cmp_AX_imm16
-                    | Code::Cmp_EAX_imm32
-                    | Code::Cmp_RAX_imm32
-            )
-        };
-        let ja_after = |k: usize| {
-            win.get(k + 1)
-                .is_some_and(|j| matches!(j.code(), Code::Ja_rel8_64 | Code::Ja_rel32_64 | Code::Jae_rel8_64 | Code::Jae_rel32_64))
-        };
-        // The compare the range check `ja default` follows. With none, the table runs as far as its entries land
-        // inside the function (a compare of something else would cut a real table short, and a missing entry is a
-        // trap at run time, where an extra one is only a label).
-        // Only a compare of the register the table is indexed by bounds it (another register's range check, a few
-        // instructions earlier, would cut the table short).
-        // (The index may be a copy of the compared register: `mov eax, r13d` after `cmp r13d, N`.)
-        let mut aliases = vec![ld.memory_index().full_register()];
-        for i in win.iter().rev() {
-            use iced_x86::Mnemonic as M;
-            if matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx | M::Movsxd)
-                && i.op0_kind() == OpKind::Register
-                && i.op1_kind() == OpKind::Register
-                && aliases.contains(&i.op0_register().full_register())
-            {
-                aliases.push(i.op1_register().full_register());
+        // The size from the range check `cmp idx, N` / `ja default` on the value the load takes as its index, or,
+        // for MSVC's two-level switch (`movzx eax, byte [base+idx+bytes]` then `mov ecx, [base+4*rax+table]`), from
+        // the largest of the byte table's checked entries. With none, the table runs as far as its entries land inside
+        // the function (a compare of something else would cut a real table short, and a missing entry is a trap at
+        // run time, where an extra one is only a label).
+        let ld_at = ins[..n].iter().rposition(|i| i.ip() == ld.ip()).unwrap_or(n);
+        let bound = match index_bound(ins, ld_at.saturating_sub(40), ld_at, &labels, &mut facts) {
+            Some(Bound::Entries(b)) => Some(b),
+            Some(Bound::Bytes { at, entries }) => {
+                let bytes = (0..entries).map(|k| read_u32(lea_rva.wrapping_add(at).wrapping_add(k as u32)).map(|w| w & 0xff));
+                bytes.collect::<Option<Vec<u32>>>().and_then(|b| b.into_iter().max()).map(|m| m as usize + 1)
             }
+            None => None,
         }
-        let on_index = |i: &Instruction| i.op0_kind() == OpKind::Register && aliases.contains(&i.op0_register().full_register());
-        let pick = (0..win.len()).rev().find(|&k| is_cmp(&win[k]) && on_index(&win[k]) && ja_after(k));
-        let bound = pick
-            .map(|k| {
-                let c = &win[k];
-                let v = match c.code() {
-                    Code::Cmp_AL_imm8 | Code::Cmp_rm8_imm8 => c.immediate(1) as u8 as usize,
-                    _ => c.immediate(1) as usize,
-                };
-                v + usize::from(!matches!(win.get(k + 1).map(|j| j.code()), Some(Code::Jae_rel8_64 | Code::Jae_rel32_64)))
-            })
-            .filter(|b| (1..=65536).contains(b));
+        .filter(|b| (1..=65536).contains(b));
+        // `movsxd`: offsets from the base; `mov`: RVAs (the base is `__ImageBase`).
+        let relative = !matches!(ld.code(), Code::Mov_r32_rm32 | Code::Mov_r64_rm64);
+        found.push(((j.ip() - base) as u32, table_rva, lea_rva, relative, bound));
+    }
+    // A table ends where the function's next table starts: tables sit side by side in .rdata (and MSVC's byte table
+    // right after its offsets), and reading on would take the next one's entries for cases. A range check that
+    // reaches past it is not this table's. Up to there every entry is the table's, so one in other code is a case
+    // that is a tail call, as with a range check; with neither, the table ends at the first entry outside the
+    // function.
+    let mut starts: Vec<u32> = found.iter().map(|t| t.1).collect();
+    starts.sort_unstable();
+    for (jmp_rva, table_rva, lea_rva, relative, bound) in found {
+        let room = starts.iter().find(|&&s| s > table_rva).map(|&next| ((next - table_rva) / 4) as usize);
+        let sized = bound.is_some() || room.is_some();
         let mut targets = vec![];
-        for k in 0..bound.unwrap_or(4096) {
+        for k in 0..bound.unwrap_or(4096).min(room.unwrap_or(4096)) {
             let Some(e) = read_u32(table_rva + 4 * k as u32) else {
                 break;
             };
-            let t = if ld.code() == Code::Mov_r32_rm32 || ld.code() == Code::Mov_r64_rm64 {
-                lea_rva.wrapping_add(e)
-            } else {
-                lea_rva.wrapping_add(e as i32 as u32)
-            };
-            if (t < f.begin || t >= f.end) && (bound.is_none() || !is_code(t)) {
+            let t = if relative { lea_rva.wrapping_add(e as i32 as u32) } else { lea_rva.wrapping_add(e) };
+            if (t < f.begin || t >= f.end) && !(sized && is_code(t)) {
                 break;
             }
             targets.push(t);
         }
         if targets.len() >= 2 || (bound.is_some() && !targets.is_empty()) {
-            out.push(JumpTable {
-                jmp_rva: (j.ip() - base) as u32,
-                table_rva,
-                targets,
-                bounded: bound.is_some(),
-            });
+            out.push(JumpTable { jmp_rva, table_rva, targets, bounded: bound.is_some() });
         }
     }
     out
+}
+
+fn is_cmp_imm(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Cmp_rm32_imm8
+            | Code::Cmp_rm32_imm32
+            | Code::Cmp_rm64_imm8
+            | Code::Cmp_rm64_imm32
+            | Code::Cmp_rm8_imm8
+            | Code::Cmp_rm16_imm8
+            | Code::Cmp_rm16_imm16
+            | Code::Cmp_AL_imm8
+            | Code::Cmp_AX_imm16
+            | Code::Cmp_EAX_imm32
+            | Code::Cmp_RAX_imm32
+    )
+}
+
+/// What a range check says of a jump table's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    /// The table's index is below this.
+    Entries(usize),
+    /// The index is an entry of a byte table (MSVC's two-level switch) at `at` from the table load's base, whose own
+    /// index is below `entries`.
+    Bytes { at: u32, entries: usize },
+}
+
+/// The range check on the index of the table load `ins[ld_at]`, read forward from `ins[from]`. Each register holds
+/// a value number: a plain copy (`mov eax, r13d`, `movzx r10d, dl`, `movsxd rax, ecx`, `mov r8d, r8d`) passes it on,
+/// any other write gives a new one, and `cmp reg, N` followed by `ja` / `jae` bounds the value it compares (by the
+/// least of its checks). So a check of a value changed after it (`add r8d, 2` after `cmp r8d, 7`) or of another one
+/// does not bound the index, and one of the value before a copy made ahead of it (`movzx r10d, dl` ... `cmp dl, 7`,
+/// the index `r10`) does. A branch target forgets everything before it: another path joins there, unchecked.
+fn index_bound(
+    ins: &[Instruction],
+    from: usize,
+    ld_at: usize,
+    labels: &HashSet<u64>,
+    facts: &mut InstructionInfoFactory,
+) -> Option<Bound> {
+    use iced_x86::Mnemonic as M;
+    let ld = &ins[ld_at];
+    let (index, table_base) = (ld.memory_index().full_register(), ld.memory_base().full_register());
+    let mut value: HashMap<Register, u32> = HashMap::new();
+    let mut bounds: HashMap<u32, usize> = HashMap::new();
+    // Values loaded from a byte table: the table's displacement and the value of its index.
+    let mut byte_of: HashMap<u32, (u32, u32)> = HashMap::new();
+    let mut fresh = 0u32;
+    let mut num = |value: &mut HashMap<Register, u32>, r: Register| -> u32 {
+        *value.entry(r).or_insert_with(|| {
+            fresh += 1;
+            fresh
+        })
+    };
+    for p in from..=ld_at {
+        let i = &ins[p];
+        if p > from && labels.contains(&i.ip()) {
+            value.clear();
+            bounds.clear();
+            byte_of.clear();
+        }
+        if p == ld_at {
+            let v = num(&mut value, index);
+            if let Some(&b) = bounds.get(&v) {
+                return Some(Bound::Entries(b));
+            }
+            return byte_of
+                .get(&v)
+                .and_then(|&(at, of)| bounds.get(&of).map(|&entries| Bound::Bytes { at, entries }));
+        }
+        let jcc = ins.get(p + 1).map(|j| j.code());
+        if is_cmp_imm(i)
+            && i.op0_kind() == OpKind::Register
+            && matches!(jcc, Some(Code::Ja_rel8_64 | Code::Ja_rel32_64 | Code::Jae_rel8_64 | Code::Jae_rel32_64))
+        {
+            let v = match i.code() {
+                Code::Cmp_AL_imm8 | Code::Cmp_rm8_imm8 => i.immediate(1) as u8 as usize,
+                Code::Cmp_rm16_imm8 | Code::Cmp_rm16_imm16 | Code::Cmp_AX_imm16 => i.immediate(1) as u16 as usize,
+                _ => i.immediate(1) as usize,
+            };
+            let b = v.saturating_add(usize::from(!matches!(jcc, Some(Code::Jae_rel8_64 | Code::Jae_rel32_64))));
+            let id = num(&mut value, i.op0_register().full_register());
+            bounds.entry(id).and_modify(|x| *x = (*x).min(b)).or_insert(b);
+            continue;
+        }
+        if matches!(i.mnemonic(), M::Mov | M::Movzx | M::Movsx | M::Movsxd)
+            && i.op0_kind() == OpKind::Register
+            && i.op1_kind() == OpKind::Register
+        {
+            // A write of 32 bits or more sets the whole register; a narrower one keeps the value only where
+            // the register already held it.
+            let s = num(&mut value, i.op1_register().full_register());
+            let d = i.op0_register();
+            if d.size() >= 4 || value.get(&d.full_register()) == Some(&s) {
+                value.insert(d.full_register(), s);
+            } else {
+                let v = num(&mut HashMap::new(), d);
+                value.insert(d.full_register(), v);
+            }
+            continue;
+        }
+        if matches!(i.code(), Code::Cdqe | Code::Cwde) {
+            // `cdqe` after `cmp eax, N` (MSVC, ahead of the byte table): the checked value, widened.
+            continue;
+        }
+        if matches!(i.flow_control(), FlowControl::Call | FlowControl::IndirectCall) {
+            // The callee may change the registers the Windows x64 convention leaves to it.
+            for r in [Register::RAX, Register::RCX, Register::RDX, Register::R8, Register::R9, Register::R10, Register::R11] {
+                let v = num(&mut HashMap::new(), r);
+                value.insert(r, v);
+            }
+        }
+        let byte_load = i.code() == Code::Movzx_r32_rm8
+            && i.op1_kind() == OpKind::Memory
+            && i.memory_base().full_register() == table_base
+            && i.memory_index_scale() == 1
+            && i.memory_index() != Register::None;
+        let of = byte_load.then(|| num(&mut value, i.memory_index().full_register()));
+        for u in facts.info(i).used_registers() {
+            if matches!(u.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite) {
+                let v = num(&mut HashMap::new(), u.register());
+                value.insert(u.register().full_register(), v);
+                if let (Some(of), true) = (of, u.register().full_register() == i.op0_register().full_register()) {
+                    byte_of.insert(v, (i.memory_displacement64() as u32, of));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[derive(Default, Clone)]
@@ -775,5 +887,282 @@ impl Report {
             let _ = writeln!(o, "  {k:<12} {v}  ({:.2}%)", pct(**v, s.instructions));
         }
         o
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::code_asm::*;
+    use iced_x86::BlockEncoderOptions;
+
+    const BASE: u64 = 0x1_4000_0000;
+    const CODE: u64 = BASE + 0x1000;
+
+    fn decode(bytes: &[u8]) -> Vec<Instruction> {
+        let mut d = Decoder::with_ip(64, bytes, CODE, DecoderOptions::NONE);
+        let mut v = vec![];
+        while d.can_decode() {
+            v.push(d.decode());
+        }
+        v
+    }
+
+    fn labels(ins: &[Instruction]) -> HashSet<u64> {
+        ins.iter()
+            .filter(|i| {
+                matches!(i.flow_control(), FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch)
+                    && i.op0_kind() == OpKind::NearBranch64
+            })
+            .map(|i| i.near_branch_target())
+            .collect()
+    }
+
+    /// The bound `index_bound` finds for the last scaled-by-4 load of the code `build` writes (ahead of 64 bytes of
+    /// table, after the code).
+    fn bound(build: impl FnOnce(&mut CodeAssembler, CodeLabel) -> Result<(), IcedError>) -> Option<Bound> {
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut table = a.create_label();
+        build(&mut a, table).unwrap();
+        a.set_label(&mut table).unwrap();
+        a.dd(&[0; 16]).unwrap();
+        let r = a.assemble_options(CODE, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+        let end = (r.label_ip(&table).unwrap() - CODE) as usize;
+        let ins = decode(&r.inner.code_buffer[..end]);
+        let ld_at = ins
+            .iter()
+            .rposition(|i| i.op1_kind() == OpKind::Memory && i.memory_index_scale() == 4)
+            .unwrap();
+        index_bound(&ins, 0, ld_at, &labels(&ins), &mut InstructionInfoFactory::new())
+    }
+
+    #[test]
+    fn a_check_of_the_index_bounds_it() {
+        let b = bound(|a, t| {
+            let mut def = a.create_label();
+            a.cmp(ecx, 5)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            a.lea(rdx, ptr(t))?;
+            a.movsxd(rax, dword_ptr(rdx + rax * 4))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            a.set_label(&mut def)?;
+            a.ret()
+        });
+        assert_eq!(b, Some(Bound::Entries(6)));
+        // `jae` and an 8-bit compare.
+        let b = bound(|a, t| {
+            let mut def = a.create_label();
+            a.cmp(al, 9)?;
+            a.jae(def)?;
+            a.movzx(eax, al)?;
+            a.lea(rdx, ptr(t))?;
+            a.movsxd(rax, dword_ptr(rdx + rax * 4))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            a.set_label(&mut def)?;
+            a.ret()
+        });
+        assert_eq!(b, Some(Bound::Entries(9)));
+    }
+
+    #[test]
+    fn a_check_of_a_value_changed_after_it_does_not() {
+        // The a3 trap (rva 0x53bf9ef): `cmp r8d, 7` / `jae`, then `add r8d, 2`; the table had 8 entries, the check
+        // gave 7.
+        let b = bound(|a, t| {
+            let mut out = a.create_label();
+            a.cmp(r8d, 7)?;
+            a.jae(out)?;
+            a.add(r8d, 2)?;
+            a.lea(r9, ptr(t))?;
+            a.movsxd(r8, dword_ptr(r9 + r8 * 4))?;
+            a.add(r8, r9)?;
+            a.jmp(r8)?;
+            a.set_label(&mut out)?;
+            a.ret()
+        });
+        assert_eq!(b, None);
+        // Nor a check of another value: the index is a loop counter copied after the check.
+        let b = bound(|a, t| {
+            let mut out = a.create_label();
+            a.cmp(ecx, 3)?;
+            a.ja(out)?;
+            a.mov(ecx, r12d)?;
+            a.lea(rsi, ptr(t))?;
+            a.movsxd(rcx, dword_ptr(rsi + rcx * 4))?;
+            a.add(rcx, rsi)?;
+            a.jmp(rcx)?;
+            a.set_label(&mut out)?;
+            a.ret()
+        });
+        assert_eq!(b, None);
+    }
+
+    #[test]
+    fn a_path_that_joins_after_the_check_is_unchecked() {
+        let b = bound(|a, t| {
+            let (mut def, mut join, mut other) = (a.create_label(), a.create_label(), a.create_label());
+            a.cmp(ecx, 5)?;
+            a.ja(def)?;
+            a.set_label(&mut join)?;
+            a.lea(rdx, ptr(t))?;
+            a.movsxd(rax, dword_ptr(rdx + rcx * 4))?;
+            a.add(rax, rdx)?;
+            a.jmp(rax)?;
+            a.set_label(&mut other)?;
+            a.mov(ecx, 9)?;
+            a.jmp(join)?;
+            a.set_label(&mut def)?;
+            a.ret()
+        });
+        assert_eq!(b, None);
+    }
+
+    #[test]
+    fn a_copy_made_ahead_of_the_check_is_checked_with_it() {
+        // `movzx r10d, dl` ... `cmp dl, 7`, the index r10 (rva 0x22e39e3); an outer, looser check first.
+        let b = bound(|a, t| {
+            let (mut def, mut high) = (a.create_label(), a.create_label());
+            a.cmp(dl, 0x28)?;
+            a.ja(def)?;
+            a.movzx(r10d, dl)?;
+            a.cmp(dl, 7)?;
+            a.ja(high)?;
+            a.lea(rax, ptr(t))?;
+            a.movsxd(rdx, dword_ptr(rax + r10 * 4))?;
+            a.add(rdx, rax)?;
+            a.jmp(rdx)?;
+            a.set_label(&mut high)?;
+            a.nop()?;
+            a.set_label(&mut def)?;
+            a.ret()
+        });
+        assert_eq!(b, Some(Bound::Entries(8)));
+        // Two copies of one argument, the check on one, the index the other (rva 0xbdc05c).
+        let b = bound(|a, t| {
+            let mut def = a.create_label();
+            a.mov(ebp, r9d)?;
+            a.mov(r12d, r9d)?;
+            a.cmp(ebp, 0x10)?;
+            a.ja(def)?;
+            a.lea(rax, ptr(t))?;
+            a.movsxd(rcx, dword_ptr(rax + r12 * 4))?;
+            a.add(rcx, rax)?;
+            a.jmp(rcx)?;
+            a.set_label(&mut def)?;
+            a.ret()
+        });
+        assert_eq!(b, Some(Bound::Entries(17)));
+    }
+
+    #[test]
+    fn a_call_ends_what_volatile_registers_held() {
+        let switch = |checked: AsmRegister32, index: AsmRegister64| {
+            bound(move |a, t| {
+                let (mut def, mut callee) = (a.create_label(), a.create_label());
+                a.cmp(checked, 5)?;
+                a.ja(def)?;
+                a.call(callee)?;
+                a.lea(rdx, ptr(t))?;
+                a.movsxd(rax, dword_ptr(rdx + index * 4))?;
+                a.add(rax, rdx)?;
+                a.jmp(rax)?;
+                a.set_label(&mut callee)?;
+                a.ret()?;
+                a.set_label(&mut def)?;
+                a.ret()
+            })
+        };
+        assert_eq!(switch(ecx, rcx), None);
+        assert_eq!(switch(ebx, rbx), Some(Bound::Entries(6)));
+    }
+
+    #[test]
+    fn msvc_two_level_switches_are_bounded_by_the_byte_table() {
+        // `cmp eax, 0x1c` / `ja`, `cdqe`, the byte table indexed by the checked value, the offsets by its byte.
+        let b = bound(|a, t| {
+            let mut def = a.create_label();
+            a.cmp(eax, 0x1c)?;
+            a.ja(def)?;
+            a.lea(r8, ptr(t))?;
+            a.cdqe()?;
+            a.movzx(eax, byte_ptr(r8 + rax + 0x50))?;
+            a.mov(ecx, dword_ptr(r8 + rax * 4 + 0x48))?;
+            a.add(rcx, r8)?;
+            a.jmp(rcx)?;
+            a.set_label(&mut def)?;
+            a.ret()
+        });
+        assert_eq!(b, Some(Bound::Bytes { at: 0x50, entries: 0x1d }));
+    }
+
+    /// Two switches over tables side by side: the first reached only by a jump (no check reaches it), the second
+    /// checked to 8 cases.
+    fn side_by_side() -> (Vec<u8>, Func, Vec<u32>) {
+        let mut entries: Vec<u32> = vec![0; 16];
+        for pass in 0..2 {
+            let mut a = CodeAssembler::new(64).unwrap();
+            let mut cases: Vec<CodeLabel> = (0..8).map(|_| a.create_label()).collect();
+            let (mut first, mut second, mut join, mut def) =
+                (a.create_label(), a.create_label(), a.create_label(), a.create_label());
+            a.jmp(join).unwrap();
+            a.set_label(&mut join).unwrap();
+            a.lea(r9, ptr(first)).unwrap();
+            a.movsxd(r8, dword_ptr(r9 + r8 * 4)).unwrap();
+            a.add(r8, r9).unwrap();
+            a.jmp(r8).unwrap();
+            a.cmp(ecx, 7).unwrap();
+            a.ja(def).unwrap();
+            a.lea(rdx, ptr(second)).unwrap();
+            a.movsxd(rax, dword_ptr(rdx + rcx * 4)).unwrap();
+            a.add(rax, rdx).unwrap();
+            a.jmp(rax).unwrap();
+            for c in cases.iter_mut() {
+                a.set_label(c).unwrap();
+                a.mov(eax, 1).unwrap();
+                a.ret().unwrap();
+            }
+            a.set_label(&mut def).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut first).unwrap();
+            a.dd(&entries[..8]).unwrap();
+            a.set_label(&mut second).unwrap();
+            a.dd(&entries[8..]).unwrap();
+            let r = a.assemble_options(CODE, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+            let ip = |l: &CodeLabel| r.label_ip(l).unwrap();
+            let rva = |x: u64| (x - BASE) as u32;
+            if pass == 0 {
+                let (t1, t2) = (ip(&first), ip(&second));
+                // The second table's cases in the reverse order, so read from the first table's base they land
+                // elsewhere in the function.
+                for k in 0..8 {
+                    entries[k] = ip(&cases[k]).wrapping_sub(t1) as u32;
+                    entries[8 + k] = ip(&cases[7 - k]).wrapping_sub(t2) as u32;
+                }
+            } else {
+                let f = Func { begin: rva(CODE), end: rva(ip(&first)), unwind: 0, chained: false };
+                let cases = cases.iter().map(|c| rva(ip(c))).collect();
+                return (r.inner.code_buffer, f, cases);
+            }
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn an_unchecked_table_ends_where_the_next_one_starts() {
+        let (bytes, f, cases) = side_by_side();
+        let read = |rva: u32| {
+            let o = (rva - f.begin) as usize;
+            bytes.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let ins = decode(&bytes[..(f.end - f.begin) as usize]);
+        let tables = find_jump_tables_with(BASE, &read, &f, &ins);
+        assert_eq!(tables.len(), 2);
+        assert!(!tables[0].bounded);
+        assert_eq!(tables[0].targets, cases, "the first table's own 8 cases, none of the second's");
+        assert!(tables[1].bounded);
+        assert_eq!(tables[1].targets, cases.iter().rev().copied().collect::<Vec<_>>());
     }
 }

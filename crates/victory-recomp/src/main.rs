@@ -104,6 +104,24 @@ fn main() -> Result<()> {
                 println!("jmp at {:#x}: table {:#x}, {} targets, not instruction starts: {bad:?}", t.jmp_rva, t.table_rva, t.targets.len());
             }
         }
+        "tablelist" => {
+            // Every jump table of every function, one per line (`jmp table cases bounded`), to compare two builds of
+            // the recovery. `tablelist <pe> [seeds]`.
+            let extra: Vec<u32> = match args.get(3) {
+                Some(f) => std::fs::read_to_string(f)?
+                    .lines()
+                    .filter_map(|l| u32::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok())
+                    .collect(),
+                None => vec![],
+            };
+            let funcs = victory_recomp::discover::discover_with(&img, &extra)?;
+            for f in funcs.iter().filter(|f| !f.chained) {
+                let (ins, _) = victory_recomp::analyze::decode_function(&img, f);
+                for t in victory_recomp::analyze::find_jump_tables(&img, f, &ins) {
+                    println!("{:#x} {:#x} {} {}", t.jmp_rva, t.table_rva, t.targets.len(), u8::from(t.bounded));
+                }
+            }
+        }
         "escapes" => {
             // Starts to feed back as extra seeds (`lift-split ... <seeds>`): direct targets that leave their function
             // and land in none. `escapes <pe> [seeds]`, the seeds file the build uses so far.

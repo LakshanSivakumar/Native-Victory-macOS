@@ -80,7 +80,7 @@ fn walk_to(img: &Image, start: u32, limit: u32, reach: u32) -> (u32, Vec<u32>) {
 /// The direct call, jump and branch targets and the executable `lea [rip + x]` addresses of every instruction in
 /// `[begin, end)`, decoded in a line from `begin` (an undecodable byte is stepped over). x64 MSVC keeps jump tables
 /// in `.rdata`, so a function's extent is code.
-fn sweep(img: &Image, begin: u32, end: u32) -> Vec<u32> {
+pub(crate) fn sweep(img: &Image, begin: u32, end: u32) -> Vec<u32> {
     let base = img.info.image_base;
     let Some(code) = img.bytes(begin, (end - begin) as usize) else {
         return vec![];

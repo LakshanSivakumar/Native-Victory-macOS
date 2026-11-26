@@ -11,7 +11,7 @@ pub const RT_HOST_C: &str = include_str!("rt_host.c");
 pub const RT_UNIT_C: &str = include_str!("rt_unit.c");
 pub const HARNESS_H: &str = include_str!("harness.h");
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 use image::{Func, Image};
@@ -81,6 +81,66 @@ fn landing_pads(img: &Image, f: &Func) -> Vec<u64> {
     img.landing_pads(f).iter().map(|&r| img.info.image_base + r as u64).collect()
 }
 
+/// The direct call, jump and branch targets (and executable `lea [rip + x]` addresses) in each function that land
+/// inside another one, not at its start: hand-written CRT routines share their tails, and a jump into the middle of
+/// one went to the dispatcher, which has no function there. Keyed by the begin of the function they are in (VAs),
+/// for those of its instructions; not for functions with landing pads.
+pub fn inner_entries(img: &Image, groups: &[(Func, Vec<Func>)]) -> HashMap<u32, Vec<u64>> {
+    let base = img.info.image_base;
+    // Every extent (a function and its chained parts) with the group it belongs to, by begin.
+    let mut extents: Vec<(u32, u32, usize)> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(g, (f, parts))| std::iter::once((f.begin, f.end, g)).chain(parts.iter().map(move |p| (p.begin, p.end, g))))
+        .collect();
+    extents.sort_unstable();
+    let group_of = |t: u32| {
+        let k = extents.partition_point(|e| e.0 <= t);
+        (k > 0 && t < extents[k - 1].1).then(|| extents[k - 1].2)
+    };
+    let starts: HashSet<u32> = groups.iter().map(|(f, _)| f.begin).collect();
+    let mut wanted: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
+    for (g, (f, parts)) in groups.iter().enumerate() {
+        for e in std::iter::once(f).chain(parts.iter()) {
+            for t in discover::sweep(img, e.begin, e.end) {
+                if starts.contains(&t) {
+                    continue;
+                }
+                match group_of(t) {
+                    Some(h) if h != g => {
+                        wanted.entry(h).or_default().insert(t);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    let (mut padded, mut split) = (vec![], vec![]);
+    for (g, ts) in wanted {
+        let (f, parts) = &groups[g];
+        if !landing_pads(img, f).is_empty() {
+            padded.extend(ts);
+            continue;
+        }
+        let (ins, _) = decode_group(img, f, parts);
+        let ips: HashSet<u64> = ins.iter().map(|i| i.ip()).collect();
+        let (at, off): (Vec<u64>, Vec<u64>) = ts.into_iter().map(|t| base + t as u64).partition(|va| ips.contains(va));
+        split.extend(off.iter().map(|va| (va - base) as u32));
+        if !at.is_empty() {
+            out.insert(f.begin, at);
+        }
+    }
+    // Left to the dispatcher (a jump there still finds no function): say which.
+    for t in padded.iter().take(20) {
+        eprintln!("not an entry (its function has landing pads): {t:#x}");
+    }
+    for t in split.iter().take(20) {
+        eprintln!("not an entry (inside an instruction of its function): {t:#x}");
+    }
+    out
+}
+
 /// Lifts every non-chained `.pdata` function of `img` into one C unit.
 pub fn lift_image(img: &Image) -> Result<lift::Unit> {
     let funcs = group_chained(img, discover::discover(img)?);
@@ -103,6 +163,7 @@ pub fn lift_image(img: &Image) -> Result<lift::Unit> {
             tables: tables.clone(),
             extra: extra_ranges(img, parts),
             landing_pads: landing_pads(img, f),
+            entries: vec![],
         })
         .collect();
     let is_func = |va: u64| starts.contains(&va);
@@ -151,7 +212,17 @@ pub fn lift_image_split(
         group_chained(img, discover::discover(img)?).iter().map(|(f, _)| f.begin).collect()
     };
     let base = img.info.image_base;
-    let starts: HashSet<u64> = funcs.iter().map(|(f, _)| base + f.begin as u64).collect();
+    let entries = inner_entries(img, &funcs);
+    eprintln!(
+        "{} entries inside {} functions (jumps into the middle of them)",
+        entries.values().map(Vec::len).sum::<usize>(),
+        entries.len()
+    );
+    let starts: HashSet<u64> = funcs
+        .iter()
+        .map(|(f, _)| base + f.begin as u64)
+        .chain(entries.values().flatten().copied())
+        .collect();
     let is_func = |va: u64| starts.contains(&va);
     let ctx = lift::Ctx {
         image_base: base,
@@ -215,6 +286,7 @@ pub fn lift_image_split(
                                 tables: tables.clone(),
                                 extra: extra_ranges(img, parts),
                                 landing_pads: landing_pads(img, f),
+                                entries: entries.get(&f.begin).cloned().unwrap_or_default(),
                             })
                             .collect();
                         let u = lift::lift_part(&ctx, &fins);
@@ -290,6 +362,7 @@ pub fn coverage(img: &Image) -> Result<Coverage> {
                             tables,
                             extra: extra_ranges(img, parts),
                             landing_pads: landing_pads(img, f),
+                            entries: vec![],
                         };
                         match lift::lift_function(ctx, &fi) {
                             Ok(_) if !bad => {

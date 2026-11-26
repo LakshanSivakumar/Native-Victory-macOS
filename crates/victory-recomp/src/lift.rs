@@ -26,6 +26,10 @@ pub struct FuncIn<'a> {
     /// function gets a frame record and an entry at each, so the host can drop the frames below it and
     /// continue there with the registers of the unwound context (`docs/recompiler.md`, "Exceptions").
     pub landing_pads: Vec<u64>,
+    /// Addresses inside the function that code outside it jumps or calls to directly (hand-written CRT routines
+    /// share their tails): VAs of its instructions. Each gets a function of its own, `f_<rva>`, the same body
+    /// entered there. (Not with landing pads: such functions have none.)
+    pub entries: Vec<u64>,
 }
 
 impl FuncIn<'_> {
@@ -59,13 +63,15 @@ pub fn lift_part(ctx: &Ctx, funcs: &[FuncIn]) -> Unit {
                 u.lifted.push(f.begin_va);
             }
             Err(e) => {
-                let _ = writeln!(
-                    body,
-                    "void {}(Cpu *c) {{ (void)c; rt_trap(\"unlifted function {:#x}: {}\"); }}",
-                    name(f.begin_va, ctx.image_base),
-                    f.begin_va - ctx.image_base,
-                    e.replace('"', "'")
-                );
+                for va in std::iter::once(f.begin_va).chain(f.entries.iter().copied()) {
+                    let _ = writeln!(
+                        body,
+                        "void {}(Cpu *c) {{ (void)c; rt_trap(\"unlifted function {:#x}: {}\"); }}",
+                        name(va, ctx.image_base),
+                        f.begin_va - ctx.image_base,
+                        e.replace('"', "'")
+                    );
+                }
                 body.push_str(&pad_defs(ctx, f));
                 u.failed.push((f.begin_va, e));
             }
@@ -1084,6 +1090,7 @@ pub fn lift_function(ctx: &Ctx, f: &FuncIn) -> Result<String, String> {
                 tables: f.tables.clone(),
                 extra: f.extra.clone(),
                 landing_pads: f.landing_pads.clone(),
+                entries: f.entries.clone(),
             };
             let (o, errs) = lift_core(ctx, &pruned, false);
             match errs.into_iter().next() {
@@ -1103,6 +1110,7 @@ fn reachable(f: &FuncIn) -> std::collections::HashSet<u64> {
     let mut seen = std::collections::HashSet::new();
     let mut work: Vec<u64> = vec![f.begin_va];
     work.extend(f.landing_pads.iter().copied());
+    work.extend(f.entries.iter().copied());
     work.extend(f.extra.iter().map(|&(b, _)| b));
     while let Some(ip) = work.pop() {
         let Some(&k) = at.get(&ip) else { continue };
@@ -1163,6 +1171,9 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     }
     let pads: Vec<u64> = f.landing_pads.iter().copied().filter(|p| ipset.contains(p)).collect();
     labels.extend(pads.iter().copied());
+    // Every entry must get its function (the dispatch table names it): one that is no instruction here traps.
+    let entries: Vec<u64> = if pads.is_empty() { f.entries.clone() } else { vec![] };
+    labels.extend(entries.iter().copied().filter(|e| ipset.contains(e)));
     // In a function with landing pads, a fault in the guarded code is recorded with every register (`c->rip`), and the
     // instruction is a resume point too: an exception handler that continues execution re-runs it with the registers it
     // chose. (EFLAGS are not carried: the lifted flags start clean, which an instruction reading them would notice.)
@@ -1184,8 +1195,10 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     };
     let mut errs = vec![];
     let prologue = if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" };
+    let mut body_at = 0;
     if pads.is_empty() {
         let _ = writeln!(l.o, "void {}(Cpu *c) {{ {prologue};", name(f.begin_va, ctx.image_base));
+        body_at = l.o.len();
     } else {
         // The body takes `resume`: set when the host unwound to this frame, with the landing pad in
         // `rt_resume_va` and the registers in `c`, which the prologue loads as always.
@@ -1224,7 +1237,34 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     }
     // Falling off the end of a function is only legal after a non-returning call.
     l.o.push_str("rt_trap(\"fell off end of function\"); }\n");
+    if !entries.is_empty() {
+        // The same body for each inner entry, entered at its label (the prologue loads every register as at the
+        // start; nothing of the body before the label has run, as for the guest).
+        let body = l.o[body_at..].to_string();
+        for &e in &entries {
+            if ipset.contains(&e) {
+                let _ = write!(l.o, "void {}(Cpu *c) {{ {prologue};\ngoto L_{e:x};\n{body}", name(e, ctx.image_base));
+            } else {
+                let _ = writeln!(
+                    l.o,
+                    "void {}(Cpu *c) {{ (void)c; rt_trap(\"entry {:#x} is inside an instruction of {:#x}\"); }}",
+                    name(e, ctx.image_base),
+                    e - ctx.image_base,
+                    f.begin_va - ctx.image_base
+                );
+            }
+        }
+    }
     if !pads.is_empty() {
+        for &e in &f.entries {
+            let _ = writeln!(
+                l.o,
+                "void {}(Cpu *c) {{ (void)c; rt_trap(\"entry {:#x} into {:#x}, a function with landing pads\"); }}",
+                name(e, ctx.image_base),
+                e - ctx.image_base,
+                f.begin_va - ctx.image_base
+            );
+        }
         let (n, rva) = (name(f.begin_va, ctx.image_base), f.begin_va - ctx.image_base);
         let _ = writeln!(
             l.o,
@@ -1233,4 +1273,48 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     }
     l.o.push_str(&pad_defs(ctx, f));
     (l.o, errs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::code_asm::*;
+    use iced_x86::{BlockEncoderOptions, Decoder, DecoderOptions};
+
+    #[test]
+    fn an_inner_entry_is_the_body_entered_at_its_label() {
+        const BASE: u64 = 0x1_4000_0000;
+        let at = BASE + 0x1000;
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut tail = a.create_label();
+        a.mov(eax, 1).unwrap();
+        a.set_label(&mut tail).unwrap();
+        a.add(eax, 2).unwrap();
+        a.ret().unwrap();
+        let r = a.assemble_options(at, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+        let entry = r.label_ip(&tail).unwrap();
+        let bytes = r.inner.code_buffer;
+        let ins: Vec<Instruction> = Decoder::with_ip(64, &bytes, at, DecoderOptions::NONE).iter().collect();
+        let is_func = move |va: u64| va == at || va == entry;
+        let ctx = Ctx { image_base: BASE, is_func: &is_func };
+        let f = FuncIn {
+            begin_va: at,
+            end_va: at + bytes.len() as u64,
+            ins: &ins,
+            tables: BTreeMap::new(),
+            extra: vec![],
+            landing_pads: vec![],
+            entries: vec![entry],
+        };
+        let c = lift_function(&ctx, &f).unwrap();
+        assert!(c.contains(&format!("void f_{:x}(Cpu *c) {{", at - BASE)), "{c}");
+        assert!(c.contains(&format!("void f_{:x}(Cpu *c) {{", entry - BASE)), "{c}");
+        assert!(c.contains(&format!("goto L_{entry:x};")), "{c}");
+        // The label in both bodies.
+        assert_eq!(c.matches(&format!("L_{entry:x}:;")).count(), 2, "{c}");
+        // An entry that is no instruction start still gets its function, one that traps.
+        let f = FuncIn { entries: vec![entry + 1], ..f };
+        let c = lift_function(&ctx, &f).unwrap();
+        assert!(c.contains(&format!("void f_{:x}(Cpu *c) {{ (void)c; rt_trap(", entry + 1 - BASE)), "{c}");
+    }
 }
