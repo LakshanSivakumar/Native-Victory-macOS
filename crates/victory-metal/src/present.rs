@@ -63,7 +63,29 @@ impl Surface {
     pub fn read_last(&self) -> Option<(usize, usize, Vec<u8>)> {
         let t = self.last.borrow().clone()?;
         let (w, h) = (t.width(), t.height());
-        let mut out = vec![0u8; w * h * 4];
+        // Bytes a texel of the presented texture holds: the read must be given rows that long
+        // (4-byte rows of an 8-byte texture made Metal write past the buffer, into the host heap
+        // where the title's own objects are: half-float texels over their pointers).
+        let texel = t.pixelFormat();
+        let bytes = if texel == MTLPixelFormat::RGBA16Float {
+            8
+        } else if texel == MTLPixelFormat::RGBA32Float {
+            16
+        } else if [
+            MTLPixelFormat::BGRA8Unorm,
+            MTLPixelFormat::BGRA8Unorm_sRGB,
+            MTLPixelFormat::RGBA8Unorm,
+            MTLPixelFormat::RGBA8Unorm_sRGB,
+            MTLPixelFormat::RGB10A2Unorm,
+            MTLPixelFormat::BGR10A2Unorm,
+        ]
+        .contains(&texel)
+        {
+            4
+        } else {
+            return None;
+        };
+        let mut out = vec![0u8; w * h * bytes];
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize {
@@ -72,14 +94,30 @@ impl Surface {
                 depth: 1,
             },
         };
-        // SAFETY: `out` holds `h` rows of `w * 4` bytes, the region's size.
+        // SAFETY: `out` holds `h` rows of `w * bytes` bytes, the region at the texture's size.
         unsafe {
             t.getBytes_bytesPerRow_fromRegion_mipmapLevel(
                 std::ptr::NonNull::new(out.as_mut_ptr().cast())?,
-                w * 4,
+                w * bytes,
                 region,
                 0,
             )
+        };
+        // Four bytes a pixel for the caller: wider texels clamped to 0..1 and scaled.
+        let out = match bytes {
+            4 => out,
+            8 => out
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| (half_to_f32(u16::from_le_bytes(*c)).clamp(0.0, 1.0) * 255.0) as u8)
+                .collect(),
+            _ => out
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| (f32::from_le_bytes(*c).clamp(0.0, 1.0) * 255.0) as u8)
+                .collect(),
         };
         Some((w, h, out))
     }
@@ -205,5 +243,23 @@ impl PresentBackend for Metal {
         *surface.last.borrow_mut() = Some(target);
         surface.frames.set(surface.frames.get() + 1);
         Ok(())
+    }
+}
+
+/// An IEEE half's value.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = (h >> 10) & 0x1f;
+    let frac = f32::from(h & 0x3ff);
+    sign * match exp {
+        0 => frac * 2f32.powi(-24),
+        31 => {
+            if frac == 0.0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        e => (1.0 + frac / 1024.0) * 2f32.powi(i32::from(e) - 15),
     }
 }
