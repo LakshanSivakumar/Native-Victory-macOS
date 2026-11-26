@@ -5363,25 +5363,6 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Sub, m, one);
                 (self.s.m.bin(c, Bin::Shl, m, b), None)
             }
-            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
-                // D = {S1 half, S0 half}, `ll`/`lh`/`hh` naming the S0 and S1
-                // halves (RDNA2 ISA, SOP2 opcodes 50-52); no SCC.
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k16 = self.s.m.i32(16);
-                let a = if name == "s_pack_hh_b32_b16" {
-                    self.s.m.bin(c, Bin::LShr, a, k16)
-                } else {
-                    let low = self.s.m.i32(0xFFFF);
-                    self.s.m.bin(c, Bin::And, a, low)
-                };
-                let b = if name == "s_pack_ll_b32_b16" {
-                    self.s.m.bin(c, Bin::Shl, b, k16)
-                } else {
-                    let high = self.s.m.i32(0xFFFF_0000);
-                    self.s.m.bin(c, Bin::And, b, high)
-                };
-                (self.s.m.bin(c, Bin::Or, a, b), None)
-            }
             _ => return Err(name),
         };
         self.set(lo, Val::I32(r));
@@ -9399,21 +9380,6 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
-            }
-            "v_mad_u32_u16" => {
-                // S0[15:0] * S1[15:0] + S2 (op_sel: a source's high half).
-                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let opsel = match &inst.fields {
-                    Fields::Valu(v) => v.opsel,
-                    _ => 0,
-                };
-                let (k16, low) = (k(self, 16), k(self, 0xFFFF));
-                let a = if opsel & 1 != 0 { self.s.m.bin(c, Bin::LShr, a, k16) } else { a };
-                let b = if opsel & 2 != 0 { self.s.m.bin(c, Bin::LShr, b, k16) } else { b };
-                let a = self.s.m.bin(c, Bin::And, a, low);
-                let b = self.s.m.bin(c, Bin::And, b, low);
-                let m = self.s.m.bin(c, Bin::Mul, a, b);
-                self.s.m.bin(c, Bin::Add, m, d)
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
