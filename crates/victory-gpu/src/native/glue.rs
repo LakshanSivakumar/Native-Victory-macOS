@@ -8,7 +8,7 @@
 //! it. The GPU never waits on the lock: submissions are asynchronous, and a timer thread moves held
 //! work and fence values along.
 
-use super::memory::{PoolObserver, PoolTable};
+use super::memory::{CrashAddresses, PoolObserver, PoolTable};
 use super::state::Graphics;
 use super::title::{Guessed, Pipe, TargetFormats, Title, TitleList, Wait};
 use crate::object::This;
@@ -28,6 +28,7 @@ unsafe impl Send for Shared {}
 static TITLE: Mutex<Option<Shared>> = Mutex::new(None);
 static FAILED: AtomicBool = AtomicBool::new(false);
 static POOLS: OnceLock<Arc<PoolTable>> = OnceLock::new();
+static CRASH_ADDRESSES: OnceLock<Arc<CrashAddresses>> = OnceLock::new();
 
 /// The table of the title's memory pools. Feed it through [`pool_observer`].
 pub fn pools() -> &'static Arc<PoolTable> {
@@ -59,6 +60,12 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
     TITLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// For crash reports: whether a pool holds title address `at` and which buffer views cover it.
+/// Reads the metadata without taking the title lock or waiting on the metadata locks.
+pub fn describe(at: u64) -> Option<String> {
+    CRASH_ADDRESSES.get().map(|addresses| addresses.describe(at))
+}
+
 /// Runs `f` on the native host, made on first use; `None` if there is no Metal device (the call
 /// is then ignored, as when there is no host GPU on Windows).
 pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
@@ -70,7 +77,9 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
         match Metal::new() {
             Ok(metal) => {
                 tracing::info!("native host: Metal");
-                *guard = Some(Shared(Title::new(metal, pools().clone())));
+                let title = Title::new(metal, pools().clone());
+                let _ = CRASH_ADDRESSES.set(title.host.crash_addresses());
+                *guard = Some(Shared(title));
                 start_timer();
             }
             Err(e) => {
@@ -91,9 +100,7 @@ fn start_timer() {
         .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                if let Ok(mut g) = TITLE.try_lock()
-                    && let Some(t) = g.as_mut()
-                {
+                if let Some(t) = lock().as_mut() {
                     refresh(&mut t.0);
                 }
             }
@@ -102,6 +109,17 @@ fn start_timer() {
 
 fn refresh(t: &mut MetalTitle) {
     t.pump();
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|l| l.elapsed().as_secs() >= 5) {
+            let stuck = t.stuck(std::time::Duration::from_secs(2));
+            if !stuck.is_empty() {
+                *last = Some(std::time::Instant::now());
+                tracing::warn!("work held for a wait that does not hold: {stuck:?}");
+            }
+        }
+    }
     for (fence, value) in t.completed() {
         crate::fence::raise(fence as This, value);
     }
@@ -311,11 +329,11 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}.ppm")), out);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}.ppm", info.memory as usize)), out);
             // The alpha channel as grey.
             let mut alpha = format!("P6\n{w} {h}\n255\n").into_bytes();
             alpha.extend(px.as_chunks::<4>().0.iter().flat_map(|p| [p[3], p[3], p[3]]));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_alpha.ppm")), alpha);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_alpha.ppm", info.memory as usize)), alpha);
             tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
         }
     });
@@ -324,6 +342,7 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 2]>) {
 /// A texture operation the native host does not do (copies, resolves), counted by the trace.
 pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
     crate::list::DROPPED_KINDS[3].fetch_add(1, Ordering::Relaxed);
+    warn_once("a texture copy or resolve");
     if tracing_targets() {
         DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()).push(format!("{what} {src:?}->{dst:?}"));
     }
@@ -362,6 +381,15 @@ fn trace_present(resource: This) {
 
 /// `PresentX` on title queue `queue`: title texture `resource` over the layer.
 pub(crate) fn present(queue: This, resource: This) {
+    // Diagnostic: VICTORY_PRESENT_DELAY_MS slows every present, to tell a trigger that follows
+    // frames from one that follows time.
+    static DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *DELAY.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     if tracing_targets() {
         trace_present(resource);
     }
@@ -379,6 +407,17 @@ pub(crate) fn present(queue: This, resource: This) {
 }
 
 /// Frames presented to the layer so far.
+/// For the window's figures: frames presented, draws recorded, draws dropped (no host
+/// pipeline), and the GPU's microseconds since the last call. Atomics only: no lock.
+pub fn hud() -> (u64, u64, u64, u64) {
+    (
+        crate::queue::presented(),
+        RECORDED.load(Ordering::Relaxed),
+        DROPPED.load(Ordering::Relaxed),
+        victory_metal::gfx::take_gpu_us(),
+    )
+}
+
 pub fn frames_presented() -> u64 {
     with_title(|t| t.surface().map_or(0, |s| s.frames())).unwrap_or(0)
 }
@@ -393,6 +432,17 @@ pub fn last_frame() -> Option<(usize, usize, Vec<u8>)> {
 /// A buffer resource object `res` of `len` bytes at title address `addr`.
 pub(crate) fn buffer_created(res: This, addr: u64, len: u64) {
     with_title(|t| t.host.register_buffer(res as usize, addr, len));
+}
+
+/// A pipeline object's last reference went: the host pipelines made for it are forgotten, as the
+/// title makes thousands of variants (device slot 0x1b8) a minute and a new one often gets a freed
+/// one's address (which drew text with the old variant's blend state: glyphs as boxes).
+pub(crate) fn pipeline_released(pipeline: This) {
+    let key = pipeline as usize;
+    with_title(|t| {
+        t.pipelines.remove(&key);
+        t.console_pipes.retain(|(k, _), _| *k != key);
+    });
 }
 
 pub(crate) fn resource_released(res: This) {
@@ -413,20 +463,38 @@ pub(crate) fn texture_created(res: This) {
 /// `OMSetRenderTargets`: the host textures of the views' resources.
 pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
     with_list(this, |t, l| {
-        let colors: Vec<usize> = color
+        let keys: Vec<Option<usize>> = color
             .iter()
-            .filter_map(|&h| crate::descriptor::rtv_record(h))
-            .map(|r| r.resource as usize)
+            .map(|&h| crate::descriptor::rtv_record(h).map(|r| r.resource as usize))
             .collect();
-        let color: Vec<_> = colors.iter().filter_map(|&k| t.texture_of(k)).collect();
         let depth_key = crate::descriptor::dsv_record(depth).map(|r| r.resource as usize);
         let depth = depth_key.and_then(|k| t.texture_of(k));
-        l.target_keys = colors.iter().copied().chain(depth_key).collect();
+        l.target_keys = keys.iter().flatten().copied().chain(depth_key).collect();
+        // A view the host cannot make keeps its slot: binding the rest would move every later
+        // target down one, and `SV_TargetN` would write a surface this pass does not own.
+        let made: Option<Vec<_>> = keys
+            .iter()
+            .map(|slot| slot.and_then(|k| t.texture_of(k)))
+            .collect();
+        let Some(color) = made else {
+            l.targets_ready = false;
+            l.targets = TargetFormats::default();
+            l.target_keys.clear();
+            l.list.set_render_targets(&[], None);
+            warn_once("a render target the host cannot make; the passes that use it are refused");
+            return;
+        };
+        l.targets_ready = true;
         l.targets = TargetFormats {
-            color: colors.iter().filter_map(|&k| t.format_of(k)).collect(),
+            color: keys.iter().flatten().filter_map(|&k| t.format_of(k)).collect(),
             depth: depth_key.and_then(|k| t.format_of(k)),
         };
-        l.list.set_render_targets(&color, depth.as_ref());
+        // Debugging: no depth attachment at all.
+        let drop_depth = std::env::var_os("VICTORY_DEBUG_NO_DEPTH_ATTACH").is_some();
+        if drop_depth {
+            l.targets.depth = None;
+        }
+        l.list.set_render_targets(&color, depth.as_ref().filter(|_| !drop_depth));
     });
 }
 
@@ -442,13 +510,38 @@ pub(crate) fn clear_rtv(this: This, handle: u64, color: [f32; 4]) {
     });
 }
 
-/// `ClearDepthStencilView`: the depth (flag 1); the stencil is cleared with it.
-pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32) {
+#[inline(never)]
+fn trace_clear_dsv(flags: u32, depth: f32) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 6 || (n % 40 == 0 && n < 3000) {
+        tracing::info!(flags, depth, n, "ClearDepthStencilView");
+    }
+}
+
+/// `ClearDepthStencilView`: depth (flag 1) and stencil (flag 2) are independent.
+pub(crate) fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, stencil: u8, count: u32) {
+    if tracing_targets() {
+        trace_clear_dsv(flags, depth);
+    }
+    // Neither rectangle bounds nor attachment mip/layer selection are represented by
+    // NativeList's clear command. Do not widen an unsupported clear to the base texture.
+    if count != 0 || flags & 3 == 0 {
+        return;
+    }
+    let Some(record) = crate::descriptor::dsv_record(handle).filter(|r| r.native_dsv_base_view()) else {
+        return;
+    };
+    if !crate::resource::native_dsv_clear_supported(record.resource) {
+        return;
+    }
     with_list(this, |t, l| {
-        if flags & 1 != 0
-            && let Some(tex) = crate::descriptor::dsv_record(handle).and_then(|r| t.texture_of(r.resource as usize))
-        {
-            l.list.clear_depth(&tex, depth);
+        if let Some(tex) = t.texture_of(record.resource as usize) {
+            l.list.clear_depth_stencil(
+                &tex,
+                (flags & 1 != 0).then_some(depth),
+                (flags & 2 != 0).then_some(stencil),
+            );
         }
     });
 }
@@ -531,7 +624,7 @@ pub(crate) fn mirror(handle: u64) {
         }
         if let Err(e) = t.host.mirror(handle) {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 12 {
+            if N.fetch_add(1, Ordering::Relaxed) < 3000 {
                 tracing::info!(error = %e, handle = format!("{handle:#x}"), "a descriptor was not mirrored");
             }
         }
@@ -566,8 +659,20 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
 /// Work dropped because its pipeline has no host pipeline.
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn dropped() {
+/// Counts a draw or dispatch the host drops, and warns the first time for each `why`.
+fn dropped(why: &'static str) {
     DROPPED.fetch_add(1, Ordering::Relaxed);
+    warn_once(why);
+}
+
+/// A warning logged once per distinct `what` for the run.
+pub(crate) fn warn_once(what: &'static str) {
+    static SEEN: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&what) {
+        seen.push(what);
+        tracing::warn!("native host drops work: {what} (first time; counted in \"native draws so far\")");
+    }
 }
 
 /// Draws the title recorded, and those that went on to the host list.
@@ -623,6 +728,9 @@ fn make_host_pipe(
     stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
     graphics: Option<super::state::Graphics>,
 ) -> Pipe<Metal> {
+    if stages.is_empty() && graphics.as_ref().is_some_and(|g| g.is_guessed()) {
+        return Pipe::Skipped;
+    }
     let name = stages
         .iter()
         .map(|(stage, s)| format!("{stage} {}", s.hash))
@@ -689,7 +797,20 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
                 tracing::warn!(error = %e, "dispatch");
             }
         }
-        _ => dropped(),
+        _ => dropped("a dispatch without a host compute pipeline"),
+    });
+}
+
+/// A dispatch of `ExecuteIndirect`: the group counts at title address `arguments`, read by the GPU.
+pub(crate) fn dispatch_indirect(this: This, arguments: u64) {
+    with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+        Pipe::Compute(pso) => {
+            l.list.set_compute_pipeline(&pso);
+            if let Err(e) = l.list.dispatch_indirect(arguments) {
+                tracing::warn!(error = %e, "indirect dispatch");
+            }
+        }
+        _ => dropped("a dispatch without a host compute pipeline"),
     });
 }
 
@@ -778,7 +899,13 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
             & !super::state::texcoords(&base_vs.dxil, victory_shader::FourCC::OSG1)
     });
     let widened = if extra != 0 {
-        match g.vs_source.translate_extra(rect, extra) {
+        let mut copy = [0u8; 32];
+        for &(orig, new) in g.ps.as_ref().map_or(&[][..], |ps| &ps.splits[..]) {
+            if orig < 32 && new < 32 {
+                copy[new as usize] = orig as u8 + 1;
+            }
+        }
+        match g.vs_source.translate_extra(rect, extra, copy) {
             Ok(h) => Some(h),
             Err(e) => {
                 t.refused_translation(&g.name, format!("extra outputs: {e}"));
@@ -792,24 +919,41 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
     tracing::info!(name = %g.name, ?reads, targets = ?l.targets, strides = ?l.strides, "guessed pipeline");
     let state = g.state.for_draw(l.targets.color.clone(), l.targets.depth, l.strides.clone(), &reads, rect);
+    if tracing_targets() {
+        tracing::info!(name = %g.name, ?state, depth_test = ?state.depth_test(), stencil = ?state.stencil(), cull = ?state.cull(), color = ?state.color_state(), "guessed pipeline state");
+    }
     let made = t.render_pipe(vs, g.ps.as_deref(), &state, &g.name);
     g.made.borrow_mut().insert(key, made.clone());
     made
 }
 
-/// Sets the draw pipeline and topology the title chose, and what the pipeline binds; false (and
-/// counted) when there is nothing to draw with.
+/// Sets the draw pipeline, topology and bindings. Returns rectangle mode for a drawable pipeline.
 fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
+    if !l.targets_ready {
+        dropped("a draw of a pass whose render targets the host cannot make");
+        return None;
+    }
     // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
     // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`).
     let rect = l.topology == 17;
     let targets = l.targets.clone();
     let made = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => guess(t, l, &g, rect),
+        p if rect => {
+            if std::env::var_os("VICTORY_TRACE_RECTS").is_some() {
+                tracing::info!(pipeline = ?l.pipeline, kind = ?std::mem::discriminant(&p), "rect draw of a pipeline that is not guessed");
+            }
+            warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
+            p
+        }
+        Pipe::Skipped => {
+            warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
+            return None;
+        }
         p => p,
     };
     let Pipe::Render(pso, binding) = made else {
-        dropped();
+        dropped("a draw without a host render pipeline (refused or not translated)");
         return None;
     };
     let topology = if rect {
@@ -820,9 +964,9 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList) -> Option<bool> {
     let Some(topology) = topology else {
         static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if l.topology < 64 && SEEN.fetch_or(1 << l.topology, Ordering::Relaxed) >> l.topology & 1 == 0 {
-            tracing::info!(topology = l.topology, "a draw dropped for its primitive topology");
+            tracing::warn!(topology = l.topology, "a draw dropped for its primitive topology");
         }
-        dropped();
+        dropped("a draw of a primitive topology the host does not draw");
         return None;
     };
     l.list.set_graphics_pipeline(&pso, topology);
@@ -846,8 +990,25 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
             });
         }
     }
+    // Debugging: only indexed draws (the content), not the boot passes.
+    if std::env::var_os("VICTORY_DEBUG_ONLY_INDEXED").is_some() {
+        return;
+    }
     with_list(this, |t, l| {
         if let Some(rect) = graphics(t, l) {
+            if rect && std::env::var_os("VICTORY_TRACE_RECTS").is_some() {
+                static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap();
+                if seen.iter().filter(|&&p| p == l.pipeline as usize).count() < 3 {
+                    seen.push(l.pipeline as usize);
+                    let stride = l.strides.first().copied().unwrap_or(0) as usize;
+                    let mut head = vec![0u8; (stride * 3).clamp(12, 192)];
+                    let at = l.list.vertex_buffer_address(0).map(|a| a + (first as u64) * stride as u64);
+                    let ok = at.is_some_and(|a| super::safe_read(a as *const u8, &mut head));
+                    let floats: Vec<f32> = head.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+                    tracing::info!(pipeline = ?l.pipeline, vertices, first, strides = ?l.strides, ok, ?floats, "rect draw");
+                }
+            }
             let call = if rect {
                 l.list.draw_instanced(4, vertices / 3, 0, first / 3)
             } else {
@@ -870,7 +1031,7 @@ pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32,
         if let Some(rect) = graphics(t, l) {
             if rect {
                 // shortcut: indexed rectangle lists are not drawn.
-                dropped();
+                dropped("an indexed rectangle-list draw");
                 return;
             }
             match l.list.draw_indexed_instanced(indices, instances, first, base, first_instance) {
@@ -961,6 +1122,10 @@ pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
 
 /// A bottom-of-pipe value write of `value`, `bytes` long.
 pub(crate) fn write_value(this: This, address: u64, value: u64, bytes: usize) -> bool {
+    if std::env::var_os("VICTORY_TRACE_WRITES").is_some() {
+        let inside = pools().resolve(address, bytes as u64).is_some();
+        tracing::warn!("list write {value:#x} ({bytes} bytes) at {address:#x}, in a pool: {inside}");
+    }
     with_list(this, |_, l| l.list.write_value(address, value, bytes)).is_some()
 }
 
@@ -986,4 +1151,38 @@ pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
 /// Counters of the host for tests and the frame line.
 pub fn stats() -> Option<super::title::Stats> {
     with_title(|t| t.stats.clone())
+}
+
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+    use crate::native::memory::PoolInfo;
+
+    #[test]
+    fn reports_a_mapped_address_with_the_title_lock_held() {
+        let Some((memory, addresses)) =
+            with_title(|t| (t.host.memory(), t.host.crash_addresses()))
+        else {
+            return;
+        };
+        let address = 0x7000_0000;
+        let heap = 0x8000_0000;
+        let pool = PoolInfo {
+            id: usize::MAX,
+            base: 0x1000_0000,
+            len: 0x1_0000,
+            memory_entry: None,
+        };
+        memory.mapped(address, pool.len, &pool, 0);
+        addresses.set_buffer_view(heap, 3, address as u64, 64);
+        let description = {
+            let _title = lock();
+            describe(address as u64)
+        };
+        addresses.remove_heap(heap);
+        memory.pool_released(&pool);
+        let description = description.expect("a crash address report");
+        assert!(description.starts_with("in a pool,"), "{description}");
+        assert!(description.contains("heap 0x80000000[3]"), "{description}");
+    }
 }

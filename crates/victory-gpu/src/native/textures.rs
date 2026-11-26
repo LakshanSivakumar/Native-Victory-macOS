@@ -54,6 +54,9 @@ impl TextureInfo {
         if depth && format == Format::R32Float {
             format = Format::D32Float;
         }
+        if depth && format == Format::R16Unorm {
+            format = Format::D16Unorm;
+        }
         let (dim, d) = match self.dimension {
             Dimension::Tex3d => (TexDim::D3, self.depth_or_layers as usize),
             _ if self.depth_or_layers > 1 => (TexDim::D2Array, self.depth_or_layers as usize),
@@ -83,6 +86,17 @@ pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
     out
 }
 
+/// Title texels as the host format holds them: DXGI `B4G4R4A4_UNORM` (115) has blue in the low
+/// nibble and alpha in the top one, Metal's `ABGR4Unorm` alpha low and red top. The host's own
+/// writes and reads agree with each other, so only bytes from title memory are converted.
+pub fn to_host(format: u32, texels: &mut [u8]) {
+    if format == 115 {
+        for t in texels.as_chunks_mut::<2>().0 {
+            *t = u16::from_le_bytes(*t).rotate_left(4).to_le_bytes();
+        }
+    }
+}
+
 /// Detiles every mip of every slice of `tiled` (the texture's whole memory) into `tex`.
 pub fn upload<B: ResourceBackend>(
     backend: &B,
@@ -107,6 +121,7 @@ pub fn upload<B: ResourceBackend>(
             layout
                 .detile(tiled, mip, slice, &mut linear, row, slice_pitch)
                 .map_err(|e| format!("detile mip {mip} slice {slice}: {e:?}"))?;
+            to_host(info.format, &mut linear);
             backend.upload_texture(tex, mip as usize, slice as usize, &linear, row, slice_pitch);
         }
     }
@@ -146,7 +161,7 @@ fn start_scanner() {
                 let list: Vec<(usize, (usize, usize, bool))> =
                     watch(|w| w.entries.iter().map(|(&k, &v)| (k, v)).collect());
                 seen.retain(|k, _| list.iter().any(|(l, _)| l == k));
-                for (key, (at, size, target)) in list {
+                for &(key, (at, size, target)) in &list {
                     let mut h = blake3::Hasher::new();
                     for off in (0..size).step_by(buf.len()) {
                         let n = buf.len().min(size - off);
@@ -174,6 +189,40 @@ pub struct Tracked<B: ResourceBackend> {
     last: Option<blake3::Hash>,
     /// Uploads of its memory so far.
     pub uploads: u64,
+    /// Submissions left in which its memory is probed at submission rather than left to the
+    /// scanner (0: cold), and what the last probe read.
+    hot: u32,
+    probe: Vec<u8>,
+}
+
+/// Submissions a texture whose memory changed (or that was uploaded blank) stays hot without a
+/// further change.
+const HOT: u32 = 600;
+/// Pages of a large hot texture's memory a probe reads, spread over it.
+const PROBE_PAGES: usize = 8;
+/// Hot textures up to this size that changed more than once are probed whole (a glyph cache gets
+/// a few glyphs at a time). Textures written once after a blank upload (streaming) are sampled:
+/// probing all of them whole looked about 15% slower in one run.
+const PROBE_WHOLE: usize = 4 << 20;
+
+/// The bytes a probe of `size` bytes at `at` compares: all of them if `whole`, else `PROBE_PAGES`
+/// pages spread over them.
+///
+/// shortcut: when sampled, a write that misses every sampled page goes unseen until the scanner's
+/// next round; a texture the title rewrites whole (a movie's planes) is caught at once.
+fn probe(at: usize, size: usize, whole: bool) -> Vec<u8> {
+    if whole || size <= PROBE_PAGES * 4096 {
+        return read_memory(at as *const u8, size);
+    }
+    const PAGE: usize = 4096;
+    let pages = size.div_ceil(PAGE);
+    let mut out = vec![0u8; PROBE_PAGES * PAGE];
+    for (k, page) in out.chunks_mut(PAGE).enumerate() {
+        let off = k * pages / PROBE_PAGES * PAGE;
+        let n = PAGE.min(size - off);
+        let _ = super::safe_read((at + off) as *const u8, &mut page[..n]);
+    }
+    out
 }
 
 /// The key of a texture a view names by address and description (no resource object): a number no
@@ -207,7 +256,13 @@ impl<B: PresentBackend> Title<B> {
             return false;
         };
         let Some(desc) = info.desc() else {
-            tracing::debug!(format = info.format, "title texture the host does not represent");
+            // Loud once per format: views of it get no texture and their draws sample nothing.
+            static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&info.format) {
+                seen.push(info.format);
+                tracing::warn!(format = info.format, w = info.width, h = info.height, flags = info.flags, "a title texture format the host does not represent (first of this format)");
+            }
             return false;
         };
         let tex = match self.host.texture(&desc) {
@@ -239,6 +294,8 @@ impl<B: PresentBackend> Title<B> {
                 info,
                 last: None,
                 uploads: 0,
+                hot: 0,
+                probe: Vec::new(),
             },
         );
         true
@@ -278,7 +335,19 @@ impl<B: PresentBackend> Title<B> {
     /// What a submission does: the textures not uploaded yet, and those the scanner found
     /// changed since.
     pub fn sync_dirty(&mut self) {
-        let dirty = watch(|w| std::mem::take(&mut w.dirty));
+        let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
+        // Hot textures (a movie's planes, a glyph cache) are probed now: the scanner's round over
+        // every texture is seconds long by the menus, and a movie frame sampled before its planes
+        // were seen showed their blank first upload (solid green) or an old frame.
+        for (&key, t) in self.textures.iter_mut().filter(|(_, t)| t.hot > 0) {
+            let now = probe(t.info.memory as usize, t.info.size, t.uploads >= 2 && t.info.size <= PROBE_WHOLE);
+            let before = std::mem::replace(&mut t.probe, now);
+            if before != t.probe {
+                dirty.insert(key);
+            } else {
+                t.hot -= 1;
+            }
+        }
         self.sync_where(|key, t| (t.last.is_none() && !t.info.render_target()) || dirty.contains(&key));
     }
 
@@ -295,6 +364,10 @@ impl<B: PresentBackend> Title<B> {
             let hash = blake3::hash(&tiled);
             if t.last == Some(hash) {
                 continue;
+            }
+            // Written again after its first upload, or blank at it (written later): hot.
+            if !t.info.render_target() && (t.uploads > 0 || tiled.iter().all(|&b| b == 0)) {
+                t.hot = HOT;
             }
             match upload(&host.backend, &t.texture, &t.info, &tiled) {
                 Ok(()) => {

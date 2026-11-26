@@ -62,11 +62,16 @@ const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. On the macOS host
+/// the mouse is the right stick and its buttons the triggers, and a few more
+/// keys sit where a PC player looks for them: left Shift A (sprint), R B,
+/// G Y (get in), left Control the left stick's click (crouch).
+const FALLBACK_BUTTONS: [(u8, u32); 20] = [
+    (0x09, MENU), // Tab
+    (b'V', VIEW),
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
+    (0x1B, B),    // Esc
     (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
@@ -78,6 +83,10 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'E', RIGHT_SHOULDER),
     (b'F', LEFT_STICK),
     (b'H', RIGHT_STICK),
+    (0xA0, A),          // left Shift
+    (b'R', B),
+    (b'G', Y),
+    (0xA2, LEFT_STICK), // left Control
 ];
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
@@ -118,6 +127,17 @@ trait Source: Send {
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The mouse as a pad: the right stick from its motion, the triggers
+    /// from its buttons (macOS host); none without one.
+    fn mouse(&mut self) -> Option<PadState> {
+        None
+    }
+    /// Whether the keyboard (and the mouse) also drive the first host pad,
+    /// so both work at once (macOS host); else they drive the stand-in pad
+    /// only while no host pad is connected.
+    fn keyboard_onto_pads(&self) -> bool {
+        false
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -142,8 +162,8 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
-/// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
+/// Combines `extra` (from `VICTORY_KEYS`, the keyboard or the mouse) onto
+/// `base` (a physical host pad).
 fn merge_pad(base: PadState, extra: PadState) -> PadState {
     PadState {
         buttons: base.buttons | extra.buttons,
@@ -383,11 +403,9 @@ unsafe impl Send for Hub {}
 // SAFETY: as above.
 unsafe impl Sync for Hub {}
 
-static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
 /// Microseconds, the clock of every timestamp we hand out.
-fn now() -> u64 {
-    START.elapsed().as_micros() as u64
+pub(crate) fn now() -> u64 {
+    victory_gpu::clock::ticks(1_000_000)
 }
 
 impl Hub {
@@ -437,7 +455,7 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             #[cfg(any(test, feature = "diagnostics"))]
@@ -445,11 +463,21 @@ impl Hub {
                 let scripted = source.scripted_keys();
                 merge_scripted(&mut pads, &scripted);
             }
-            #[cfg(not(any(test, feature = "diagnostics")))]
-            let _ = &mut pads;
-            (pads, source.keys())
+            let keys = source.keys();
+            let mouse = source.mouse();
+            // Keyboard and mouse onto the first host pad too (macOS).
+            if source.keyboard_onto_pads()
+                && let Some(pad) = pads.iter_mut().flatten().next()
+            {
+                let mut extra = fallback(&keys);
+                if let Some(m) = mouse {
+                    extra = merge_pad(extra, m);
+                }
+                *pad = merge_pad(*pad, extra);
+            }
+            (pads, keys, mouse)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -500,6 +528,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: Option<PadState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -507,7 +536,10 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| {
+            let keyboard = fallback(&keys);
+            Value::Pad(mouse.map_or(keyboard, |m| merge_pad(keyboard, m)))
+        });
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -559,6 +591,277 @@ impl State {
     }
 }
 
+/// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
+/// 0.2 s that long after input starts, with or without focus. A key is a
+/// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+/// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+#[cfg(any(not(windows), feature = "diagnostics"))]
+fn scripted() -> Vec<u8> {
+    static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+        let keys = list.split(',').filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            Some((
+                Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                vk,
+            ))
+        });
+        (Instant::now(), keys.collect())
+    });
+    let (start, keys) = &*SCRIPT;
+    let now = start.elapsed();
+    keys.iter()
+        .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+        .map(|&(_, vk)| vk)
+        .collect()
+}
+
+/// Snapshot of a connected macOS `GCExtendedGamepad` (Xbox, DualSense, or MFi),
+/// mapped into `GameInput`'s Xbox button layout and analog axes.
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ControllerSnapshot {
+    pub a: bool,
+    pub b: bool,
+    pub x: bool,
+    pub y: bool,
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub left_shoulder: bool,
+    pub right_shoulder: bool,
+    pub left_stick: bool,
+    pub right_stick: bool,
+    pub menu: bool,
+    pub view: bool,
+    /// Analog triggers, 0.0 to 1.0.
+    pub left_trigger: f32,
+    pub right_trigger: f32,
+    /// Analog sticks, -1.0 to 1.0 (up positive).
+    pub left_x: f32,
+    pub left_y: f32,
+    pub right_x: f32,
+    pub right_y: f32,
+}
+
+#[cfg(not(windows))]
+fn pad_from_snapshot(s: ControllerSnapshot) -> PadState {
+    let mut buttons = 0u32;
+    for (on, bit) in [
+        (s.menu, MENU),
+        (s.view, VIEW),
+        (s.a, A),
+        (s.b, B),
+        (s.x, X),
+        (s.y, Y),
+        (s.up, UP),
+        (s.down, DOWN),
+        (s.left, LEFT),
+        (s.right, RIGHT),
+        (s.left_shoulder, LEFT_SHOULDER),
+        (s.right_shoulder, RIGHT_SHOULDER),
+        (s.left_stick, LEFT_STICK),
+        (s.right_stick, RIGHT_STICK),
+    ] {
+        if on {
+            buttons |= bit;
+        }
+    }
+    let finite = |v: f32, lo: f32, hi: f32| if v.is_finite() { v.clamp(lo, hi) } else { 0.0 };
+    PadState {
+        buttons,
+        left_trigger: finite(s.left_trigger, 0.0, 1.0),
+        right_trigger: finite(s.right_trigger, 0.0, 1.0),
+        left_x: finite(s.left_x, -1.0, 1.0),
+        left_y: finite(s.left_y, -1.0, 1.0),
+        right_x: finite(s.right_x, -1.0, 1.0),
+        right_y: finite(s.right_y, -1.0, 1.0),
+    }
+}
+
+/// Live physical controller state on macOS, updated by the window's event loop.
+#[cfg(not(windows))]
+static LIVE_PAD: Mutex<PadState> = Mutex::new(PadState {
+    buttons: 0,
+    left_trigger: 0.0,
+    right_trigger: 0.0,
+    left_x: 0.0,
+    left_y: 0.0,
+    right_x: 0.0,
+    right_y: 0.0,
+});
+
+/// Updates the live macOS controller state from a `GCExtendedGamepad` snapshot.
+#[cfg(not(windows))]
+pub fn set_live_pad(snapshot: ControllerSnapshot) {
+    *lock(&LIVE_PAD) = pad_from_snapshot(snapshot);
+}
+
+/// Clears the live macOS controller state (on disconnect or window focus loss).
+#[cfg(not(windows))]
+pub fn release_live_pad() {
+    *lock(&LIVE_PAD) = PadState::default();
+}
+
+/// Stand-in pad state: on macOS, merges any live physical `GCController` pad
+/// with the keyboard and `VICTORY_KEYS`; on Windows, keyboard fallback only.
+fn stand_in_pad(keys: &[KeyState]) -> PadState {
+    let kb = fallback(keys);
+    #[cfg(not(windows))]
+    {
+        merge_pad(*lock(&LIVE_PAD), kb)
+    }
+    #[cfg(windows)]
+    {
+        kb
+    }
+}
+
+/// Keys held down in the host window (macOS), kept by its event loop.
+#[cfg(not(windows))]
+static LIVE: Mutex<std::collections::BTreeSet<u8>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// A key went down or up in the host window; `vk` is a Windows virtual key.
+#[cfg(not(windows))]
+pub fn set_live_key(vk: u8, down: bool) {
+    let mut live = lock(&LIVE);
+    if down {
+        live.insert(vk);
+    } else {
+        live.remove(&vk);
+    }
+}
+
+/// The window lost focus: no key is held any more.
+#[cfg(not(windows))]
+pub fn release_live_keys() {
+    lock(&LIVE).clear();
+}
+
+/// Whether virtual key `vk` is currently held in the live macOS key set.
+#[cfg(not(windows))]
+pub fn is_live_key_down(vk: u8) -> bool {
+    lock(&LIVE).contains(&vk)
+}
+
+/// PS/2 Set-1 scan code (with `0xE000` extended prefix, matching Windows
+/// `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)`) for standard virtual keys.
+#[cfg(not(windows))]
+fn vk_to_scan_code(vk: u8) -> u32 {
+    match vk {
+        0x1B => 0x01, // Esc
+        b'1' => 0x02,
+        b'2' => 0x03,
+        b'3' => 0x04,
+        b'4' => 0x05,
+        b'5' => 0x06,
+        b'6' => 0x07,
+        b'7' => 0x08,
+        b'8' => 0x09,
+        b'9' => 0x0A,
+        b'0' => 0x0B,
+        0xBD => 0x0C, // -
+        0xBB => 0x0D, // =
+        0x08 => 0x0E, // Backspace
+        0x09 => 0x0F, // Tab
+        b'Q' => 0x10,
+        b'W' => 0x11,
+        b'E' => 0x12,
+        b'R' => 0x13,
+        b'T' => 0x14,
+        b'Y' => 0x15,
+        b'U' => 0x16,
+        b'I' => 0x17,
+        b'O' => 0x18,
+        b'P' => 0x19,
+        0xDB => 0x1A, // [
+        0xDD => 0x1B, // ]
+        0x0D => 0x1C, // Enter
+        0xA2 => 0x1D, // Left Ctrl
+        b'A' => 0x1E,
+        b'S' => 0x1F,
+        b'D' => 0x20,
+        b'F' => 0x21,
+        b'G' => 0x22,
+        b'H' => 0x23,
+        b'J' => 0x24,
+        b'K' => 0x25,
+        b'L' => 0x26,
+        0xBA => 0x27, // ;
+        0xDE => 0x28, // '
+        0xC0 => 0x29, // `
+        0xA0 => 0x2A, // Left Shift
+        0xDC => 0x2B, // \
+        b'Z' => 0x2C,
+        b'X' => 0x2D,
+        b'C' => 0x2E,
+        b'V' => 0x2F,
+        b'B' => 0x30,
+        b'N' => 0x31,
+        b'M' => 0x32,
+        0xBC => 0x33, // ,
+        0xBE => 0x34, // .
+        0xBF => 0x35, // /
+        0xA1 => 0x36, // Right Shift
+        0xA4 => 0x38, // Left Alt
+        0x20 => 0x39, // Space
+        0x70 => 0x3B, // F1
+        0x71 => 0x3C, // F2
+        0x72 => 0x3D, // F3
+        0x73 => 0x3E, // F4
+        0x74 => 0x3F, // F5
+        0x75 => 0x40, // F6
+        0x76 => 0x41, // F7
+        0x77 => 0x42, // F8
+        0x78 => 0x43, // F9
+        0x79 => 0x44, // F10
+        0x7A => 0x57, // F11
+        0x7B => 0x58, // F12
+        0xA3 => 0xE01D, // Right Ctrl
+        0xA5 => 0xE038, // Right Alt
+        0x24 => 0xE047, // Home
+        0x26 => 0xE048, // Up
+        0x21 => 0xE049, // Page Up
+        0x25 => 0xE04B, // Left
+        0x27 => 0xE04D, // Right
+        0x23 => 0xE04F, // End
+        0x28 => 0xE050, // Down
+        0x22 => 0xE051, // Page Down
+        0x2E => 0xE053, // Delete
+        _ => 0,
+    }
+}
+
+/// `scripted` (`VICTORY_KEYS`) and the live keys, OR-ed: each key once.
+#[cfg(not(windows))]
+fn held(mut vks: Vec<u8>) -> Vec<KeyState> {
+    vks.extend(lock(&LIVE).iter());
+    vks.sort_unstable();
+    vks.dedup();
+    vks.into_iter()
+        .map(|vk| KeyState {
+            scan_code: vk_to_scan_code(vk),
+            virtual_key: vk,
+            ..Default::default()
+        })
+        .collect()
+}
+
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
     Box::new(host::Host::default())
@@ -566,17 +869,214 @@ fn host() -> Box<dyn Source> {
 
 #[cfg(not(windows))]
 fn host() -> Box<dyn Source> {
-    struct Nothing;
-    impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
-            None
-        }
-        fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
-        }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+    struct Mac {
+        /// The mouse stick, smoothed between polls.
+        stick: (f32, f32),
+        last: Instant,
     }
-    Box::new(Nothing)
+    impl Source for Mac {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            mac::PADS.lock().unwrap_or_else(PoisonError::into_inner)[slot].map(|p| PadState {
+                buttons: p.buttons,
+                left_trigger: p.left_trigger,
+                right_trigger: p.right_trigger,
+                left_x: p.left_x,
+                left_y: p.left_y,
+                right_x: p.right_x,
+                right_y: p.right_y,
+            })
+        }
+        /// Keys held in our window (with scan codes and characters), and
+        /// the scripted and other live ones (`set_live_key`).
+        fn keys(&mut self) -> Vec<KeyState> {
+            let mut keys: Vec<KeyState> = mac::KEYS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|k| KeyState {
+                    scan_code: k.scan_code,
+                    code_point: k.code_point,
+                    virtual_key: k.virtual_key,
+                    dead_key: false,
+                })
+                .collect();
+            for k in held(scripted()) {
+                if !keys.iter().any(|h| h.virtual_key == k.virtual_key) {
+                    keys.push(k);
+                }
+            }
+            keys
+        }
+        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            if let Some(r) = mac::RUMBLE.lock().unwrap_or_else(PoisonError::into_inner).get_mut(slot) {
+                *r = (low, high);
+            }
+        }
+        fn mouse(&mut self) -> Option<PadState> {
+            let (dx, dy, buttons, captured) = mac::take_mouse();
+            let dt = self.last.elapsed().as_secs_f32().max(0.001);
+            self.last = Instant::now();
+            if !captured {
+                self.stick = (0.0, 0.0);
+                return (buttons != 0).then(|| mac::mouse_pad(0.0, 0.0, buttons));
+            }
+            // Points a second for a full turn of the stick.
+            let full = mac::sensitivity();
+            let want = ((dx / dt / full).clamp(-1.0, 1.0), (-dy / dt / full).clamp(-1.0, 1.0));
+            // Half of the way each poll: motion reads as a steady stick.
+            self.stick = (
+                self.stick.0 + (want.0 - self.stick.0) * 0.5,
+                self.stick.1 + (want.1 - self.stick.1) * 0.5,
+            );
+            if self.stick.0.abs() < 0.01 && self.stick.1.abs() < 0.01 {
+                self.stick = (0.0, 0.0);
+            }
+            Some(mac::mouse_pad(self.stick.0, self.stick.1, buttons))
+        }
+        fn keyboard_onto_pads(&self) -> bool {
+            true
+        }
+    }
+    Box::new(Mac {
+        stick: (0.0, 0.0),
+        last: Instant::now(),
+    })
+}
+
+/// Input of the macOS host, written by the app's main thread (the window's
+/// key and mouse events, the Game Controller framework's pads) and read by
+/// the poll thread.
+#[cfg(not(windows))]
+pub mod mac {
+    use std::sync::{Mutex, PoisonError};
+
+    use super::{PADS as SLOTS, PadState};
+
+    /// Gamepad buttons (the bits of `Pad::buttons`), as in `GameInput`.
+    pub const MENU: u32 = super::MENU;
+    pub const VIEW: u32 = super::VIEW;
+    pub const A: u32 = super::A;
+    pub const B: u32 = super::B;
+    pub const X: u32 = super::X;
+    pub const Y: u32 = super::Y;
+    pub const UP: u32 = super::UP;
+    pub const DOWN: u32 = super::DOWN;
+    pub const LEFT: u32 = super::LEFT;
+    pub const RIGHT: u32 = super::RIGHT;
+    pub const LEFT_SHOULDER: u32 = super::LEFT_SHOULDER;
+    pub const RIGHT_SHOULDER: u32 = super::RIGHT_SHOULDER;
+    pub const LEFT_STICK: u32 = super::LEFT_STICK;
+    pub const RIGHT_STICK: u32 = super::RIGHT_STICK;
+
+    /// A pad as the app reads it: buttons (the bits above), triggers 0 to
+    /// 1, sticks -1 to 1 (up positive).
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Pad {
+        pub buttons: u32,
+        pub left_trigger: f32,
+        pub right_trigger: f32,
+        pub left_x: f32,
+        pub left_y: f32,
+        pub right_x: f32,
+        pub right_y: f32,
+    }
+
+    /// A key held down: Windows virtual key, set-1 scan code (0xE0xx when
+    /// extended), character.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Key {
+        pub virtual_key: u8,
+        pub scan_code: u32,
+        pub code_point: u32,
+    }
+
+    pub(super) static PADS: Mutex<[Option<Pad>; SLOTS]> = Mutex::new([None; SLOTS]);
+    pub(super) static KEYS: Mutex<Vec<Key>> = Mutex::new(Vec::new());
+    /// Wanted motor speeds per slot (low, high), for the app to play.
+    pub(super) static RUMBLE: Mutex<[(u16, u16); SLOTS]> = Mutex::new([(0, 0); SLOTS]);
+    /// Motion since the last poll (points, down positive), buttons held
+    /// (bit 0 left, 1 right, 2 middle), whether the mouse is captured.
+    static MOUSE: Mutex<(f32, f32, u8, bool)> = Mutex::new((0.0, 0.0, 0, false));
+
+    /// Pad `slot` (0 to 3) is `pad`, or gone.
+    pub fn set_pad(slot: usize, pad: Option<Pad>) {
+        if let Some(p) = PADS.lock().unwrap_or_else(PoisonError::into_inner).get_mut(slot) {
+            *p = pad;
+        }
+    }
+
+    /// The motor speeds the title asked of pad `slot`.
+    pub fn rumble(slot: usize) -> (u16, u16) {
+        RUMBLE.lock().unwrap_or_else(PoisonError::into_inner).get(slot).copied().unwrap_or_default()
+    }
+
+    /// A key went down or up.
+    pub fn key(key: Key, down: bool) {
+        let mut keys = KEYS.lock().unwrap_or_else(PoisonError::into_inner);
+        keys.retain(|k| k.virtual_key != key.virtual_key);
+        if down {
+            keys.push(key);
+        }
+    }
+
+    /// Every key up (the window lost focus).
+    pub fn release_all() {
+        KEYS.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        let mut m = MOUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        *m = (0.0, 0.0, 0, false);
+    }
+
+    /// The mouse moved by (dx, dy) points (down positive).
+    pub fn mouse_moved(dx: f64, dy: f64) {
+        let mut m = MOUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        m.0 += dx as f32;
+        m.1 += dy as f32;
+    }
+
+    /// Mouse button `button` (0 left, 1 right, 2 middle) went down or up.
+    pub fn mouse_button(button: u8, down: bool) {
+        let mut m = MOUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        if down {
+            m.2 |= 1 << button;
+        } else {
+            m.2 &= !(1 << button);
+        }
+    }
+
+    /// Whether mouse motion turns the right stick (the app hides and holds
+    /// the pointer then).
+    pub fn set_captured(captured: bool) {
+        MOUSE.lock().unwrap_or_else(PoisonError::into_inner).3 = captured;
+    }
+
+    pub(super) fn take_mouse() -> (f32, f32, u8, bool) {
+        let mut m = MOUSE.lock().unwrap_or_else(PoisonError::into_inner);
+        let out = *m;
+        m.0 = 0.0;
+        m.1 = 0.0;
+        out
+    }
+
+    /// Mouse speed (points a second) for a full stick (`VICTORY_MOUSE_SPEED`, 1500).
+    pub(super) fn sensitivity() -> f32 {
+        static S: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_MOUSE_SPEED").ok().and_then(|v| v.parse().ok()).filter(|&v: &f32| v > 0.0).unwrap_or(1500.0)
+        });
+        *S
+    }
+
+    /// The mouse as a pad: right stick, right button aims (left trigger),
+    /// left button fires (right trigger), middle clicks the right stick.
+    pub(super) fn mouse_pad(x: f32, y: f32, buttons: u8) -> PadState {
+        PadState {
+            buttons: if buttons & 4 != 0 { RIGHT_STICK } else { 0 },
+            left_trigger: if buttons & 2 != 0 { 1.0 } else { 0.0 },
+            right_trigger: if buttons & 1 != 0 { 1.0 } else { 0.0 },
+            right_x: x,
+            right_y: y,
+            ..Default::default()
+        }
+    }
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
@@ -1266,45 +1766,6 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
-    }
-
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
@@ -1605,6 +2066,178 @@ mod tests {
         for r in order {
             release(r);
         }
+    }
+
+    #[cfg(not(windows))]
+    static LIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(not(windows))]
+    #[test]
+    fn live_keys_drive_the_pad_while_held_and_merge_with_scripted() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_live_keys();
+        release_live_pad();
+        let pad_of = |scripted: Vec<u8>| fallback(&held(scripted));
+        set_live_key(b'W', true);
+        set_live_key(0x20, true); // Space
+        set_live_key(0x1B, true); // Esc
+        set_live_key(0x09, true); // Tab
+        set_live_key(0x27, true); // Right
+        set_live_key(b'C', true);
+        // Enter from the script is A too, together with the live Space.
+        let pad = pad_of(vec![0x0D]);
+        assert_eq!(pad.buttons, A | B | MENU | RIGHT);
+        assert_eq!((pad.left_y, pad.right_trigger, pad.left_trigger), (1.0, 1.0, 0.0));
+        set_live_key(b'S', true); // W and S cancel
+        assert_eq!(pad_of(vec![]).left_y, 0.0);
+        set_live_key(0x20, false);
+        set_live_key(b'S', false);
+        assert_eq!(pad_of(vec![]).buttons, B | MENU | RIGHT);
+        release_live_keys();
+        assert_eq!(pad_of(vec![b'X']), PadState { buttons: X, ..Default::default() });
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn live_keys_report_ps2_scan_codes_through_hub_readings() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_live_keys();
+        release_live_pad();
+        let hub = Hub::new(host());
+        hub.poll();
+
+        set_live_key(0x0D, true); // Enter
+        set_live_key(b'W', true); // Left stick up
+        set_live_key(0x26, true); // Up arrow (extended)
+        set_live_key(0xA0, true); // Left Shift
+        hub.poll();
+
+        let kr = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let Value::Keys(ref ks) = reading(kr).value else {
+            panic!("expected keyboard reading");
+        };
+        assert!(ks.iter().any(|k| k.virtual_key == 0x0D && k.scan_code == 0x1C));
+        assert!(ks.iter().any(|k| k.virtual_key == b'W' && k.scan_code == 0x11));
+        assert!(ks.iter().any(|k| k.virtual_key == 0x26 && k.scan_code == 0xE048));
+        assert!(ks.iter().any(|k| k.virtual_key == 0xA0 && k.scan_code == 0x2A));
+        release(kr);
+
+        let pr = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let ps = pad(pr);
+        assert_eq!(ps.buttons, A | UP);
+        assert_eq!(ps.left_y, 1.0);
+        release(pr);
+
+        release_live_keys();
+        hub.poll();
+        let pr2 = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(pr2), PadState::default());
+        release(pr2);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn controller_snapshot_maps_all_buttons_and_analog_axes() {
+        let snap = ControllerSnapshot {
+            a: true,
+            b: true,
+            x: true,
+            y: true,
+            up: true,
+            down: false,
+            left: true,
+            right: false,
+            left_shoulder: true,
+            right_shoulder: true,
+            left_stick: true,
+            right_stick: true,
+            menu: true,
+            view: true,
+            left_trigger: 0.35,
+            right_trigger: 1.5, // clamped to 1.0
+            left_x: -0.6,
+            left_y: 0.75,
+            right_x: 2.0,     // clamped to 1.0
+            right_y: f32::NAN, // sanitized to 0.0
+        };
+        assert_eq!(
+            pad_from_snapshot(snap),
+            PadState {
+                buttons: MENU
+                    | VIEW
+                    | A
+                    | B
+                    | X
+                    | Y
+                    | UP
+                    | LEFT
+                    | LEFT_SHOULDER
+                    | RIGHT_SHOULDER
+                    | LEFT_STICK
+                    | RIGHT_STICK,
+                left_trigger: 0.35,
+                right_trigger: 1.0,
+                left_x: -0.6,
+                left_y: 0.75,
+                right_x: 1.0,
+                right_y: 0.0,
+            }
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn live_controller_merges_with_keyboard_and_clears_on_release() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_live_keys();
+        release_live_pad();
+        let hub = Hub::new(host());
+        hub.poll();
+
+        // Analog DualSense/Xbox input combined with a keyboard key (Enter -> A).
+        set_live_pad(ControllerSnapshot {
+            x: true,
+            left_trigger: 0.4,
+            left_x: -0.5,
+            right_y: 0.8,
+            ..Default::default()
+        });
+        set_live_key(0x0D, true);
+        hub.poll();
+
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A | X,
+                left_trigger: 0.4,
+                right_trigger: 0.0,
+                left_x: -0.5,
+                left_y: 0.0,
+                right_x: 0.0,
+                right_y: 0.8,
+            }
+        );
+        release(r);
+
+        // Disconnect / focus loss clears controller state cleanly while keeping keyboard separate.
+        release_live_pad();
+        hub.poll();
+        let r2 = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r2),
+            PadState {
+                buttons: A,
+                ..Default::default()
+            }
+        );
+        release(r2);
+
+        release_live_keys();
+        hub.poll();
+        let r3 = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r3), PadState::default());
+        release(r3);
     }
 
     #[test]

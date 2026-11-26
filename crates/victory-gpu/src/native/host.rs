@@ -8,7 +8,7 @@
 use super::addr::{self, Mapping, Pages, Pairs};
 use super::descriptors::{Decoded, decode};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
-use super::memory::PoolTable;
+use super::memory::{CrashAddresses, PoolTable};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
@@ -31,7 +31,23 @@ pub struct NativeHost<B: GraphicsBackend> {
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
+    crash_addresses: Arc<CrashAddresses>,
+    /// Descriptor slots whose buffer view named memory no pool held when the title wrote it
+    /// (views made before the title maps their pages): tried again when pools change.
+    unmapped: RefCell<std::collections::BTreeSet<u64>>,
+    /// The pool generation `unmapped` was last tried at.
+    unmapped_tried: std::cell::Cell<u64>,
+    /// Draws and dispatches dropped because they read a root parameter the title never set.
+    unset_roots: std::cell::Cell<u64>,
+    /// Draws and clears dropped because none of their targets has a host texture.
+    no_targets: std::cell::Cell<u64>,
+    /// Passes handed to the backend.
+    passes: std::cell::Cell<u64>,
 }
+
+/// How the error of a root parameter read with nothing set in it ends ([`NativeHost::execute`]
+/// drops that draw or dispatch alone).
+const NEVER_SET: &str = "was never set";
 
 /// The host's side of the pool-offset contract ([`super::addr`]).
 struct Contract<B: GraphicsBackend> {
@@ -68,6 +84,8 @@ struct Prep<B: GraphicsBackend> {
     vertex: Vec<(Rc<B::Buffer>, *const u8)>,
     index: Option<(Rc<B::Buffer>, *const u8)>,
     blit: Vec<(Rc<B::Buffer>, *const u8)>,
+    /// An indirect dispatch's group counts.
+    indirect: Option<(Rc<B::Buffer>, *const u8)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
 }
@@ -88,6 +106,13 @@ fn heaps<B: GraphicsBackend>(h: &HeapPair<B>) -> Heaps<'_, B> {
     }
 }
 
+/// The title's record in descriptor slot `handle` (tag, view index, generation).
+fn record_at(handle: u64) -> [u8; 12] {
+    let mut r = [0u8; 12];
+    super::safe_read(handle as *const u8, &mut r);
+    r
+}
+
 impl<B: GraphicsBackend> NativeHost<B> {
     pub fn new(backend: B) -> Self {
         Self::with_memory(backend, Arc::new(PoolTable::default()))
@@ -97,12 +122,66 @@ impl<B: GraphicsBackend> NativeHost<B> {
     pub fn with_memory(backend: B, memory: Arc<PoolTable>) -> Self {
         NativeHost {
             backend,
+            crash_addresses: Arc::new(CrashAddresses::new(memory.clone())),
             memory,
             buffers: RefCell::default(),
             resources: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
+            unmapped: RefCell::default(),
+            unmapped_tried: std::cell::Cell::new(0),
+            unset_roots: std::cell::Cell::new(0),
+            no_targets: std::cell::Cell::new(0),
+            passes: std::cell::Cell::new(0),
         }
+    }
+
+    /// Makes the views that named unmapped memory again once pools have changed (the title maps
+    /// a view's pages after writing it): until then their entries name nothing.
+    fn retry_unmapped(&self) {
+        let generation = self.memory.generation();
+        if generation == self.unmapped_tried.get() || self.unmapped.borrow().is_empty() {
+            return;
+        }
+        self.unmapped_tried.set(generation);
+        let handles: Vec<u64> = self.unmapped.borrow().iter().copied().collect();
+        let mut made = 0usize;
+        for h in handles {
+            if matches!(self.mirror(h), Ok(true)) {
+                made += 1;
+            }
+        }
+        if made > 0 {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                tracing::info!(made, left = self.unmapped.borrow().len(), "views of memory mapped since were made");
+            }
+        }
+    }
+
+    /// For crash reports: whether a pool holds `at`, and the buffer views over it.
+    pub fn describe(&self, at: u64) -> String {
+        self.crash_addresses.describe(at)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn crash_addresses(&self) -> Arc<CrashAddresses> {
+        self.crash_addresses.clone()
+    }
+
+    /// Draws and clears dropped so far because none of their targets has a host texture.
+    pub fn no_targets(&self) -> u64 {
+        self.no_targets.get()
+    }
+
+    /// Draws and dispatches dropped so far because they read a root parameter never set.
+    pub fn unset_roots(&self) -> u64 {
+        self.unset_roots.get()
+    }
+
+    /// Passes handed to the backend so far (compute, render and blit; a clear is a render pass).
+    pub fn passes(&self) -> u64 {
+        self.passes.get()
     }
 
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
@@ -144,6 +223,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pso: self.backend.create_compute_pipeline(dxil)?,
             threads,
             binding: None,
+            name: String::new(),
         }))
     }
 
@@ -192,13 +272,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
         } else {
             count
         };
+        // Shaders that take buffer views at indices they compute read the view-stride table and,
+        // where it holds 0, the null views at the end of `HEAP_VIEWS` (`victory_shader::emit`,
+        // "Buffer views at computed heap indices"): the heap reaches that far when they fit
+        // past the title's entries and the contract's.
+        let views = victory_shader::emit::HEAP_VIEWS as usize;
+        let strided = kind == HeapKind::Resource && entries + 2 <= views;
+        let entries = if strided { views } else { entries };
+        let backend_heap = self.backend.create_heap(kind, entries)?;
+        let strides = if strided {
+            for i in [views - 2, views - 1] {
+                self.backend.clear_entry(&backend_heap, i);
+            }
+            Some(Rc::new(addr::Pages::new(&self.backend, views * 4)?))
+        } else {
+            None
+        };
         let heap = Rc::new(NativeHeap {
-            heap: self.backend.create_heap(kind, entries)?,
+            heap: backend_heap,
             kind,
             start,
             count,
             pairs: Default::default(),
             table: Default::default(),
+            mirrored: Default::default(),
+            strides,
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -215,6 +313,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The title released the heap whose descriptors start at `start`.
     pub fn drop_heap(&self, start: u64) {
         self.heaps.borrow_mut().retain(|h| h.start != start);
+        self.crash_addresses.remove_heap(start);
     }
 
     /// The title released resource object `key`: later views naming it decode to nothing.
@@ -244,8 +343,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(false);
         };
         let Some(view) = crate::descriptor::view(handle) else {
+            set_stride(&heap, index, 0);
             return Ok(false);
         };
+        set_stride(&heap, index, stride_word(&view));
         let resources = self.resources.borrow();
         let buffer_of = |r: usize| match resources.get(&r) {
             Some(Res::Buffer(a, n)) => Some((*a, *n)),
@@ -255,16 +356,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(false);
         };
         match decoded {
-            Decoded::Buffer { addr, size } => {
-                let (buf, ptr) = self.resolve(addr, u64::from(size))?;
-                self.backend
-                    .write_buffer(&heap.heap, index, &buf, ptr, size);
-            }
+            Decoded::Buffer { addr, size } => match self.resolve(addr, u64::from(size)) {
+                Ok((buf, ptr)) => {
+                    self.backend.write_buffer(&heap.heap, index, &buf, ptr, size);
+                    self.crash_addresses.set_buffer_view(heap.start, index, addr, u64::from(size));
+                    self.unmapped.borrow_mut().remove(&handle);
+                }
+                Err(e) => {
+                    // Shaders taking it at a computed index read the null view instead.
+                    set_stride(&heap, index, 0);
+                    self.unmapped.borrow_mut().insert(handle);
+                    // Left as it was, the entry would still name the memory its last view
+                    // named, which the title may have handed to something else since: the
+                    // GPU's writes through it land there (title data overwritten).
+                    self.backend.clear_entry(&heap.heap, index);
+                    self.crash_addresses.remove_buffer_view(heap.start, index);
+                    heap.mirrored.borrow_mut().insert(index, record_at(handle));
+                    return Err(e);
+                }
+            },
             Decoded::Image {
                 resource,
                 mips,
                 format,
             } => {
+                self.unmapped.borrow_mut().remove(&handle);
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
                     return Ok(false);
                 };
@@ -282,13 +398,44 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                self.crash_addresses.remove_buffer_view(heap.start, index);
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;
                 self.backend.write_sampler(&heap.heap, index, &s, lod_bias);
             }
         }
+        heap.mirrored.borrow_mut().insert(index, record_at(handle));
         Ok(true)
+    }
+
+    /// Minimum entries of each bound table checked at submission when a shader has no
+    /// metadata for that table (or declares fewer entries).
+    const TABLE_CHECK: usize = 16;
+
+    /// Mirrors again the entries of each table `root` binds whose title record changed since
+    /// they were last mirrored. The title copies records into its shader-visible heaps with plain
+    /// stores (the content draws' constant buffers, from frame ~700), which no device call reports,
+    /// so their host entries stayed empty and the shaders read zeros.
+    fn remirror_tables(&self, root: &[Option<Root<B>>], binding: Option<&Binding>) {
+        for (slot, r) in root.iter().enumerate() {
+            let Some(Root::Table(h, at)) = r else { continue };
+            let check = table_check_count(slot, binding, Self::TABLE_CHECK);
+            for index in *at..(*at + check).min(h.count) {
+                let handle = h.start + index as u64 * Self::step(h.kind);
+                let record = record_at(handle);
+                if h.mirrored.borrow().get(&index) == Some(&record) {
+                    continue;
+                }
+                // shortcut: views of resources the host has not realized yet are not made here
+                // (`glue::mirror` does that for device writes); such an entry stays as it was.
+                if let Err(e) = self.mirror(handle) {
+                    tracing::debug!(error = %e, handle = format!("{handle:#x}"), "a table entry was not mirrored at submission");
+                }
+                // Tried once per record, whatever the result.
+                h.mirrored.borrow_mut().insert(index, record);
+            }
+        }
     }
 
     /// The arguments of a translated title shader: its user-data block, then its root views.
@@ -304,7 +451,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let set = |slot: u8| {
             root.get(usize::from(slot))
                 .and_then(|r| r.as_ref())
-                .ok_or_else(|| format!("root parameter {slot} was never set"))
+                .ok_or_else(|| format!("root parameter {slot} {NEVER_SET}"))
         };
         let mut args = std::mem::take(&mut p.root);
         if b.dwords > 0 {
@@ -349,6 +496,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
             args = args.constants(&values);
         }
         for &(slot, _) in &b.views {
+            if slot == victory_shader::emit::VIEW_STRIDES {
+                // The view-stride table of the resource heap the work indexes.
+                let h = p.heap.clone().or_else(|| heap.cloned());
+                let table = h
+                    .as_ref()
+                    .and_then(|h| h.strides.clone())
+                    .ok_or("a shader reads the view-stride table and its heap has none")?;
+                let gpu = self.backend.gpu_address(&table.buf, table.ptr().cast_const());
+                p.bufs.push(table.buf.clone());
+                args = args.address(gpu);
+                continue;
+            }
             let Root::View(a) = set(slot)? else {
                 return Err(format!("root parameter {slot} is not a root view"));
             };
@@ -370,12 +529,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.count
             ));
         }
-        let (generation, mappings) = self.memory.mappings();
         if let Some((g, t)) = &*heap.table.borrow()
-            && *g == generation
+            && *g == self.memory.generation()
         {
             return Ok(t.clone());
         }
+        let (generation, mappings) = self.memory.mappings();
         let maps: Vec<Mapping> = mappings
             .iter()
             .map(|(at, len, pool, offset)| Mapping {
@@ -430,25 +589,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
     fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
-        let maps = self.mapping_list();
-        addr::root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
-    }
-
-    /// The pool table as the page table builder reads it.
-    fn mapping_list(&self) -> Vec<Mapping> {
-        self.memory
-            .mappings()
-            .1
-            .iter()
-            .map(|(at, len, pool, offset)| Mapping {
-                at: *at as u64,
-                len: *len as u64,
-                pool: pool.id,
-                base: pool.base,
-                pool_len: pool.len as u64,
-                offset: *offset as u64,
-            })
-            .collect()
+        let mapping = self.memory.resolve(a, 1).map(|(pool, address)| Mapping {
+            at: a,
+            len: 1,
+            pool: pool.id,
+            base: pool.base,
+            pool_len: pool.len as u64,
+            offset: (address as usize - pool.base) as u64,
+        });
+        addr::root_view(
+            mapping.as_slice(),
+            &mut self.contract.borrow_mut().pairs,
+            heap.count as u32,
+            a,
+        )
     }
 
     /// What a shader that finds title memory through the page table is given besides its user data:
@@ -483,6 +637,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
             count: 0,
             pairs: Default::default(),
             table: Default::default(),
+            mirrored: Default::default(),
+            strides: None,
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -493,7 +649,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             let args = std::mem::take(&mut p.root);
             p.root = match r
                 .as_ref()
-                .ok_or_else(|| format!("root parameter {i} was never set"))?
+                .ok_or_else(|| format!("root parameter {i} {NEVER_SET}"))?
             {
                 Root::Constants(w) => args.constants(w),
                 Root::View(a) => {
@@ -573,18 +729,29 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
     /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
     #[inline(never)]
-    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall) {
+    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[u64], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         let start = START.get_or_init(std::time::Instant::now);
         let Some(v) = std::env::var_os("VICTORY_TRACE_CONTENT") else { return };
-        // `<dir>[,<seconds>]`: from that many seconds after the first draw on.
+        // `<dir>[,<seconds>[,<format>]]`: from that many seconds after the first draw on; with a
+        // format, only the draws into render targets of that title format, boot passes included.
         let v = v.to_string_lossy().into_owned();
-        let (dir, after) = v.rsplit_once(',').map_or((v.as_str(), 0), |(d, s)| (d, s.parse().unwrap_or(0)));
-        let dir = std::path::PathBuf::from(dir);
+        let mut parts = v.split(',');
+        let dir = std::path::PathBuf::from(parts.next().unwrap_or_default());
+        let after: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let only: Option<u32> = parts.next().and_then(|s| s.parse().ok());
         if start.elapsed().as_secs() < after {
+            return;
+        }
+        let target = targets.color.first().and_then(|c| {
+            self.resources.borrow().iter().find_map(|(k, r)| matches!(r, Res::Texture(t) if Rc::ptr_eq(t, c)).then_some(*k))
+        });
+        if let Some(f) = only
+            && target.and_then(texture_info_of).map(|i| i.format) != Some(f)
+        {
             return;
         }
         // The boot passes (a 3840-wide texture sampled, nothing else) are skipped.
@@ -606,7 +773,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 _ => false,
             })
         });
-        if boot || plain {
+        if only.is_none() && (boot || plain) {
             return;
         }
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -632,7 +799,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
             super::safe_read(a as *const u8, &mut b);
             b
         });
-        tracing::info!(draw = n, ?kinds, ?vertex, ?call, ?head, "content: draw");
+        let target = target.map(|k| format!("{k:#x}"));
+        tracing::info!(draw = n, ?target, ?kinds, ?vertex, ?call, ?head, vs = ?binding.map(|b| (b.dwords, b.user_data.clone(), b.views.clone())), ps = ?binding.and_then(|b| b.ps.as_ref()).map(|p| (p.dwords, p.user_data.clone())), "content: draw");
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             let base = h.start + *at as u64 * Self::step(h.kind);
@@ -661,6 +829,28 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 let tiled = super::textures::read_memory(info.memory, info.size.min(1 << 26));
                 let nz = tiled.iter().filter(|&&b| b != 0).count();
                 tracing::info!(draw = n, slot, entry = k, key = format!("{key:#x}"), format = info.format, w = info.width, h = info.height, layers = info.depth_or_layers, flags = info.flags, at = format!("{:#x}", info.memory as usize), size = info.size, nonzero = nz, fraction = nz as f64 / tiled.len().max(1) as f64, what, "content: texture");
+                // A single-channel 8-bit texture (A8, R8) is written as grey: the title's memory once,
+                // the host texture at every draw (the last one standing).
+                if matches!(info.format, 65 | 61) {
+                    let (w, hh) = (info.width as usize, info.height as usize);
+                    let grey = |px: &[u8]| px.iter().flat_map(|&v| [v, v, v, 255]).collect::<Vec<u8>>();
+                    let mut px = vec![0u8; w * hh];
+                    if !SEEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
+                        SEEN.lock().unwrap_or_else(|e| e.into_inner()).push(key);
+                        if let Some(desc) = info.desc()
+                            && let Ok(tmp) = self.backend.create_texture(&desc)
+                            && super::textures::upload(&self.backend, &tmp, &info, &tiled).is_ok()
+                        {
+                            self.backend.read_texture(&tmp, 0, 0, &mut px, w, w * hh);
+                            ppm(format!("{key:x}_title_{n}.ppm"), w, hh, &grey(&px), false);
+                        }
+                    }
+                    if let Some(Res::Texture(t)) = self.resources.borrow().get(&key) {
+                        self.backend.read_texture(t, 0, 0, &mut px, w, w * hh);
+                        ppm(format!("{key:x}_host.ppm"), w, hh, &grey(&px), false);
+                    }
+                    continue;
+                }
                 if !matches!(info.format, 28 | 87 | 91 | 29) || SEEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
                     continue;
                 }
@@ -691,13 +881,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
             vertex: vec![],
             index: None,
             blit: vec![],
+            indirect: None,
             heap: None,
         };
         match cmd {
             Cmd::Dispatch {
-                root, pso, heaps, groups, ..
+                root, pso, heaps, groups, indirect,
             } => {
-                tracing::debug!(?groups, "dispatch");
+                tracing::debug!(?groups, ?indirect, "dispatch");
+                if let Some(a) = indirect {
+                    p.indirect = Some(self.resolve(*a, 12)?);
+                }
                 if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
                     static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if G.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
@@ -705,6 +899,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                 }
                 self.trace_draw(root, pso.binding.as_ref(), true);
+                self.remirror_tables(root, pso.binding.as_ref());
                 match &pso.binding {
                 Some(b) => {
                     self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
@@ -723,21 +918,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 vertex,
                 index,
                 call,
+                targets,
                 ..
             } => {
                 if !vertex.is_empty() {
                     self.trace_draw(root, binding.as_deref(), false);
                 }
-                self.trace_content(root, vertex, call);
+                self.remirror_tables(root, binding.as_deref());
+                self.trace_content(root, vertex, call, binding.as_deref(), targets);
                 match binding {
                     Some(b) => {
                         self.translated_args(root, b, heaps.0.as_ref(), &mut p)?;
+                        if b.memory {
+                            self.memory_args(heaps.0.as_ref(), &mut p)?;
+                        }
                         if let Some(ps) = &b.ps {
                             let vs_args = std::mem::take(&mut p.root);
                             self.translated_args(root, ps, heaps.0.as_ref(), &mut p)?;
+                            if ps.memory {
+                                self.memory_args(heaps.0.as_ref(), &mut p)?;
+                            }
                             p.ps_root = Some(std::mem::replace(&mut p.root, vs_args));
                         }
-                        if let Some(h) = p.heap.clone() {
+                        if !b.memory && !b.ps.as_ref().is_some_and(|ps| ps.memory)
+                            && let Some(h) = p.heap.clone()
+                        {
                             self.write_pairs(&h)?;
                         }
                     }
@@ -769,23 +974,85 @@ impl<B: GraphicsBackend> NativeHost<B> {
         waits: &[(&B::Fence, u64)],
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
-        let cmds: Vec<&Cmd<B>> = lists.iter().flat_map(|l| l.cmds.iter()).collect();
-        let preps = cmds
-            .iter()
-            .map(|c| self.prep(c))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.retry_unmapped();
+        // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
+        // refusing the whole piece for it also dropped the piece's value writes, and a queue that
+        // waits for one of those then holds everything behind it for good. (A title shader's
+        // metadata can name a root slot the title sets nothing in, 255 observed; what the console
+        // gives such a shader there is not known.) Any other error drops that command alone too.
+        // A dropped command still ends the pass it would have ended: the commands either side of it
+        // that it kept apart stay in two passes (`cut`), so the backend still orders their
+        // accesses to pool buffers. `VICTORY_TRACE_TARGETS=1` warns at the first drop of each kind.
+        let same = |a: &Cmd<B>, b: &Cmd<B>| match (a, b) {
+            (Cmd::Dispatch { .. }, Cmd::Dispatch { .. }) => true,
+            (Cmd::Copy { .. } | Cmd::Fill { .. }, Cmd::Copy { .. } | Cmd::Fill { .. }) => true,
+            (Cmd::Draw { targets: x, .. }, Cmd::Draw { targets: y, .. }) => x.same(y),
+            _ => false,
+        };
+        let trace = std::env::var_os("VICTORY_TRACE_TARGETS").is_some();
+        let mut cmds: Vec<&Cmd<B>> = Vec::new();
+        let mut preps = Vec::new();
+        // Whether a pass ends before the kept command of that index, and the commands dropped since
+        // the last kept one.
+        let mut cut: Vec<bool> = Vec::new();
+        let mut dropped: Vec<&Cmd<B>> = Vec::new();
+        for c in lists.iter().flat_map(|l| l.cmds.iter()) {
+            // A draw or clear left with no target (the title's targets have formats the host does
+            // not represent, so none was realized) cannot open a render pass: Metal gives no
+            // encoder for a pass without attachments, and that refused the whole piece.
+            let no_target = match c {
+                Cmd::Draw { targets, .. } => targets.color.is_empty() && targets.depth.is_none(),
+                Cmd::Clear { color, depth } => color.is_none() && depth.is_none(),
+                _ => false,
+            };
+            if no_target {
+                self.no_targets.set(self.no_targets.get() + 1);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                if trace {
+                    ONCE.call_once(|| {
+                        tracing::warn!("native host drops work: a draw or clear with no render target the host represents (first time)");
+                    });
+                }
+                dropped.push(c);
+                continue;
+            }
+            match self.prep(c) {
+                Ok(p) => {
+                    cut.push(dropped.drain(..).any(|d| !same(d, c)));
+                    cmds.push(c);
+                    preps.push(p);
+                }
+                Err(e)
+                    if e.ends_with(NEVER_SET)
+                        && matches!(c, Cmd::Draw { .. } | Cmd::Dispatch { .. }) =>
+                {
+                    self.unset_roots.set(self.unset_roots.get() + 1);
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    if trace {
+                        ONCE.call_once(|| {
+                            tracing::warn!(error = %e, "native host drops work: a draw or dispatch that reads a root parameter the title never set (first time)");
+                        });
+                    }
+                    dropped.push(c);
+                }
+                // Any other command the host cannot prepare is left out too, not the whole
+                // submission: the rest (other queues' waits on memory it writes, the fence
+                // signals) must still run.
+                Err(e) => {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                        tracing::warn!(error = %e, "a command was left out of a submission");
+                    }
+                    dropped.push(c);
+                }
+            }
+        }
 
         let mut groups = vec![];
         let mut i = 0;
         while i < cmds.len() {
             let mut j = i + 1;
-            let same = |a: &Cmd<B>, b: &Cmd<B>| match (a, b) {
-                (Cmd::Dispatch { .. }, Cmd::Dispatch { .. }) => true,
-                (Cmd::Copy { .. } | Cmd::Fill { .. }, Cmd::Copy { .. } | Cmd::Fill { .. }) => true,
-                (Cmd::Draw { targets: x, .. }, Cmd::Draw { targets: y, .. }) => x.same(y),
-                _ => false,
-            };
-            while j < cmds.len() && same(cmds[i], cmds[j]) {
+            while j < cmds.len() && !cut[j] && same(cmds[i], cmds[j]) {
                 j += 1;
             }
             groups.push(match cmds[i] {
@@ -807,6 +1074,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             buffers.extend(p.vertex.iter().map(|b| &*b.0));
             buffers.extend(p.index.iter().map(|b| &*b.0));
             buffers.extend(p.blit.iter().map(|b| &*b.0));
+            buffers.extend(p.indirect.iter().map(|b| &*b.0));
         }
         if let Err(e) = self.backend.make_resident(queue, &buffers) {
             tracing::warn!(error = %e, "pool buffers were not made resident");
@@ -839,6 +1107,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             },
                             groups: *groups,
                             threads_per_group: pso.threads,
+                            indirect: preps[k].indirect.as_ref().map(|b| (&*b.0, b.1)),
                         }
                     })
                     .collect(),
@@ -885,9 +1154,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 clear: Some(*c),
                             })
                             .collect(),
-                        depth: depth.as_ref().map(|(t, d)| DepthTarget {
+                        depth: depth.as_ref().map(|(t, d, s)| DepthTarget {
                             texture: &**t,
-                            clear: Some(*d),
+                            clear: *d,
+                            clear_stencil: *s,
                         }),
                         draws: vec![],
                     })
@@ -911,6 +1181,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         depth: depth.as_ref().map(|t| DepthTarget {
                             texture: &**t,
                             clear: None,
+                            clear_stencil: None,
                         }),
                         draws: (*a..*b)
                             .map(|k| {
@@ -953,12 +1224,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
             });
         }
+        self.passes.set(self.passes.get() + passes.len() as u64);
+        // The command buffer's label: the compute shaders it runs (a GPU hang names its buffer).
+        let mut names: Vec<&str> = Vec::new();
+        let mut draws = 0usize;
+        for c in &cmds {
+            match c {
+                Cmd::Dispatch { pso, .. } if !pso.name.is_empty() && !names.contains(&pso.name.as_str()) => {
+                    names.push(&pso.name);
+                }
+                Cmd::Draw { .. } => draws += 1,
+                _ => {}
+            }
+        }
+        let label = format!(
+            "{} commands, {draws} draws; {}",
+            cmds.len(),
+            names[..names.len().min(40)].join(", ")
+        );
         self.backend.submit_passes(
             queue,
             &PassSubmission {
                 waits,
                 passes: &passes,
                 signals,
+                label: Some(&label),
             },
         )
     }
@@ -983,4 +1273,128 @@ fn placed_info_of(address: u64, res: &[u32; 14]) -> Option<super::textures::Text
 #[cfg(not(target_os = "macos"))]
 fn placed_info_of(_: u64, _: &[u32; 14]) -> Option<super::textures::TextureInfo> {
     None
+}
+
+/// Entries of a bound table at root `slot` to check for plain-store updates at submission:
+/// at least `floor`, extended to cover any higher table entry declared or read by the bound
+/// shader(s).
+fn table_check_count(slot: usize, binding: Option<&Binding>, floor: usize) -> usize {
+    let mut count = floor;
+    let Ok(slot) = u8::try_from(slot) else {
+        return count;
+    };
+    let mut scan = |b: &Binding| {
+        for &(s, n) in &b.table_entries {
+            if s == slot {
+                count = count.max(n);
+            }
+        }
+    };
+    if let Some(b) = binding {
+        scan(b);
+        if let Some(ps) = &b.ps {
+            scan(ps);
+        }
+    }
+    count
+}
+
+/// Enters dword `index` of `heap`'s view-stride table (if it has one).
+fn set_stride<B: GraphicsBackend>(heap: &NativeHeap<B>, index: usize, word: u32) {
+    if let Some(t) = &heap.strides
+        && index < victory_shader::emit::HEAP_VIEWS as usize
+    {
+        // SAFETY: the table has a dword per index below `HEAP_VIEWS`.
+        unsafe { (t.ptr() as *mut u32).add(index).write_volatile(word) };
+    }
+}
+
+/// What the view-stride table holds for a view (as `descriptor::host` does on Windows, from the
+/// view description's words): a buffer view's element size, at least 1 (its structure stride, 4
+/// for a raw one, else its format's size), with `VIEW_INTEGER` (and `VIEW_SIGNED`) for a typed
+/// one of an integer format; 0 for anything else.
+fn stride_word(view: &crate::descriptor::View) -> u32 {
+    use crate::descriptor::View;
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    let (unordered, w): (bool, &[u32]) = match view {
+        View::Constant(..) => return 4,
+        View::Shader(_, Some(d)) => (false, &d[..]),
+        View::Unordered(_, _, Some(d)) => (true, &d[..]),
+        View::Placed(unordered, resource, d) if resource[0] == 1 => (*unordered, &d[..10]),
+        _ => return 0,
+    };
+    // The view dimension: buffer (1).
+    if w.get(1) != Some(&1) {
+        return 0;
+    }
+    let format = w[0];
+    // D3D12_SHADER_RESOURCE_VIEW_DESC: Buffer at byte 16 (stride word 7, flags 8);
+    // D3D12_UNORDERED_ACCESS_VIEW_DESC: Buffer at byte 8 (stride word 5, flags 8).
+    let (stride, flags) = if unordered { (w[5], w[8]) } else { (w[7], w[8]) };
+    let raw = flags & 1 != 0;
+    let (element, typed) = if stride > 0 {
+        (stride, false)
+    } else if raw {
+        (4, false)
+    } else {
+        (crate::resource::element(format).map_or(0, |(bytes, _)| bytes as u32), true)
+    };
+    let kind = match typed.then_some(format) {
+        Some(3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62) => VIEW_INTEGER,
+        Some(4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64) => VIEW_INTEGER | VIEW_SIGNED,
+        _ => 0,
+    };
+    element.max(1) | kind
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_root_view_does_not_snapshot_unrelated_mappings() {
+        use crate::native::memory::{PoolInfo, PoolObserver};
+        use victory_metal::metal::Metal;
+
+        let Ok(metal) = Metal::new() else { return };
+        let host = NativeHost::new(metal);
+        let buffer_at = 0x7000_0000;
+        let pool = PoolInfo {
+            id: 1,
+            base: 0x1_0000_0000,
+            len: 0x4_0000,
+            memory_entry: None,
+        };
+        host.memory.mapped(buffer_at, 0x1_0000, &pool, 0x2_0000);
+        host.memory.mapped(buffer_at + 0x2_0000, 0x1_0000, &pool, 0);
+        let heap = host.heap(HeapKind::Resource, 0, 8).unwrap();
+
+        assert_eq!(
+            host.root_view(&heap, buffer_at as u64 + 32),
+            (addr::pair_index(8, 1), 0x2_0020),
+        );
+        assert_eq!(
+            host.root_view(&heap, buffer_at as u64 + 0x1_0000),
+            (addr::pair_index(8, 0), 0),
+        );
+        assert_eq!(host.memory.mapping_snapshots(), 0);
+    }
+
+    #[test]
+    fn table_check_count_uses_shader_metadata_above_default() {
+        assert_eq!(table_check_count(0, None, 16), 16);
+        let vs = Binding {
+            table_entries: vec![(0, 4), (2, 24)],
+            ps: Some(Rc::new(Binding {
+                table_entries: vec![(2, 30), (3, 19)],
+                ..Binding::default()
+            })),
+            ..Binding::default()
+        };
+        assert_eq!(table_check_count(0, Some(&vs), 16), 16);
+        assert_eq!(table_check_count(1, Some(&vs), 16), 16);
+        assert_eq!(table_check_count(2, Some(&vs), 16), 30);
+        assert_eq!(table_check_count(3, Some(&vs), 16), 19);
+    }
 }

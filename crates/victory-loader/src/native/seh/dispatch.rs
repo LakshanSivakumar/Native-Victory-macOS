@@ -450,6 +450,12 @@ extern "C" fn raise_exception(
 /// # Safety
 /// `ctx` and `rec` stay valid until the thread is resumed.
 unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
+    // SAFETY: both are ours for this dispatch.
+    #[cfg(target_arch = "x86_64")]
+    if unsafe { super::super::dump::write_trap(&*ctx, &*rec) } {
+        // SAFETY: forwarded from the caller.
+        unsafe { resume(ctx) };
+    }
     // First-chance log: the title's own handlers may hide where a fault started.
     // SAFETY: both are ours for this dispatch.
     unsafe {
@@ -466,6 +472,43 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
                 "first-chance exception"
             );
+            // Every register, and what the GPU host knows of those that look like title
+            // addresses (a crash on data a GPU write may have overwritten). The first few.
+            static FULL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if r.code == 0xc000_0005 && FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                const NAMES: [&str; 16] = [
+                    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10",
+                    "r11", "r12", "r13", "r14", "r15",
+                ];
+                let regs: Vec<String> = NAMES.iter().zip(g.iter()).map(|(n, v)| format!("{n}={v:#x}")).collect();
+                tracing::warn!("registers: {}", regs.join(" "));
+                for (n, &v) in NAMES.iter().zip(g.iter()) {
+                    if !(0x1_0000_0000..0x7f_0000_0000).contains(&v) {
+                        continue;
+                    }
+                    let mut bytes = [0u8; 64];
+                    let read = victory_core::crash::read(v, &mut bytes);
+                    let words: Vec<String> = bytes
+                        .chunks(8)
+                        .map(|w| format!("{:x}", u64::from_le_bytes(w.try_into().unwrap())))
+                        .collect();
+                    tracing::warn!(
+                        "  {n}={v:#x}: {} gpu: {}",
+                        if read { words.join(" ") } else { "(unreadable)".into() },
+                        victory_core::crash::describe(v).unwrap_or_else(|| "-".into())
+                    );
+                }
+            }
+            // VICTORY_DUMP_THREADS=0: at a breakpoint (the title's asserts), or at a write to
+            // address 0 (its watchdog's deliberate crash, fatal by design: dumped before the
+            // crash reporter runs). Other access violations wait for `unhandled`: the title's
+            // handlers take some and go on.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let watchdog =
+                    r.code == 0xc000_0005 && r.information[0] == 1 && r.information[1] == 0;
+                super::super::dump::report_at_fault(r.code, watchdog);
+            }
             // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
             // the faulting image.
             if let (Ok(list), Some(base)) = (
@@ -633,6 +676,9 @@ unsafe fn unhandled(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     let filter = *UNHANDLED.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: valid for the whole dispatch.
     let (code, address) = unsafe { ((*rec).code, (*rec).address) };
+    // Before the filter, which may end the process.
+    #[cfg(target_arch = "x86_64")]
+    super::super::dump::report_at_fault(code, true);
     if let Some(handler) = filter {
         let mut ptrs = ExceptionPointers {
             record: rec,

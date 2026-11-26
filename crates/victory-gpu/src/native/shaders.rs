@@ -7,10 +7,10 @@
 //!
 //! Title memory at addresses the shader computes is found through the page table of
 //! `victory_shader`'s "Title memory", which `super::addr` fills with views of the pools
-//! themselves (the pool-offset contract; compute shaders so far). What a translated shader needs
+//! themselves (the pool-offset contract). What a translated shader needs
 //! from the host that this one does not give yet, and is refused for: buffer views read from the
-//! heap by index, the write marks and view addresses of the shadow-copy design, and, in a graphics
-//! pipeline, the page table. See docs/metal-backend.md.
+//! heap by index, the write marks and view addresses of the shadow-copy design, and the page
+//! table for graphics pipelines outside the guessed path. See docs/metal-backend.md.
 
 use super::list::{Binding, ComputePso};
 use super::state::{self, Graphics};
@@ -41,13 +41,13 @@ pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
 
 /// A guessed vertex shader's container translated for rectangle lists or not, writing the
 /// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write.
-pub fn translate_extra(container: &[u8], rect: bool, extra: u32) -> Result<HostShader, String> {
-    victory_shader::emit::translate_with(container, Options { rect_list: rect, extra_params: extra, ..options() })
+pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> Result<HostShader, String> {
+    victory_shader::emit::translate_with(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
         .map_err(|e| e.to_string())
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
-/// give the page table (compute shaders).
+/// give the page table (compute and guessed graphics shaders).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
     if shader.memory_writes {
         return Some("marks the pages it writes (translated without zero_copy_memory)");
@@ -65,9 +65,9 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
 }
 
 /// Why a vertex shader and pixel shader cannot be a pipeline of the host, if they cannot.
-fn refusal(vs: &HostShader, ps: Option<&HostShader>) -> Option<&'static str> {
+fn refusal(vs: &HostShader, ps: Option<&HostShader>, memory: bool) -> Option<&'static str> {
     for s in [Some(vs), ps].into_iter().flatten() {
-        if let Some(why) = unsupported(s, false) {
+        if let Some(why) = unsupported(s, memory) {
             return Some(why);
         }
     }
@@ -171,6 +171,7 @@ impl<B: PresentBackend> Title<B> {
                     pso,
                     threads,
                     binding: Some(binding),
+                    name: name.to_string(),
                 }))
             }
             Err(e) => {
@@ -188,7 +189,7 @@ impl<B: PresentBackend> Title<B> {
         graphics: &Graphics,
         name: &str,
     ) -> Pipe<B> {
-        if let Some(why) = refusal(vs, ps) {
+        if let Some(why) = refusal(vs, ps, graphics.is_guessed()) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }
@@ -240,9 +241,23 @@ impl<B: PresentBackend> Title<B> {
             return Pipe::Refused;
         }
         let color_state = g.color_state();
+        if std::env::var_os("VICTORY_TRACE_PIPES").is_some() {
+            tracing::info!(name, stencil = ?g.stencil(), depth = ?g.depth_test(), ?color_state, "guessed pipeline state");
+        }
+        let vs_binding = Binding::of(vs);
+        let ps_binding = ps
+            .map(Binding::of)
+            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+        // As for compute: without the host's layout the converter makes the user-data block a
+        // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
+        // user data (descriptor table offsets, root constants) from address 0.
+        let vs_layout = vs_binding.layout();
+        let ps_layout = ps.map(Binding::of).and_then(|b| b.layout());
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),
+            vs_layout: vs_layout.as_ref(),
+            ps_layout: ps_layout.as_ref(),
             attributes: &attributes,
             streams: &streams,
             color: &color,
@@ -257,8 +272,8 @@ impl<B: PresentBackend> Title<B> {
             Ok(p) => {
                 self.shaders.pipelines += 1;
                 Pipe::Render(p, Some(Rc::new(Binding {
-                    ps: ps.map(Binding::of).filter(|b| b.dwords > 0 || !b.views.is_empty()).map(Rc::new),
-                    ..Binding::of(vs)
+                    ps: ps_binding.map(Rc::new),
+                    ..vs_binding
                 })))
             }
             Err(e) => {
@@ -271,5 +286,58 @@ impl<B: PresentBackend> Title<B> {
     /// A translation that failed, counted.
     pub fn refused_translation(&mut self, name: &str, reason: String) {
         self.shaders.refuse(name, format!("translation: {reason}"));
+    }
+}
+
+/// Translates new pipelines' shaders on threads of their own as the title creates them (and,
+/// for compute, converts them to Metal libraries), so the draw or dispatch that first binds them
+/// finds the work done. A scene's first frame binds about a thousand new pipelines; made one by
+/// one under the host's lock on the title's render threads they kept those threads in host calls
+/// past the title's 30-second watchdog. `VICTORY_PREFETCH=0`: off; `=<n>`: n threads.
+pub(crate) fn prefetch(shaders: &[std::sync::Arc<crate::pipeline::Shader>]) {
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    type Job = Arc<crate::pipeline::Shader>;
+    static QUEUE: OnceLock<Option<Mutex<mpsc::Sender<Job>>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let threads = match std::env::var("VICTORY_PREFETCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(0) => return None,
+            Some(n) => n.min(32),
+            None => std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(6).clamp(2, 8)),
+        };
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..threads {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("victory shader prefetch {i}"))
+                .stack_size(64 << 20)
+                .spawn(move || {
+                    loop {
+                        let job = { rx.lock().unwrap_or_else(|e| e.into_inner()).recv() };
+                        let Ok(shader) = job else { return };
+                        static DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n.is_multiple_of(1000) {
+                            tracing::info!(n, "shaders translated ahead");
+                        }
+                        let Ok(host) = shader.native() else { continue };
+                        if shader.stage == "compute" && unsupported(host, true).is_none() {
+                            let msc = victory_metal::msc::shared();
+                            match Binding::of(host).layout() {
+                                Some(l) => msc.prefetch(&host.dxil, None, Some(&l)),
+                                None => msc.prefetch(&host.dxil, None, None),
+                            }
+                        }
+                    }
+                });
+        }
+        tracing::info!(threads, "shaders are translated ahead on threads of their own");
+        Some(Mutex::new(tx))
+    });
+    if let Some(tx) = queue {
+        let tx = tx.lock().unwrap_or_else(|e| e.into_inner());
+        for s in shaders {
+            let _ = tx.send(s.clone());
+        }
     }
 }

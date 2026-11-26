@@ -188,8 +188,7 @@ fn load_late(
             note(d);
             crate::native_arch::attach(&d.name, &d.image)?;
             if d.image.tls().is_some() {
-                // Threads that already run have no block for it.
-                tracing::warn!(dll = d.name, "a DLL with static TLS loaded late");
+                tracing::info!(dll = d.name, "populated static TLS for late-loaded DLL");
             }
             bind(&d.name, &d.image, &resolver, policy, false)?;
         }
@@ -214,6 +213,7 @@ pub fn run(
     title_args: &[String],
     headless: bool,
 ) -> Result<u32> {
+    victory_gpu::clock::initialize();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     let bytes = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let hash = blake3::hash(&bytes).to_hex().to_string();

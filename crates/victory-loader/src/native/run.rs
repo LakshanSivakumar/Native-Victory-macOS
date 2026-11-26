@@ -236,6 +236,10 @@ pub unsafe fn run_entry_with(
     #[cfg(target_arch = "x86_64")]
     super::dump::start();
     #[cfg(target_arch = "x86_64")]
+    super::dump::start_mem_watch();
+    #[cfg(target_arch = "x86_64")]
+    super::dump::start_write_trap();
+    #[cfg(target_arch = "x86_64")]
     super::bridge::start_profile();
     let dlls = dlls.to_vec();
     let failure = std::sync::Arc::new(Mutex::new(None::<String>));

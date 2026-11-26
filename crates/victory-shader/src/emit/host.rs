@@ -754,9 +754,12 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
+        copy_params: [0; 32],
         view_marks: false,
     })?;
     Ok(HostShader {
+        splits: Vec::new(),
+        table_entries: lowered.table_entries,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -852,6 +855,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         .collect();
     s.m.terminate(b, Term::Ret);
     HostShader {
+        splits: Vec::new(),
+        table_entries: Vec::new(),
         stage: if pixel {
             crate::native::HwStage::Ps
         } else {

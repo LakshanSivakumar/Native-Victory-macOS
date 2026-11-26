@@ -7,6 +7,49 @@
 use super::descriptors::format;
 use victory_backend::resources::*;
 
+/// A `CB_BLEND<n>_CONTROL` register as the D3D12 description of a target (all channels written);
+/// `None` for a factor D3D12 has no value for (`BOTH_SRC_ALPHA`, `BOTH_INV_SRC_ALPHA`).
+fn cb_blend(r: u32) -> Option<TargetBlend> {
+    if r & 1 << 30 == 0 {
+        return Some(TargetBlend::default());
+    }
+    // The hardware's factors are D3D12's less one; its 11 and 12 (both-alpha factors) have none.
+    let factor = |f: u32| match f {
+        0..=10 => Some(f + 1),
+        13..=20 => Some(f + 1),
+        _ => None,
+    };
+    // Hardware: add, source minus destination, min, max, destination minus source.
+    let op = |o: u32| [1, 2, 4, 5, 3].get(o as usize).copied();
+    let (src, comb, dst) = (r & 0x1f, r >> 5 & 7, r >> 8 & 0x1f);
+    let (src_a, comb_a, dst_a) = if r & 1 << 29 != 0 { (r >> 16 & 0x1f, r >> 21 & 7, r >> 24 & 0x1f) } else { (src, comb, dst) };
+    Some(TargetBlend {
+        enable: true,
+        src: factor(src)?,
+        dst: factor(dst)?,
+        op: op(comb)?,
+        src_alpha: factor(src_a)?,
+        dst_alpha: factor(dst_a)?,
+        op_alpha: op(comb_a)?,
+        mask: 0xf,
+    })
+}
+
+/// A `DB_STENCIL_CONTROL` operation as D3D12's (keep, zero, replace, increment and decrement
+/// clamped, invert, increment and decrement wrapped); KEEP for those D3D12 has none of.
+fn stencil_op_hw(op: u32) -> u32 {
+    match op {
+        1 => 2,
+        3 | 4 => 3,
+        5 => 4,
+        6 => 5,
+        7 => 6,
+        8 => 7,
+        9 => 8,
+        _ => 1,
+    }
+}
+
 /// One colour target of the blend description.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TargetBlend {
@@ -232,6 +275,76 @@ impl Graphics {
         Graphics { cull: 1, depth_func: 4, guess: Some(Guess::default()), ..Graphics::default() }
     }
 
+    /// [`Graphics::guess_base`] with the blend state of the 0x1c8 register image `image` (pair 0
+    /// of the description's slot), where it is found.
+    ///
+    /// Decoded from 23,000 images of one title: word 1 is 4 or 6 (sections that come before), and
+    /// the eight `CB_BLEND<n>_CONTROL` registers start at byte 0xd0 or 0x124 respectively, with
+    /// DISABLE_ROP3 (bit 31) set in each and 0xffffffff after them (then 3 words and the eight
+    /// `SX_MRT<n>_BLEND_OPT`). shortcut: any other image keeps the guessed "no blend".
+    pub fn guess_from(image: &[u32]) -> Graphics {
+        let mut g = Graphics::guess_base();
+        let at = match image.get(1) {
+            Some(4) => 0xd0 / 4,
+            Some(6) => 0x124 / 4,
+            _ => return g,
+        };
+        let (Some(regs), Some(&0xffff_ffff)) = (image.get(at..at + 8), image.get(at + 8)) else {
+            return g;
+        };
+        if regs.iter().any(|r| r >> 31 == 0) {
+            return g;
+        }
+        g.independent = true;
+        for (t, &r) in g.blend.iter_mut().zip(regs) {
+            if let Some(b) = cb_blend(r) {
+                *t = b;
+            }
+        }
+        // Debugging: the blend alone, the rest guessed as before.
+        if std::env::var_os("VICTORY_GUESS_BLEND_ONLY").is_some() {
+            return g;
+        }
+        // The registers before the blend ones (same offsets in every image): PA_SU_SC_MODE_CNTL,
+        // then DB_DEPTH_CONTROL, DB_STENCIL_CONTROL, DB_STENCILREFMASK(_BF), CB_TARGET_MASK.
+        let reg = |back: usize| image[at - back / 4];
+        let mode = reg(0x30);
+        g.cull = match mode & 3 {
+            1 => 2,
+            2 => 3,
+            _ => 1,
+        };
+        // FACE 0: counter-clockwise is front.
+        g.front_ccw = mode & 4 == 0;
+        // Guess (docs/native-host.md, "Polygon offset"): the three floats are
+        // PA_SU_POLY_OFFSET_CLAMP, _FRONT_SCALE and _FRONT_OFFSET in register order, written as
+        // AMD's PAL writes them: the slope scale in the hardware's 1/16ths, D3D12's integer bias as
+        // a float. Only with POLY_OFFSET_FRONT_ENABLE, which every image seen sets.
+        if mode & 1 << 11 != 0 {
+            let float = |back: usize| f32::from_bits(reg(back));
+            g.bias = (float(0x1c) as i32, float(0x24), float(0x20) / 16.0);
+        }
+        let depth = reg(0x18);
+        g.depth_enable = depth & 2 != 0;
+        g.depth_write = depth & 4 != 0;
+        // The hardware's compare functions are D3D12's less one.
+        g.depth_func = (depth >> 4 & 7) + 1;
+        g.stencil_enable = depth & 1 != 0;
+        let (stencil, refmask) = (reg(0x14), reg(0x10));
+        g.stencil_masks = ((refmask >> 8) as u8, (refmask >> 16) as u8);
+        // Front, then back (the front's unless BACKFACE_ENABLE): fail, pass and depth fail ops.
+        let front = (stencil & 0xfff, depth >> 8 & 7);
+        let back = if depth & 0x80 != 0 { (stencil >> 12 & 0xfff, depth >> 20 & 7) } else { front };
+        for (face, (ops, func)) in g.stencil_faces.iter_mut().zip([front, back]) {
+            *face = [stencil_op_hw(ops & 0xf), stencil_op_hw(ops >> 8 & 0xf), stencil_op_hw(ops >> 4 & 0xf), func + 1];
+        }
+        let mask = reg(0x4);
+        for (t, b) in g.blend.iter_mut().enumerate() {
+            b.mask = (mask >> (4 * t) & 0xf) as u8;
+        }
+        g
+    }
+
     /// This guessed state for a draw: the targets and vertex strides bound, and the input
     /// elements the vertex shader's `VB<kind><n>` semantics are (`reads`, as [`vertex_inputs`]
     /// gives them; index: corner << 28 | slot << 16 | byte offset, corner 0 unless `rect`).
@@ -383,6 +496,10 @@ impl Graphics {
     }
 
     pub fn depth_test(&self) -> Option<(bool, Compare)> {
+        // Debugging: no depth test at all.
+        if self.guess.is_some() && std::env::var_os("VICTORY_DEBUG_NO_DEPTH").is_some() {
+            return None;
+        }
         self.depth_enable
             .then(|| (self.depth_write, compare(self.depth_func)))
     }
@@ -665,6 +782,48 @@ mod tests {
         v.extend(data.iter().flat_map(|w| w.to_le_bytes()));
         v.resize(v.len().next_multiple_of(8), 0);
         v
+    }
+
+    /// The text pipeline's image: straight alpha on target 0 (`e5010504`), the rest disabled.
+    #[test]
+    fn blend_is_read_from_the_register_image() {
+        for (sections, at) in [(4, 0xd0 / 4), (6, 0x124 / 4)] {
+            let mut image = vec![0u32; at + 20];
+            image[1] = sections;
+            image[at..at + 8].copy_from_slice(&[0xe501_0504, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0x8000_0000, 0xe001_0161]);
+            image[at + 8] = 0xffff_ffff;
+            // Cull back; depth on with writes, GREATER_EQUAL; stencil on, EQUAL, pass REPLACE,
+            // read mask 0xff, write mask 0x80; targets 0 and 7 write all channels, target 1 red.
+            image[at - 12] = 0x0020_1a42;
+            image[at - 6] = 0x0020_02e7;
+            image[at - 5] = 0x0003_0030;
+            image[at - 4] = 0x0180_ff00;
+            image[at - 1] = 0xf000_001f;
+            // Polygon offset: clamp 0.003, slope scale 16 (1.0 in D3D12's units), bias 29.
+            image[at - 9] = 0.003f32.to_bits();
+            image[at - 8] = 16.0f32.to_bits();
+            image[at - 7] = 29.0f32.to_bits();
+            let g = Graphics::guess_from(&image);
+            assert!(g.independent);
+            assert_eq!((g.cull, g.front_ccw), (3, true));
+            assert_eq!((g.depth_enable, g.depth_write, g.depth_func), (true, true, 7));
+            assert_eq!((g.stencil_enable, g.stencil_masks), (true, (0xff, 0x80)));
+            assert_eq!(g.stencil_faces, [[1, 1, 3, 3]; 2]);
+            assert_eq!((g.blend[1].mask, g.blend[2].mask), (1, 0));
+            assert_eq!(g.blend[0], TargetBlend { enable: true, src: 5, dst: 6, op: 1, src_alpha: 2, dst_alpha: 6, op_alpha: 1, mask: 0xf });
+            assert_eq!(g.blend[1], TargetBlend { mask: 1, ..TargetBlend::default() });
+            // Max of one and one for colour, alpha added.
+            assert_eq!(g.blend[7], TargetBlend { enable: true, src: 2, dst: 2, op: 5, src_alpha: 2, dst_alpha: 1, op_alpha: 1, mask: 0xf });
+            assert_eq!(g.bias, (29, 0.003, 1.0));
+            // Metal's order: bias, slope scale, clamp.
+            assert_eq!(g.raster().depth_bias, (29.0, 1.0, 0.003));
+            // Without POLY_OFFSET_FRONT_ENABLE there is no bias.
+            image[at - 12] &= !(1 << 11);
+            assert_eq!(Graphics::guess_from(&image).bias, (0, 0.0, 0.0));
+            // Without the marker after the registers, nothing is read.
+            image[at + 8] = 0;
+            assert_eq!(Graphics::guess_from(&image), Graphics::guess_base());
+        }
     }
 
     #[test]

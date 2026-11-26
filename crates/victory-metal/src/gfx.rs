@@ -85,6 +85,7 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         Format::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
         Format::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
+        Format::Bgra8UnormSrgb => MTLPixelFormat::BGRA8Unorm_sRGB,
         Format::Rgba16Float => MTLPixelFormat::RGBA16Float,
         Format::R32Float => MTLPixelFormat::R32Float,
         Format::D32Float => MTLPixelFormat::Depth32Float,
@@ -96,6 +97,35 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::Bc5 => MTLPixelFormat::BC5_RGUnorm,
         Format::Bc6h => MTLPixelFormat::BC6H_RGBFloat,
         Format::Bc7 => MTLPixelFormat::BC7_RGBAUnorm,
+        Format::R8Unorm => MTLPixelFormat::R8Unorm,
+        Format::A8Unorm => MTLPixelFormat::A8Unorm,
+        Format::R16Unorm => MTLPixelFormat::R16Unorm,
+        Format::Rgba32Float => MTLPixelFormat::RGBA32Float,
+        Format::Rg32Float => MTLPixelFormat::RG32Float,
+        Format::Rgb10a2Unorm => MTLPixelFormat::RGB10A2Unorm,
+        Format::Rg11b10Float => MTLPixelFormat::RG11B10Float,
+        Format::Rgba8Uint => MTLPixelFormat::RGBA8Uint,
+        Format::Rg16Float => MTLPixelFormat::RG16Float,
+        Format::Rg16Unorm => MTLPixelFormat::RG16Unorm,
+        Format::R32Uint => MTLPixelFormat::R32Uint,
+        Format::R8Uint => MTLPixelFormat::R8Uint,
+        Format::Rgb9e5Float => MTLPixelFormat::RGB9E5Float,
+        Format::Bc7Srgb => MTLPixelFormat::BC7_RGBAUnorm_sRGB,
+        Format::Rgba32Uint => MTLPixelFormat::RGBA32Uint,
+        Format::Rgba16Unorm => MTLPixelFormat::RGBA16Unorm,
+        Format::Rgba16Snorm => MTLPixelFormat::RGBA16Snorm,
+        Format::Rg32Uint => MTLPixelFormat::RG32Uint,
+        Format::Rg16Uint => MTLPixelFormat::RG16Uint,
+        Format::Rg8Unorm => MTLPixelFormat::RG8Unorm,
+        Format::Rg8Uint => MTLPixelFormat::RG8Uint,
+        Format::Rg8Snorm => MTLPixelFormat::RG8Snorm,
+        Format::R16Float => MTLPixelFormat::R16Float,
+        Format::R16Uint => MTLPixelFormat::R16Uint,
+        Format::D16Unorm => MTLPixelFormat::Depth16Unorm,
+        Format::Bc1Srgb => MTLPixelFormat::BC1_RGBA_sRGB,
+        Format::Bc3Srgb => MTLPixelFormat::BC3_RGBA_sRGB,
+        Format::Bgr5a1Unorm => MTLPixelFormat::BGR5A1Unorm,
+        Format::Abgr4Unorm => MTLPixelFormat::ABGR4Unorm,
     }
 }
 
@@ -308,8 +338,9 @@ impl Metal {
     fn stage_function(
         &self,
         dxil: &[u8],
+        layout: Option<&victory_backend::backend::RootLayout>,
     ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, String> {
-        let (_, lib) = self.msc.convert(dxil, None).map_err(|e| e.to_string())?;
+        let (_, lib) = self.msc.convert_with(dxil, None, layout).map_err(|e| e.to_string())?;
         let l = self.load_library(&lib)?;
         let name = l
             .functionNames()
@@ -449,6 +480,12 @@ impl ResourceBackend for Metal {
         self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some(keep));
     }
 
+    fn clear_entry(&self, heap: &Heap, index: usize) {
+        if heap.kind == HeapKind::Resource {
+            self.heap_entry(heap, index, [0, 0, 0], None);
+        }
+    }
+
     fn write_sampler(&self, heap: &Heap, index: usize, s: &Sampler, lod_bias: f32) {
         debug_assert_eq!(heap.kind, HeapKind::Sampler);
         let id = resource_id(s.0.gpuResourceID());
@@ -503,15 +540,29 @@ impl ResourceBackend for Metal {
         } else {
             pixel_format(v.format)
         };
-        // SAFETY: the ranges are checked by Metal (nil on failure).
+        // Metal asserts (it does not return nil) on a range past the texture, which a
+        // title view asks for over a texture we made with fewer levels or layers (one
+        // over title memory has one level): the range is cut to what is there.
+        let fit = |(start, len): (usize, usize), count: usize| {
+            (start < count).then(|| NSRange::new(start, len.min(count - start)))
+        };
+        let slices = if ty == MTLTextureType::Type2DArray {
+            t.tex.arrayLength()
+        } else {
+            1
+        };
+        let (Some(levels), Some(layers)) =
+            (fit(v.mips, t.tex.mipmapLevelCount()), fit(v.slices, slices))
+        else {
+            return Err(format!(
+                "view {:?} {:?} is past the texture",
+                v.mips, v.slices
+            ));
+        };
+        // SAFETY: the ranges are inside the texture.
         let tex = unsafe {
             t.tex
-                .newTextureViewWithPixelFormat_textureType_levels_slices(
-                    format,
-                    ty,
-                    NSRange::new(v.mips.0, v.mips.1),
-                    NSRange::new(v.slices.0, v.slices.1),
-                )
+                .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
         }
         .ok_or("newTextureView refused (format not view-compatible)")?;
         Ok(Texture { tex })
@@ -642,11 +693,11 @@ impl GraphicsBackend for Metal {
     type RenderPipeline = RenderPipeline;
 
     fn create_render_pipeline(&self, d: &RenderPipelineDesc<'_>) -> Result<RenderPipeline, String> {
-        let vf = self.stage_function(d.vs)?;
+        let vf = self.stage_function(d.vs, d.vs_layout)?;
         let pd = MTLRenderPipelineDescriptor::new();
         pd.setVertexFunction(Some(&vf));
         if let Some(ps) = d.ps {
-            pd.setFragmentFunction(Some(&*self.stage_function(ps)?));
+            pd.setFragmentFunction(Some(&*self.stage_function(ps, d.ps_layout)?));
         }
         // The converter's stage-in function takes its inputs at attribute indices from
         // `kIRStageInAttributeStartIndex`, in input-signature order; buffers from `kIRVertexBufferBindPoint`.
@@ -694,7 +745,7 @@ impl GraphicsBackend for Metal {
                 }
             }
             a.setWriteMask(mask);
-            if let Some(b) = state.blend {
+            if let Some(b) = state.blend.filter(|_| !f.is_integer()) {
                 a.setBlendingEnabled(true);
                 a.setSourceRGBBlendFactor(blend_factor(b.src));
                 a.setDestinationRGBBlendFactor(blend_factor(b.dst));
@@ -744,6 +795,9 @@ impl GraphicsBackend for Metal {
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
         let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
+        if let Some(l) = work.label {
+            cb.setLabel(Some(&objc2_foundation::NSString::from_str(l)));
+        }
         for (f, v) in work.waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
@@ -763,11 +817,18 @@ impl GraphicsBackend for Metal {
             }
         });
         let order = order.as_ref().and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
+        // A pass that cannot be encoded is left out, but the command buffer is still committed:
+        // its queue-order wait is already encoded and the next one waits for its signal, so
+        // dropping it would hold the queue (and the title's fences) for good.
+        let mut failed_pass = None;
         for pass in work.passes {
-            match pass {
-                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order)?,
-                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order)?,
-                Pass::Blit(ops) => self.encode_blit(&cb, ops, order)?,
+            let r = match pass {
+                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order),
+                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order),
+                Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
+            };
+            if let Err(e) = r {
+                failed_pass.get_or_insert(e);
             }
         }
         if set_on_queue {
@@ -776,8 +837,30 @@ impl GraphicsBackend for Metal {
         for (f, v) in work.signals {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
+        // A command buffer the GPU fails is logged (the first few), not silently dropped.
+        let failed = block2::RcBlock::new(|done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            // SAFETY: Metal passes the command buffer that completed.
+            let done = unsafe { done.as_ref() };
+            if let Some(e) = done.error()
+                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20
+            {
+                eprintln!(
+                    "metal: command buffer failed: {} [{}]",
+                    e.localizedDescription(),
+                    done.label().map(|l| l.to_string()).unwrap_or_default()
+                );
+            }
+            // GPU time, for the window's figures.
+            let secs = done.GPUEndTime() - done.GPUStartTime();
+            if secs > 0.0 && secs < 10.0 {
+                GPU_US.fetch_add((secs * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        // SAFETY: the block is retained by Metal until it has run.
+        unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
-        Ok(())
+        failed_pass.map_or(Ok(()), Err)
     }
 }
 
@@ -852,6 +935,25 @@ impl Metal {
             e.waitForFence(f);
         }
         for d in dispatches {
+            // An indirect dispatch's counts are checked into a slot of their own first (the
+            // encoder runs its dispatches in order).
+            let checked = match d.indirect {
+                Some((b, title)) => self.clamp_groups().map(|(clamp, slots, at)| {
+                    e.setComputePipelineState(clamp);
+                    // Bound at slots no converted shader uses (0 and 1 are the converter's
+                    // descriptor heaps: a shader that reads a heap the host does not bind would
+                    // find these buffers there).
+                    // SAFETY: the argument record is three u32s at that offset; the slot is 16 bytes.
+                    unsafe {
+                        e.setBuffer_offset_atIndex(Some(&*b.buf), title as usize - b.base as usize, crate::metal::CLAMP_SOURCE);
+                        e.setBuffer_offset_atIndex(Some(slots), at, crate::metal::CLAMP_SOURCE + 1);
+                    }
+                    let one = size([1, 1, 1]);
+                    e.dispatchThreadgroups_threadsPerThreadgroup(one, one);
+                    (slots, at)
+                }),
+                None => None,
+            };
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
@@ -863,7 +965,36 @@ impl Metal {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
-            e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group));
+            match d.indirect {
+                Some((b, title)) => {
+                    // The group counts are three u32s at the title address, as Metal reads them.
+                    if self.names(b, set_on_queue) {
+                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
+                    }
+                    let off = title as usize - b.base as usize;
+                    // SAFETY: the buffer is live and holds the three counts at `off` (or the
+                    // checked slot does).
+                    unsafe {
+                        match checked {
+                            Some((slots, at)) => e
+                                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                                    slots,
+                                    at,
+                                    size(d.threads_per_group),
+                                ),
+                            None => e
+                                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                                    &b.buf,
+                                    off,
+                                    size(d.threads_per_group),
+                                ),
+                        }
+                    };
+                }
+                None => {
+                    e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group))
+                }
+            }
         }
         if let Some((f, started)) = order {
             e.updateFence(f);
@@ -915,13 +1046,42 @@ impl Metal {
                 let a = desc.stencilAttachment();
                 a.setTexture(Some(&dp.texture.tex));
                 a.setStoreAction(MTLStoreAction::Store);
-                match dp.clear {
-                    Some(_) => {
+                match dp.clear_stencil {
+                    Some(v) => {
                         a.setLoadAction(MTLLoadAction::Clear);
-                        a.setClearStencil(0);
+                        a.setClearStencil(u32::from(v));
                     }
                     None => a.setLoadAction(MTLLoadAction::Load),
                 }
+            }
+        }
+        // A pass with no targets (pixel shaders that only write UAVs) needs its size set, or Metal
+        // makes no encoder: the draws' viewports (else scissors) give it.
+        let bare = rp.color.is_empty() && rp.depth.is_none();
+        let mut bare_size = (0usize, 0usize);
+        if bare {
+            for d in &rp.draws {
+                let (w, h) = match (d.state.viewport, d.state.scissor) {
+                    (Some(v), _) if v.width > 0.0 && v.height > 0.0 => (
+                        (v.x + v.width).ceil().max(1.0) as usize,
+                        (v.y + v.height).ceil().max(1.0) as usize,
+                    ),
+                    (_, Some([_, _, r, b])) if r > 0 && b > 0 => (r as usize, b as usize),
+                    _ => (0, 0),
+                };
+                bare_size = (bare_size.0.max(w), bare_size.1.max(h));
+            }
+            if bare_size.0 == 0 || bare_size.1 == 0 {
+                // Nothing tells the size: the draws are left out.
+                return Err("a pass without targets and without a viewport".into());
+            }
+            bare_size = (bare_size.0.min(16384), bare_size.1.min(16384));
+            #[allow(unused_unsafe)]
+            // SAFETY: sizes within Metal's limit; one sample, as the pipelines are built.
+            unsafe {
+                desc.setRenderTargetWidth(bare_size.0);
+                desc.setRenderTargetHeight(bare_size.1);
+                desc.setDefaultRasterSampleCount(1);
             }
         }
         let e = cb
@@ -932,12 +1092,16 @@ impl Metal {
         {
             e.waitForFence_beforeStages(f, MTLRenderStages::Vertex);
         }
-        let rt_size = rp
-            .color
-            .first()
-            .map(|c| &c.texture.tex)
-            .or(rp.depth.as_ref().map(|d| &d.texture.tex))
-            .map_or((0, 0), |t| (t.width(), t.height()));
+        let mut no_index: Option<String> = None;
+        let rt_size = if bare {
+            bare_size
+        } else {
+            rp.color
+                .first()
+                .map(|c| &c.texture.tex)
+                .or(rp.depth.as_ref().map(|d| &d.texture.tex))
+                .map_or((0, 0), |t| (t.width(), t.height()))
+        };
         for d in &rp.draws {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
@@ -960,9 +1124,7 @@ impl Metal {
             } else {
                 MTLDepthClipMode::Clamp
             });
-            if r.depth_bias != (0.0, 0.0, 0.0) {
-                e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
-            }
+            e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
             if let Some(ds) = &d.pipeline.depth {
                 e.setDepthStencilState(Some(ds));
             }
@@ -1074,9 +1236,12 @@ impl Metal {
                     first_instance,
                     wide,
                 } => {
-                    let (b, title) = d
-                        .index_buffer
-                        .ok_or("indexed draw without an index buffer")?;
+                    // Without an index buffer the draw is left out (the encoder stays open for the
+                    // rest of the pass; returning here would leave it unended).
+                    let Some((b, title)) = d.index_buffer else {
+                        no_index.get_or_insert("indexed draw without an index buffer".to_string());
+                        continue;
+                    };
                     let width = if wide { 4 } else { 2 };
                     let off = title as usize - b.base as usize + first_index as usize * width;
                     dp = [
@@ -1116,7 +1281,7 @@ impl Metal {
             started.set(true);
         }
         e.endEncoding();
-        Ok(())
+        no_index.map_or(Ok(()), Err)
     }
 }
 
@@ -1146,4 +1311,12 @@ fn is_depth(f: MTLPixelFormat) -> bool {
         MTLPixelFormat::Depth32Float_Stencil8,
     ]
     .contains(&f)
+}
+
+/// Microseconds the GPU spent on our command buffers (summed: overlapping ones count twice).
+static GPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`GPU_US`] since the last call.
+pub fn take_gpu_us() -> u64 {
+    GPU_US.swap(0, std::sync::atomic::Ordering::Relaxed)
 }

@@ -56,6 +56,8 @@ impl<'a> Scene<'a> {
             .create_render_pipeline(&RenderPipelineDesc {
                 vs: &fixture("tri_vs"),
                 ps: Some(&fixture("tri_ps")),
+                vs_layout: None,
+                ps_layout: None,
                 attributes: &attrs,
                 streams: &[VertexStream {
                     slot: 0,
@@ -115,6 +117,7 @@ impl<'a> Scene<'a> {
             topology: Topology::Triangles,
             state: DrawState::default(),
             root: self.root(z),
+            fragment_root: None,
             heaps: Heaps {
                 resource: Some(&self.res),
                 sampler: Some(&self.smp),
@@ -135,6 +138,7 @@ impl<'a> Scene<'a> {
             depth: Some(DepthTarget {
                 texture: &self.depth,
                 clear: Some(1.0),
+                clear_stencil: Some(0),
             }),
             draws,
         })
@@ -150,6 +154,7 @@ impl<'a> Scene<'a> {
                     waits: &[],
                     passes,
                     signals: &[(&f, 1)],
+                    label: None,
                 },
             )
             .unwrap();
@@ -277,6 +282,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
         },
         groups: [W / 4, W / 4, 1],
         threads_per_group: [4, 4, 1],
+        indirect: None,
     }];
     s.submit(&[
         s.pass(vec![quad, tri], [0.0, 0.0, 0.0, 1.0]),

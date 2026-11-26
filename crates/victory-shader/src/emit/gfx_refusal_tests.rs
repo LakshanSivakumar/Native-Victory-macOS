@@ -8,11 +8,177 @@ use super::container::SigElement;
 use super::lower::{self, Lowered, Parts};
 use super::{Options, graphics, translate_with};
 use crate::dxbc::{Container, FourCC};
-use crate::native::{HwStage, NativeProgram, PsInput, RootParam, RootType, StageIo, Usage};
+use crate::native::{
+    ComputeIo, HwStage, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo, Usage,
+    UsedResource,
+};
 use crate::{ShaderError, io, ir, resource, structure};
 
 fn bytes_of(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+#[test]
+fn guessed_pixel_computed_buffer_loads_use_title_memory() {
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // CBV, root constants in slot 0, live-in s0
+    let code = [
+        0x8004_9000, // s_add_u32 s4, s0, 16
+        0x8205_8080, // s_addc_u32 s5, 0, 0
+        0x8705_FF05,
+        0x0000_FFFF, // s_and_b32 s5, s5, 0xffff
+        0x8F06_9090, // s_lshl_b32 s6, 16, 16
+        0x8805_0605, // s_or_b32 s5, s5, s6
+        0xBE86_0384, // s_mov_b32 s6, 4
+        0xBE87_03FF,
+        0x0001_4FAC, // s_mov_b32 s7, 0x00014fac
+        0xE034_3004,
+        0x8001_0200, // buffer_load_dwordx2 v[2:3], v[0:1], s[4:7], 0 idxen offen offset:4
+        0xF420_0202,
+        0xFA00_000C, // s_buffer_load_dword s8, s[4:7], 12
+        0x7E08_0208, // v_mov_b32 v4, s8
+        0xF800_180F,
+        0x0404_0302, // exp mrt0 v2, v3, v4, v4 done vm
+        0xBF81_0000,
+    ];
+    let container = |code: &[u32]| graphics::container(HwStage::Ps, &bytes_of(code), &meta).unwrap();
+    let options = Options { wave32_host: true, zero_copy_memory: true, ..Options::default() };
+    for flags in [0x0001_4FAC, 0x3001_4FAC] {
+        let mut code = code;
+        code[8] = flags;
+        let shader = translate_with(&container(&code), options).unwrap();
+        assert!(shader.memory);
+        assert!(!shader.memory_writes && !shader.heap);
+        assert_eq!(shader.user_data.len(), 1);
+        assert_eq!(shader.user_data[0].slot, 0);
+    }
+    let mut dynamic_count = code;
+    dynamic_count[6] = 0xBE86_0300; // s_mov_b32 s6, s0
+    assert!(translate_with(&container(&dynamic_count), options).unwrap().memory);
+    assert!(translate_with(&container(&code), Options::default()).is_err());
+
+    let mut swizzled = code;
+    swizzled[5] = 0x8805_FF05; // s_or_b32 s5, s5, 0x80000000
+    let mut swizzled = swizzled.to_vec();
+    swizzled.insert(6, 0x8000_0000);
+    let err = translate_with(&container(&swizzled), options).err().unwrap();
+    assert!(err.to_string().contains("computed buffer descriptor with swizzling"), "{err}");
+}
+
+#[test]
+fn guessed_pixel_computed_subword_loads_use_title_memory() {
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2;
+    let code = [
+        0x8004_9000, // s_add_u32 s4, s0, 16
+        0x8205_8080, // s_addc_u32 s5, 0, 0
+        0x8705_FF05, 0x0000_FFFF, // s_and_b32 s5, s5, 0xffff
+        0x8F06_9090, // s_lshl_b32 s6, 16, 16
+        0x8805_0605, // s_or_b32 s5, s5, s6
+        0xBE86_0384, // s_mov_b32 s6, 4
+        0xBE87_03FF, 0x3001_4FAC, // s_mov_b32 s7, flags
+        0xE020_3000, 0x8001_0200, // buffer_load_ubyte v2, v[0:1], s[4:7], 0 idxen offen
+        0xF800_180F, 0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+        0xBF81_0000,
+    ];
+    let translate = |words: &[u32], wave32_host| {
+        let container = graphics::container(HwStage::Ps, &bytes_of(words), &meta).unwrap();
+        translate_with(&container, Options { wave32_host, zero_copy_memory: true, ..Options::default() })
+    };
+    for wave32_host in [false, true] {
+        for op in 8..=11 {
+            for bounds in 0..4 {
+                for offset in [0, 1, 2, 3, 15, 16, 4095] {
+                    let mut words = code;
+                    words[8] = 0x0001_4FAC | bounds << 28;
+                    words[9] = 0xE000_3000 | op << 18 | offset;
+                    let shader = translate(&words, wave32_host).unwrap();
+                    assert!(shader.memory && !shader.memory_writes && !shader.heap);
+                }
+            }
+        }
+    }
+    // Typed loads, stores and atomics must not gain support accidentally.
+    for op in [0, 24, 26, 28, 50] {
+        let mut words = code;
+        words[9] = 0xE000_3000 | op << 18;
+        assert!(translate(&words, true).is_err(), "opcode {op}");
+    }
+    for flags in [0x3081_4FAC, 0x7001_4FAC] {
+        let mut words = code;
+        words[8] = flags; // ADD_TID or non-buffer type
+        assert!(translate(&words, true).is_err());
+    }
+    let mut swizzled = code.to_vec();
+    swizzled[5] = 0x8805_FF05;
+    swizzled.insert(6, 0x8000_0000);
+    assert!(translate(&swizzled, true).is_err());
+}
+
+/// Exercise the graphics descriptor classification with a compute entry point
+/// so the Windows test host can dispatch it and read back exact integer results.
+/// This does not enable computed descriptors for production compute shaders.
+pub(super) fn computed_subword_test_shader(op: u32, bounds: u32) -> super::HostShader {
+    use crate::native::{ComputeIo, ResourceType, UsedResource};
+    let words = [
+        0xBE88_0300, // s_mov_b32 s8, s0 (base low)
+        0x8709_FF01, 0x3FFF_FFFF, // s_and_b32 s9, s1, 0x3fffffff (base high + stride)
+        0xBE8A_0302, // s_mov_b32 s10, s2 (record count)
+        0xBE8B_03FF, 0x0001_4FAC | bounds << 28,
+        0x7E00_0203, // v_mov_b32 v0, s3 (index)
+        0x7E02_0204, // v_mov_b32 v1, s4 (vector offset)
+        0xE000_3000 | op << 18, 0x0502_0200, // buffer_load_* v2, v[0:1], s[8:11], s5 idxen offen
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0303, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0
+        0xBF8C_0000, // s_waitcnt
+        0xE070_0000, 0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0
+        0xBF81_0000,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs, wave64: false, vgprs: 4,
+        layout: vec![root_const(0, 6), RootParam {
+            root: RootType::Table, table_offset_dwords: 0, sgprs: 1,
+            base_register: 0, user_data: 6, slot: 1,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav, root: RootType::Table, table_offset_dwords: 0,
+            lower_bound: 0, stride: 0, dwords: 4, user_data: 6, slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 7 << 1, threads: [1, 1, 1] }),
+        code: bytes_of(&words),
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track_graphics(&p, &native.layout, HwStage::Ps, Some(&st), true).unwrap();
+    assert!(res.descriptors.iter().any(|d| matches!(d.source, resource::Source::BuiltMemory { .. })));
+    let io = io::raise(&p, &native).unwrap();
+    let l = lower::lower(&Parts {
+        native: &native, p: &p, st: &st, io: &io, res: &res,
+        inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0,
+        atomic_locks: false, bias_as_gradients: false, narrow_waves: false,
+        wave32_host: false, zero_copy_memory: true, view_marks: false,
+        rect_list: false, copy_params: [0; 32],
+    }).unwrap();
+    super::HostShader {
+        stage: HwStage::Cs, dxil: l.dxil, splits: l.splits, table_entries: l.table_entries,
+        user_data: l.user_data, samplers: l.samplers, static_samplers: vec![],
+        root_cbvs: l.root_cbvs, root_srvs: l.root_srvs, root_uavs: l.root_uavs,
+        memory: l.memory, memory_writes: l.memory_writes, view_addresses: l.view_addresses,
+        heap: l.heap, heap_writes: l.heap_writes, view_marks: l.view_marks,
+    }
+}
+
+#[test]
+fn computed_subword_execution_fixtures_lower() {
+    for op in 8..=11 {
+        for bounds in 0..4 {
+            assert!(computed_subword_test_shader(op, bounds).memory);
+        }
+    }
 }
 
 fn sig_el(
@@ -84,6 +250,7 @@ fn lower_ps(
         zero_copy_memory: false,
         view_marks: false,
         rect_list: false,
+        copy_params: [0; 32],
     })
 }
 
@@ -126,6 +293,7 @@ fn lower_vs(
         zero_copy_memory: false,
         view_marks: false,
         rect_list,
+        copy_params: [0; 32],
     })
 }
 
@@ -753,6 +921,81 @@ fn refusal3_non_interp_hardware_sgpr_remains_refused() {
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
 }
 
+#[test]
+fn guessed_pixel_masked_prim_mask_anchors_the_pops_input() {
+    let code = [
+        0x8705_FF06,
+        0x0000_FFFF, // s_and_b32 s5, s6, 0xffff
+        0xBEFC_0305, // s_mov_b32 m0, s5
+        0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+        0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+        0xBF06_EF07, // s_cmp_eq_u32 s7, src_pops_exiting_wave_id
+        0x8512_8081, // s_cselect_b32 s18, 1, 0
+        0x7E0A_0212, // v_mov_b32 v5, s18
+        0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        0xF800_180F,
+        0x0404_0504, // exp mrt0 v4, v5, v4, v4 done vm
+        0xBF81_0000,
+    ];
+    let lower = |code: &[u32]| {
+        let container = graphics::container(HwStage::Ps, &bytes_of(code), &[0; 0x10]).unwrap();
+        translate_with(&container, Options::default())
+    };
+    lower(&code).unwrap();
+
+    let mut mixed = code;
+    mixed[7] = 0x7E0A_0206; // v_mov_b32 v5, s6: the mask also escapes into the export.
+    let err = lower(&mixed).err().unwrap();
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+
+    let mut scc_use = code;
+    scc_use.swap(5, 6); // The select now consumes the SCC result of the mask operation.
+    let err = lower(&scc_use).err().unwrap();
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+}
+
+#[test]
+fn guessed_pixel_extracted_prim_mask_anchors_the_pops_input() {
+    // Bit-field extraction is another way to prepare M0 for interpolation.
+    // The collision ID is s7 because the primitive mask is live-in s6.
+    let code = [
+        0x9385_FF06,
+        0x0010_0000, // s_bfe_u32 s5, s6, 0x00100000 (offset 0, width 16)
+        0xBEFC_0305, // s_mov_b32 m0, s5
+        0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+        0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+        0xBF06_EF07, // s_cmp_eq_u32 s7, src_pops_exiting_wave_id
+        0x8512_8081, // s_cselect_b32 s18, 1, 0
+        0x7E0A_0212, // v_mov_b32 v5, s18
+        0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        0xF800_180F,
+        0x0404_0504, // exp mrt0 v4, v5, v4, v4 done vm
+        0xBF81_0000,
+    ];
+    for wave32_host in [false, true] {
+        let lower = |code: &[u32]| {
+            let container = graphics::container(HwStage::Ps, &bytes_of(code), &[0; 0x10]).unwrap();
+            translate_with(&container, Options { wave32_host, ..Options::default() })
+        };
+        lower(&code).unwrap();
+
+        let mut mixed = code;
+        mixed[7] = 0x7E0A_0206; // The live-in mask also escapes into an export.
+        let err = lower(&mixed).expect_err("exported mask must remain refused");
+        assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+
+        let mut extracted = code;
+        extracted[7] = 0x7E0A_0205; // The extracted mask escapes into an export.
+        let err = lower(&extracted).expect_err("exported extraction must remain refused");
+        assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+
+        let mut scc_use = code;
+        scc_use.swap(5, 6); // The select consumes the extraction's SCC result.
+        let err = lower(&scc_use).expect_err("observable SCC must remain refused");
+        assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+    }
+}
+
 // =========================================================================
 // Refusal #4: "one input interpolated two ways"
 // =========================================================================
@@ -928,6 +1171,100 @@ fn refusal5_guessed_vs_inferred_heap_lowers_while_nonguessed_refuses() {
     );
 }
 
+#[test]
+fn guessed_vertex_rebases_a_header_relative_table_alongside_vertex_fetch() {
+    let mut meta = [0u8; 0x30];
+    meta[0] = 2;
+    meta[12..15].copy_from_slice(&[0x40, 4, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14..0x16].copy_from_slice(&[2, 3]); // CBV in a table
+    meta[0x18] = 8; // descriptor at byte 32 of the table
+    meta[0x24..0x27].copy_from_slice(&[4, 0, 3]); // four dwords, relative s0, title slot 3
+    let code = [
+        0xF408_0200,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 32
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2000,
+        0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+        0xF420_0406,
+        0xFA00_0000, // s_buffer_load_dword s16, s[12:15], 0
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0x7E04_0210, // v_mov_b32 v2, s16
+        0xF800_08CF,
+        0x0202_0201, // exp pos0 v1, v2, v2, v2 done
+        0xBF81_0000,
+    ];
+    let lower = |code: &[u32], meta: &[u8]| {
+        let container = graphics::container(HwStage::Vs, &bytes_of(code), meta).unwrap();
+        translate_with(&container, Options::default())
+    };
+    let shader = lower(&code, &meta).unwrap();
+    assert!(!shader.heap);
+    assert_eq!(shader.user_data.len(), 1);
+    assert_eq!(shader.user_data[0].slot, 3);
+    assert_eq!(shader.user_data[0].root, RootType::Table);
+    assert_eq!(shader.table_entries, [(3, 2)]);
+    assert!(parsed_isg1(&shader.dxil).iter().any(|e| e.name == "VBU1"));
+
+    // Reading a descriptor past the 16-entry table window (entry 20 = byte 640 = 0x280,
+    // table_offset_dwords = 160) reports table_entries = [(3, 21)] for host re-mirroring.
+    let mut wide_meta = meta;
+    wide_meta[0x18] = 160;
+    let mut wide_code = code;
+    wide_code[4] = 0xFA00_0280; // s_load_dwordx4 s[12:15], s[4:5], 640
+    let wide_shader = lower(&wide_code, &wide_meta).unwrap();
+    assert_eq!(wide_shader.table_entries, [(3, 21)]);
+
+    meta[0x25] = 4; // The original absolute interpretation also supports an explicit s4 record.
+    assert_eq!(lower(&code, &meta).unwrap().user_data, shader.user_data);
+
+    let unbound = [
+        0xF400_0103,
+        0xFA00_0000, // s_load_dword s4, s[6:7], 0
+        0x7E02_0204, // v_mov_b32 v1, s4
+        0xF800_08CF,
+        0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+        0xBF81_0000,
+    ];
+    meta[0x25] = 0;
+    let err = lower(&unbound, &meta).err().unwrap();
+    assert!(err.to_string().contains("an address in an SGPR that is no root parameter"), "{err}");
+}
+
+#[test]
+fn guessed_vertex_rebases_a_header_relative_root_view() {
+    let mut meta = [0u8; 0x30];
+    meta[0] = 2;
+    meta[12..15].copy_from_slice(&[0x40, 4, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14..0x16].copy_from_slice(&[2, 1]); // Root CBV
+    meta[0x26] = 3; // Title slot 3
+    let code = bytes_of(&[
+        0xBE88_0404, // s_mov_b64 s[8:9], s[4:5]
+        0xBE8A_03C1, // s_mov_b32 s10, -1
+        0xBE8B_03FF,
+        0x3001_4FAC, // s_mov_b32 s11, 0x30014fac
+        0xF420_0304,
+        0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0xF800_08CF,
+        0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+        0xBF81_0000,
+    ]);
+    let lower = |meta: &[u8]| {
+        let container = graphics::container(HwStage::Vs, &code, meta).unwrap();
+        translate_with(&container, Options::default())
+    };
+    assert_eq!(lower(&meta).unwrap().root_cbvs, [3]);
+    meta[13] = 6;
+    let err = lower(&meta).err().unwrap();
+    assert!(err.to_string().contains("an address in an SGPR that is no root parameter"), "{err}");
+}
+
 // =========================================================================
 // Refusal #6: "a vertex fetch format the host's vertex layout lacks"
 // =========================================================================
@@ -1071,5 +1408,268 @@ fn refusal6_unsupported_vertex_fetch_formats_remain_refused() {
         err.to_string()
             .contains("a vertex fetch format the host's vertex layout lacks"),
         "untyped buffer_load_format: got `{err}`"
+    );
+}
+
+// =========================================================================
+// Compute: "a typed buffer store of some channels or at an offset"
+// =========================================================================
+
+/// A wave32 compute program whose table in user data 0 holds a typed buffer
+/// UAV: each lane stores registers from v1 on (copies of its lane number) to
+/// element `lane` with the typed store `store` (two words).
+fn typed_store_cs(store: [u32; 2]) -> Result<Lowered, ShaderError> {
+    typed_store_cs_after(&[], store)
+}
+
+/// [`typed_store_cs`] with the words `setup` run just before the store.
+fn typed_store_cs_after(setup: &[u32], store: [u32; 2]) -> Result<Lowered, ShaderError> {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0x7E02_0300, // v_mov_b32 v1, v0
+        0x7E04_0300, // v_mov_b32 v2, v0
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    words.extend_from_slice(setup);
+    words.extend([store[0], store[1], 0xBF81_0000]); // then s_endpgm
+    let table = RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![table],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 3 << 1, threads: [32, 1, 1] }),
+        code: bytes_of(&words),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    lower::lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: false,
+        zero_copy_memory: false,
+        view_marks: false,
+        rect_list: false,
+        copy_params: [0; 32],
+    })
+}
+
+/// Typed stores of one, two or three channels write the whole element (0 in
+/// the channels they do not name: `stride_tests` runs one), so they lower as
+/// the four-channel store does.
+#[test]
+fn typed_buffer_stores_of_some_channels_lower() {
+    let stores: &[(u32, &str)] = &[
+        (0xE010_2000, "buffer_store_format_x v1, v0, s[8:11], 0 idxen"),
+        (0xE014_2000, "buffer_store_format_xy v[1:2], v0, s[8:11], 0 idxen"),
+        (0xE018_2000, "buffer_store_format_xyz v[1:3], v0, s[8:11], 0 idxen"),
+        (0xE01C_2000, "buffer_store_format_xyzw v[1:4], v0, s[8:11], 0 idxen"),
+        (0xE210_2000, "buffer_store_format_d16_x v1, v0, s[8:11], 0 idxen"),
+        (0xE214_2000, "buffer_store_format_d16_xy v1, v0, s[8:11], 0 idxen"),
+        (0xE218_2000, "buffer_store_format_d16_xyz v[1:2], v0, s[8:11], 0 idxen"),
+        (0xE21C_2000, "buffer_store_format_d16_xyzw v[1:2], v0, s[8:11], 0 idxen"),
+    ];
+    for &(w0, asm) in stores {
+        let l = typed_store_cs([w0, 0x8002_0100]).unwrap_or_else(|e| panic!("{asm}: {e}"));
+        assert!(!l.dxil.is_empty(), "{asm}");
+    }
+}
+
+/// A typed view has no bytes inside an element to address: a typed store at
+/// an offset stays refused.
+#[test]
+fn typed_buffer_stores_at_an_offset_remain_refused() {
+    let stores: &[([u32; 2], &str)] = &[
+        ([0xE010_2004, 0x8002_0100], "buffer_store_format_x v1, v0, s[8:11], 0 idxen offset:4"),
+        ([0xE010_3000, 0x8002_0102], "buffer_store_format_x v1, v[2:3], s[8:11], 0 idxen offen"),
+        ([0xE01C_2004, 0x8002_0100], "buffer_store_format_xyzw v[1:4], v0, s[8:11], 0 idxen offset:4"),
+    ];
+    for &(store, asm) in stores {
+        let err = typed_store_cs(store).err().unwrap_or_else(|| panic!("{asm}: expected refusal"));
+        assert!(err.to_string().contains("a typed buffer store at an offset"), "{asm}: got `{err}`");
+    }
+}
+
+/// A scalar offset register that provably holds 0 (a move of the constant) is
+/// no offset: the store lowers, whatever its channel count.
+#[test]
+fn typed_buffer_stores_at_a_zero_sgpr_offset_lower() {
+    let stores: &[(u32, &str)] = &[
+        (0xE01C_2000, "buffer_store_format_xyzw v[1:4], v0, s[8:11], s2 idxen"),
+        (0xE010_2000, "buffer_store_format_x v1, v0, s[8:11], s2 idxen"),
+    ];
+    for &(w0, asm) in stores {
+        // s_mov_b32 s2, 0
+        let l = typed_store_cs_after(&[0xBE82_0380], [w0, 0x0202_0100])
+            .unwrap_or_else(|e| panic!("{asm}: {e}"));
+        assert!(!l.dxil.is_empty(), "{asm}");
+    }
+}
+
+/// A scalar offset register holding another constant, or a value that is not
+/// known, is an offset: refused, not dropped.
+#[test]
+fn typed_buffer_stores_at_a_nonzero_or_unknown_sgpr_offset_remain_refused() {
+    let setups: &[(u32, &str)] = &[
+        (0xBE82_0384, "s_mov_b32 s2, 4"),
+        (0xBE82_0300, "s_mov_b32 s2, s0"),
+    ];
+    for &(setup, asm) in setups {
+        // buffer_store_format_xyzw v[1:4], v0, s[8:11], s2 idxen
+        let err = typed_store_cs_after(&[setup], [0xE01C_2000, 0x0202_0100])
+            .err()
+            .unwrap_or_else(|| panic!("{asm}: expected refusal"));
+        assert!(err.to_string().contains("a typed buffer store at an offset"), "{asm}: got `{err}`");
+    }
+}
+
+// =========================================================================
+// "v_cvt_pknorm_u16_f32 is not supported"
+// =========================================================================
+
+#[test]
+fn normalized_16_bit_packing_lowers_in_pixel_shader() {
+    // v_mov_b32_e32 v1, 0.5
+    // v_mov_b32_e32 v2, 1.0
+    // <pack> v0, <src0>, <src1>
+    // exp mrt0 v0, v0, v0, v0 done vm
+    // s_endpgm
+    let code = |pack: [u32; 2]| {
+        [
+            0x7E02_02F0,
+            0x7E04_02F2,
+            pack[0],
+            pack[1],
+            0xF800_180F,
+            0x0000_0000,
+            0xBF81_0000,
+        ]
+    };
+    for (what, pack) in [
+        (
+            "v_cvt_pknorm_u16_f32 v0, v1, v2",
+            [0xD769_0000, 0x0202_0501],
+        ),
+        (
+            "v_cvt_pknorm_i16_f32 v0, v1, v2",
+            [0xD768_0000, 0x0202_0501],
+        ),
+        (
+            "v_cvt_pknorm_u16_f32 v0, |v1|, -v2",
+            [0xD769_0100, 0x4202_0501],
+        ),
+        (
+            "v_cvt_pknorm_u16_f32 v0, 0.5, v2",
+            [0xD769_0000, 0x0202_04F0],
+        ),
+    ] {
+        for wave32_host in [false, true] {
+            lower_ps(&code(pack), true, vec![], vec![], 0, 0, vec![], wave32_host)
+                .unwrap_or_else(|e| panic!("{what}, wave32_host={wave32_host}: {e}"));
+        }
+    }
+    // v_cvt_pknorm_u16_f16 v0, v1, v2: the f16 forms stay refused.
+    let f16 = code([0xD713_0000, 0x0202_0501]);
+    let err = lower_ps(&f16, true, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("expected refusal");
+    assert!(
+        err.to_string()
+            .contains("v_cvt_pknorm_u16_f16 is not supported"),
+        "got `{err}`"
+    );
+}
+
+/// What "a computed buffer descriptor used as a view" names: only an image
+/// instruction asks for a view of four computed dwords, as its sampler (told
+/// apart here) or as a 128-bit image descriptor (`r128`, instruction bit 15).
+/// The refusal is reported where the missing result is first needed.
+#[test]
+fn guessed_pixel_computed_samplers_and_short_images_remain_refused() {
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // CBV, root constants in slot 0, live-in s0
+    let head = [
+        0xBE8C_030A, // s_mov_b32 s12, s10
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0xF40C_0406,
+        0xFA00_0000, // s_load_dwordx8 s[16:23], s[12:13], 0x0
+        0xBE98_03FF,
+        0x0001_2345, // s_mov_b32 s24, 0x12345
+        0xBE99_03FF,
+        0x00FF_F000, // s_mov_b32 s25, 0xfff000
+        0xBE9A_0300, // s_mov_b32 s26, s0
+        0xBE9B_0380, // s_mov_b32 s27, 0
+        0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+        0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+        0xC80C_0100, // v_interp_p1_f32 v3, v0, attr0.y
+        0xC80D_0101, // v_interp_p2_f32 v3, v1, attr0.y
+    ];
+    // image_sample_lz v[4:7], v[2:3], s[16:23], s[24:27] dmask:0xf dim:2D
+    let sample = [0xF09C_0F08, 0x00C4_0402];
+    let tail = [
+        0xF800_180F,
+        0x0706_0504, // exp mrt0 v4, v5, v6, v7 done vm
+        0xBF81_0000,
+    ];
+    let options = Options { wave32_host: true, zero_copy_memory: true, ..Options::default() };
+    let run = |mid: &[u32]| {
+        let code: Vec<u32> = head.iter().chain(mid).chain(&tail).copied().collect();
+        let c = graphics::container(HwStage::Ps, &bytes_of(&code), &meta).unwrap();
+        translate_with(&c, options)
+    };
+    // Sampler dword 2 from a root constant: refused at the export, 8 bytes on.
+    let at = 4 * head.len() + 8;
+    let err = run(&sample).err().unwrap();
+    assert_eq!(err, ShaderError::Unsupported { offset: at, what: "a sampler built from computed words" });
+    // The same sampler with dword 2 fixed is an immediate sampler.
+    let fixed = [0xBE9A_0380, sample[0], sample[1]]; // s_mov_b32 s26, 0
+    assert_eq!(run(&fixed).unwrap().samplers, [[0x0001_2345, 0x00FF_F000, 0, 0]]);
+    // A 128-bit image descriptor of loaded and built dwords.
+    let short = [
+        0xBE93_03FF,
+        0x0001_2345, // s_mov_b32 s19, 0x12345
+        fixed[0],
+        sample[0] | 1 << 15, // ... s[16:19], s[24:27] ... r128
+        sample[1],
+    ];
+    let err = run(&short).err().unwrap();
+    assert_eq!(
+        err,
+        ShaderError::Unsupported { offset: at + 12, what: "a computed buffer descriptor used as a view" }
     );
 }
