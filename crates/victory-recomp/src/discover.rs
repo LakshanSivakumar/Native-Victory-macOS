@@ -77,6 +77,66 @@ fn walk_to(img: &Image, start: u32, limit: u32, reach: u32) -> (u32, Vec<u32>) {
     (end, targets)
 }
 
+/// The direct call, jump and branch targets and the executable `lea [rip + x]` addresses of every instruction in
+/// `[begin, end)`, decoded in a line from `begin` (an undecodable byte is stepped over). x64 MSVC keeps jump tables
+/// in `.rdata`, so a function's extent is code.
+fn sweep(img: &Image, begin: u32, end: u32) -> Vec<u32> {
+    let base = img.info.image_base;
+    let Some(code) = img.bytes(begin, (end - begin) as usize) else {
+        return vec![];
+    };
+    let mut dec = Decoder::with_ip(64, code, base + begin as u64, DecoderOptions::NONE);
+    let mut targets = vec![];
+    while dec.can_decode() {
+        let i = dec.decode();
+        if i.is_invalid() {
+            continue;
+        }
+        if i.mnemonic() == Mnemonic::Lea && i.is_ip_rel_memory_operand() {
+            let t = i.ip_rel_memory_address().wrapping_sub(base);
+            if t < u32::MAX as u64 && img.is_exec(t as u32) {
+                targets.push(t as u32);
+            }
+        }
+        if matches!(i.op0_kind(), OpKind::NearBranch64)
+            && matches!(
+                i.flow_control(),
+                FlowControl::Call | FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
+            )
+        {
+            targets.push((i.near_branch_target() - base) as u32);
+        }
+    }
+    targets
+}
+
+/// Direct branch and call targets that leave the function they are in, as its final extent has it, and land in
+/// no function, sorted: starts the discovery walk took for labels of a function whose extent was not cut yet (a
+/// thunk's `jmp` to code past the padding, before the next start was known). The lifted code reaches them through
+/// the dispatcher, which has nothing there. The second list is such targets inside another function (a jump into
+/// the middle of it), for the record: a start there is not taken as a seed.
+pub fn escaping_targets(img: &Image, funcs: &[Func]) -> (Vec<u32>, Vec<u32>) {
+    let mut sorted: Vec<Func> = funcs.to_vec();
+    sorted.sort_by_key(|f| f.begin);
+    let starts: BTreeSet<u32> = sorted.iter().map(|f| f.begin).collect();
+    let (mut free, mut inside) = (BTreeSet::new(), BTreeSet::new());
+    for f in &sorted {
+        // Every instruction of the extent, not only the ones a walk from the start reaches: the cases of a switch
+        // (reached through its table) hold tail calls of their own, and the discovery walk stops at the `jmp reg`.
+        for t in sweep(img, f.begin, f.end) {
+            if !img.is_exec(t) || starts.contains(&t) || (t >= f.begin && t < f.end) {
+                continue;
+            }
+            if covering(&sorted, t) {
+                inside.insert(t);
+            } else {
+                free.insert(t);
+            }
+        }
+    }
+    (free.into_iter().collect(), inside.into_iter().collect())
+}
+
 /// All functions: `.pdata` entries plus discovered leaf functions and thunks.
 pub fn discover(img: &Image) -> anyhow::Result<Vec<Func>> {
     discover_with(img, &[])

@@ -104,6 +104,26 @@ fn main() -> Result<()> {
                 println!("jmp at {:#x}: table {:#x}, {} targets, not instruction starts: {bad:?}", t.jmp_rva, t.table_rva, t.targets.len());
             }
         }
+        "escapes" => {
+            // Starts to feed back as extra seeds (`lift-split ... <seeds>`): direct targets that leave their function
+            // and land in none. `escapes <pe> [seeds]`, the seeds file the build uses so far.
+            let extra: Vec<u32> = match args.get(3) {
+                Some(f) => std::fs::read_to_string(f)?
+                    .lines()
+                    .filter_map(|l| u32::from_str_radix(l.trim().trim_start_matches("0x"), 16).ok())
+                    .collect(),
+                None => vec![],
+            };
+            let funcs = victory_recomp::discover::discover_with(&img, &extra)?;
+            let (free, inside) = victory_recomp::discover::escaping_targets(&img, &funcs);
+            eprintln!("{} targets in no function, {} into the middle of one", free.len(), inside.len());
+            for t in free {
+                println!("{t:#x}");
+            }
+            for t in inside {
+                eprintln!("into a function: {t:#x}");
+            }
+        }
         "jmpshapes" => {
             for (k, v) in victory_recomp::unresolved_jmp_shapes(&img)?.iter().take(25) {
                 println!("{v:>6}  {k}");
