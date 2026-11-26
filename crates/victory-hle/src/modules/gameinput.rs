@@ -66,7 +66,7 @@ const POLL: Duration = Duration::from_millis(8);
 /// the mouse is the right stick and its buttons the triggers, and a few more
 /// keys sit where a PC player looks for them: left Shift A (sprint), R B,
 /// G Y (get in), left Control the left stick's click (crouch).
-const FALLBACK_BUTTONS: [(u8, u32); 18] = [
+const FALLBACK_BUTTONS: [(u8, u32); 20] = [
     (0x09, MENU), // Tab
     (b'V', VIEW),
     (0x0D, A),    // Enter
