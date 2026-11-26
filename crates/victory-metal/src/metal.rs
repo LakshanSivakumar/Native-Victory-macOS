@@ -29,6 +29,8 @@ pub struct Metal {
 
 /// Slots of the clamped group counts (16 bytes each), used in turn.
 pub(crate) const CLAMP_SLOTS: usize = 1 << 16;
+/// The buffer index of the group-count kernel's source (and the next, its slot).
+pub(crate) const CLAMP_SOURCE: usize = 29;
 
 impl Metal {
     /// The kernel that copies an indirect dispatch's three group counts into a slot of its own,
@@ -41,7 +43,7 @@ impl Metal {
     ) -> Option<(&ProtocolObject<dyn MTLComputePipelineState>, &ProtocolObject<dyn MTLBuffer>, usize)> {
         let made = self.clamp.get_or_init(|| {
             let src = "#include <metal_stdlib>\nusing namespace metal;\n\
-                kernel void victory_clamp_groups(device const uint* s [[buffer(0)]], device uint* d [[buffer(1)]]) {\n\
+                kernel void victory_clamp_groups(device const uint* s [[buffer(29)]], device uint* d [[buffer(30)]]) {\n\
                   uint x = s[0], y = s[1], z = s[2];\n\
                   ulong n = ulong(x) * ulong(y) * ulong(z);\n\
                   bool bad = x > 65535u || y > 65535u || z > 65535u || n > (1ul << 22);\n\

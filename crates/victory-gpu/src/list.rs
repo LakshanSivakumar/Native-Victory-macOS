@@ -1974,8 +1974,13 @@ extern "system" fn execute_indirect(
     }
     // The native host: dispatches whose count is not in a buffer, each execution's group
     // counts read by the GPU at its argument record.
+    // `VICTORY_INDIRECT_DISPATCH=0`: dropped as before (for comparisons).
+    #[cfg(target_os = "macos")]
+    static INDIRECT_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("VICTORY_INDIRECT_DISPATCH").as_deref() != Ok("0"));
     #[cfg(target_os = "macos")]
     if let ([[kind, ..]], Some(address)) = (args, address)
+        && *INDIRECT_ON
         && (*kind == 2 || *kind == 105)
         && count.is_null()
         && max <= 4096

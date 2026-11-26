@@ -985,10 +985,13 @@ impl Metal {
             let checked = match d.indirect {
                 Some((b, title)) => self.clamp_groups().map(|(clamp, slots, at)| {
                     e.setComputePipelineState(clamp);
+                    // Bound at slots no converted shader uses (0 and 1 are the converter's
+                    // descriptor heaps: a shader that reads a heap the host does not bind would
+                    // find these buffers there).
                     // SAFETY: the argument record is three u32s at that offset; the slot is 16 bytes.
                     unsafe {
-                        e.setBuffer_offset_atIndex(Some(&*b.buf), title as usize - b.base as usize, 0);
-                        e.setBuffer_offset_atIndex(Some(slots), at, 1);
+                        e.setBuffer_offset_atIndex(Some(&*b.buf), title as usize - b.base as usize, crate::metal::CLAMP_SOURCE);
+                        e.setBuffer_offset_atIndex(Some(slots), at, crate::metal::CLAMP_SOURCE + 1);
                     }
                     let one = size([1, 1, 1]);
                     e.dispatchThreadgroups_threadsPerThreadgroup(one, one);
