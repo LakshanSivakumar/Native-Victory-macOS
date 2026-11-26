@@ -171,6 +171,7 @@ impl<B: PresentBackend> Title<B> {
                     pso,
                     threads,
                     binding: Some(binding),
+                    name: name.to_string(),
                 }))
             }
             Err(e) => {

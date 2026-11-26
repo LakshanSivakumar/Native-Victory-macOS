@@ -533,6 +533,8 @@ pub struct PassSubmission<'a, B: GraphicsBackend + ?Sized> {
     pub waits: &'a [(&'a B::Fence, u64)],
     pub passes: &'a [Pass<'a, B>],
     pub signals: &'a [(&'a B::Fence, u64)],
+    /// What the work is, for the GPU's error reports (the command buffer's label).
+    pub label: Option<&'a str>,
 }
 
 pub trait GraphicsBackend: ResourceBackend {

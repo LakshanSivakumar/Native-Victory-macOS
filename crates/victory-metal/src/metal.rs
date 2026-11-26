@@ -247,6 +247,7 @@ impl ComputeBackend for Metal {
                 waits: work.waits,
                 passes: &[Pass::Compute(work.dispatches)],
                 signals: work.signals,
+                label: None,
             },
         )
     }

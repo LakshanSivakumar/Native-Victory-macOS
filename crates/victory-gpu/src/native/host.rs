@@ -200,6 +200,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pso: self.backend.create_compute_pipeline(dxil)?,
             threads,
             binding: None,
+            name: String::new(),
         }))
     }
 
@@ -1153,12 +1154,30 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
             });
         }
+        // The command buffer's label: the compute shaders it runs (a GPU hang names its buffer).
+        let mut names: Vec<&str> = Vec::new();
+        let mut draws = 0usize;
+        for c in &cmds {
+            match c {
+                Cmd::Dispatch { pso, .. } if !pso.name.is_empty() && !names.contains(&pso.name.as_str()) => {
+                    names.push(&pso.name);
+                }
+                Cmd::Draw { .. } => draws += 1,
+                _ => {}
+            }
+        }
+        let label = format!(
+            "{} commands, {draws} draws; {}",
+            cmds.len(),
+            names[..names.len().min(40)].join(", ")
+        );
         self.backend.submit_passes(
             queue,
             &PassSubmission {
                 waits,
                 passes: &passes,
                 signals,
+                label: Some(&label),
             },
         )
     }

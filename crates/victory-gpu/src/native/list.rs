@@ -143,6 +143,8 @@ pub struct ComputePso<B: GraphicsBackend> {
     pub pso: B::Pipeline,
     pub threads: [usize; 3],
     pub binding: Option<Binding>,
+    /// The title shader's name ("compute <hash>"), for error reports.
+    pub name: String,
 }
 
 /// One root parameter as the title set it.

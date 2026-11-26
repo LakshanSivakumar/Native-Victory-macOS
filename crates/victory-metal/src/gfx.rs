@@ -769,6 +769,9 @@ impl GraphicsBackend for Metal {
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
         let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
+        if let Some(l) = work.label {
+            cb.setLabel(Some(&objc2_foundation::NSString::from_str(l)));
+        }
         for (f, v) in work.waits {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
         }
@@ -816,7 +819,11 @@ impl GraphicsBackend for Metal {
             if let Some(e) = done.error()
                 && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20
             {
-                eprintln!("metal: command buffer failed: {e:?} ({})", e.localizedDescription());
+                eprintln!(
+                    "metal: command buffer failed: {} [{}]",
+                    e.localizedDescription(),
+                    done.label().map(|l| l.to_string()).unwrap_or_default()
+                );
             }
             // GPU time, for the window's figures.
             let secs = done.GPUEndTime() - done.GPUStartTime();

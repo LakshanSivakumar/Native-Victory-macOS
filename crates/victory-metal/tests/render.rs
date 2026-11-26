@@ -153,6 +153,7 @@ impl<'a> Scene<'a> {
                     waits: &[],
                     passes,
                     signals: &[(&f, 1)],
+                    label: None,
                 },
             )
             .unwrap();
