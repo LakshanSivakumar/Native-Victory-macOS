@@ -857,7 +857,7 @@ mod tests {
         };
 
         #[unsafe(naked)]
-        extern "win64" fn start(_end: usize) -> u32 {
+        extern "efiapi" fn start(_end: usize) -> u32 {
             core::arch::naked_asm!(
                 "sub rsp, 40",
                 "mov rax, rcx",

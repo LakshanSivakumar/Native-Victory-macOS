@@ -40,9 +40,26 @@ fragment float4 present_fragment(Out in [[stage_in]], texture2d<float> source [[
 
 type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
+// CAMetalLayer supports drawable acquisition on a background rendering thread. Only the
+// worker calls nextDrawable; ownership of each retained drawable crosses the channel once.
+struct AcquisitionLayer(Retained<CAMetalLayer>);
+// SAFETY: the retained layer is used only for thread-safe drawable acquisition on the worker.
+unsafe impl Send for AcquisitionLayer {}
+struct Drawable(Retained<ProtocolObject<dyn CAMetalDrawable>>);
+// SAFETY: Metal drawables may cross rendering threads; the channel transfers ownership.
+unsafe impl Send for Drawable {}
+
+impl AcquisitionLayer {
+    fn next(&self) -> Option<Drawable> {
+        self.0.nextDrawable().map(Drawable)
+    }
+}
+
 /// A `CAMetalLayer` presented to.
 pub struct Surface {
-    layer: Retained<CAMetalLayer>,
+    acquisition: std::sync::mpsc::Sender<()>,
+    drawables: std::sync::mpsc::Receiver<Option<Drawable>>,
+    acquiring: std::cell::Cell<bool>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     /// The copy pipeline for each drawable format seen.
     pipelines: RefCell<HashMap<usize, Pipeline>>,
@@ -63,7 +80,29 @@ impl Surface {
     pub fn read_last(&self) -> Option<(usize, usize, Vec<u8>)> {
         let t = self.last.borrow().clone()?;
         let (w, h) = (t.width(), t.height());
-        let mut out = vec![0u8; w * h * 4];
+        // Bytes a texel of the presented texture holds: the read must be given rows that long
+        // (4-byte rows of an 8-byte texture made Metal write past the buffer, into the host heap
+        // where the title's own objects are: half-float texels over their pointers).
+        let texel = t.pixelFormat();
+        let bytes = if texel == MTLPixelFormat::RGBA16Float {
+            8
+        } else if texel == MTLPixelFormat::RGBA32Float {
+            16
+        } else if [
+            MTLPixelFormat::BGRA8Unorm,
+            MTLPixelFormat::BGRA8Unorm_sRGB,
+            MTLPixelFormat::RGBA8Unorm,
+            MTLPixelFormat::RGBA8Unorm_sRGB,
+            MTLPixelFormat::RGB10A2Unorm,
+            MTLPixelFormat::BGR10A2Unorm,
+        ]
+        .contains(&texel)
+        {
+            4
+        } else {
+            return None;
+        };
+        let mut out = vec![0u8; w * h * bytes];
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize {
@@ -72,14 +111,30 @@ impl Surface {
                 depth: 1,
             },
         };
-        // SAFETY: `out` holds `h` rows of `w * 4` bytes, the region's size.
+        // SAFETY: `out` holds `h` rows of `w * bytes` bytes, the region at the texture's size.
         unsafe {
             t.getBytes_bytesPerRow_fromRegion_mipmapLevel(
                 std::ptr::NonNull::new(out.as_mut_ptr().cast())?,
-                w * 4,
+                w * bytes,
                 region,
                 0,
             )
+        };
+        // Four bytes a pixel for the caller: wider texels clamped to 0..1 and scaled.
+        let out = match bytes {
+            4 => out,
+            8 => out
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| (half_to_f32(u16::from_le_bytes(*c)).clamp(0.0, 1.0) * 255.0) as u8)
+                .collect(),
+            _ => out
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| (f32::from_le_bytes(*c).clamp(0.0, 1.0) * 255.0) as u8)
+                .collect(),
         };
         Some((w, h, out))
     }
@@ -123,7 +178,7 @@ fn pipeline(
     surface: &Surface,
     format: MTLPixelFormat,
 ) -> Result<Pipeline, String> {
-    if let Some(p) = surface.pipelines.borrow().get(&(format.0 as usize)) {
+    if let Some(p) = surface.pipelines.borrow().get(&format.0) {
         return Ok(p.clone());
     }
     let d = MTLRenderPipelineDescriptor::new();
@@ -141,7 +196,7 @@ fn pipeline(
         .dev
         .newRenderPipelineStateWithDescriptor_error(&d)
         .map_err(|e| e.localizedDescription().to_string())?;
-    surface.pipelines.borrow_mut().insert(format.0 as usize, p.clone());
+    surface.pipelines.borrow_mut().insert(format.0, p.clone());
     Ok(p)
 }
 
@@ -161,8 +216,21 @@ impl PresentBackend for Metal {
             .dev
             .newLibraryWithSource_options_error(&NSString::from_str(SHADER), None)
             .map_err(|e| e.localizedDescription().to_string())?;
+        let (acquisition, requests) = std::sync::mpsc::channel();
+        let (results, drawables) = std::sync::mpsc::sync_channel(1);
+        let layer = AcquisitionLayer(layer);
+        std::thread::Builder::new().name("victory drawables".into()).spawn(move || {
+            while requests.recv().is_ok() {
+                let drawable = objc2::rc::autoreleasepool(|_| layer.next());
+                if results.send(drawable).is_err() {
+                    break;
+                }
+            }
+        }).map_err(|e| e.to_string())?;
         Ok(Surface {
-            layer,
+            acquisition,
+            drawables,
+            acquiring: std::cell::Cell::new(false),
             library,
             pipelines: RefCell::default(),
             last: RefCell::default(),
@@ -176,34 +244,109 @@ impl PresentBackend for Metal {
         surface: &Surface,
         source: &Texture,
     ) -> Result<(), String> {
-        let drawable = surface.layer.nextDrawable().ok_or("no drawable")?;
-        let target = drawable.texture();
-        // An sRGB source is shown as the bytes it holds when the layer is not sRGB (the title's
-        // swap chain holds display values).
-        let src = source.view_without_srgb(self);
-        let pass = MTLRenderPassDescriptor::new();
-        // SAFETY: colour attachment 0 always exists.
-        let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
-        a.setTexture(Some(&target));
-        a.setLoadAction(MTLLoadAction::DontCare);
-        a.setStoreAction(MTLStoreAction::Store);
-        let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
-        let e = cb
-            .renderCommandEncoderWithDescriptor(&pass)
-            .ok_or("no render encoder")?;
-        let state = pipeline(self, surface, target.pixelFormat())?;
-        e.setRenderPipelineState(&state);
-        // SAFETY: slot 0 of the fragment stage takes the source texture.
-        unsafe { e.setFragmentTexture_atIndex(Some(&src), 0) };
-        // SAFETY: three vertices, no buffers.
-        unsafe {
-            e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
+        // Standalone backend callers may block, but an unavailable drawable must not keep
+        // them here forever. The title pump uses try_present instead and never sleeps.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if self.try_present(queue, surface, source)? {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out waiting for a drawable".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn try_present(&self, queue: &Queue, surface: &Surface, source: &Texture) -> Result<bool, String> {
+        if !surface.acquiring.replace(true) {
+            surface.acquisition.send(()).map_err(|_| "drawable worker stopped")?;
+        }
+        let drawable = match surface.drawables.try_recv() {
+            Ok(drawable) => {
+                surface.acquiring.set(false);
+                drawable.ok_or("no drawable")?.0
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
+            Err(_) => return Err("drawable worker stopped".into()),
         };
-        e.endEncoding();
-        cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
-        cb.commit();
-        *surface.last.borrow_mut() = Some(target);
-        surface.frames.set(surface.frames.get() + 1);
-        Ok(())
+        objc2::rc::autoreleasepool(|_| {
+            let target = drawable.texture();
+            // An sRGB source is shown as the bytes it holds when the layer is not sRGB (the title's
+            // swap chain holds display values).
+            let src = source.view_without_srgb(self);
+            let pass = MTLRenderPassDescriptor::new();
+            // SAFETY: colour attachment 0 always exists.
+            let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            a.setTexture(Some(&target));
+            a.setLoadAction(MTLLoadAction::DontCare);
+            a.setStoreAction(MTLStoreAction::Store);
+            let cb = queue.0.commandBuffer().ok_or("no command buffer")?;
+            let e = cb
+                .renderCommandEncoderWithDescriptor(&pass)
+                .ok_or("no render encoder")?;
+            let state = pipeline(self, surface, target.pixelFormat())?;
+            e.setRenderPipelineState(&state);
+            // SAFETY: slot 0 of the fragment stage takes the source texture.
+            unsafe { e.setFragmentTexture_atIndex(Some(&src), 0) };
+            // SAFETY: three vertices, no buffers.
+            unsafe {
+                e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3)
+            };
+            e.endEncoding();
+            cb.presentDrawable(ProtocolObject::from_ref(&*drawable));
+            cb.commit();
+            *surface.last.borrow_mut() = Some(target);
+            surface.frames.set(surface.frames.get() + 1);
+            Ok(true)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::ComputeBackend;
+    use crate::resources::{Format, ResourceBackend, TextureDesc};
+
+    #[test]
+    fn blocking_present_times_out_when_acquisition_never_returns() {
+        let Ok(metal) = Metal::new() else { return };
+        let layer = metal.create_layer(4, 4);
+        let mut surface = metal.create_surface(layer.as_ptr()).unwrap();
+        let queue = metal.create_queue().unwrap();
+        let source = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap();
+        // A connected acquisition worker that never produces a drawable. Disconnect after
+        // four seconds as a test watchdog, so removing the deadline fails rather than hangs.
+        let (requests, _requests_rx) = std::sync::mpsc::channel();
+        let (results, drawables) = std::sync::mpsc::channel();
+        surface.acquisition = requests;
+        surface.drawables = drawables;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            drop(results);
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(metal.present(&queue, &surface, &source).unwrap_err(), "timed out waiting for a drawable");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert_eq!(surface.frames(), 0);
+    }
+}
+
+/// An IEEE half's value.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = (h >> 10) & 0x1f;
+    let frac = f32::from(h & 0x3ff);
+    sign * match exp {
+        0 => frac * 2f32.powi(-24),
+        31 => {
+            if frac == 0.0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        e => (1.0 + frac / 1024.0) * 2f32.powi(i32::from(e) - 15),
     }
 }

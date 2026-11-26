@@ -26,6 +26,10 @@ pub struct FuncIn<'a> {
     /// function gets a frame record and an entry at each, so the host can drop the frames below it and
     /// continue there with the registers of the unwound context (`docs/recompiler.md`, "Exceptions").
     pub landing_pads: Vec<u64>,
+    /// Addresses inside the function that code outside it jumps or calls to directly (hand-written CRT routines
+    /// share their tails): VAs of its instructions. Each gets a function of its own, `f_<rva>`, the same body
+    /// entered there. (Not with landing pads: such functions have none.)
+    pub entries: Vec<u64>,
 }
 
 impl FuncIn<'_> {
@@ -59,13 +63,15 @@ pub fn lift_part(ctx: &Ctx, funcs: &[FuncIn]) -> Unit {
                 u.lifted.push(f.begin_va);
             }
             Err(e) => {
-                let _ = writeln!(
-                    body,
-                    "void {}(Cpu *c) {{ (void)c; rt_trap(\"unlifted function {:#x}: {}\"); }}",
-                    name(f.begin_va, ctx.image_base),
-                    f.begin_va - ctx.image_base,
-                    e.replace('"', "'")
-                );
+                for va in std::iter::once(f.begin_va).chain(f.entries.iter().copied()) {
+                    let _ = writeln!(
+                        body,
+                        "void {}(Cpu *c) {{ (void)c; rt_trap(\"unlifted function {:#x}: {}\"); }}",
+                        name(va, ctx.image_base),
+                        f.begin_va - ctx.image_base,
+                        e.replace('"', "'")
+                    );
+                }
                 body.push_str(&pad_defs(ctx, f));
                 u.failed.push((f.begin_va, e));
             }
@@ -193,9 +199,52 @@ struct L<'a> {
     y: bool,
     /// Addresses of this function's instructions: the only valid `goto` targets.
     ips: std::collections::HashSet<u64>,
+    /// Stack reads that are shared accesses all the same ([`spin_reads`]).
+    spin: std::collections::HashSet<u64>,
+    /// The cases of the function's tables of addresses, which its `JT` switch takes.
+    jt: BTreeSet<u64>,
 }
 
 type R<T> = Result<T, String>;
+
+/// Reads of a fixed stack slot (`[rsp + d]`) in a polling loop: a short loop that only reads memory and tests what
+/// it read (loads, compares, branches; no call, no store, no register arithmetic, so nothing of its own changes from
+/// one turn to the next). Only another thread can end it: a waiter spins on a counter it handed out by address
+/// (rva 0x9dd0da: workers `lock inc` it, the waiter does `mov eax, [rsp + 0x48]` / `cmp eax, 8` / `jne` back), and
+/// as a plain access clang takes the read as loop-invariant and the loop as endless (`b .`). These are emitted as
+/// shared accesses, which it must repeat (and which order what follows them, as the spin's exit must). (A loop
+/// with `pause` keeps its reads in any case: `pause` is a compiler barrier.)
+fn spin_reads(ins: &[Instruction]) -> std::collections::HashSet<u64> {
+    use iced_x86::FlowControl as FC;
+    let at: std::collections::HashMap<u64, usize> = ins.iter().enumerate().map(|(k, i)| (i.ip(), k)).collect();
+    let mut out = std::collections::HashSet::new();
+    for (b, j) in ins.iter().enumerate() {
+        if !matches!(j.flow_control(), FC::ConditionalBranch | FC::UnconditionalBranch) || j.op0_kind() != OpKind::NearBranch64 {
+            continue;
+        }
+        let t = j.near_branch_target();
+        let Some(&s) = at.get(&t).filter(|_| t <= j.ip()) else { continue };
+        let body = &ins[s..=b];
+        let polls = body.len() <= 16
+            && body.iter().all(|i| {
+                let load = matches!(i.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd)
+                    && i.op0_kind() == OpKind::Register
+                    && i.op1_kind() == OpKind::Memory;
+                load || matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Nop)
+                    || matches!(i.flow_control(), FC::ConditionalBranch | FC::UnconditionalBranch)
+                        && i.op0_kind() == OpKind::NearBranch64
+            });
+        if polls {
+            out.extend(
+                body.iter()
+                    .filter(|i| i.memory_base() == Register::RSP && i.memory_index() == Register::None)
+                    .filter(|i| (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory))
+                    .map(|i| i.ip()),
+            );
+        }
+    }
+    out
+}
 
 fn gpr(r: Register) -> R<(usize, u32, bool)> {
     if !r.is_gpr() {
@@ -731,7 +780,7 @@ impl L<'_> {
     fn insn(&mut self, i: &Instruction, labels: &BTreeSet<u64>) -> R<()> {
         let start = self.o.len();
         self.insn_inner(i, labels)?;
-        let local = i.segment_prefix() == Register::GS || i.memory_base() == Register::RSP;
+        let local = (i.segment_prefix() == Register::GS || i.memory_base() == Register::RSP) && !self.spin.contains(&i.ip());
         if !local && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory) {
             let tail = shared_accesses(&self.o[start..]);
             self.o.truncate(start);
@@ -760,7 +809,10 @@ impl L<'_> {
             return Ok(());
         }
         match m {
-            M::Nop | M::Pause => {}
+            M::Nop => {}
+            // A spin-wait hint: ARM's own, and a compiler barrier, so a waiting loop reads memory again on every turn
+            // (clang would otherwise keep a plain read of a loop that writes nothing in a register, and spin forever).
+            M::Pause => self.emit("__asm__ volatile(\"yield\" ::: \"memory\");"),
             M::Mfence | M::Sfence | M::Lfence => self.emit("__atomic_thread_fence(__ATOMIC_SEQ_CST);"),
             M::Int3 | M::Ud2 => self.emit("rt_trap(\"int3/ud2\");"),
             M::Mov => {
@@ -1004,10 +1056,23 @@ impl L<'_> {
                 }
                 _ => {
                     let t = self.rd(i, 0, 64)?;
-                    self.emit(&format!(
-                        "{{ u64 t = {t}; {}; rt_dispatch(c, t); return; }}",
-                        self.sp()
-                    ));
+                    let cases: Vec<u64> = self
+                        .f
+                        .tables
+                        .get(&i.ip())
+                        .map(|ts| ts.iter().copied().filter(|t| self.ips.contains(t)).collect())
+                        .unwrap_or_default();
+                    if cases.is_empty() {
+                        self.emit(&format!(
+                            "{{ u64 t = {t}; {}; rt_dispatch(c, t); return; }}",
+                            self.sp()
+                        ));
+                    } else {
+                        // `jmp [base + 8*idx]` through a table of addresses: an interpreter's dispatch, at the end of
+                        // each of its handlers. One switch for the function, after its body (`JT`, [`lift_core`]).
+                        self.jt.extend(cases);
+                        self.emit(&format!("{{ jt = {t}; goto JT; }}"));
+                    }
                 }
             },
             _ if i.flow_control() == iced_x86::FlowControl::ConditionalBranch => {
@@ -1084,6 +1149,7 @@ pub fn lift_function(ctx: &Ctx, f: &FuncIn) -> Result<String, String> {
                 tables: f.tables.clone(),
                 extra: f.extra.clone(),
                 landing_pads: f.landing_pads.clone(),
+                entries: f.entries.clone(),
             };
             let (o, errs) = lift_core(ctx, &pruned, false);
             match errs.into_iter().next() {
@@ -1103,6 +1169,7 @@ fn reachable(f: &FuncIn) -> std::collections::HashSet<u64> {
     let mut seen = std::collections::HashSet::new();
     let mut work: Vec<u64> = vec![f.begin_va];
     work.extend(f.landing_pads.iter().copied());
+    work.extend(f.entries.iter().copied());
     work.extend(f.extra.iter().map(|&(b, _)| b));
     while let Some(ip) = work.pop() {
         let Some(&k) = at.get(&ip) else { continue };
@@ -1163,6 +1230,9 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     }
     let pads: Vec<u64> = f.landing_pads.iter().copied().filter(|p| ipset.contains(p)).collect();
     labels.extend(pads.iter().copied());
+    // Every entry must get its function (the dispatch table names it): one that is no instruction here traps.
+    let entries: Vec<u64> = if pads.is_empty() { f.entries.clone() } else { vec![] };
+    labels.extend(entries.iter().copied().filter(|e| ipset.contains(e)));
     // In a function with landing pads, a fault in the guarded code is recorded with every register (`c->rip`), and the
     // instruction is a resume point too: an exception handler that continues execution re-runs it with the registers it
     // chose. (EFLAGS are not carried: the lifted flags start clean, which an instruction reading them would notice.)
@@ -1181,11 +1251,23 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         o: String::new(),
         y,
         ips: f.ins.iter().map(|i| i.ip()).collect(),
+        spin: spin_reads(f.ins),
+        jt: BTreeSet::new(),
     };
     let mut errs = vec![];
-    let prologue = if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" };
+    let mut prologue = String::from(if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" });
+    // A dispatch through a table of addresses (`jmp [base + 8*idx]`) passes the address to the `JT` switch in `jt`.
+    if f.ins.iter().any(|i| {
+        i.code() == iced_x86::Code::Jmp_rm64
+            && i.op0_kind() == OpKind::Memory
+            && f.tables.get(&i.ip()).is_some_and(|ts| ts.iter().any(|t| ipset.contains(t)))
+    }) {
+        prologue.push_str("; u64 jt = 0; (void)jt");
+    }
+    let mut body_at = 0;
     if pads.is_empty() {
         let _ = writeln!(l.o, "void {}(Cpu *c) {{ {prologue};", name(f.begin_va, ctx.image_base));
+        body_at = l.o.len();
     } else {
         // The body takes `resume`: set when the host unwound to this frame, with the landing pad in
         // `rt_resume_va` and the registers in `c`, which the prologue loads as always.
@@ -1223,8 +1305,46 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         }
     }
     // Falling off the end of a function is only legal after a non-returning call.
-    l.o.push_str("rt_trap(\"fell off end of function\"); }\n");
+    if l.jt.is_empty() {
+        l.o.push_str("rt_trap(\"fell off end of function\"); }\n");
+    } else {
+        // The function's dispatch through its tables of addresses (`jt`, the address read); one not among the
+        // cases (no instruction here) goes to the dispatcher, as an untabled jump would.
+        let mut sw = String::from("rt_trap(\"fell off end of function\");\nJT:; switch (jt - (u64)IMG + IMAGE_BASE) { ");
+        for t in &l.jt {
+            let _ = write!(sw, "case {t:#x}ull: goto L_{t:x}; ");
+        }
+        let _ = writeln!(sw, "default: {{ {}; rt_dispatch(c, jt); return; }} }}\n}}", l.sp());
+        l.o.push_str(&sw);
+    }
+    if !entries.is_empty() {
+        // The same body for each inner entry, entered at its label (the prologue loads every register as at the
+        // start; nothing of the body before the label has run, as for the guest).
+        let body = l.o[body_at..].to_string();
+        for &e in &entries {
+            if ipset.contains(&e) {
+                let _ = write!(l.o, "void {}(Cpu *c) {{ {prologue};\ngoto L_{e:x};\n{body}", name(e, ctx.image_base));
+            } else {
+                let _ = writeln!(
+                    l.o,
+                    "void {}(Cpu *c) {{ (void)c; rt_trap(\"entry {:#x} is inside an instruction of {:#x}\"); }}",
+                    name(e, ctx.image_base),
+                    e - ctx.image_base,
+                    f.begin_va - ctx.image_base
+                );
+            }
+        }
+    }
     if !pads.is_empty() {
+        for &e in &f.entries {
+            let _ = writeln!(
+                l.o,
+                "void {}(Cpu *c) {{ (void)c; rt_trap(\"entry {:#x} into {:#x}, a function with landing pads\"); }}",
+                name(e, ctx.image_base),
+                e - ctx.image_base,
+                f.begin_va - ctx.image_base
+            );
+        }
         let (n, rva) = (name(f.begin_va, ctx.image_base), f.begin_va - ctx.image_base);
         let _ = writeln!(
             l.o,
@@ -1233,4 +1353,161 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
     }
     l.o.push_str(&pad_defs(ctx, f));
     (l.o, errs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::code_asm::*;
+    use iced_x86::{BlockEncoderOptions, Decoder, DecoderOptions};
+
+    #[test]
+    fn an_inner_entry_is_the_body_entered_at_its_label() {
+        const BASE: u64 = 0x1_4000_0000;
+        let at = BASE + 0x1000;
+        let mut a = CodeAssembler::new(64).unwrap();
+        let mut tail = a.create_label();
+        a.mov(eax, 1).unwrap();
+        a.set_label(&mut tail).unwrap();
+        a.add(eax, 2).unwrap();
+        a.ret().unwrap();
+        let r = a.assemble_options(at, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+        let entry = r.label_ip(&tail).unwrap();
+        let bytes = r.inner.code_buffer;
+        let ins: Vec<Instruction> = Decoder::with_ip(64, &bytes, at, DecoderOptions::NONE).iter().collect();
+        let is_func = move |va: u64| va == at || va == entry;
+        let ctx = Ctx { image_base: BASE, is_func: &is_func };
+        let f = FuncIn {
+            begin_va: at,
+            end_va: at + bytes.len() as u64,
+            ins: &ins,
+            tables: BTreeMap::new(),
+            extra: vec![],
+            landing_pads: vec![],
+            entries: vec![entry],
+        };
+        let c = lift_function(&ctx, &f).unwrap();
+        assert!(c.contains(&format!("void f_{:x}(Cpu *c) {{", at - BASE)), "{c}");
+        assert!(c.contains(&format!("void f_{:x}(Cpu *c) {{", entry - BASE)), "{c}");
+        assert!(c.contains(&format!("goto L_{entry:x};")), "{c}");
+        // The label in both bodies.
+        assert_eq!(c.matches(&format!("L_{entry:x}:;")).count(), 2, "{c}");
+        // An entry that is no instruction start still gets its function, one that traps.
+        let f = FuncIn { entries: vec![entry + 1], ..f };
+        let c = lift_function(&ctx, &f).unwrap();
+        assert!(c.contains(&format!("void f_{:x}(Cpu *c) {{ (void)c; rt_trap(", entry + 1 - BASE)), "{c}");
+    }
+
+    #[test]
+    fn a_dispatch_through_a_table_of_addresses_goes_to_the_function_switch() {
+        const BASE: u64 = 0x1_4000_0000;
+        let at = BASE + 0x1000;
+        let mut a = CodeAssembler::new(64).unwrap();
+        let (mut dispatch, mut h0, mut h1) = (a.create_label(), a.create_label(), a.create_label());
+        a.set_label(&mut dispatch).unwrap();
+        a.movzx(ebx, byte_ptr(rsi)).unwrap();
+        a.jmp(qword_ptr(r12 + rbx * 8)).unwrap();
+        a.set_label(&mut h0).unwrap();
+        a.jmp(dispatch).unwrap();
+        a.set_label(&mut h1).unwrap();
+        a.ret().unwrap();
+        let r = a.assemble_options(at, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+        let (h0, h1) = (r.label_ip(&h0).unwrap(), r.label_ip(&h1).unwrap());
+        let bytes = r.inner.code_buffer;
+        let ins: Vec<Instruction> = Decoder::with_ip(64, &bytes, at, DecoderOptions::NONE).iter().collect();
+        let jmp = ins[1].ip();
+        let is_func = move |va: u64| va == at;
+        let ctx = Ctx { image_base: BASE, is_func: &is_func };
+        let f = FuncIn {
+            begin_va: at,
+            end_va: at + bytes.len() as u64,
+            ins: &ins,
+            tables: BTreeMap::from([(jmp, vec![h0, h1, BASE + 0x9000])]),
+            extra: vec![],
+            landing_pads: vec![],
+            entries: vec![],
+        };
+        let c = lift_function(&ctx, &f).unwrap();
+        assert!(c.contains("u64 jt = 0;"), "{c}");
+        assert!(c.contains("goto JT;"), "{c}");
+        assert!(c.contains(&format!("JT:; switch (jt - (u64)IMG + IMAGE_BASE) {{ case {h0:#x}ull: goto L_{h0:x}; case {h1:#x}ull: goto L_{h1:x}; default:")), "{c}");
+    }
+
+    fn lifted(build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> String {
+        const BASE: u64 = 0x1_4000_0000;
+        let at = BASE + 0x1000;
+        let mut a = CodeAssembler::new(64).unwrap();
+        build(&mut a).unwrap();
+        let bytes = a.assemble(at).unwrap();
+        let ins: Vec<Instruction> = Decoder::with_ip(64, &bytes, at, DecoderOptions::NONE).iter().collect();
+        let is_func = move |va: u64| va == at;
+        let ctx = Ctx { image_base: BASE, is_func: &is_func };
+        let f = FuncIn {
+            begin_va: at,
+            end_va: at + bytes.len() as u64,
+            ins: &ins,
+            tables: BTreeMap::new(),
+            extra: vec![],
+            landing_pads: vec![],
+            entries: vec![],
+        };
+        lift_function(&ctx, &f).unwrap()
+    }
+
+    #[test]
+    fn a_stack_slot_a_loop_spins_on_is_read_as_shared() {
+        // rva 0x9dd0da: the workers' counter, handed out by address, on the waiter's stack.
+        let c = lifted(|a| {
+            let mut spin = a.create_label();
+            a.mov(dword_ptr(rsp + 0x48), 0)?;
+            a.set_label(&mut spin)?;
+            a.mov(eax, dword_ptr(rsp + 0x48))?;
+            a.cmp(eax, 8)?;
+            a.jne(spin)?;
+            a.mov(ecx, dword_ptr(rsp + 0x50))?;
+            a.ret()
+        });
+        assert!(c.contains("r0 = (u32)((u64)sld32((u8*)(r4 + (u64)(s64)72ll)));"), "{c}");
+        // Outside the loop, and in one that writes the slot or calls, the stack stays plain.
+        assert!(c.contains("ld32((u8*)(r4 + (u64)(s64)80ll))") && !c.contains("sld32((u8*)(r4 + (u64)(s64)80ll))"), "{c}");
+        let c = lifted(|a| {
+            let mut again = a.create_label();
+            a.set_label(&mut again)?;
+            a.mov(eax, dword_ptr(rsp + 0x48))?;
+            a.inc(dword_ptr(rsp + 0x48))?;
+            a.cmp(eax, 8)?;
+            a.jne(again)?;
+            a.ret()
+        });
+        assert!(!c.contains("sld32"), "{c}");
+        let c = lifted(|a| {
+            let (mut again, mut callee) = (a.create_label(), a.create_label());
+            a.set_label(&mut again)?;
+            a.call(callee)?;
+            a.mov(eax, dword_ptr(rsp + 0x48))?;
+            a.cmp(eax, 8)?;
+            a.jne(again)?;
+            a.set_label(&mut callee)?;
+            a.ret()
+        });
+        assert!(!c.contains("sld32"), "{c}");
+        // A search: the loop counts (its own state changes), its reads are its business.
+        let c = lifted(|a| {
+            let mut again = a.create_label();
+            a.set_label(&mut again)?;
+            a.mov(rdx, qword_ptr(rsp + 0x28))?;
+            a.cmp(dword_ptr(rdx + rcx * 4), eax)?;
+            a.inc(rcx)?;
+            a.cmp(rcx, qword_ptr(rsp + 0x40))?;
+            a.jb(again)?;
+            a.ret()
+        });
+        assert!(!c.contains("sld64((u8*)(r4"), "{c}");
+        // `pause` is a compiler barrier.
+        let c = lifted(|a| {
+            a.pause()?;
+            a.ret()
+        });
+        assert!(c.contains("__asm__ volatile(\"yield\" ::: \"memory\");"), "{c}");
+    }
 }

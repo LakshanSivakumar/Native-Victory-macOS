@@ -7,8 +7,10 @@
 //! were made. A list segment that waits for a memory value another queue's list writes stays on
 //! the CPU side until the value is there (`hold.rs`; the GPU's own writes into title memory are
 //! visible to the CPU as they land, there is no copy); everything else goes to the GPU at once and
-//! is never waited for. Fence signals and waits that need no CPU decision are encoded on the GPU
-//! (`MTLSharedEvent`); behind held work they are held too, so that they stay in order.
+//! is never waited for. Fence signals that need no CPU decision are encoded on the GPU
+//! (`MTLSharedEvent`); behind held work they are held too, so that they stay in order. Fence
+//! waits stay on the CPU until the backend reports completion. A committed producer can be
+//! delayed or fail asynchronously; submission is not proof that an event will be signalled.
 
 use super::host::NativeHost;
 use super::list::{Binding, ComputePso, NativeList};
@@ -57,6 +59,10 @@ pub struct TitleList<B: GraphicsBackend> {
     pub topology: u32,
     /// The formats of the targets `OMSetRenderTargets` bound last.
     pub targets: TargetFormats,
+    /// Whether every target `OMSetRenderTargets` bound last has a host texture. When one has
+    /// none the binding is refused (a partial one would renumber the slots) and draws are
+    /// dropped until the title binds a set the host can make.
+    pub targets_ready: bool,
     /// The strides of the bound vertex buffers by slot, which a guessed pipeline is made from at
     /// its draw, and the title resources bound as targets (for the target trace).
     pub strides: Vec<u32>,
@@ -80,6 +86,7 @@ impl<B: GraphicsBackend> Default for TitleList<B> {
             pipeline: 0,
             topology: 0,
             targets: TargetFormats::default(),
+            targets_ready: true,
             strides: Vec::new(),
             target_keys: Vec::new(),
         }
@@ -141,6 +148,9 @@ pub enum Pipe<B: GraphicsBackend> {
     /// A guessed graphics pipeline (`VICTORY_GUESS_GRAPHICS`): made, per target formats and
     /// vertex strides, at its draws.
     Guess(Rc<Guessed<B>>),
+    /// A guessed graphics slot without a vertex producer.
+    #[cfg(target_os = "macos")]
+    Skipped,
     /// The host refused it (the reason is logged and counted once); work using it is dropped.
     Refused,
 }
@@ -151,6 +161,8 @@ impl<B: GraphicsBackend> Clone for Pipe<B> {
             Pipe::Compute(p) => Pipe::Compute(p.clone()),
             Pipe::Render(p, b) => Pipe::Render(p.clone(), b.clone()),
             Pipe::Guess(g) => Pipe::Guess(g.clone()),
+            #[cfg(target_os = "macos")]
+            Pipe::Skipped => Pipe::Skipped,
             Pipe::Refused => Pipe::Refused,
         }
     }
@@ -170,6 +182,12 @@ pub struct Guessed<B: GraphicsBackend> {
     pub made: std::cell::RefCell<HashMap<String, Pipe<B>>>,
 }
 
+/// An operation that must keep its place between list submissions in the held FIFO.
+enum QueuedAction<B: PresentBackend> {
+    Signal(Rc<B::Queue>, Rc<B::Fence>, u64),
+    Present(Rc<B::Queue>, Rc<B::Surface>, Rc<B::Texture>),
+}
+
 pub struct Title<B: PresentBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
@@ -182,15 +200,19 @@ pub struct Title<B: PresentBackend> {
     pub(super) libraries: super::shaders::Libraries<B>,
     pub(super) textures: super::textures::Textures<B>,
     /// Where `Present` shows frames, if the app gave a layer.
-    pub(super) surface: Option<B::Surface>,
+    pub(super) surface: Option<Rc<B::Surface>>,
     /// Title textures no view has named yet.
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
     held: Held<Rc<NativeList<B>>>,
-    /// Signals held behind work: the queue, fence and value, by the number the held item carries.
-    signals: HashMap<usize, (usize, usize, u64)>,
-    next_signal: usize,
+    /// Operations held behind work, indexed by the token in a FIFO Signal item.
+    actions: HashMap<usize, QueuedAction<B>>,
+    next_action: usize,
+    /// The highest value each fence was told to reach, and when that changed (diagnostics).
+    requested: HashMap<usize, (u64, std::time::Instant)>,
+    /// Unique wait tokens retain fence instances independently of title address reuse.
+    waiting: HashMap<usize, Rc<B::Fence>>,
     pub stats: Stats,
 }
 
@@ -207,9 +229,11 @@ impl<B: PresentBackend> Title<B> {
             pending: HashMap::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
+            requested: HashMap::new(),
+            waiting: HashMap::new(),
             held: Held::new(),
-            signals: HashMap::new(),
-            next_signal: 0,
+            actions: HashMap::new(),
+            next_action: 0,
             stats: Stats::default(),
         }
     }
@@ -236,6 +260,7 @@ impl<B: PresentBackend> Title<B> {
     /// The title released fence `key`.
     pub fn forget_fence(&mut self, key: usize) {
         self.fences.remove(&key);
+        self.requested.remove(&key);
     }
 
     /// The title released queue `key`; held work stays held (the title does not do it).
@@ -290,12 +315,15 @@ impl<B: PresentBackend> Title<B> {
     /// `ID3D12CommandQueue::Signal`: behind work the queue still holds, else on the GPU at once
     /// (after the work already submitted to its queue).
     pub fn signal_queue(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
+        let r = self.requested.entry(fence).or_insert((0, std::time::Instant::now()));
+        if value > r.0 {
+            *r = (value, std::time::Instant::now());
+        }
         if self.held.holds_work(queue) {
-            let n = self.next_signal;
-            self.next_signal += 1;
-            self.signals.insert(n, (queue, fence, value));
-            // Make the backend fence now: `initial` is its value until the signal runs.
-            let _ = self.fence(fence, initial);
+            let n = self.next_action;
+            self.next_action += 1;
+            let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else { return };
+            self.actions.insert(n, QueuedAction::Signal(q, f, value));
             self.held.push(queue, Item::Signal(n, 0));
         } else {
             self.signal_gpu(queue, fence, initial, value);
@@ -312,15 +340,14 @@ impl<B: PresentBackend> Title<B> {
         }
     }
 
-    /// `ID3D12CommandQueue::Wait`: later work on the queue starts once the fence has the value.
+    /// Queue waits remain on the CPU until completion, including committed producers.
     pub fn wait_queue(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
-        if self.held.holds_work(queue) {
-            let _ = self.fence(fence, initial);
-            self.held.push(queue, Item::FenceWait(fence, value));
-        } else if let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial))
-            && let Err(e) = self.host.execute(&q, &[], &[(&*f, value)], &[])
-        {
-            tracing::warn!(error = %e, "a fence wait was not queued");
+        let Ok(f) = self.fence(fence, initial) else { return };
+        if self.held.holds_work(queue) || self.host.backend.completed(&f) < value {
+            let token = self.next_action;
+            self.next_action += 1;
+            self.waiting.insert(token, f);
+            self.held.push(queue, Item::FenceWait(token, value));
         }
         self.pump();
     }
@@ -333,18 +360,18 @@ impl<B: PresentBackend> Title<B> {
         let Title {
             host,
             queues,
-            fences,
+            waiting,
             held,
-            signals,
+            actions,
             stats,
             ..
         } = self;
         let memory = host.memory();
         let read = |address: u64, bytes: u8| read_title(&memory, address, bytes);
         let fence = |f: usize| {
-            fences
+            waiting
                 .get(&f)
-                .map_or(u64::MAX, |fence| host.backend.completed(fence))
+                .map_or(0, |fence| host.backend.completed(fence))
         };
         let mut run = |queue: usize, lists: Vec<Rc<NativeList<B>>>| {
             stats.pieces += 1;
@@ -358,14 +385,23 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         let mut signal = |n: usize, _: u64| {
-            let Some((queue, fence, value)) = signals.remove(&n) else {
-                return;
-            };
-            if let (Some(q), Some(f)) = (queues.get(&queue), fences.get(&fence))
-                && let Err(e) = host.execute(q, &[], &[], &[(&**f, value)])
-            {
-                tracing::warn!(error = %e, "a held fence signal was not queued");
+            match actions.get(&n) {
+                Some(QueuedAction::Signal(q, f, value)) => {
+                    if let Err(e) = host.execute(q, &[], &[], &[(&**f, *value)]) {
+                        tracing::warn!(error = %e, "a held fence signal was not queued");
+                    }
+                }
+                Some(QueuedAction::Present(queue, surface, texture)) => {
+                    match host.backend.try_present(queue, surface, texture) {
+                        Ok(false) => return false,
+                        Ok(true) => {}
+                        Err(e) => tracing::warn!(error = %e, "a held present was not queued"),
+                    }
+                }
+                None => {}
             }
+            actions.remove(&n);
+            true
         };
         let done = held.pump(&mut World {
             read: &read,
@@ -374,18 +410,58 @@ impl<B: PresentBackend> Title<B> {
             signal: &mut signal,
         });
         stats.waited += done.waited.len() as u64;
+        waiting.retain(|token, _| held.waits_for(*token));
+    }
+
+    /// Queues whose head has been held longer than `limit`: a line each, with the waits that do
+    /// not hold (address, comparison, reference, mask, current value).
+    pub fn stuck(&self, limit: std::time::Duration) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .requested
+            .iter()
+            .filter_map(|(k, &(want, since))| {
+                let f = self.fences.get(k)?;
+                let done = self.host.backend.completed(f);
+                (done < want && since.elapsed() >= limit)
+                    .then(|| format!("fence {k:#x}: signal of {want} queued {:.1?} ago, GPU at {done}", since.elapsed()))
+            })
+            .collect();
+        let memory = self.host.memory();
+        let read = |address: u64, bytes: u8| read_title(&memory, address, bytes);
+        out.extend(self
+            .held
+            .blocked(&read)
+            .into_iter()
+            .filter(|(.., since, _)| *since >= limit)
+            .map(|(q, items, since, unmet)| {
+                let waits: Vec<String> = unmet
+                    .iter()
+                    .map(|w| {
+                        format!(
+                            "{:#x} cmp {} ref {:#x} mask {:#x} now {:?}",
+                            w.address,
+                            w.comparison,
+                            w.reference,
+                            w.mask,
+                            read(w.address, w.bytes)
+                        )
+                    })
+                    .collect();
+                format!("queue {q:#x}: {items} held, head for {since:.1?}, waits {waits:?}")
+            }));
+        out
     }
 
     /// Gives the host the app's drawable layer (`CAMetalLayer` on Metal, by address): frames the
     /// title presents are shown there from now on.
     pub fn set_surface(&mut self, layer: *mut std::ffi::c_void) -> Result<(), String> {
-        self.surface = Some(self.host.backend.create_surface(layer)?);
+        self.surface = Some(Rc::new(self.host.backend.create_surface(layer)?));
         Ok(())
     }
 
-    /// `PresentX`: title texture `key` shown over the surface, after the work queue `queue` has
-    /// been given. shortcut: not behind work the queue still holds back (the frame is shown as
-    /// far as it ran); `Ok(false)` when there is no surface or the title has no such texture.
+    /// `PresentX`: show title texture `key` after all earlier work on `queue`, including held
+    /// work. `Ok(true)` means accepted (possibly deferred); deferred errors are logged by pump.
+    /// `Ok(false)` when there is no surface or the title has no such texture.
     pub fn present(&mut self, queue: usize, key: usize) -> Result<bool, String> {
         self.pump();
         if self.surface.is_none() {
@@ -396,14 +472,18 @@ impl<B: PresentBackend> Title<B> {
         };
         let q = self.queue(queue)?;
         if let Some(surface) = &self.surface {
-            self.host.backend.present(&q, surface, &tex)?;
+            let n = self.next_action;
+            self.next_action += 1;
+            self.actions.insert(n, QueuedAction::Present(q, surface.clone(), tex));
+            self.held.push(queue, Item::Signal(n, 0));
         }
+        self.pump();
         Ok(true)
     }
 
     /// The surface presented to (to read the frame counter, say).
     pub fn surface(&self) -> Option<&B::Surface> {
-        self.surface.as_ref()
+        self.surface.as_deref()
     }
 
     /// Whether any queue holds work (a timer should test it again soon).
@@ -427,4 +507,52 @@ fn read_title(memory: &PoolTable, address: u64, bytes: u8) -> Option<u64> {
     };
     let mut v = [0u8; 8];
     crate::native::safe_read(at, &mut v[..n]).then(|| u64::from_le_bytes(v))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod scheduling_tests {
+    use super::*;
+    use victory_backend::backend::ComputeBackend;
+    use victory_metal::metal::Metal;
+
+    #[test]
+    fn a_wait_retains_its_fence_across_release_and_address_reuse() {
+        let Ok(metal) = Metal::new() else { return };
+        let mut title = Title::new(metal, Arc::new(PoolTable::default()));
+        title.ensure_queue(1).unwrap();
+        let old = title.fence(10, 0).unwrap();
+        let weak = Rc::downgrade(&old);
+        title.wait_queue(1, 10, 0, 5);
+        title.forget_fence(10);
+        drop(old);
+        assert!(weak.upgrade().is_some(), "queued wait owns the backend fence");
+        title.signal_cpu(10, 0, 5); // A new fence at the same title address.
+        assert!(title.held.holds_work(1), "the replacement must not satisfy the old wait");
+        title.host.backend.signal(&weak.upgrade().unwrap(), 5);
+        title.pump();
+        assert!(!title.held.holds_work(1));
+        assert!(weak.upgrade().is_none(), "completed waits release their retained fences");
+    }
+
+    #[test]
+    fn a_committed_producer_does_not_put_an_unsatisfied_wait_on_metal() {
+        let Ok(metal) = Metal::new() else { return };
+        let mut title = Title::new(metal, Arc::new(PoolTable::default()));
+        let producer = title.queue(1).unwrap();
+        title.ensure_queue(2).unwrap();
+        let gate = title.fence(10, 0).unwrap();
+        // Deliberately stall a backend producer. A title wait must stay CPU-side even after
+        // its signal commits; the same rule applies if this producer subsequently fails.
+        title.host.execute(&producer, &[], &[(&*gate, 1)], &[]).unwrap();
+        title.signal_queue(1, 20, 0, 7);
+        title.wait_queue(2, 20, 0, 7);
+        assert!(title.held.holds_work(2));
+        title.host.backend.signal(&gate, 1);
+        let start = std::time::Instant::now();
+        while title.held.holds_work(2) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(3));
+            title.pump();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 }

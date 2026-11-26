@@ -18,9 +18,16 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// View pairs of the pool-offset contract ([`super::addr`]) written into the heap's reserved
     /// entries so far.
     pub pairs: std::cell::Cell<usize>,
-    /// The page table built for this heap (its view indices are the heap's own) and the pool-table
-    /// generation it is current for.
-    pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
+    /// The page table of this heap (its view indices are the heap's own), kept current in place.
+    pub table: std::cell::RefCell<Option<super::addr::Table<B>>>,
+    /// The title record (tag, view index, generation) each entry was last mirrored from.
+    pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
+    /// The view-stride table translated shaders read as root SRV
+    /// `victory_shader::emit::VIEW_STRIDES`: a dword per entry up to `HEAP_VIEWS` (the element
+    /// size of the buffer view there, with the integer-format bits of a typed one; 0 for no
+    /// buffer view, where those shaders read the null view at `NULL_BUFFER_VIEW`). Resource heaps
+    /// with room for the null views at the end of `HEAP_VIEWS` only.
+    pub strides: Option<Rc<super::addr::Pages<B>>>,
 }
 
 /// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):
@@ -44,6 +51,10 @@ pub struct Binding {
     /// Some user data takes the heap index of a view of a root view's buffer (and the address's
     /// offset in it): the heap needs the view pairs.
     pub root_views: bool,
+    /// The shader's immediate samplers, as [`RootLayout::static_samplers`] declares them.
+    pub static_samplers: Vec<[u32; 10]>,
+    /// Minimum descriptor-table entries needed per `RootType::Table` root slot: `(slot, count)`.
+    pub table_entries: Vec<(u8, usize)>,
 }
 
 /// A root view's kind.
@@ -72,6 +83,21 @@ impl Binding {
                 u.root == victory_shader::RootType::Descriptor
                     && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
             }),
+            static_samplers: shader
+                .static_samplers
+                .iter()
+                .map(|s| {
+                    // Anisotropic filtering with a point mip filter becomes linear-mip, as on
+                    // D3D12 devices without it.
+                    let [u, v, w] = s.address;
+                    [s.filter_for_host(false), u, v, w, s.mip_lod_bias.to_bits(), s.max_anisotropy, s.comparison, s.border, s.min_lod.to_bits(), s.max_lod.to_bits()]
+                })
+                .collect(),
+            table_entries: shader
+                .table_entries
+                .iter()
+                .map(|&(slot, count)| (slot, count as usize))
+                .collect(),
         }
     }
 
@@ -102,10 +128,11 @@ impl Binding {
                 space: MEMORY_SPACE,
             });
         }
-        (!params.is_empty()).then_some(RootLayout {
+        (!params.is_empty() || !self.static_samplers.is_empty()).then(|| RootLayout {
             params,
             // Memory no mapped pool holds is read through a view of size 0.
             bounds_checked: true,
+            static_samplers: self.static_samplers.clone(),
         })
     }
 }
@@ -115,6 +142,8 @@ pub struct ComputePso<B: GraphicsBackend> {
     pub pso: B::Pipeline,
     pub threads: [usize; 3],
     pub binding: Option<Binding>,
+    /// The title shader's name ("compute <hash>"), for error reports.
+    pub name: String,
 }
 
 /// One root parameter as the title set it.
@@ -168,12 +197,17 @@ impl<B: GraphicsBackend> Targets<B> {
     }
 }
 
+/// Target and independent depth/stencil clear values (`None` preserves a plane).
+type DepthClear<T> = (Rc<T>, Option<f32>, Option<u8>);
+
 pub enum Cmd<B: GraphicsBackend> {
     Dispatch {
         pso: Rc<ComputePso<B>>,
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         groups: [usize; 3],
+        /// `ExecuteIndirect`: the title address of the group counts (`groups` unused).
+        indirect: Option<u64>,
     },
     Copy {
         dst: u64,
@@ -187,7 +221,7 @@ pub enum Cmd<B: GraphicsBackend> {
     },
     Clear {
         color: Option<(Rc<B::Texture>, [f32; 4])>,
-        depth: Option<(Rc<B::Texture>, f32)>,
+        depth: Option<DepthClear<B::Texture>>,
     },
     Draw {
         pso: Rc<B::RenderPipeline>,
@@ -211,11 +245,13 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 root,
                 heaps,
                 groups,
+                indirect,
             } => Cmd::Dispatch {
                 pso: pso.clone(),
                 root: root.clone(),
                 heaps: heaps.clone(),
                 groups: *groups,
+                indirect: *indirect,
             },
             Cmd::Copy { dst, src, len } => Cmd::Copy {
                 dst: *dst,
@@ -439,6 +475,25 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.compute_root.clone(),
             heaps: self.state.heaps.clone(),
             groups: [x as usize, y as usize, z as usize],
+            indirect: None,
+        });
+        Ok(())
+    }
+
+    /// A dispatch of `ExecuteIndirect`: the group counts are the three `u32`s at title address
+    /// `arguments`, read on the GPU when the work runs. Needs the compute pipeline set.
+    pub fn dispatch_indirect(&mut self, arguments: u64) -> Result<(), String> {
+        let pso = self
+            .state
+            .compute
+            .clone()
+            .ok_or("indirect dispatch without a compute pipeline")?;
+        self.cmds.push(Cmd::Dispatch {
+            pso,
+            root: self.state.compute_root.clone(),
+            heaps: self.state.heaps.clone(),
+            groups: [0; 3],
+            indirect: Some(arguments),
         });
         Ok(())
     }
@@ -471,10 +526,22 @@ impl<B: GraphicsBackend> NativeList<B> {
     }
 
     pub fn clear_depth(&mut self, target: &Rc<B::Texture>, depth: f32) {
-        self.cmds.push(Cmd::Clear {
-            color: None,
-            depth: Some((target.clone(), depth)),
-        });
+        self.clear_depth_stencil(target, Some(depth), None);
+    }
+
+    /// Clear only the requested planes; absent values preserve their contents.
+    pub fn clear_depth_stencil(
+        &mut self,
+        target: &Rc<B::Texture>,
+        depth: Option<f32>,
+        stencil: Option<u8>,
+    ) {
+        if depth.is_some() || stencil.is_some() {
+            self.cmds.push(Cmd::Clear {
+                color: None,
+                depth: Some((target.clone(), depth, stencil)),
+            });
+        }
     }
 
     /// `RSSetViewports` (the first viewport; the host draws into one).

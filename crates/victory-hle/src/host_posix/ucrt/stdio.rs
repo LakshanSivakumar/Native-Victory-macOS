@@ -645,9 +645,12 @@ pub extern "system" fn fgets(buf: *mut u8, n: i32, file: *mut c_void) -> *mut u8
         return std::ptr::null_mut();
     }
     with(file, std::ptr::null_mut(), |s| {
-        let mut i = 0;
+        let (mut i, mut ended) = (0, false);
         while i + 1 < n as usize {
-            let Some(b) = s.get() else { break };
+            let Some(b) = s.get() else {
+                ended = true;
+                break;
+            };
             // SAFETY: inside the title's buffer of `n`.
             unsafe { buf.add(i).write(b) };
             i += 1;
@@ -655,7 +658,9 @@ pub extern "system" fn fgets(buf: *mut u8, n: i32, file: *mut c_void) -> *mut u8
                 break;
             }
         }
-        if i == 0 {
+        // NULL only for an end of file (or error) before any character: with n = 1 nothing
+        // is read and the buffer gets "".
+        if i == 0 && ended {
             return std::ptr::null_mut();
         }
         // SAFETY: `i < n`.
@@ -1135,7 +1140,11 @@ pub extern "system" fn _dup2(fd: i32, to: i32) -> i32 {
 unsafe fn deliver<C: super::Ch>(out: &[u32], buf: *mut C, count: usize, options: u64) -> i32 {
     let len = out.len();
     let standard = options & format::PRINTF_STANDARD_SNPRINTF_BEHAVIOR != 0;
-    if buf.is_null() || count == 0 {
+    // No buffer and no room asks for the length (the sizing idiom), whatever the options.
+    if buf.is_null() {
+        return if count == 0 { len as i32 } else { err(EINVAL) };
+    }
+    if count == 0 {
         return if standard { len as i32 } else { -1 };
     }
     // SAFETY: the title's buffer of `count` units.
@@ -1156,14 +1165,15 @@ unsafe fn deliver<C: super::Ch>(out: &[u32], buf: *mut C, count: usize, options:
             buf.add(len).write(C::default());
             return len as i32;
         }
-        if len == count && options & format::PRINTF_LEGACY_VSPRINTF_NULL_TERMINATION == 0 {
-            put(len);
-            return len as i32;
-        }
-        put(count);
+        // `_vsnprintf` and `_vsnwprintf`: what fits, terminated only when there is room, so a text
+        // that fills the buffer exactly is returned whole.
         if options & format::PRINTF_LEGACY_VSPRINTF_NULL_TERMINATION != 0 {
-            buf.add(count - 1).write(C::default());
+            put(count);
+            return if len == count { len as i32 } else { -1 };
         }
+        // ISO `vswprintf` (`_vswprintf_c_l`, no option): truncated, always terminated, negative.
+        put(count - 1);
+        buf.add(count - 1).write(C::default());
         -1
     }
 }
@@ -1659,6 +1669,26 @@ mod tests {
     }
 
     #[test]
+    fn fgets_with_room_for_only_the_nul_stores_an_empty_string() {
+        // n = 1 reads nothing: no character was read, but no end of file was met either, so
+        // it stores "" and returns the buffer (C 7.21.7.2), and the stream is untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.txt");
+        std::fs::write(&path, b"ab").unwrap();
+        let f = open(&path, "rb");
+        let mut line = [0xEEu8; 4];
+        assert_eq!(fgets(line.as_mut_ptr(), 1, f), line.as_mut_ptr());
+        assert_eq!(line, [0, 0xEE, 0xEE, 0xEE]);
+        assert_eq!(fgetc(f), i32::from(b'a'));
+        assert_eq!(feof(f), 0);
+        // With room for more, an end of file before any character is still NULL.
+        assert_eq!(fgetc(f), i32::from(b'b'));
+        assert!(fgets(line.as_mut_ptr(), 4, f).is_null());
+        assert_eq!(feof(f), 1);
+        fclose(f);
+    }
+
+    #[test]
     fn descriptors_share_the_stream() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d.bin");
@@ -1677,11 +1707,12 @@ mod tests {
         assert_eq!(_eof(fd), 1);
         let f = _fdopen(fd, c"rb".as_ptr().cast());
         assert_eq!(_fileno(f), fd);
+        assert_eq!(_ftelli64(f), 6);
         assert_eq!(_chsize_s(fd, 3), 0);
         assert_eq!(_close(fd), 0);
-        assert_eq!(_close(fd), -1);
-        assert_eq!(errno(), EBADF);
-        fclose(f);
+        // The descriptor number can be reused immediately, so check the original stream.
+        assert_eq!(_fileno(f), -1);
+        assert_eq!(fclose(f), 0);
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
     }
 
@@ -1739,26 +1770,58 @@ mod tests {
             [123456u64].as_ptr(),
         );
         assert_eq!(n, 6);
-        // Without the standard behaviour, truncation is -1 and a full buffer has no NUL.
+    }
+
+    /// `%d` of `value` into four bytes of `x` with `count` and `options`: the result and the bytes.
+    fn into_four(options: u64, count: usize, value: u64) -> (i32, [u8; 4]) {
         let mut b = [b'x'; 4];
         let n = __stdio_common_vsprintf(
-            0,
+            options,
             b.as_mut_ptr(),
-            4,
+            count,
             cstr("%d").as_ptr(),
             0,
-            [1234u64].as_ptr(),
+            [value].as_ptr(),
         );
-        assert_eq!((n, &b), (4, b"1234"));
-        let n = __stdio_common_vsprintf(
-            0,
-            b.as_mut_ptr(),
-            3,
-            cstr("%d").as_ptr(),
-            0,
-            [1234u64].as_ptr(),
-        );
-        assert_eq!(n, -1);
+        (n, b)
+    }
+
+    #[test]
+    fn legacy_and_iso_printf_truncate_as_the_ucrt_does() {
+        let legacy = format::PRINTF_LEGACY_VSPRINTF_NULL_TERMINATION;
+        // `_vsnprintf`: terminated when there is room; a text that fills the buffer is returned
+        // whole without a NUL; a longer one is cut without a NUL and gives -1.
+        assert_eq!(into_four(legacy, 4, 123), (3, *b"123\0"));
+        assert_eq!(into_four(legacy, 4, 1234), (4, *b"1234"));
+        assert_eq!(into_four(legacy, 3, 1234), (-1, *b"123x"));
+        // ISO `vswprintf` (`_vswprintf_c_l`, no option): always terminated, -1 when cut.
+        assert_eq!(into_four(0, 4, 123), (3, *b"123\0"));
+        assert_eq!(into_four(0, 4, 1234), (-1, *b"123\0"));
+        assert_eq!(into_four(0, 3, 1234), (-1, *b"12\0x"));
+        // A buffer with no room is left alone.
+        assert_eq!(into_four(legacy, 0, 1), (-1, *b"xxxx"));
+        assert_eq!(into_four(0, 0, 1), (-1, *b"xxxx"));
+        // No buffer and no room is the sizing idiom in every mode; no buffer with room is invalid.
+        for options in [0, legacy, format::PRINTF_STANDARD_SNPRINTF_BEHAVIOR] {
+            let size = |count| {
+                __stdio_common_vsprintf(
+                    options,
+                    std::ptr::null_mut(),
+                    count,
+                    cstr("%d").as_ptr(),
+                    0,
+                    [123456u64].as_ptr(),
+                )
+            };
+            assert_eq!(size(0), 6);
+            assert_eq!(size(8), -1);
+            assert_eq!(errno(), EINVAL);
+        }
+        // `swprintf(buf, 4, L"%d", 1234)` ends in a NUL the title can read up to.
+        let fmt: Vec<u16> = "%d".encode_utf16().chain([0]).collect();
+        let mut w = [u16::from(b'x'); 4];
+        let n = __stdio_common_vswprintf(0, w.as_mut_ptr(), 4, fmt.as_ptr(), 0, [1234u64].as_ptr());
+        assert_eq!((n, String::from_utf16(&w).unwrap()), (-1, "123\0".to_string()));
     }
 
     #[test]

@@ -10,9 +10,10 @@
 use crate::native::list::NativeList;
 use crate::native::memory::{PoolInfo, PoolObserver};
 use crate::native::shaders;
+use crate::native::state::Graphics;
 use crate::native::title::{Pipe, Title};
 use std::sync::Arc;
-use victory_backend::resources::HeapKind;
+use victory_backend::resources::{Format, HeapKind, ResourceBackend, TextureDesc, Topology};
 use victory_metal::mem::Alias;
 use victory_metal::metal::Metal;
 use victory_shader::emit::{HostShader, emit_with};
@@ -218,7 +219,103 @@ fn computed_addresses_read_and_write_the_pool_at_its_title_addresses() {
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[a, b, c, d], false);
     check_computed(&f, 0x2_0000, 0x6_0000);
+
+    assert_eq!(t.host.page_table_work(), (1, 0), "built whole once");
+
+    // The same heap and unchanged mappings use the table as it is.
+    prepare_computed(&f, 0x2_0000, 0x6_0000);
+    dispatch(&mut t, &cs, &[a, b, c, d], false);
+    check_computed(&f, 0x2_0000, 0x6_0000);
+    assert_eq!(t.host.page_table_work(), (1, 0));
+
+    // A remap is written into that table in place: the GPU follows it, nothing is built again, and no
+    // snapshot of every mapping is taken.
+    t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, 0x4_0000);
+    f.put(0, &[CANARY; POOL / 4]);
+    prepare_computed(&f, 0x4_0000, 0x8_0000);
+    dispatch(&mut t, &cs, &[a, b, c, d], false);
+    check_computed(&f, 0x4_0000, 0x8_0000);
+    assert_eq!(f.get(0x6_0000, 64), [CANARY; 64]);
+    assert_eq!(t.host.page_table_work(), (1, 1));
+    assert_eq!(t.host.memory().mapping_snapshots(), 0);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+#[test]
+fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
+    let vertex = [
+        0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+        0xD501_0001, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v1, -1.0, 3.0, vcc
+        0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+        0xD501_0002, 0x01A9_FEF3, 0x4040_0000, // v_cndmask_b32 v2, -1.0, 3.0, vcc
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_02F2, // v_mov_b32 v4, 1.0
+        0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+        0xBF81_0000, // s_endpgm
+    ];
+    let pixel = [
+        0x8004_9000, // s_add_u32 s4, s0, 16
+        0x8205_8080, // s_addc_u32 s5, 0, 0
+        0x8805_FF05, 0x0010_0000, // s_or_b32 s5, s5, 0x100000
+        0xBE86_0382, // s_mov_b32 s6, 2
+        0xBE87_03FF, 0x0001_4FAC, // s_mov_b32 s7, 0x14fac
+        0x7E00_0281, // v_mov_b32 v0, 1
+        0xE030_2004, 0x8001_0200, // buffer_load_dword v2, v0, s[4:7], 0 idxen offset:4
+        0xE030_2010, 0x8001_0300, // buffer_load_dword v3, v0, s[4:7], 0 idxen offset:16
+        0x7E00_0282, // v_mov_b32 v0, 2
+        0xE030_2000, 0x8001_0400, // buffer_load_dword v4, v0, s[4:7], 0 idxen
+        0xF420_0202, 0xFA00_0004, // s_buffer_load_dword s8, s[4:7], 4
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0x7E0A_0208, // v_mov_b32 v5, s8
+        0xF800_180F, 0x0504_0302, // exp mrt0 v2, v3, v4, v5 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let translate = |stage, words: &[u32], meta: &[u8]| {
+        let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let c = victory_shader::emit::graphics::container(stage, &bytes, meta).unwrap();
+        shaders::translate(&c).unwrap()
+    };
+    let vs = translate(HwStage::Vs, &vertex, &[0; 0x10]);
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2; // Root constants in slot 0.
+    let ps = translate(HwStage::Ps, &pixel, &meta);
+    use victory_metal::msc::{DEFAULT_DYLIB, Msc};
+    if !std::path::Path::new(DEFAULT_DYLIB).exists() && std::env::var_os("VICTORY_MSC_DYLIB").is_none() {
+        eprintln!("skipped: Metal Shader Converter not installed");
+        return;
+    }
+    let layout = crate::native::list::Binding::of(&ps).layout().unwrap();
+    Msc::open_default().convert_with(&ps.dxil, None, Some(&layout)).unwrap();
+    let Ok(metal) = Metal::new() else {
+        eprintln!("skipped the draw: no Metal device");
+        return;
+    };
+    let mut t = Title::new(metal, Arc::new(crate::native::memory::PoolTable::default()));
+    let f = Fixture::new(&t);
+    f.put(20, &[1.0f32]); // base + 4
+    f.put(36, &[0.5f32]); // base + 1 * stride + 4
+    f.put(48, &[1.0f32]); // backing memory at the address of both out-of-bounds reads
+
+    let state = Graphics::guess_base()
+        .for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "computed fragment") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+    desc.render_target = true;
+    let color = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&color), None);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.set_graphics_root_constants(0, &[VA_B as u32]);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut pixels = [0; 8 * 8 * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+    assert_eq!(&pixels[(4 * 8 + 4) * 4..][..4], [128, 0, 0, 255]);
 }
 
 /// The table follows the title's maps: the same dispatch, the same title addresses, after the title
@@ -290,4 +387,79 @@ fn only_the_zero_copy_option_drops_the_page_marks() {
     let host = shader(COMPUTED, 4);
     assert!(host.memory && !host.memory_writes);
     assert_ne!(d3d12.dxil, host.dxil);
+}
+
+/// A table kept current in place agrees with one built whole, page for page: after unmaps, remaps to
+/// another pool, and pages made of 16 KiB pieces (a whole page when they follow each other in the
+/// pool, none when they do not). Its mappings reach more 256 MiB regions than a table has blocks for
+/// at first, so it grows on the way, and keeps the buffer it outgrew.
+#[test]
+fn a_table_kept_in_place_matches_one_built_whole() {
+    use crate::native::addr::{CHUNK, Pairs, Table, lookup};
+    use crate::native::memory::PoolTable;
+    let Ok(metal) = Metal::new() else {
+        eprintln!("skipped: no Metal device");
+        return;
+    };
+    const P: usize = 1 << 16;
+    const REGION: usize = 1 << 28;
+    const AT: usize = 0x10_0000_0000;
+    let pool = |id: usize, len: usize| PoolInfo {
+        id,
+        base: 0x100_0000_0000 * id,
+        len,
+        memory_entry: None,
+    };
+    let (p, q) = (pool(1, 1 << 30), pool(2, 1 << 26));
+    let m = PoolTable::default();
+    m.pool_created(&p);
+    m.pool_created(&q);
+    for r in 0..70 {
+        m.mapped(AT + r * REGION, P, &p, r * P);
+    }
+    let first = 1000;
+    let mut pairs = Pairs::default();
+    let (g, pages) = m.pages();
+    let mut t = Table::new(&metal, first, g, &pages, &mut pairs).unwrap();
+    assert_eq!(t.size(), (71, 1), "70 blocks and the null one, after growing once");
+
+    for r in (0..70).step_by(3) {
+        m.unmapped(AT + r * REGION, P);
+    }
+    for r in (1..70).step_by(3) {
+        m.mapped(AT + r * REGION, P, &q, r * P);
+    }
+    for i in 0..4 {
+        m.mapped(0x20_0000_0000 + i * 0x4000, 0x4000, &q, 0x10_0000 + i * 0x4000);
+        m.mapped(0x20_0001_0000 + i * 0x4000, 0x4000, &q, 0x20_0000 + (3 - i) * 0x4000);
+    }
+    let (g2, changed) = m.pages_since(t.generation).unwrap();
+    for (page, target) in changed {
+        t.set(&metal, page, target, &mut pairs).unwrap();
+    }
+    t.generation = g2;
+
+    let (g3, pages) = m.pages();
+    assert_eq!(g3, g2);
+    let whole = Table::new(&metal, first, g3, &pages, &mut pairs).unwrap();
+    let (kept, built) = (t.words(), whole.words());
+    let addresses: Vec<u64> = (0..70)
+        .map(|r| (AT + r * REGION + 0x1234) as u64)
+        .chain([0x20_0000_0100, 0x20_0001_0100, 0x30_0000_0000, 0x10_0001_0000])
+        .collect();
+    for &va in &addresses {
+        assert_eq!(lookup(&kept, va), lookup(&built, va), "{va:#x}");
+    }
+    // What the lookups say, by pool and offset in it.
+    let target = |va: u64| {
+        lookup(&kept, va).map(|(view, offset)| {
+            let key = pairs.keys[((view - first) / 2 - 1) as usize];
+            (key.pool, key.chunk * CHUNK + u64::from(offset))
+        })
+    };
+    assert_eq!(target((AT + 0x1234) as u64), None, "unmapped");
+    assert_eq!(target((AT + REGION + 0x1234) as u64), Some((2, (P + 0x1234) as u64)), "remapped");
+    assert_eq!(target((AT + 2 * REGION + 0x1234) as u64), Some((1, (2 * P + 0x1234) as u64)), "as it was");
+    assert_eq!(target(0x20_0000_0100), Some((2, 0x10_0100)), "quarters in pool order");
+    assert_eq!(target(0x20_0001_0100), None, "quarters out of order");
 }

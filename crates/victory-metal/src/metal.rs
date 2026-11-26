@@ -22,6 +22,50 @@ pub struct Metal {
     pool_set: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
     /// What the encoders did to make buffers resident, for the tests and the frame line.
     pub(crate) counts: std::cell::Cell<ResidencyCounts>,
+    /// Indirect dispatches' group counts, checked on the GPU first ([`Metal::clamp_groups`]).
+    pub(crate) clamp: std::cell::OnceCell<Option<(Retained<ProtocolObject<dyn MTLComputePipelineState>>, Retained<ProtocolObject<dyn MTLBuffer>>)>>,
+    pub(crate) clamp_next: std::cell::Cell<usize>,
+}
+
+/// Slots of the clamped group counts (16 bytes each), used in turn.
+pub(crate) const CLAMP_SLOTS: usize = 1 << 16;
+/// The buffer index of the group-count kernel's source (and the next, its slot).
+pub(crate) const CLAMP_SOURCE: usize = 29;
+
+impl Metal {
+    /// The kernel that copies an indirect dispatch's three group counts into a slot of its own,
+    /// zeroing them when they cannot be a dispatch the title meant (a count past 65535, or more
+    /// than 2^22 groups): counts read from memory nothing wrote (the work that writes them
+    /// dropped) made dispatches the GPU's watchdog ended as a hang, and its victims' fences with
+    /// them. And the slot it writes next.
+    pub(crate) fn clamp_groups(
+        &self,
+    ) -> Option<(&ProtocolObject<dyn MTLComputePipelineState>, &ProtocolObject<dyn MTLBuffer>, usize)> {
+        let made = self.clamp.get_or_init(|| {
+            let src = "#include <metal_stdlib>\nusing namespace metal;\n\
+                kernel void victory_clamp_groups(device const uint* s [[buffer(29)]], device uint* d [[buffer(30)]]) {\n\
+                  uint x = s[0], y = s[1], z = s[2];\n\
+                  ulong n = ulong(x) * ulong(y) * ulong(z);\n\
+                  bool bad = x > 65535u || y > 65535u || z > 65535u || n > (1ul << 22);\n\
+                  d[0] = bad ? 0u : x; d[1] = bad ? 0u : y; d[2] = bad ? 0u : z;\n\
+                }\n";
+            let lib = self
+                .dev
+                .newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(src), None)
+                .map_err(|e| eprintln!("metal: no group-count kernel: {}", e.localizedDescription()))
+                .ok()?;
+            let f = lib.newFunctionWithName(&objc2_foundation::NSString::from_str("victory_clamp_groups"))?;
+            let pso = self.dev.newComputePipelineStateWithFunction_error(&f).ok()?;
+            let buf = self
+                .dev
+                .newBufferWithLength_options(CLAMP_SLOTS * 16, MTLResourceOptions::StorageModePrivate)?;
+            Some((pso, buf))
+        });
+        let (pso, buf) = made.as_ref()?;
+        let slot = self.clamp_next.get();
+        self.clamp_next.set((slot + 1) % CLAMP_SLOTS);
+        Some((pso, buf, slot * 16))
+    }
 }
 
 /// Counters of residency work.
@@ -103,6 +147,8 @@ impl Metal {
             residency_sets,
             pool_set: Default::default(),
             counts: Default::default(),
+            clamp: Default::default(),
+            clamp_next: Default::default(),
         })
     }
 
@@ -247,6 +293,7 @@ impl ComputeBackend for Metal {
                 waits: work.waits,
                 passes: &[Pass::Compute(work.dispatches)],
                 signals: work.signals,
+                label: None,
             },
         )
     }
@@ -335,6 +382,7 @@ mod tests {
             heaps: Default::default(),
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
+            indirect: None,
         }
     }
 

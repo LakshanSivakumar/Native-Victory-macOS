@@ -504,7 +504,23 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
-    let (layout, used) = metadata_resources(meta, FSPX_RECORDS, false)?;
+    // Root constants: a record names a block's first user SGPR; the block runs to the next
+    // parameter's first SGPR, or to the last user SGPR.
+    let (mut layout, used) = metadata_resources(meta, FSPX_RECORDS, true)?;
+    let user_sgprs = (u32_at(packet, PACKET_RSRC2)? >> 1 & 0x1F) as u8;
+    let starts: Vec<u8> = layout.iter().filter(|p| p.sgprs > 0).map(|p| p.user_data).collect();
+    for p in layout.iter_mut().filter(|p| p.root == RootType::Constants) {
+        let end = starts
+            .iter()
+            .copied()
+            .filter(|&s| s > p.user_data)
+            .min()
+            .unwrap_or(user_sgprs);
+        let span = u32::from(end.saturating_sub(p.user_data));
+        if span > p.sgprs && span <= 32 {
+            p.sgprs = span;
+        }
+    }
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -560,7 +576,18 @@ pub(crate) fn metadata_resources(
             RootType::Constants if constants => 1,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
-            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+            refused => {
+                return Err(ShaderError::FspxRoot {
+                    root: e[5],
+                    what: match refused {
+                        RootType::Constants => "root constants in a compute shader",
+                        RootType::ResourceHeap | RootType::SamplerHeap => {
+                            "a descriptor heap (SM 6.6 dynamic resources)"
+                        }
+                        _ => "an unknown root type",
+                    },
+                });
+            }
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
             layout.push(RootParam {
@@ -1316,6 +1343,28 @@ pub(crate) mod tests {
         assert!(corrupt(8, 0xFF).is_err(), "entry count");
         // The code entry's size no longer matches the metadata's count.
         assert!(corrupt(FSPX_HEADER + 32 + 8, 8).is_err(), "code size");
+        // Each refused root type names itself (after an accepted table).
+        let refusal = |root: u8| {
+            let records = [
+                fspx_resource(0, 3, 0, 0, 4, 0),
+                fspx_resource(2, root, 0, 0, 5, 1),
+            ];
+            native_programs(&fspx(&code, 0, [64, 1, 1], false, &records))
+                .unwrap_err()
+                .to_string()
+        };
+        // (Root constants, type 0, are taken in compute shaders too, below.)
+        for (root, what) in [
+            (5, "a descriptor heap (SM 6.6 dynamic resources)"),
+            (6, "a descriptor heap (SM 6.6 dynamic resources)"),
+            (2, "an unknown root type"),
+            (7, "an unknown root type"),
+        ] {
+            assert_eq!(
+                refusal(root),
+                format!("FSPX metadata resource of root type {root}: {what}")
+            );
+        }
         let mut root_constants = fspx(
             &code,
             0,
@@ -1323,10 +1372,9 @@ pub(crate) mod tests {
             false,
             &[fspx_resource(2, 0, 0, 0, 4, 0)],
         );
-        assert!(
-            native_programs(&root_constants).is_err(),
-            "unknown root type"
-        );
+        // Root constants (one record, the block's first user SGPR) are a root parameter.
+        let program = native_programs(&root_constants).expect("root constants");
+        assert!(program[0].layout.iter().any(|p| p.root == RootType::Constants));
         root_constants.truncate(40);
         assert!(native_programs(&root_constants).is_err(), "truncated");
     }

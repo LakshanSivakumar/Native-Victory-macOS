@@ -1231,8 +1231,8 @@ fn clear_dsv_impl(
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (stencil, count, rects);
-        crate::native::glue::clear_dsv(this, handle, flags, depth);
+        let _ = rects;
+        crate::native::glue::clear_dsv(this, handle, flags, depth, stencil, count);
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
@@ -1302,8 +1302,7 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// (type 2) are the GPU clock then; occlusion counts (0) say a million
 /// samples passed and binary occlusion (1) visible, so nothing is culled
 /// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// shortcut: query results are synthesized on the CPU, use host query samples when a title needs measured GPU results.
 extern "system" fn resolve_queries(
     this: This,
     _heap: This,
@@ -1917,6 +1916,7 @@ pub(crate) fn indirect_dropped() -> u64 {
 #[cfg(target_os = "macos")]
 fn drop_kind(kind: usize) {
     DROPPED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::native::glue::warn_once(["a mesh dispatch", "an indirect mesh dispatch", "an indirect execution", "a texture copy or resolve", "a dropped command of kind 4"][kind.min(4)]);
 }
 
 #[cfg(target_os = "macos")]
@@ -1978,6 +1978,24 @@ extern "system" fn execute_indirect(
             count.is_null() || counter.is_some()
         ));
     }
+    // The native host: dispatches whose count is not in a buffer, each execution's group
+    // counts read by the GPU at its argument record.
+    // `VICTORY_INDIRECT_DISPATCH=0`: dropped as before (for comparisons).
+    #[cfg(target_os = "macos")]
+    static INDIRECT_ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("VICTORY_INDIRECT_DISPATCH").as_deref() != Ok("0"));
+    #[cfg(target_os = "macos")]
+    if let ([[kind, ..]], Some(address)) = (args, address)
+        && *INDIRECT_ON
+        && (*kind == 2 || *kind == 105)
+        && count.is_null()
+        && max <= 4096
+    {
+        for i in 0..max as u64 {
+            crate::native::glue::dispatch_indirect(this, address + i * stride as u64);
+        }
+        ran = true;
+    }
     if ran {
         return;
     }
@@ -1986,7 +2004,7 @@ extern "system" fn execute_indirect(
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize)) {
         seen.push(signature as usize);
-        tracing::info!(
+        tracing::warn!(
             stride,
             ?args,
             max,
@@ -2074,8 +2092,8 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
-    // On the native host the write runs on the GPU in order with the list's other work.
     #[cfg(target_os = "macos")]
+    // shortcut: native timestamps are sampled while recording, use calibrated Metal counter samples for GPU completion timing.
     if crate::native::glue::write_value(this, address, what.value(), bytes) {
         return;
     }
@@ -2216,6 +2234,65 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tracing::{Event, Metadata, Subscriber, span};
+
+    /// Exercise the title-facing ABI and real descriptor lookup.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_dsv_clear_rejects_rectangles_and_unrepresented_views() {
+        if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
+            && std::env::var_os("VICTORY_MSC_DYLIB").is_none()
+        {
+            eprintln!("skipped: Metal Shader Converter not installed");
+            return;
+        }
+        use crate::resource::{HeapProperties, ResourceDesc, create_committed};
+        let null = std::ptr::null();
+        let heap = [1u32, 0, 0, 0, 0];
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut list), S_OK);
+        let mut storage = [0u64; 14];
+        let handle = storage.as_mut_ptr() as u64;
+        let rect = Rect { left: 1, top: 1, right: 2, bottom: 2 };
+        let release = |o| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        // Resource dimension, height, samples, mips, DSV dimension, full-clear support.
+        for (dimension, height, samples, mips, view_dimension, supported) in [
+            (3u64, 16, 1, 2, 3, true),
+            (2, 1, 1, 2, 1, true),
+            (3, 16, 4, 1, 5, false),
+        ] {
+            // Public D3D12_RESOURCE_DESC ABI: one layer, D32_FLOAT_S8X24_UINT,
+            // ALLOW_DEPTH_STENCIL. Multisampled resources have just one mip.
+            let desc = [dimension, 0, 16, height | (1 << 32) | (mips << 48),
+                20 | (samples << 32), 0, 2];
+            let mut resource = null;
+            assert_eq!(create_committed(null, heap.as_ptr().cast::<HeapProperties>(), 0,
+                desc.as_ptr().cast::<ResourceDesc>(), 0x10, null.cast(),
+                &PAGEABLE_IIDS[0], &mut resource), S_OK);
+            for flags in [1, 2, 3] {
+                for (view, count, rectangles, expected) in [
+                    (Some([20, view_dimension, 0, 0, 0, 0]), 1, &rect as *const Rect, false),
+                    (Some([20, view_dimension, 0, 0, 0, 0]), 1, null.cast(), false),
+                    (Some([20, view_dimension, 0, 1, 0, 0]), 0, null.cast(), false),
+                    (Some([20, view_dimension + 1, 0, 0, 1, 1]), 0, null.cast(), false),
+                    (Some([20, 0, 0, 0, 0, 0]), 0, null.cast(), false),
+                    (Some([20, view_dimension, 0, 0, 0, 0]), 0, &rect as *const Rect, supported),
+                    (None, 0, null.cast(), supported),
+                ] {
+                    crate::native::glue::with_list(list, |_, l| l.list.reset()).expect("Metal device");
+                    crate::descriptor::create_dsv(null, resource,
+                        view.as_ref().map_or(null.cast(), std::ptr::from_ref), handle);
+                    clear_dsv(list, handle, flags, 0.25, 173, count, rectangles);
+                    let recorded = crate::native::glue::with_list(list, |_, l| !l.list.is_empty()).unwrap();
+                    assert_eq!(recorded, expected, "dimension={dimension}, samples={samples}, flags={flags}, view={view:?}, count={count}");
+                }
+            }
+            release(resource);
+        }
+        release(list);
+        release(allocator);
+    }
 
     struct PipelineBinds(Arc<AtomicUsize>);
 

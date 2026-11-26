@@ -136,6 +136,7 @@ fn lowered(
         wave32_host,
         zero_copy_memory: false,
         rect_list: false,
+        copy_params: [0; 32],
         view_marks: false,
     })?;
     // VICTORY_DUMP_DXIL=<dir>: keep the containers, to run Apple's converter on.
@@ -172,22 +173,42 @@ fn a_ballot_of_64_lanes_is_two_host_waves_joined() {
 
 #[test]
 fn a_lane_read_across_the_halves_goes_through_group_shared_memory() {
-    for words in [READLANE, BPERMUTE] {
-        let l = host32(words, 64);
-        assert_eq!(l.wave_size, Some(32));
-        assert!(l.exchanges);
-    }
-    assert_eq!(host32(READLANE, 64).barriers, 2);
-    // The permute also ballots the lanes that run (0 from the others).
-    assert_eq!(host32(BPERMUTE, 64).barriers, 4);
+    let l = host32(READLANE, 64);
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.exchanges);
+    assert_eq!(l.barriers, 2);
 }
 
 #[test]
 fn operations_inside_32_lanes_stay_native() {
-    let l = host32(IN_HALF, 64);
-    assert_eq!(l.wave_size, Some(32));
-    assert_eq!(l.barriers, 0);
-    assert!(!l.exchanges);
+    // `ds_bpermute_b32` too: a wave of 64 permutes each half apart (RDNA 2 ISA
+    // 10.4.4), so lane l reading "lane l + 32" reads lane (l + 32) & 31 of its
+    // own half.
+    for words in [IN_HALF, BPERMUTE] {
+        let l = host32(words, 64);
+        assert_eq!(l.wave_size, Some(32));
+        assert_eq!(l.barriers, 0);
+        assert!(!l.exchanges);
+    }
+}
+
+#[test]
+fn a_permute_in_divergent_code_needs_no_exchange() {
+    // ds_bpermute in the lanes below 10 only: refused while it went across
+    // the halves, the host wave's own read now.
+    const DIVERGENT_BPERMUTE: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0x7D88_008A, // v_cmp_gt_u32_e32 vcc, 10, v0
+        0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+        skip_execz(2),
+        0xDACC_0000,
+        0x0200_0001, // ds_bpermute_b32 v2, v1, v0
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x7E0A_0302, // v_mov_b32_e32 v5, v2 (the result is used)
+        S_ENDPGM,
+    ];
+    let l = host32(DIVERGENT_BPERMUTE, 64);
+    assert_eq!((l.barriers, l.exchanges), (0, false));
 }
 
 #[test]
@@ -280,4 +301,22 @@ fn a_whole_wave_sum_combines_the_two_halves() {
     assert_eq!(l.wave_size, Some(32));
     // Whatever the section leaves is one reduction: write, barrier, read, barrier.
     assert_eq!(l.barriers, 2);
+}
+
+#[test]
+fn permlane16_and_permlanex16_lower_within_host32_half() {
+    // v_permlane16_b32 v2, v0, 0, 0 fi:1 (op 0x377, opsel=1 -> 0xD777_0802)
+    // v_permlanex16_b32 v3, v2, -1, -1 fi:1 (op 0x378, opsel=1 -> 0xD778_0803)
+    const PROG: &[u32] = &[
+        0xD777_0802,
+        0x0201_0100, // v_permlane16_b32 v2, v0, 0, 0 fi:1
+        0xD778_0803,
+        0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1 fi:1
+        0x7E0A_0303, // v_mov_b32_e32 v5, v3
+        S_ENDPGM,
+    ];
+    let l = host32(PROG, 64);
+    assert_eq!(l.wave_size, Some(32));
+    // Both stay within the 32-lane half, so no cross-half LDS exchange barriers are needed.
+    assert_eq!(l.barriers, 0);
 }

@@ -45,6 +45,10 @@ pub struct RootLayout {
     /// The shader reads the memory of a raw buffer view out of range as 0 and drops its writes
     /// (`D3D12` hardware does; Metal needs the converter told).
     pub bounds_checked: bool,
+    /// Static samplers, `s<n>` at position n in space 0: the words of a
+    /// `D3D12_STATIC_SAMPLER_DESC` up to `MaxLOD` (filter, address U, V, W, LOD bias as f32 bits,
+    /// anisotropy, comparison, border, minimum and maximum LOD as f32 bits).
+    pub static_samplers: Vec<[u32; 10]>,
 }
 
 /// One `Dispatch` call: the pipeline, its root arguments, the memory it touches (for residency),
@@ -58,6 +62,9 @@ pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     pub heaps: Heaps<'a, B>,
     pub groups: [usize; 3],
     pub threads_per_group: [usize; 3],
+    /// `ExecuteIndirect` of a dispatch: the group counts are read on the GPU from the buffer at
+    /// this title address (three `u32`s), and `groups` is unused.
+    pub indirect: Option<(&'a B::Buffer, *const u8)>,
 }
 
 /// The descriptor heaps a draw or dispatch binds (`SetDescriptorHeaps`): slot 0 and slot 1.

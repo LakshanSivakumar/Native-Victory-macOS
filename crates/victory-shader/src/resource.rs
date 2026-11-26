@@ -62,6 +62,12 @@ pub enum Source {
         bits: u32,
         words: [u32; 2],
     },
+    /// A guessed pixel shader's buffer descriptor over a computed title address.
+    BuiltMemory {
+        control: u32,
+        /// Whether dword 1 may enable swizzling.
+        swizzled: bool,
+    },
     /// Fixed in the code (an immediate sampler, say).
     Constant(Vec<u32>),
     /// Chosen by control flow: one source per predecessor of `block`, in
@@ -163,7 +169,18 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    track_graphics(p, layout, stage, lanes, false)
+}
+
+pub(crate) fn track_graphics(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+    computed_buffers: bool,
+) -> Result<Resources, ShaderError> {
+    let mut t = Tracer::new(p, layout, stage, lanes)?;
+    t.computed_buffers = computed_buffers && stage == HwStage::Ps;
     let mut out = Resources {
         params: p
             .inputs
@@ -320,6 +337,7 @@ struct Tracer<'a> {
     p: &'a Program,
     layout: &'a [RootParam],
     stage: HwStage,
+    computed_buffers: bool,
     /// Defining instruction per value (phis and inputs have none).
     defs: Vec<Option<Site>>,
     /// Block and index of each phi value.
@@ -427,6 +445,7 @@ impl<'a> Tracer<'a> {
             p,
             layout,
             stage,
+            computed_buffers: false,
             defs,
             phis,
             inputs,
@@ -536,18 +555,34 @@ impl<'a> Tracer<'a> {
 
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
+    ///
+    /// A sweep reads some arguments as this sweep made them and others as
+    /// the last one did, so a phi whose arguments are all copies of one
+    /// value can see them disagree, stand for itself for a sweep, and
+    /// return to the copy once they agree again. Where such phis feed each
+    /// other across nested loops that repeats without end (the test
+    /// `copies_restored_in_nested_loops_settle`). So after [`MAX_ROUNDS`]
+    /// sweeps a phi that still changes stands for itself for good, as any
+    /// real join does: that names no wrong origin, only fewer copies.
     fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
         let mut o: Vec<Option<Term>> = vec![None; n];
         for &(_, v) in &self.p.inputs {
             o[v.0 as usize] = Some(Term::Value(v));
         }
         let order = crate::ir::reverse_postorder(&self.p.blocks);
-        for _ in 0..MAX_ROUNDS {
+        // Once pinning, a phi changes at most twice, and a sweep without
+        // such a change settles the moves that follow their sources.
+        for round in 0..MAX_ROUNDS + 2 * n + 2 {
+            let pinning = round >= MAX_ROUNDS;
             let mut changed = false;
             for &b in &order {
                 let block = &self.p.blocks[b];
                 for phi in &block.phis {
                     let own = Term::Value(phi.value);
+                    let old = o[phi.value.0 as usize];
+                    if pinning && old == Some(own) {
+                        continue;
+                    }
                     let mut args = phi
                         .args
                         .iter()
@@ -555,8 +590,12 @@ impl<'a> Tracer<'a> {
                         .filter(|&t| t != own);
                     let new = args
                         .next()
-                        .map(|first| if args.all(|t| t == first) { first } else { own });
-                    if new.is_some() && new != o[phi.value.0 as usize] {
+                        .map(|first| if args.all(|t| t == first) { first } else { own })
+                        .map(|new| match old {
+                            Some(t) if pinning && t != new => own,
+                            _ => new,
+                        });
+                    if new.is_some() && new != old {
                         o[phi.value.0 as usize] = new;
                         changed = true;
                     }
@@ -1164,7 +1203,10 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
-        if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
+        if let [lo, hi, w2, Term::Const(w3)] = *words
+            && (self.computed_buffers || matches!(w2, Term::Const(_)))
+        {
+            let descriptor_hi = hi;
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
                 && let Some((x, more)) = self.set_bits(v)
@@ -1180,11 +1222,15 @@ impl<'a> Tracer<'a> {
                     dynamic: None,
                 },
             )?;
-            return Ok(Source::Built {
-                address,
-                bits,
-                words: [w2, w3],
-            });
+            if self.computed_buffers && address.param == MEMORY {
+                return Ok(Source::BuiltMemory {
+                    control: w3,
+                    swizzled: self.possible_bits(descriptor_hi, 8) >> 30 != 0,
+                });
+            }
+            if let Term::Const(w2) = w2 {
+                return Ok(Source::Built { address, bits, words: [w2, w3] });
+            }
         }
         let loaded = |w: &Term| {
             matches!(*w, Term::Value(v)
@@ -1195,6 +1241,39 @@ impl<'a> Tracer<'a> {
         } else {
             "a descriptor neither loaded nor built"
         })
+    }
+
+    /// Bits that may be set in a built buffer descriptor's high dword.
+    // shortcut: prove bounds through short scalar ALU chains, extend the analysis if
+    // a buffer descriptor's swizzle bits are cleared through other instructions.
+    fn possible_bits(&self, term: Term, depth: u8) -> u32 {
+        let v = match term {
+            Term::Const(bits) => return bits,
+            Term::Value(v) => v,
+        };
+        if depth == 0 {
+            return u32::MAX;
+        }
+        let Some((inst, [a, b])) = self.sop2(
+            v,
+            &["s_and_b32", "s_or_b32", "s_lshl_b32", "s_add_u32", "s_addc_u32"],
+        ) else {
+            return u32::MAX;
+        };
+        let bits = |t| self.possible_bits(t, depth - 1);
+        match inst.name() {
+            "s_and_b32" => bits(a) & bits(b),
+            "s_or_b32" => bits(a) | bits(b),
+            "s_lshl_b32" => match b {
+                Term::Const(shift) => bits(a) << (shift & 31),
+                _ => u32::MAX,
+            },
+            // A carry can set every bit below the most significant possible bit.
+            _ => {
+                let max = bits(a).saturating_add(bits(b)).saturating_add(u32::from(inst.name() == "s_addc_u32"));
+                u32::MAX.checked_shr(max.leading_zeros()).unwrap_or(0)
+            }
+        }
     }
 
     /// Words that phis of one block join, traced per predecessor (words
@@ -2243,6 +2322,65 @@ pub(crate) fn infer_roots(
     })
 }
 
+/// Whether shifting a guessed vertex layout explains an otherwise unbound address. The alternate
+/// layout must agree with existing root-address uses and cannot move a live-in away from an
+/// existing root unless the code identifies that pair as the vertex fetch table.
+pub(crate) fn vertex_roots_match_rebased(
+    p: &Program,
+    absolute: &[RootParam],
+    relative: &[RootParam],
+) -> Result<bool, ShaderError> {
+    let old = Tracer::new(p, absolute, HwStage::Vs, None)?;
+    let new = Tracer::new(p, relative, HwStage::Vs, None)?;
+    if p.inputs.iter().any(|&(reg, _)| old.param_of(reg).is_some()) {
+        let vt = infer_roots(p, relative, HwStage::Vs)?.vertex_table;
+        if p.inputs.iter().any(|&(reg, _)| {
+            old.param_of(reg) != new.param_of(reg)
+                && old.param_of(reg).is_some()
+                && !vt.is_some_and(|n| reg == Reg::S(n) || reg == Reg::S(n + 1))
+        }) {
+            return Ok(false);
+        }
+    }
+    let mut found = false;
+    for (b, block) in p.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            let address = |t: &Tracer<'_>| match &inst.fields {
+                Fields::Smem { base, offset, soffset, .. } if inst.name().starts_with("s_load_") => {
+                    t.smem_address(inst, base, *offset, soffset).map(Some)
+                }
+                Fields::Flat { addr, saddr, offset, .. } if inst.name().starts_with("global_") => {
+                    t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset).map(Some)
+                }
+                Fields::Smem { base: rsrc, .. } | Fields::Buffer { rsrc, .. }
+                    if inst.name().starts_with("s_buffer_")
+                        || inst.name().starts_with("buffer_load_")
+                        || inst.name().starts_with("tbuffer_load_") =>
+                {
+                    t.descriptor(inst, rsrc, b).map(|src| match src {
+                        Source::Built { address, .. } => Some(address),
+                        _ => None,
+                    })
+                }
+                _ => Ok(None),
+            };
+            match (address(&old), address(&new)) {
+                (Ok(Some(a)), after) if a.param < absolute.len() && after != Ok(Some(a)) => {
+                    return Ok(false);
+                }
+                (Err("an address in an SGPR that is no root parameter"), Ok(Some(a)))
+                    if relative.get(a.param).is_some_and(|r|
+                        matches!(r.root, RootType::Table | RootType::Descriptor)) =>
+                {
+                    found = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(found)
+}
+
 impl Tracer<'_> {
     /// Collects `s_load_dword*` and `global_load_dword*` sites feeding descriptor `words`.
     fn collect_descriptor_loads(
@@ -2815,6 +2953,53 @@ pub(crate) mod tests {
         assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
         assert_eq!(value(2, 0), Term::Const(0x1850_0000));
         assert_eq!(value(2, 1), Term::Const(0));
+    }
+
+    /// A register kept in a second one across an inner loop that restores
+    /// it, inside a loop whose entry value is itself a loop's phi: s2 at
+    /// 0x08 and at 0x0c is s2 at 0x04 whichever way it is reached. The
+    /// origins must settle, and name no value the register does not hold.
+    #[test]
+    fn copies_restored_in_nested_loops_settle() {
+        let words = [
+            0xBE87_0380, // 0x00 s_mov_b32 s7, 0
+            0xBF06_8006, // 0x04 s_cmp_eq_u32 s6, 0
+            0xBE83_0302, // 0x08 s_mov_b32 s3, s2
+            0xBF06_8004, // 0x0c s_cmp_eq_u32 s4, 0
+            0xBF85_0002, // 0x10 s_cbranch_scc1 -> 0x1c
+            0xBE82_0303, // 0x14 s_mov_b32 s2, s3
+            0xBF82_FFFC, // 0x18 s_branch -> 0x0c
+            0xBF06_8005, // 0x1c s_cmp_eq_u32 s5, 0
+            0xBF85_FFF9, // 0x20 s_cbranch_scc1 -> 0x08
+            0x8002_8102, // 0x24 s_add_u32 s2, s2, 1
+            0xBF06_8006, // 0x28 s_cmp_eq_u32 s6, 0
+            0xBF85_FFF5, // 0x2c s_cbranch_scc1 -> 0x04
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let t = Tracer::new(&p, &[], HwStage::Ps, None).unwrap();
+        let block = |offset| &p.blocks[block_at(&words, offset)];
+        let phi = |offset| {
+            let phis = &block(offset).phis;
+            phis.iter().find(|phi| phi.reg == Reg::S(2)).unwrap().value
+        };
+        let write = |offset: usize, name| {
+            let inst = block(offset).insts.iter().find(|i| i.name() == name);
+            inst.unwrap().writes[0].1
+        };
+        let (outer, middle, inner) = (phi(0x04), phi(0x08), phi(0x0c));
+        let sum = write(0x24, "s_add_u32");
+        // The outer phi joins the entry value and the sum, which is no copy.
+        assert_eq!(t.origin(sum), Term::Value(sum));
+        assert_eq!(t.origin(outer), Term::Value(outer));
+        // Both inner phis hold the outer one's value; a phi may stand for itself.
+        let held = [Term::Value(outer), Term::Value(middle)];
+        assert!(held.contains(&t.origin(middle)));
+        assert!(held.contains(&t.origin(inner)) || t.origin(inner) == Term::Value(inner));
+        // The moves are copies of the middle phi.
+        assert_eq!(t.origin(write(0x08, "s_mov_b32")), t.origin(middle));
+        assert_eq!(t.origin(write(0x14, "s_mov_b32")), t.origin(middle));
     }
 
     #[test]

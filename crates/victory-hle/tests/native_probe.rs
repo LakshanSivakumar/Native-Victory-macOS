@@ -129,7 +129,7 @@ mod run {
     }
 
     // Windows ABI: floats arrive in xmm0, the integer in edx.
-    extern "win64" fn probe_scale(x: f64, k: i32) -> f64 {
+    extern "efiapi" fn probe_scale(x: f64, k: i32) -> f64 {
         // Host code with a std call: GS must be the host's here.
         let _ = std::thread::current().id();
         x * f64::from(k)

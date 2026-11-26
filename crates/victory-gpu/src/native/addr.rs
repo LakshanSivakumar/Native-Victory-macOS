@@ -21,14 +21,19 @@
 //! * `Options::zero_copy_memory`: the shader marks no pages and binds no bitmap, so the table is
 //!   all the host binds besides the heap.
 //!
-//! The table is rebuilt (into a new buffer: the GPU may still read the old one) when the pool table
-//! changed since it was made. shortcut: whole, not incrementally; at 64 KiB a page and 8 bytes an
-//! entry, 16 GiB of mappings is 2 MiB of words. A 64 KiB title page that is not wholly inside one
-//! mapping of one pool (mappings of 16 KiB granularity, or a pool boundary) is a null page.
+//! A heap's table ([`Table`]) is built whole once and then kept current in place: when the pool
+//! table changed, the host rewrites the entries of the pages whose mappings changed, in the buffer
+//! the GPU reads (as a console's GPU sees the title map and unmap pages at once). At 64 KiB a page
+//! and 8 bytes an entry, 16 GiB of mappings is 2 MiB of words. A 64 KiB title page shows a pool only
+//! if all of it shows one run of that pool (one mapping, or mappings that follow each other in title
+//! memory and in the pool); any other page (a pool boundary, a hole) is a null page. [`build`] is the
+//! whole-table form of the same layout, for mappings taken as they are.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::rc::Rc;
 use victory_backend::backend::ComputeBackend;
+
+use super::memory::PageTarget;
 
 /// Bytes of a title page of the table (the console's allocation granularity).
 pub const PAGE: u64 = 1 << 16;
@@ -76,10 +81,17 @@ pub struct Mapping {
 #[derive(Default, Debug)]
 pub struct Pairs {
     pub keys: Vec<PairKey>,
+    /// The last key asked for and its pair: the pages of a table come mostly in runs of one pool.
+    last: Option<(PairKey, u32)>,
 }
 
 impl Pairs {
     fn pair(&mut self, key: PairKey) -> Option<u32> {
+        if let Some((k, pair)) = self.last
+            && k == key
+        {
+            return Some(pair);
+        }
         let n = match self.keys.iter().rposition(|k| *k == key) {
             Some(n) => n,
             None if self.keys.len() + 1 < PAIRS => {
@@ -88,7 +100,9 @@ impl Pairs {
             }
             None => return None,
         };
-        Some(n as u32 + 1)
+        let pair = n as u32 + 1;
+        self.last = Some((key, pair));
+        Some(pair)
     }
 
     /// The bytes of the pool a pair shows: from `chunk * CHUNK`, a chunk and a page long, as far
@@ -142,6 +156,167 @@ pub fn build(maps: &[Mapping], pairs: &mut Pairs, first: u32) -> Vec<u32> {
         }
     }
     words
+}
+
+/// Blocks a [`Table`] has room for at first (two MiB of entries, besides level 1); it doubles when
+/// the title's mappings reach more 256 MiB regions than that.
+const FIRST_BLOCKS: usize = 64;
+/// Blocks any table can use: one per level-1 entry, and the null block.
+const MAX_BLOCKS: usize = LEVEL_1 + 1;
+
+/// The page table of one resource heap (its view indices are that heap's), kept current in place:
+/// the host writes only the pages whose mappings changed ([`super::memory::PoolTable::pages_since`])
+/// into the buffer the GPU reads, as the console's own page tables change under GPU work when the
+/// title maps memory. Rebuilding a table for every change of the pool table (each mapping the
+/// title's streaming makes) cost a snapshot of every mapping and a new buffer, under the pool and
+/// title locks, many times per submission; and a buffer superseded more than a few times behind the
+/// GPU was freed while queued work still read it. A buffer that must grow is copied into one twice
+/// its size, and the old one is kept for the work that may still read it.
+pub struct Table<B: ComputeBackend> {
+    pages: Rc<Pages<B>>,
+    /// Superseded buffers, for the work queued before they were.
+    // shortcut: kept as long as the table; it grows a few times at most (it doubles, to MAX_BLOCKS).
+    old: Vec<Rc<Pages<B>>>,
+    /// Level 1 as the buffer has it: the block of each 256 MiB of title addresses (0: none).
+    level1: Vec<u32>,
+    /// Blocks in use, the null block 0 included, and blocks the buffer has room for.
+    blocks: usize,
+    capacity: usize,
+    /// The heap's title entries: its pair 0 (the null view) is at this index.
+    first: u32,
+    /// The pool-table generation the table is current for.
+    pub generation: u64,
+    /// Pages left null because no view pair was left for their pool and chunk.
+    pub unpaired: u64,
+}
+
+impl<B: ComputeBackend> Table<B> {
+    /// The table of a heap of `first` title entries, showing `pages` (current for `generation`).
+    pub fn new(
+        backend: &B,
+        first: u32,
+        generation: u64,
+        pages: &[(u64, PageTarget)],
+        pairs: &mut Pairs,
+    ) -> Result<Table<B>, String> {
+        let mut table = Table {
+            pages: Rc::new(Self::alloc(backend, first, FIRST_BLOCKS)?),
+            old: Vec::new(),
+            level1: vec![0; LEVEL_1],
+            blocks: 1,
+            capacity: FIRST_BLOCKS,
+            first,
+            generation,
+            unpaired: 0,
+        };
+        for &(page, target) in pages {
+            table.set(backend, page, Some(target), pairs)?;
+        }
+        Ok(table)
+    }
+
+    /// The buffer the GPU reads now.
+    pub fn buffer(&self) -> &Rc<Pages<B>> {
+        &self.pages
+    }
+
+    /// Blocks in use (the null block included) and superseded buffers kept.
+    pub fn size(&self) -> (usize, usize) {
+        (self.blocks, self.old.len())
+    }
+
+    /// A buffer with room for `blocks` blocks: level 1 all block 0, every entry the null view.
+    fn alloc(backend: &B, first: u32, blocks: usize) -> Result<Pages<B>, String> {
+        let words = LEVEL_1 + blocks * BLOCK;
+        let pages = Pages::new(backend, words * 4)?;
+        let null = pair_index(first, 0);
+        let mut block = vec![0u32; BLOCK];
+        for e in block.chunks_exact_mut(2) {
+            e[0] = null;
+        }
+        for b in 0..blocks {
+            pages.write_at(LEVEL_1 + b * BLOCK, &block);
+        }
+        Ok(pages)
+    }
+
+    fn at(block: usize, page: u64) -> usize {
+        LEVEL_1 + block * BLOCK + 2 * ((page >> 16) as usize & 0xFFF)
+    }
+
+    /// Writes what the 64 KiB title page `page` shows (`None`: nothing, the null view). Pages above
+    /// 40 bits are never looked up (the translator sends them to block 0).
+    pub fn set(
+        &mut self,
+        backend: &B,
+        page: u64,
+        target: Option<PageTarget>,
+        pairs: &mut Pairs,
+    ) -> Result<(), String> {
+        if page >> 40 != 0 {
+            return Ok(());
+        }
+        let null = [pair_index(self.first, 0), 0];
+        let entry = match target {
+            None => null,
+            Some(t) => {
+                let key = PairKey {
+                    pool: t.pool,
+                    base: t.base,
+                    len: t.pool_len,
+                    chunk: t.pool_at / CHUNK,
+                };
+                match pairs.pair(key) {
+                    Some(pair) => {
+                        let in_view = t.pool_at - key.chunk * CHUNK;
+                        [pair_index(self.first, pair), (page as u32).wrapping_sub(in_view as u32)]
+                    }
+                    None => {
+                        self.unpaired += 1;
+                        null
+                    }
+                }
+            }
+        };
+        let l1 = (page >> 28) as usize;
+        if self.level1[l1] != 0 {
+            self.pages.write_entry(Self::at(self.level1[l1] as usize, page), entry);
+            return Ok(());
+        }
+        if entry == null {
+            // Its block is the null block already.
+            return Ok(());
+        }
+        if self.blocks == self.capacity {
+            self.grow(backend)?;
+        }
+        let block = self.blocks;
+        self.blocks += 1;
+        // The new block's entries are null already: the entry, then level 1 points at the block (so
+        // a lookup never reads a block before its entry is in).
+        self.pages.write_entry(Self::at(block, page), entry);
+        self.pages.write_at(l1, &[block as u32]);
+        self.level1[l1] = block as u32;
+        Ok(())
+    }
+
+    fn grow(&mut self, backend: &B) -> Result<(), String> {
+        let capacity = (self.capacity * 2).min(MAX_BLOCKS);
+        if capacity <= self.capacity {
+            return Err("a page table has a block for every 256 MiB already".into());
+        }
+        let bigger = Self::alloc(backend, self.first, capacity)?;
+        bigger.copy_from(&self.pages, LEVEL_1 + self.blocks * BLOCK);
+        let old = std::mem::replace(&mut self.pages, Rc::new(bigger));
+        self.old.push(old);
+        self.capacity = capacity;
+        Ok(())
+    }
+
+    /// The words the GPU reads, as far as they are in use (for tests and checks).
+    pub fn words(&self) -> Vec<u32> {
+        self.pages.read(LEVEL_1 + self.blocks * BLOCK)
+    }
 }
 
 /// A root SRV or UAV address as the translator's root views want it (`emit`, "Root SRVs and root
@@ -219,6 +394,40 @@ impl<B: ComputeBackend> Pages<B> {
         assert!(words.len() * 4 <= self.layout.size());
         // SAFETY: inside the allocation; the GPU does not read a table before it is bound.
         unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), self.ptr.cast(), words.len()) };
+    }
+
+    /// Writes `words` from word `index` on, each word in one store (the GPU may be reading them).
+    pub fn write_at(&self, index: usize, words: &[u32]) {
+        assert!((index + words.len()) * 4 <= self.layout.size());
+        let at = self.ptr.cast::<u32>();
+        for (i, &w) in words.iter().enumerate() {
+            // SAFETY: inside the allocation, aligned (the allocation is page aligned).
+            unsafe { at.add(index + i).write_volatile(w) };
+        }
+    }
+
+    /// Writes the two-word entry at the even word `index` in one store, so a lookup the GPU makes
+    /// meanwhile sees the old entry or the new one, not half of each.
+    pub fn write_entry(&self, index: usize, entry: [u32; 2]) {
+        assert!(index.is_multiple_of(2) && (index + 2) * 4 <= self.layout.size());
+        let value = u64::from(entry[0]) | u64::from(entry[1]) << 32;
+        // SAFETY: inside the allocation, 8-byte aligned (an even word of a page-aligned allocation).
+        unsafe { self.ptr.cast::<u64>().add(index / 2).write_volatile(value.to_le()) };
+    }
+
+    /// Copies the first `words` words of `other` here.
+    pub fn copy_from(&self, other: &Pages<B>, words: usize) {
+        assert!(words * 4 <= self.layout.size() && words * 4 <= other.layout.size());
+        // SAFETY: inside both allocations, which are distinct.
+        unsafe { std::ptr::copy_nonoverlapping(other.ptr.cast::<u32>(), self.ptr.cast::<u32>(), words) };
+    }
+
+    /// The first `words` words.
+    pub fn read(&self, words: usize) -> Vec<u32> {
+        assert!(words * 4 <= self.layout.size());
+        let at = self.ptr.cast::<u32>();
+        // SAFETY: inside the allocation, aligned.
+        (0..words).map(|i| unsafe { at.add(i).read_volatile() }).collect()
     }
 }
 

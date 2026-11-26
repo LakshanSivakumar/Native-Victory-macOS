@@ -1,7 +1,7 @@
 //! Descriptor heaps, textures, samplers and render passes: the second slice of the seam (`backend`
 //! has queues, fences and compute). Platform neutral, no Metal types.
 
-use crate::backend::{ComputeBackend, Dispatch, Heaps, RootArgs};
+use crate::backend::{ComputeBackend, Dispatch, Heaps, RootArgs, RootLayout};
 
 /// Which descriptor heap type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -18,6 +18,7 @@ pub enum Format {
     Rgba8Unorm,
     Rgba8UnormSrgb,
     Bgra8Unorm,
+    Bgra8UnormSrgb,
     Rgba16Float,
     R32Float,
     D32Float,
@@ -31,6 +32,39 @@ pub enum Format {
     Bc5,
     Bc6h,
     Bc7,
+    R8Unorm,
+    /// Alpha only: samples as (0, 0, 0, a), as D3D's `A8_UNORM` (UI font atlases).
+    A8Unorm,
+    R16Unorm,
+    Rgba32Float,
+    Rg32Float,
+    Rgb10a2Unorm,
+    Rg11b10Float,
+    Rgba8Uint,
+    Rg16Float,
+    Rg16Unorm,
+    R32Uint,
+    R8Uint,
+    /// Shared-exponent RGB (DXGI `R9G9B9E5_SHAREDEXP`).
+    Rgb9e5Float,
+    Bc7Srgb,
+    Rgba32Uint,
+    Rgba16Unorm,
+    Rgba16Snorm,
+    Rg32Uint,
+    Rg16Uint,
+    Rg8Unorm,
+    Rg8Uint,
+    Rg8Snorm,
+    R16Float,
+    R16Uint,
+    D16Unorm,
+    Bc1Srgb,
+    Bc3Srgb,
+    /// Metal's `BGR5A1Unorm`.
+    Bgr5a1Unorm,
+    /// Metal's `ABGR4Unorm`.
+    Abgr4Unorm,
 }
 
 impl Format {
@@ -38,12 +72,23 @@ impl Format {
     pub fn block(self) -> (usize, usize) {
         use Format::*;
         match self {
-            Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | R32Float | D32Float => (1, 4),
+            Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | Bgra8UnormSrgb | R32Float | D32Float => (1, 4),
+            Rgb10a2Unorm | Rg11b10Float | Rgba8Uint | Rg16Float | Rg16Unorm | R32Uint | Rgb9e5Float => (1, 4),
+            Rg16Uint => (1, 4),
             D32FloatS8 => (1, 8),
-            Rgba16Float => (1, 8),
-            Bc1 | Bc4 => (4, 8),
-            Bc2 | Bc3 | Bc5 | Bc6h | Bc7 => (4, 16),
+            Rgba16Float | Rg32Float | Rgba16Unorm | Rgba16Snorm | Rg32Uint => (1, 8),
+            Bc1 | Bc1Srgb | Bc4 => (4, 8),
+            Bc2 | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc7 | Bc7Srgb => (4, 16),
+            R8Unorm | A8Unorm | R8Uint => (1, 1),
+            R16Unorm | R16Float | R16Uint | D16Unorm | Rg8Unorm | Rg8Uint | Rg8Snorm | Bgr5a1Unorm | Abgr4Unorm => (1, 2),
+            Rgba32Float | Rgba32Uint => (1, 16),
         }
+    }
+
+    /// An integer format: its render targets cannot blend.
+    pub fn is_integer(self) -> bool {
+        use Format::*;
+        matches!(self, Rgba8Uint | R32Uint | R8Uint | Rgba32Uint | Rg32Uint | Rg16Uint | Rg8Uint | R16Uint)
     }
 
     /// Bytes of one row of `width` texels (of blocks, for BC).
@@ -157,6 +202,10 @@ pub trait ResourceBackend: ComputeBackend {
     /// A texture SRV or UAV.
     fn write_texture(&self, heap: &Self::Heap, index: usize, tex: &Self::Texture, min_lod: f32);
     fn write_sampler(&self, heap: &Self::Heap, index: usize, s: &Self::Sampler, lod_bias: f32);
+    /// Entry `index` names nothing: a buffer view over no bytes (reads give 0, writes are
+    /// dropped where the shader checks bounds). For a view the host could not make, so the
+    /// entry does not keep naming what it named before.
+    fn clear_entry(&self, _heap: &Self::Heap, _index: usize) {}
 
     fn create_texture(&self, desc: &TextureDesc) -> Result<Self::Texture, String>;
     fn create_texture_view(
@@ -408,6 +457,9 @@ pub enum Topology {
 pub struct RenderPipelineDesc<'a> {
     pub vs: &'a [u8],
     pub ps: Option<&'a [u8]>,
+    /// Explicit root layouts when the converter needs the host's argument contract.
+    pub vs_layout: Option<&'a RootLayout>,
+    pub ps_layout: Option<&'a RootLayout>,
     pub attributes: &'a [VertexAttr],
     pub streams: &'a [VertexStream],
     pub color: &'a [Format],
@@ -430,6 +482,8 @@ pub struct ColorTarget<'a, B: GraphicsBackend + ?Sized> {
 pub struct DepthTarget<'a, B: GraphicsBackend + ?Sized> {
     pub texture: &'a B::Texture,
     pub clear: Option<f32>,
+    /// Independent stencil load action; `None` preserves the existing plane.
+    pub clear_stencil: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -518,6 +572,8 @@ pub struct PassSubmission<'a, B: GraphicsBackend + ?Sized> {
     pub waits: &'a [(&'a B::Fence, u64)],
     pub passes: &'a [Pass<'a, B>],
     pub signals: &'a [(&'a B::Fence, u64)],
+    /// What the work is, for the GPU's error reports (the command buffer's label).
+    pub label: Option<&'a str>,
 }
 
 pub trait GraphicsBackend: ResourceBackend {
@@ -543,6 +599,12 @@ pub trait PresentBackend: GraphicsBackend {
     /// A surface over the app's drawable layer (`CAMetalLayer` on Metal), passed by address; the
     /// layer must stay alive while the surface does.
     fn create_surface(&self, layer: *mut std::ffi::c_void) -> Result<Self::Surface, String>;
+    /// Attempts presentation without blocking drawable acquisition. False keeps the FIFO head
+    /// pending; callers must retry before submitting later work on this queue.
+    fn try_present(&self, queue: &Self::Queue, surface: &Self::Surface, source: &Self::Texture) -> Result<bool, String> {
+        self.present(queue, surface, source).map(|()| true)
+    }
+
     /// Draws `source` over the surface's next drawable (scaled to it, whatever the formats) and
     /// presents it after the work already submitted to `queue`. Never waits for the GPU.
     fn present(

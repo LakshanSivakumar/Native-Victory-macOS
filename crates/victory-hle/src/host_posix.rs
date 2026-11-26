@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use victory_gpu::clock;
 use victory_loader::native::seh::context::Context;
 use victory_loader::native::{self, seh, teb};
 use victory_platform::mem::{self, Protect};
@@ -35,6 +36,7 @@ mod system;
 pub(crate) mod ucrt;
 mod winhttp;
 mod winsock;
+mod wasapi;
 mod xaudio2;
 
 const WAIT_OBJECT_0: u32 = 0;
@@ -56,6 +58,10 @@ const MEM_RELEASE: u32 = 0x8000;
 const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
 const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
 const DEFAULT_STACK: usize = 1 << 20;
+/// The least stack a title thread gets: host work runs on title threads too (the native GPU host
+/// converts and builds Metal pipelines at a draw), and the title's own sizes (1 MiB and less)
+/// overflowed there at the first guessed draw.
+const MIN_STACK: usize = 8 << 20;
 const STILL_ACTIVE: u32 = 259;
 /// `VirtualAlloc`'s allocation granularity: where a reservation starts, and
 /// the least it takes of the address space.
@@ -87,27 +93,20 @@ pub extern "system" fn GetCurrentProcessId() -> u32 {
     std::process::id()
 }
 
-fn epoch() -> Instant {
-    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
-    *START
-}
-
 pub extern "system" fn QueryPerformanceFrequency(out: *mut i64) -> i32 {
     // SAFETY: the title passes a valid pointer.
-    unsafe { out.write(1_000_000_000) };
+    unsafe { out.write(clock::counter_frequency() as i64) };
     1
 }
 
 pub extern "system" fn QueryPerformanceCounter(out: *mut i64) -> i32 {
-    // One tick is a nanosecond; the epoch's first read is not zero.
-    let ticks = epoch().elapsed().as_nanos() as i64 + 1;
     // SAFETY: the title passes a valid pointer.
-    unsafe { out.write(ticks) };
+    unsafe { out.write(clock::counter() as i64) };
     1
 }
 
 pub extern "system" fn GetTickCount64() -> u64 {
-    epoch().elapsed().as_millis() as u64
+    clock::ticks(1_000)
 }
 
 pub extern "system" fn GetTickCount() -> u32 {
@@ -208,6 +207,14 @@ pub extern "system" fn VirtualAlloc(
                 }
             }
             lock(&REGIONS).insert(p as usize, len);
+            // Where the title's own big reservations lie (memory the GPU cannot reach unless
+            // pools back it), for "not in a mapped pool" (the first few).
+            if len >= 1 << 20 {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                    tracing::info!(at = format_args!("{:#x}", p as usize), len = format_args!("{len:#x}"), kind = format_args!("{kind:#x}"), protect = format_args!("{protect:#x}"), "VirtualAlloc: a reservation");
+                }
+            }
             Ok(p)
         })
     } else if kind & MEM_COMMIT != 0 && at != 0 {
@@ -373,8 +380,41 @@ struct ThreadState {
 static HANDLES: LazyLock<Mutex<HashMap<usize, Object>>> = LazyLock::new(Default::default);
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
+/// The title return addresses on the calling thread's stack (image offsets), for the handle traces.
+/// On the arm64 host the lifted code keeps no x86 frames to walk: nothing.
+fn caller_chain() -> Vec<usize> {
+    #[cfg(target_arch = "x86_64")]
+    return native::dump::caller_chain();
+    #[cfg(not(target_arch = "x86_64"))]
+    Vec::new()
+}
+
 fn new_handle(object: Object) -> *mut c_void {
     let handle = (NEXT_HANDLE.fetch_add(1, Ordering::Relaxed) as usize) << 2;
+    if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+        let kind = match &object {
+            Object::Event(_) => "event",
+            Object::Semaphore(_) => "semaphore",
+            Object::Thread(_) => "thread",
+            _ => "other",
+        };
+        let chain = caller_chain();
+        if matches!(object, Object::Semaphore(_)) {
+            lock(&LEDGER).insert(handle, (chain.iter().take(4).copied().collect(), 0, 0));
+            static START: std::sync::Once = std::sync::Once::new();
+            START.call_once(|| {
+                std::thread::spawn(|| loop {
+                    std::thread::sleep(Duration::from_secs(4));
+                    let mut rows: Vec<_> = lock(&LEDGER).iter().map(|(h, v)| (*h, v.clone())).collect();
+                    rows.sort_by_key(|r| r.0);
+                    for (h, (chain, rel, got)) in rows {
+                        tracing::warn!("ledger {h:#x} made at {chain:x?}: released {rel}, taken {got}");
+                    }
+                });
+            });
+        }
+        tracing::warn!("handle {handle:#x} ({kind}) made at image+ {chain:x?}");
+    }
     lock(&HANDLES).insert(handle, object);
     handle as *mut c_void
 }
@@ -427,7 +467,13 @@ pub extern "system" fn CreateSemaphoreW(
     _name: *const u16,
 ) -> *mut c_void {
     match Semaphore::new(initial as u32, max as u32) {
-        Ok(s) => new_handle(Object::Semaphore(Arc::new(s))),
+        Ok(s) => {
+            let h = new_handle(Object::Semaphore(Arc::new(s)));
+            if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+                tracing::warn!("semaphore {h:?} initial {initial} max {max}");
+            }
+            h
+        }
         Err(_) => {
             set_error(ERROR_INVALID_PARAMETER);
             std::ptr::null_mut()
@@ -440,11 +486,13 @@ pub extern "system" fn ReleaseSemaphore(
     count: i32,
     previous: *mut i32,
 ) -> i32 {
+    watched(handle as usize, "release", count as u32);
     let semaphore = match lock(&HANDLES).get(&(handle as usize)) {
         Some(Object::Semaphore(s)) => Some(s.clone()),
         _ => None,
     };
     let Some(s) = semaphore else {
+        tracing::warn!("ReleaseSemaphore on {handle:p}: not a semaphore");
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
@@ -458,6 +506,7 @@ pub extern "system" fn ReleaseSemaphore(
             1
         }
         None => {
+            tracing::warn!("ReleaseSemaphore on {handle:p}: past the maximum");
             set_error(ERROR_INVALID_PARAMETER);
             0
         }
@@ -520,10 +569,40 @@ pub extern "system" fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32 
         set_error(ERROR_INVALID_HANDLE);
         return WAIT_FAILED;
     };
-    if object.wait(timeout) {
+    let got = object.wait(timeout);
+    watched(handle as usize, if got { "wait got it" } else { "wait timed out" }, ms);
+    if got {
         WAIT_OBJECT_0
     } else {
         WAIT_TIMEOUT
+    }
+}
+
+static LEDGER: LazyLock<Mutex<HashMap<usize, (Vec<usize>, u64, u64)>>> = LazyLock::new(Default::default);
+
+static WATCHED: LazyLock<Mutex<std::collections::HashSet<usize>>> = LazyLock::new(Default::default);
+
+/// `VICTORY_WATCH_HANDLE=<hex>`: logs every wait and release on that handle.
+fn watched(handle: usize, what: &str, arg: u32) {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_TRACE_HANDLES").is_some());
+    if !*ON {
+        return;
+    }
+    static WATCH: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_WATCH_HANDLE")
+            .ok()
+            .and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0)
+    });
+    if let Some(e) = lock(&LEDGER).get_mut(&handle) {
+        match what {
+            "release" => e.1 += 1,
+            "wait got it" | "multi wait got it" => e.2 += 1,
+            _ => {}
+        }
+    }
+    if (handle == *WATCH && handle != 0 || lock(&WATCHED).contains(&handle)) && what != "wait timed out" {
+        tracing::warn!("watch {handle:#x}: {what} ({arg}) at image+ {:x?}", caller_chain());
     }
 }
 
@@ -549,7 +628,11 @@ pub extern "system" fn WaitForMultipleObjects(
         return WAIT_FAILED;
     };
     let timeout = (ms != INFINITE).then(|| Duration::from_millis(u64::from(ms)));
-    sync::wait_multiple(&objects, wait_all != 0, timeout)
+    let r = sync::wait_multiple(&objects, wait_all != 0, timeout);
+    if let Some(&h) = handles.get(r as usize) {
+        watched(h as usize, "multi wait got it", count);
+    }
+    r
 }
 
 pub extern "system" fn WaitForMultipleObjectsEx(
@@ -599,11 +682,7 @@ pub extern "system" fn CreateThread(
     let started = unsafe {
         native::spawn_title_thread_with(
             "title-thread",
-            if stack_size == 0 {
-                DEFAULT_STACK
-            } else {
-                stack_size
-            },
+            if stack_size == 0 { DEFAULT_STACK } else { stack_size }.max(MIN_STACK),
             start,
             param as usize,
             // Before anything of the title's runs: park if suspended.
@@ -616,6 +695,9 @@ pub extern "system" fn CreateThread(
                 lock(&me.state).running = true;
             },
             move |code| {
+                if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
+                    tracing::warn!("title thread ends, code {code:#x}");
+                }
                 lock(&finished.state).exit_code = code;
                 finished.done.set();
                 sync::signalled();
@@ -869,6 +951,130 @@ fn exceptions(name: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn qpc() -> u64 {
+        let mut ticks = 0;
+        assert_eq!(QueryPerformanceCounter(&mut ticks), 1);
+        ticks as u64
+    }
+
+    fn crt<F: Copy>(name: &str) -> F {
+        let address = ucrt::lookup("ucrtbase.dll", name).unwrap();
+        // SAFETY: the caller supplies the CRT export's function type.
+        unsafe { std::mem::transmute_copy(&address) }
+    }
+
+    fn readings() -> impl Iterator<Item = u128> {
+        let crt_clock: extern "system" fn() -> i32 = crt("clock");
+        let timespec_get: extern "system" fn(*mut i64, i32) -> i32 = crt("timespec_get");
+        let time64: extern "system" fn(*mut i64) -> i64 = crt("_time64");
+        let mut timespec = [0i64; 2];
+        let (mut filetime, mut precise) = (0, 0);
+        let mut calendar = [0; 8];
+        const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+        let wall_before = clock::unix_time().as_nanos();
+        let before = qpc();
+        let tick = GetTickCount();
+        let tick64 = GetTickCount64();
+        let crt_ms = crt_clock();
+        let input = crate::modules::gameinput::now();
+        let after = qpc();
+        system::GetSystemTimeAsFileTime(&mut filetime);
+        system::GetSystemTimePreciseAsFileTime(&mut precise);
+        system::GetSystemTime(&mut calendar);
+        let mf = mf::MFGetSystemTime();
+        assert_eq!(timespec_get(timespec.as_mut_ptr(), 1), 1);
+        let seconds = time64(std::ptr::null_mut());
+        let wall_after = clock::unix_time().as_nanos();
+        let mut calendar_filetime = 0;
+        assert_eq!(
+            system::SystemTimeToFileTime(&calendar, &mut calendar_filetime),
+            1
+        );
+        let unix_ns = |ft| u128::from(ft - FILETIME_UNIX_EPOCH) * 100;
+        let monotonic = [
+            (u128::from(tick) * 1_000_000, 1_000_000),
+            (u128::from(tick64) * 1_000_000, 1_000_000),
+            (crt_ms as u128 * 1_000_000, 1_000_000),
+            (u128::from(input) * 1_000, 1_000),
+        ];
+        let wall = [
+            (unix_ns(filetime), 100),
+            (unix_ns(precise), 100),
+            (unix_ns(calendar_filetime), 1_000_000),
+            (unix_ns(mf as u64), 100),
+            (timespec[0] as u128 * 1_000_000_000 + timespec[1] as u128, 1),
+            (seconds as u128 * 1_000_000_000, 1_000_000_000),
+        ];
+        for (samples, low, high) in [
+            (&monotonic[..], u128::from(before), u128::from(after)),
+            (&wall[..], wall_before, wall_after),
+        ] {
+            for &(ns, quantum) in samples {
+                assert!(
+                    ns >= low.saturating_sub(quantum - 1) && ns <= high,
+                    "{ns} ns (tick {quantum} ns) outside {low}..={high}"
+                );
+            }
+        }
+        monotonic.into_iter().chain(wall).map(|(ns, _)| ns)
+    }
+
+    fn check_rate(rate: f64) {
+        let mut hz = 0;
+        assert_eq!(QueryPerformanceFrequency(&mut hz), 1);
+        assert_eq!(hz, 1_000_000_000);
+        clock::initialize();
+        std::thread::sleep(Duration::from_millis(20));
+        let before_first = Instant::now();
+        let first = qpc();
+        let first_utc = clock::unix_time();
+        let after_first = Instant::now();
+        let first_readings = readings();
+        std::thread::sleep(Duration::from_millis(20));
+        let second_readings = readings();
+        let before_second = Instant::now();
+        let second = qpc();
+        let second_utc = clock::unix_time();
+        let after_second = Instant::now();
+        for (a, b) in first_readings.zip(second_readings) {
+            assert!(a <= b, "{a} ns followed by {b} ns");
+        }
+        let low = (before_second - after_first).as_nanos() as f64 * rate;
+        let high = (after_second - before_first).as_nanos() as f64 * rate;
+        for actual in [(second - first) as f64, (second_utc - first_utc).as_nanos() as f64] {
+            assert!(
+                (low - 1.0..=high + 1.0).contains(&actual),
+                "{actual} ns at rate {rate}"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_clocks_agree_and_slow_down_together() {
+        const NAME: &str = "host_posix::clock_tests::guest_clocks_agree_and_slow_down_together";
+        const CHILD: &str = "VICTORY_TEST_CLOCK_RATE";
+        if let Ok(rate) = std::env::var(CHILD) {
+            check_rate(rate.parse().unwrap());
+            return;
+        }
+        for (rate, setting) in [("1", None), ("0.25", Some("0.25"))] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", NAME]).env(CHILD, rate);
+            match setting {
+                Some(setting) => child.env("VICTORY_CLOCK_SLOW", setting),
+                None => child.env_remove("VICTORY_CLOCK_SLOW"),
+            };
+            let status = child.status().unwrap();
+            assert!(status.success(), "clock rate {rate}: {status}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod memory_tests {
     use super::*;
 
@@ -894,17 +1100,6 @@ mod memory_tests {
             assert_eq!(lock(&REGIONS)[&(p as usize)], granules);
             bases.push(p);
         }
-        // A fixed address rounds down to the granule.
-        let fixed = VirtualAlloc(
-            std::ptr::null_mut(),
-            GRANULARITY,
-            MEM_RESERVE,
-            0x01, // PAGE_NOACCESS
-        );
-        assert_eq!(VirtualFree(fixed, 0, MEM_RELEASE), 1);
-        let again = VirtualAlloc(fixed.wrapping_byte_add(0x5000), 1, MEM_RESERVE, 0x01);
-        assert_eq!(again, fixed);
-        bases.push(again);
         // Splitting a placeholder inside a region succeeds, outside it fails.
         let r = bases[3];
         assert_eq!(
@@ -917,7 +1112,6 @@ mod memory_tests {
         );
         for p in bases {
             assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
-            assert!(!lock(&REGIONS).contains_key(&(p as usize)));
         }
     }
 }

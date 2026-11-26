@@ -14,8 +14,9 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use victory_gpu::clock;
 use victory_loader::native::{seh, teb};
 use victory_platform::mem::{self, Protect};
 use victory_platform::sync::{Event, Semaphore};
@@ -380,11 +381,8 @@ pub extern "system" fn DecodePointer(pointer: *mut c_void) -> *mut c_void {
 
 // Time.
 
-fn now_ticks() -> u64 {
-    let since = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    since.as_secs() * TICKS_PER_SECOND + u64::from(since.subsec_nanos()) / 100 + EPOCH_DIFFERENCE
+pub(super) fn now_ticks() -> u64 {
+    EPOCH_DIFFERENCE + (clock::unix_time().as_nanos() / 100) as u64
 }
 
 /// Seconds east of UTC at the current time.
@@ -1049,6 +1047,7 @@ fn until(due: i64) -> Duration {
     let ticks = if due < 0 {
         due.unsigned_abs()
     } else {
+        // shortcut: waits use host time at debug rates, scale wait durations if virtual deadlines must match them.
         (due as u64).saturating_sub(now_ticks())
     };
     Duration::from_nanos(ticks.saturating_mul(100))
@@ -1630,12 +1629,31 @@ pub extern "system" fn CoInitializeEx(_reserved: *const c_void, _model: u32) -> 
 pub extern "system" fn CoUninitialize() {}
 
 pub extern "system" fn CoCreateInstance(
-    _class: *const c_void,
+    class: *const c_void,
     _outer: *const c_void,
     _context: u32,
-    _interface: *const c_void,
+    interface: *const c_void,
     out: *mut *mut c_void,
 ) -> i32 {
+    if let Some(hr) = super::wasapi::create(class, interface, out) {
+        return hr;
+    }
+    static SEEN: Mutex<Vec<([u8; 16], [u8; 16])>> = Mutex::new(Vec::new());
+    let guid = |p: *const c_void| {
+        let mut g = [0u8; 16];
+        if !p.is_null() {
+            // SAFETY: a 16-byte GUID.
+            g.copy_from_slice(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), 16) });
+        }
+        g
+    };
+    let key = (guid(class), guid(interface));
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&key) {
+        seen.push(key);
+        tracing::info!(class = ?key.0, interface = ?key.1, "CoCreateInstance: class not registered");
+    }
+    drop(seen);
     if !out.is_null() {
         // SAFETY: the title's output pointer.
         unsafe { out.write(std::ptr::null_mut()) };
