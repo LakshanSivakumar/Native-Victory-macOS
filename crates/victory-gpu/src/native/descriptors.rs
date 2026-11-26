@@ -70,16 +70,39 @@ pub fn format(dxgi: u32) -> Option<Format> {
         // D32_FLOAT_S8X24_UINT (19), its shader views (20) and the console's variant (45).
         19 | 20 | 45 => Format::D32FloatS8,
         71 => Format::Bc1,
+        72 => Format::Bc1Srgb,
         74 => Format::Bc2,
+        75 => Format::Bc2Srgb,
         77 => Format::Bc3,
+        78 => Format::Bc3Srgb,
         80 => Format::Bc4,
         83 => Format::Bc5,
         95 => Format::Bc6h,
         98 => Format::Bc7,
+        99 => Format::Bc7Srgb,
         61 => Format::R8Unorm,
+        62 => Format::R8Uint,
         65 => Format::A8Unorm,
-        56 => Format::R16Unorm,
+        49 => Format::Rg8Unorm,
+        50 => Format::Rg8Uint,
+        51 => Format::Rg8Snorm,
+        53 | 56 => Format::R16Unorm,
+        54 => Format::R16Float,
+        57 => Format::R16Uint,
+        34 => Format::Rg16Float,
+        35 => Format::Rg16Unorm,
+        36 => Format::Rg16Uint,
+        30 => Format::Rgba8Uint,
+        24 => Format::Rgb10A2Unorm,
+        26 => Format::Rg11B10Float,
+        67 => Format::Rgb9E5Float,
+        42 => Format::R32Uint,
+        16 => Format::Rg32Float,
+        17 => Format::Rg32Uint,
+        11 => Format::Rgba16Unorm,
+        13 => Format::Rgba16Snorm,
         2 => Format::Rgba32Float,
+        3 => Format::Rgba32Uint,
         _ => return None,
     })
 }
@@ -254,6 +277,42 @@ mod tests {
                 size: 256
             })
         );
+    }
+
+    #[test]
+    fn dxgi_formats_map_with_expected_block_sizes() {
+        let cases = [
+            (2, Format::Rgba32Float, (1, 16)),
+            (3, Format::Rgba32Uint, (1, 16)),
+            (11, Format::Rgba16Unorm, (1, 8)),
+            (13, Format::Rgba16Snorm, (1, 8)),
+            (16, Format::Rg32Float, (1, 8)),
+            (17, Format::Rg32Uint, (1, 8)),
+            (24, Format::Rgb10A2Unorm, (1, 4)),
+            (26, Format::Rg11B10Float, (1, 4)),
+            (30, Format::Rgba8Uint, (1, 4)),
+            (34, Format::Rg16Float, (1, 4)),
+            (35, Format::Rg16Unorm, (1, 4)),
+            (36, Format::Rg16Uint, (1, 4)),
+            (42, Format::R32Uint, (1, 4)),
+            (49, Format::Rg8Unorm, (1, 2)),
+            (50, Format::Rg8Uint, (1, 2)),
+            (51, Format::Rg8Snorm, (1, 2)),
+            (53, Format::R16Unorm, (1, 2)),
+            (54, Format::R16Float, (1, 2)),
+            (57, Format::R16Uint, (1, 2)),
+            (62, Format::R8Uint, (1, 1)),
+            (67, Format::Rgb9E5Float, (1, 4)),
+            (72, Format::Bc1Srgb, (4, 8)),
+            (75, Format::Bc2Srgb, (4, 16)),
+            (78, Format::Bc3Srgb, (4, 16)),
+            (99, Format::Bc7Srgb, (4, 16)),
+        ];
+        for (dxgi, expected, block) in cases {
+            let f = format(dxgi).unwrap_or_else(|| panic!("DXGI format {dxgi} should map"));
+            assert_eq!(f, expected, "DXGI format {dxgi}");
+            assert_eq!(f.block(), block, "block size for DXGI format {dxgi}");
+        }
     }
 
     #[test]

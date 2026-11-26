@@ -25,17 +25,40 @@ pub enum Format {
     /// depth formats, which Apple GPUs do not have).
     D32FloatS8,
     Bc1,
+    Bc1Srgb,
     Bc2,
+    Bc2Srgb,
     Bc3,
+    Bc3Srgb,
     Bc4,
     Bc5,
     Bc6h,
     Bc7,
+    Bc7Srgb,
     R8Unorm,
+    R8Uint,
     /// Alpha only: samples as (0, 0, 0, a), as D3D's `A8_UNORM` (UI font atlases).
     A8Unorm,
+    Rg8Unorm,
+    Rg8Snorm,
+    Rg8Uint,
     R16Unorm,
+    R16Float,
+    R16Uint,
+    Rg16Float,
+    Rg16Unorm,
+    Rg16Uint,
+    Rgba8Uint,
+    Rgb10A2Unorm,
+    Rg11B10Float,
+    Rgb9E5Float,
+    R32Uint,
+    Rg32Float,
+    Rg32Uint,
+    Rgba16Unorm,
+    Rgba16Snorm,
     Rgba32Float,
+    Rgba32Uint,
 }
 
 impl Format {
@@ -43,14 +66,16 @@ impl Format {
     pub fn block(self) -> (usize, usize) {
         use Format::*;
         match self {
-            Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | R32Float | D32Float => (1, 4),
-            D32FloatS8 => (1, 8),
-            Rgba16Float => (1, 8),
-            Bc1 | Bc4 => (4, 8),
-            Bc2 | Bc3 | Bc5 | Bc6h | Bc7 => (4, 16),
-            R8Unorm | A8Unorm => (1, 1),
-            R16Unorm => (1, 2),
-            Rgba32Float => (1, 16),
+            Rgba8Unorm | Rgba8UnormSrgb | Bgra8Unorm | Rgba8Uint | Rgb10A2Unorm | Rg11B10Float
+            | Rgb9E5Float | R32Float | R32Uint | D32Float | Rg16Float | Rg16Unorm | Rg16Uint => {
+                (1, 4)
+            }
+            D32FloatS8 | Rgba16Float | Rgba16Unorm | Rgba16Snorm | Rg32Float | Rg32Uint => (1, 8),
+            Bc1 | Bc1Srgb | Bc4 => (4, 8),
+            Bc2 | Bc2Srgb | Bc3 | Bc3Srgb | Bc5 | Bc6h | Bc7 | Bc7Srgb => (4, 16),
+            R8Unorm | R8Uint | A8Unorm => (1, 1),
+            Rg8Unorm | Rg8Snorm | Rg8Uint | R16Unorm | R16Float | R16Uint => (1, 2),
+            Rgba32Float | Rgba32Uint => (1, 16),
         }
     }
 
