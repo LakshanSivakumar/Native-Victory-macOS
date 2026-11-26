@@ -118,6 +118,8 @@ impl Inner {
 #[derive(Default)]
 pub struct PoolTable {
     inner: Mutex<Inner>,
+    #[cfg(all(test, target_os = "macos"))]
+    mapping_snapshots: std::sync::atomic::AtomicUsize,
 }
 
 impl PoolTable {
@@ -152,12 +154,21 @@ impl PoolTable {
     /// Every mapping, by title address: `(at, len, pool, offset in the pool)`.
     pub fn mappings(&self) -> (u64, Vec<(usize, usize, PoolInfo, usize)>) {
         let g = self.lock();
+        #[cfg(all(test, target_os = "macos"))]
+        self.mapping_snapshots
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let maps = g
             .maps
             .iter()
             .filter_map(|(&at, m)| Some((at, m.len, g.pools.get(&m.pool)?.clone(), m.offset)))
             .collect();
         (g.generation, maps)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn mapping_snapshots(&self) -> usize {
+        self.mapping_snapshots
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Pools released since the last call; the host drops their buffers.

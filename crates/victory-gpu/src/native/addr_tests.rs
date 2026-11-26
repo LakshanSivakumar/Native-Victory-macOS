@@ -219,6 +219,21 @@ fn computed_addresses_read_and_write_the_pool_at_its_title_addresses() {
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[a, b, c, d], false);
     check_computed(&f, 0x2_0000, 0x6_0000);
+
+    // The same heap and unchanged mappings can use the existing page table.
+    prepare_computed(&f, 0x2_0000, 0x6_0000);
+    dispatch(&mut t, &cs, &[a, b, c, d], false);
+    check_computed(&f, 0x2_0000, 0x6_0000);
+    assert_eq!(t.host.memory().mapping_snapshots(), 1);
+
+    // Remapping must still rebuild that heap's table.
+    t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, 0x4_0000);
+    f.put(0, &[CANARY; POOL / 4]);
+    prepare_computed(&f, 0x4_0000, 0x8_0000);
+    dispatch(&mut t, &cs, &[a, b, c, d], false);
+    check_computed(&f, 0x4_0000, 0x8_0000);
+    assert_eq!(f.get(0x6_0000, 64), [CANARY; 64]);
+    assert_eq!(t.host.memory().mapping_snapshots(), 2);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 

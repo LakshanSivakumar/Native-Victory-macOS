@@ -501,12 +501,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.count
             ));
         }
-        let (generation, mappings) = self.memory.mappings();
         if let Some((g, t)) = &*heap.table.borrow()
-            && *g == generation
+            && *g == self.memory.generation()
         {
             return Ok(t.clone());
         }
+        let (generation, mappings) = self.memory.mappings();
         let maps: Vec<Mapping> = mappings
             .iter()
             .map(|(at, len, pool, offset)| Mapping {
@@ -561,25 +561,20 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The pair view and the offset in it of root view address `a` (see [`addr::root_view`]).
     fn root_view(&self, heap: &NativeHeap<B>, a: u64) -> (u32, u32) {
-        let maps = self.mapping_list();
-        addr::root_view(&maps, &mut self.contract.borrow_mut().pairs, heap.count as u32, a)
-    }
-
-    /// The pool table as the page table builder reads it.
-    fn mapping_list(&self) -> Vec<Mapping> {
-        self.memory
-            .mappings()
-            .1
-            .iter()
-            .map(|(at, len, pool, offset)| Mapping {
-                at: *at as u64,
-                len: *len as u64,
-                pool: pool.id,
-                base: pool.base,
-                pool_len: pool.len as u64,
-                offset: *offset as u64,
-            })
-            .collect()
+        let mapping = self.memory.resolve(a, 1).map(|(pool, address)| Mapping {
+            at: a,
+            len: 1,
+            pool: pool.id,
+            base: pool.base,
+            pool_len: pool.len as u64,
+            offset: (address as usize - pool.base) as u64,
+        });
+        addr::root_view(
+            mapping.as_slice(),
+            &mut self.contract.borrow_mut().pairs,
+            heap.count as u32,
+            a,
+        )
     }
 
     /// What a shader that finds title memory through the page table is given besides its user data:
@@ -1276,6 +1271,36 @@ fn stride_word(view: &crate::descriptor::View) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_root_view_does_not_snapshot_unrelated_mappings() {
+        use crate::native::memory::{PoolInfo, PoolObserver};
+        use victory_metal::metal::Metal;
+
+        let Ok(metal) = Metal::new() else { return };
+        let host = NativeHost::new(metal);
+        let buffer_at = 0x7000_0000;
+        let pool = PoolInfo {
+            id: 1,
+            base: 0x1_0000_0000,
+            len: 0x4_0000,
+            memory_entry: None,
+        };
+        host.memory.mapped(buffer_at, 0x1_0000, &pool, 0x2_0000);
+        host.memory.mapped(buffer_at + 0x2_0000, 0x1_0000, &pool, 0);
+        let heap = host.heap(HeapKind::Resource, 0, 8).unwrap();
+
+        assert_eq!(
+            host.root_view(&heap, buffer_at as u64 + 32),
+            (addr::pair_index(8, 1), 0x2_0020),
+        );
+        assert_eq!(
+            host.root_view(&heap, buffer_at as u64 + 0x1_0000),
+            (addr::pair_index(8, 0), 0),
+        );
+        assert_eq!(host.memory.mapping_snapshots(), 0);
+    }
 
     #[test]
     fn table_check_count_uses_shader_metadata_above_default() {

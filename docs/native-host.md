@@ -235,6 +235,8 @@ The windowed n26 run of `d5a3ca0` logged 3,000 buffer views rejected as outside 
 
 At draw counter 6,144, n27 on `4c255d6` had logged 33 buffer-view rejections, compared with 3,000 by that counter in n26. n27 reached prologue prestreaming, then exited with an access violation. Its 16 GPU address descriptions were all unavailable. The crash hook now reads pool and mirrored buffer-view metadata through separate nonblocking lookups outside the title lock. Each table is reported as unavailable when it cannot be read, so a busy table can still leave a partial address report.
 
+During prologue prestreaming, n28 on `d67e4c3` hit the same watchdog write to null as n27. All 16 pool lookups reported unavailable while the buffer-view lookup returned zero covering views for each address. Resolving the host addresses in the thread dump against the matching emulator binary identified `reset_x` on the render subsystem thread, with other threads in `execute_x` and `compute_table`. Submission was taking full pool-map snapshots before checking the cached table's generation, and for each root view. It now snapshots the map when the page table needs rebuilding and resolves each root view through a single pool lookup. Synthetic Metal tests check both snapshot counts and the shader's writes after a remap. The effect on the game's watchdog remains to be measured.
+
 ## Interfaces for the recompiler
 
 The recompiler produces arm64 code for the title's functions and runs it in an arm64 host process with the same loader, runtime and HLE. What it can rely on:
