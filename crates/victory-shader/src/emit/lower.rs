@@ -360,6 +360,9 @@ struct Lower<'a> {
     split_inputs: Map<(usize, u8), usize>,
     /// Debug (`VICTORY_DEBUG_VS_POS`): the last two-dword raw vertex fetch, as floats.
     debug_pos: Option<(V, V)>,
+    /// Rectangle list: which stored corner holds the right angle, `(block, at v0, at v2)`
+    /// (neither: v1), picked from the first two-channel float fetch (the position).
+    rect_corner: Option<(usize, V, V)>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -845,6 +848,7 @@ impl<'a> Lower<'a> {
             mode16: Some(0),
             split_inputs: Map::default(),
             debug_pos: None,
+            rect_corner: None,
         }
     }
 
@@ -6655,8 +6659,9 @@ impl<'a> Lower<'a> {
     }
 
     /// A guessed PS's linear buffer descriptor in SGPRs, addressed in title memory.
-    // shortcut: aligned dword reads with constant control flags and nonnegative SMEM
-    // immediates only, extend when shaders need other access types or descriptor forms.
+    // shortcut: constant control flags and nonnegative SMEM immediates only.
+    // Subword reads assume SH_MEM_CONFIG.alignment_mode = UNALIGNED; the
+    // guessed path does not yet decode that register. Dword alignment is unchanged.
     fn computed_buffer(
         &mut self,
         inst: &Inst,
@@ -6691,7 +6696,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let index = index.unwrap_or(zero);
         let bounds = (control >> 28) & 3;
-        let records = if bounds == 2 { zero } else { word(self, 2)? };
+        let records = word(self, 2)?;
 
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64;
@@ -6706,20 +6711,31 @@ impl<'a> Lower<'a> {
 
         let record_ok = self.s.m.cmp(c, pred::IULT, index, records);
         let byte_count = widen(self, records);
+        let (bytes, signed) = match inst.name() {
+            "buffer_load_ubyte" => (1, false),
+            "buffer_load_sbyte" => (1, true),
+            "buffer_load_ushort" => (2, false),
+            "buffer_load_sshort" => (2, true),
+            _ => (4, false),
+        };
         let mut values = Vec::new();
         for k in 0..count {
             let c = self.cur;
-            let delta = self.s.m.int_const(i64t, i64::from(4 * k));
+            let delta = self.s.m.int_const(i64t, i64::from(bytes * k));
             let at = self.s.m.bin(c, Bin::Add, byte, delta);
-            let end = self.s.m.int_const(i64t, i64::from(4 * (k + 1)));
+            let end = self.s.m.int_const(i64t, i64::from(bytes * (k + 1)));
             let in_bounds = match bounds {
                 0 => {
-                    let end = self.s.m.bin(c, Bin::Add, off, end);
-                    let fits = self.s.m.cmp(c, pred::IULE, end, stride);
+                    // Mode 0 checks the component's starting offset, not its
+                    // end (RDNA2 ISA table 35). Mode 3 checks the payload end.
+                    let start = self.s.m.bin(c, Bin::Add, off, delta);
+                    let fits = self.s.m.cmp(c, pred::IULT, start, stride);
                     Some(self.s.m.bin(c, Bin::And, record_ok, fits))
                 }
                 1 => Some(record_ok),
-                2 => None,
+                // OOB_SELECT=2 disables range checks, but an empty descriptor
+                // still returns zero (RDNA2 ISA section 8.1.5, table 35).
+                2 => Some(self.s.m.cmp(c, pred::NE, records, zero)),
                 _ => {
                     let end = self.s.m.bin(c, Bin::Add, byte, end);
                     Some(self.s.m.cmp(c, pred::IULE, end, byte_count))
@@ -6729,11 +6745,46 @@ impl<'a> Lower<'a> {
             let (low, high) = self.split64(at);
             let (lo, hi) = self.add64(lo, hi, low, false);
             let hi = self.s.m.bin(self.cur, Bin::Add, hi, high);
-            let (h, byte) = self.memory(lo, hi, 4, false, None);
-            let value = self.raw_dword(h, byte);
+            let value = if bytes == 4 {
+                let (h, byte) = self.memory(lo, hi, 4, false, None);
+                self.raw_dword(h, byte)
+            } else {
+                self.memory_subword(lo, hi, bytes, signed)
+            };
             values.push(self.end_guarded(start, &[(value, zero)])[0]);
         }
         Ok(values)
+    }
+
+    /// Read each byte through its own page-table lookup, including a halfword
+    /// straddling a dword, a 64 KiB page, or the low 32 bits of the address.
+    /// Bounds have already been checked for the whole element, not its backing dwords.
+    fn memory_subword(&mut self, lo: V, hi: V, bytes: u32, signed: bool) -> V {
+        let mut value = self.s.m.i32(0);
+        for k in 0..bytes {
+            let delta = self.s.m.i32(k);
+            let (low, high) = self.add64(lo, hi, delta, false);
+            let not3 = self.s.m.i32(!3);
+            let aligned = self.s.m.bin(self.cur, Bin::And, low, not3);
+            let (h, at) = self.memory(aligned, high, 4, false, None);
+            let word = self.raw_dword(h, at);
+            let c = self.cur;
+            let three = self.s.m.i32(3);
+            let lane = self.s.m.bin(c, Bin::And, low, three);
+            let shift = self.s.m.bin(c, Bin::Shl, lane, three);
+            let byte = self.s.m.bin(c, Bin::LShr, word, shift);
+            let mask = self.s.m.i32(0xFF);
+            let byte = self.s.m.bin(c, Bin::And, byte, mask);
+            let shift = self.s.m.i32(8 * k);
+            let byte = self.s.m.bin(c, Bin::Shl, byte, shift);
+            value = self.s.m.bin(c, Bin::Or, value, byte);
+        }
+        if signed {
+            let shift = self.s.m.i32(32 - bytes * 8);
+            value = self.s.m.bin(self.cur, Bin::Shl, value, shift);
+            value = self.s.m.bin(self.cur, Bin::AShr, value, shift);
+        }
+        value
     }
 
     /// The byte stride of the buffer view a heap-indexed descriptor names
@@ -8205,43 +8256,6 @@ impl<'a> Lower<'a> {
                 };
                 int(self, r)
             }
-            "v_permlane16_b32" | "v_permlanex16_b32" => {
-                // Lane l reads lane pick | base: pick is nibble (l & 15) of {src2, src1}, base
-                // the lane's own row of 16 (x16: the other row of its 32). It never leaves the
-                // lane's 32, so it stays in one host wave. (Inactive source lanes: read as is;
-                // the FI and bound_ctrl bits are not followed.)
-                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                self.cross_lane(false)?;
-                let me = self.lane_index();
-                let (k7, k8, k15, k16, k2) = (
-                    self.s.m.i32(7),
-                    self.s.m.i32(8),
-                    self.s.m.i32(15),
-                    self.s.m.i32(16),
-                    self.s.m.i32(2),
-                );
-                let i = self.s.m.bin(c, Bin::And, me, k15);
-                let low = self.s.m.cmp(c, pred::IULT, i, k8);
-                let word = self.s.m.select(c, low, s1, s2);
-                let sh = self.s.m.bin(c, Bin::And, i, k7);
-                let sh = self.s.m.bin(c, Bin::Shl, sh, k2);
-                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
-                let pick = self.s.m.bin(c, Bin::And, pick, k15);
-                let base = if name == "v_permlanex16_b32" {
-                    // (l & ~31) | ((l & 16) ^ 16)
-                    let not31 = self.s.m.i32(!31);
-                    let half = self.s.m.bin(c, Bin::And, me, not31);
-                    let row = self.s.m.bin(c, Bin::And, me, k16);
-                    let row = self.s.m.bin(c, Bin::Xor, row, k16);
-                    self.s.m.bin(c, Bin::Or, half, row)
-                } else {
-                    let not15 = self.s.m.i32(!15);
-                    self.s.m.bin(c, Bin::And, me, not15)
-                };
-                let src = self.s.m.bin(c, Bin::Or, base, pick);
-                let r = self.read_in_half(a, src);
-                int(self, r)
-            }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
@@ -8280,6 +8294,77 @@ impl<'a> Lower<'a> {
                     &[a],
                 );
                 let r = self.helper_reads_own(a, r);
+                int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads from its own 16-lane row (`v_permlane16`) or
+                // the other row in the same 32-lane half (`v_permlanex16`),
+                // using nibble `lane & 15` of `{src2, src1}` as the lane within
+                // that row.
+                self.cross_lane(false)?;
+                self.s.flags |= flags::WAVE_OPS;
+                let (x, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (k0, k2, k7, k8, k15, not15) = (
+                    k(self, 0),
+                    k(self, 2),
+                    k(self, 7),
+                    k(self, 8),
+                    k(self, 15),
+                    k(self, !15),
+                );
+                let hi_bit = self.s.m.bin(c, Bin::And, lane, k8);
+                let is_hi = self.s.m.cmp(c, pred::NE, hi_bit, k0);
+                let word = self.s.m.select(c, is_hi, s2, s1);
+                let nibble = self.s.m.bin(c, Bin::And, lane, k7);
+                let shift = self.s.m.bin(c, Bin::Shl, nibble, k2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let row = self.s.m.bin(c, Bin::And, lane, not15);
+                let row = if name == "v_permlanex16_b32" {
+                    let k16 = k(self, 16);
+                    self.s.m.bin(c, Bin::Xor, row, k16)
+                } else {
+                    row
+                };
+                let src = self.s.m.bin(c, Bin::Or, row, pick);
+                let mut r = self.read_in_half(x, src);
+                // Without `fi:1` (opsel bit 0), reading an inactive lane yields 0
+                // (`bound_ctrl:1`, opsel bit 1) or keeps the destination's old value.
+                if v.opsel & 1 == 0
+                    && let Some(on) = guard
+                {
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let ballot = self
+                        .s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                    let (lo, hi) = (
+                        self.s.m.extract(c, ballot, 0),
+                        self.s.m.extract(c, ballot, 1),
+                    );
+                    let active = if self.host32 {
+                        let k31 = k(self, 31);
+                        let in_half = self.s.m.bin(c, Bin::And, src, k31);
+                        let bit = self.s.m.bin(c, Bin::LShr, lo, in_half);
+                        let one = k(self, 1);
+                        let bit = self.s.m.bin(c, Bin::And, bit, one);
+                        self.s.m.cmp(c, pred::NE, bit, k0)
+                    } else {
+                        self.lane_bit_of(c, src, lo, hi)
+                    };
+                    let fallback = if v.opsel & 2 != 0 {
+                        k0
+                    } else if let Some(Operand::Vector { reg, .. }) = v.dst
+                        && let Some(old) = inst.read(Reg::V(reg))
+                    {
+                        self.i32_of(old)?
+                    } else {
+                        k0
+                    };
+                    r = self.s.m.select(c, active, r, fallback);
+                }
                 int(self, r)
             }
             _ => {
@@ -11124,6 +11209,7 @@ impl<'a> Lower<'a> {
         *cols = (*cols).max(count as u8);
         ids.push(id);
         }
+        let mut loaded = Vec::new();
         for k in 0..count {
             let mut x = [None; 3];
             for (corner, &id) in ids.iter().enumerate() {
@@ -11132,6 +11218,32 @@ impl<'a> Lower<'a> {
                 };
                 x[corner] = Some(v);
             }
+            loaded.push(x);
+        }
+        let float = !matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C');
+        if let ([[Some(a0), Some(b0), Some(d0)], [Some(a1), Some(b1), Some(d1)], ..], true, None) =
+            (&loaded[..], float, self.rect_corner)
+        {
+            // The right angle is opposite the longest side (the corners may come in any order).
+            let c = self.cur;
+            let p: Vec<V> = [*a0, *a1, *b0, *b1, *d0, *d1].map(|v| self.as_float(v)).to_vec();
+            let mut d2 = |i: usize, j: usize| {
+                let dx = self.s.m.bin(c, Bin::Sub, p[2 * i], p[2 * j]);
+                let dy = self.s.m.bin(c, Bin::Sub, p[2 * i + 1], p[2 * j + 1]);
+                let xx = self.s.m.bin(c, Bin::Mul, dx, dx);
+                let yy = self.s.m.bin(c, Bin::Mul, dy, dy);
+                self.s.m.bin(c, Bin::Add, xx, yy)
+            };
+            let (ab, bd, ad) = (d2(0, 1), d2(1, 2), d2(0, 2));
+            let ge1 = self.s.m.cmp(c, pred::OGE, bd, ab);
+            let ge2 = self.s.m.cmp(c, pred::OGE, bd, ad);
+            let at_a = self.s.m.bin(c, Bin::And, ge1, ge2);
+            let ge3 = self.s.m.cmp(c, pred::OGT, ab, ad);
+            let ge4 = self.s.m.cmp(c, pred::OGT, ab, bd);
+            let at_d = self.s.m.bin(c, Bin::And, ge3, ge4);
+            self.rect_corner = Some((c, at_a, at_d));
+        }
+        for (k, x) in loaded.into_iter().enumerate() {
             let Some(mut v) = x[0] else { return Err("a vertex input") };
             if let [Some(a), Some(b), Some(d)] = x {
                 // Rectangle corner by vertex id: 1 and 2 are the stored ones, 3 is b + d - a.
@@ -11141,21 +11253,37 @@ impl<'a> Lower<'a> {
                     let n = l.s.m.i32(n);
                     l.s.m.cmp(c, pred::EQ, vid, n)
                 };
-                let ex = if matches!(kind, 'U' | 'I' | 'W' | 'K' | 'B' | 'C') {
-                    d
-                } else {
-                    let (fa, fb, fd) = (self.as_float(a), self.as_float(b), self.as_float(d));
-                    // Observed: the corners come as top-left, bottom-left, bottom-right, so the
-                    // missing one is opposite the middle vertex: v0 + v2 - v1.
-                    let sum = self.s.m.bin(c, Bin::Add, fa, fd);
-                    let fourth = self.s.m.bin(c, Bin::Sub, sum, fb);
-                    self.as_int(fourth)
+                // r: the right-angle corner, p and q the others (v1, v0 and v2 unless the
+                // position says otherwise); the missing corner is p + q - r.
+                let (p, r, q) = match self.rect_corner {
+                    Some((block, at_a, at_d)) if block == c => {
+                        let r = self.s.m.select(c, at_d, d, b);
+                        let r = self.s.m.select(c, at_a, a, r);
+                        let p = self.s.m.select(c, at_a, b, a);
+                        let q = self.s.m.select(c, at_d, b, d);
+                        (p, r, q)
+                    }
+                    _ => (a, b, d),
                 };
-                // Strip order v0, v1, the missing corner, v2: both triangles wind alike.
+                let ex = if float {
+                    let (fp, fr, fq) = (self.as_float(p), self.as_float(r), self.as_float(q));
+                    let sum = self.s.m.bin(c, Bin::Add, fp, fq);
+                    let fourth = self.s.m.bin(c, Bin::Sub, sum, fr);
+                    let fourth = self.as_int(fourth);
+                    // A value two corners share is the fourth's exactly (no rounding, NaN or
+                    // flushed denormal from the arithmetic).
+                    let pr = self.s.m.cmp(c, pred::EQ, p, r);
+                    let qr = self.s.m.cmp(c, pred::EQ, q, r);
+                    let v = self.s.m.select(c, qr, p, fourth);
+                    self.s.m.select(c, pr, q, v)
+                } else {
+                    q
+                };
+                // Strip order p, r, the missing corner, q: two triangles sharing the r diagonal.
                 let (c1, c2, c3) = (is(self, 1), is(self, 2), is(self, 3));
-                v = self.s.m.select(c, c1, b, a);
+                v = self.s.m.select(c, c1, r, p);
                 v = self.s.m.select(c, c2, ex, v);
-                v = self.s.m.select(c, c3, d, v);
+                v = self.s.m.select(c, c3, q, v);
             }
             if count == 2 && kind == 'F' {
                 match (k, self.debug_pos) {
@@ -11279,8 +11407,8 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         if matches!(src, Source::BuiltMemory { .. }) {
-            if typed || store || atomic.is_some() || sub.is_some() {
-                return Err("a computed buffer descriptor used for an access other than a dword load");
+            if typed || store || atomic.is_some() {
+                return Err("a computed buffer descriptor used for an unsupported buffer access");
             }
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");

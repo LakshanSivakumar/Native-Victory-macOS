@@ -100,6 +100,30 @@ fn pixel_format(f: Format) -> MTLPixelFormat {
         Format::A8Unorm => MTLPixelFormat::A8Unorm,
         Format::R16Unorm => MTLPixelFormat::R16Unorm,
         Format::Rgba32Float => MTLPixelFormat::RGBA32Float,
+        Format::Rg32Float => MTLPixelFormat::RG32Float,
+        Format::Rgb10a2Unorm => MTLPixelFormat::RGB10A2Unorm,
+        Format::Rg11b10Float => MTLPixelFormat::RG11B10Float,
+        Format::Rgba8Uint => MTLPixelFormat::RGBA8Uint,
+        Format::Rg16Float => MTLPixelFormat::RG16Float,
+        Format::Rg16Unorm => MTLPixelFormat::RG16Unorm,
+        Format::R32Uint => MTLPixelFormat::R32Uint,
+        Format::R8Uint => MTLPixelFormat::R8Uint,
+        Format::Rgb9e5Float => MTLPixelFormat::RGB9E5Float,
+        Format::Bc7Srgb => MTLPixelFormat::BC7_RGBAUnorm_sRGB,
+        Format::Rgba32Uint => MTLPixelFormat::RGBA32Uint,
+        Format::Rgba16Unorm => MTLPixelFormat::RGBA16Unorm,
+        Format::Rgba16Snorm => MTLPixelFormat::RGBA16Snorm,
+        Format::Rg32Uint => MTLPixelFormat::RG32Uint,
+        Format::Rg16Uint => MTLPixelFormat::RG16Uint,
+        Format::Rg8Unorm => MTLPixelFormat::RG8Unorm,
+        Format::Rg8Uint => MTLPixelFormat::RG8Uint,
+        Format::R16Float => MTLPixelFormat::R16Float,
+        Format::R16Uint => MTLPixelFormat::R16Uint,
+        Format::D16Unorm => MTLPixelFormat::Depth16Unorm,
+        Format::Bc1Srgb => MTLPixelFormat::BC1_RGBA_sRGB,
+        Format::Bc3Srgb => MTLPixelFormat::BC3_RGBA_sRGB,
+        Format::Bgr5a1Unorm => MTLPixelFormat::BGR5A1Unorm,
+        Format::Abgr4Unorm => MTLPixelFormat::ABGR4Unorm,
     }
 }
 
@@ -719,7 +743,7 @@ impl GraphicsBackend for Metal {
                 }
             }
             a.setWriteMask(mask);
-            if let Some(b) = state.blend {
+            if let Some(b) = state.blend.filter(|_| !f.is_integer()) {
                 a.setBlendingEnabled(true);
                 a.setSourceRGBBlendFactor(blend_factor(b.src));
                 a.setDestinationRGBBlendFactor(blend_factor(b.dst));
@@ -1095,9 +1119,7 @@ impl Metal {
             } else {
                 MTLDepthClipMode::Clamp
             });
-            if r.depth_bias != (0.0, 0.0, 0.0) {
-                e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
-            }
+            e.setDepthBias_slopeScale_clamp(r.depth_bias.0, r.depth_bias.1, r.depth_bias.2);
             if let Some(ds) = &d.pipeline.depth {
                 e.setDepthStencilState(Some(ds));
             }

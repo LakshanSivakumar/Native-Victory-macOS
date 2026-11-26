@@ -42,6 +42,20 @@ WINE=... tools/macos/test-wine.sh -p victory-platform # the same conformance tes
 
 `crates/victory-hle/tests/native_probe.rs` builds `tests/fixtures/native-probe/probe.c` with `tools/macos/build-native-probe.sh` (the gnullvm clang and lld, no CRT), maps it, binds it, runs it, and checks 16 things the probe reports in its exit code. The probe also imports a second fixture, `probe_dll.c` (built beside it as `victory-probe-dll.dll`): the test maps it with `native::dll`, and `probe_dll` checks its `DllMain` and TLS callback order, per-thread static TLS, thread notices, an exception raised in the DLL unwinding through its `__finally` to a handler in the exe (and from the exe to a handler in the DLL), and `GetModuleHandle`/`GetProcAddress` by name. The C++ runtime is not ours to build, so the throw is a Windows exception through `__C_specific_handler`, not `_CxxThrowException` through `__CxxFrameHandler`.
 
+The native probe's waits check must run as `x86_64-apple-darwin` (under Rosetta
+on Apple Silicon); the arm64 binary only runs its two image-mapping tests.
+Its critical-section try check holds the lock on the calling thread until the
+competing thread finishes, rather than assuming it runs within an 80 ms sleep,
+then requires a successful try after release.
+Under contention, an SRW acquisition CAS can fail and then observe the previous
+owner's release. The POSIX host retries acquisition if that observed state is
+available to the caller; sleeping on an unlocked word can strand a waiter with
+no owner left to wake it. `srw_does_not_sleep_on_an_available_lock_after_a_failed_try`
+exercises those states directly, with a bounded failure guard and worker cleanup.
+This preserves Windows' [shared-reader/exclusive-writer ownership semantics](https://learn.microsoft.com/en-us/windows/win32/sync/slim-reader-writer--srw--locks);
+it does not add a fairness guarantee.
+
+
 ## Function pointers we hand to title code, and title pointers we call
 
 Title code runs with GS = its TEB, ours with GS = the host's TSD, and the two ABIs differ, so every pointer crossing needs a bridge.
@@ -322,8 +336,8 @@ Without ground truth for the 0x1c8 register image, `VICTORY_GUESS_GRAPHICS=1` bu
 * **Root layout.** Each stage is converted with the host's layout of its arguments (`Binding::layout`: user data inline, then root views, then the page table), as compute is; with its immediate samplers as static samplers.
 * **State.** Blend from the register image (`Graphics::guess_from`, below); no culling, depth less-equal with writes, formats from the targets bound at the draw, strides from the vertex buffers bound; the host pipeline is made at the draw (`Pipe::Guess`, cached per formats and strides). Topology 17 (rectangle list) is drawn as a triangle list, so half of each rectangle: the fourth corner needs a geometry stage.
 * **Vertex user data.** If a v2 vertex stage has a nonzero first user-data dword and a 0x41 register index below it, try those record indices relative to the header's start. Accept that layout only when it resolves an otherwise unbound address to a declared table or root view and agrees with existing root-address uses. The title's root slot and descriptor table offsets come from the record. Absolute indices remain the default until the register image is decoded.
-* **Pixel primitive mask.** Scalar masks and shifts may feed M0 for interpolation. When the resulting value and SCC have no other use, the inferred primitive-mask SGPR anchors the existing POPS collision-id mapping in the next SGPR.
-* **Computed pixel buffers.** Scalar and vector dword loads through linear descriptors with a known control word use the pool page table at the computed address. The descriptor supplies the stride, record count and bounds mode. The Metal host binds that table for the fragment stage, as for compute. The translator requires proof that the descriptor's swizzle flags are clear.
+* **Pixel primitive mask.** Scalar masks, shifts and unsigned bit-field extraction (`s_bfe_u32`) may feed M0 for interpolation. When the resulting value and SCC have no other use, the inferred primitive-mask SGPR anchors the existing POPS collision-id mapping in the next SGPR. A hand-assembled regression covers extraction and rejects exports of either the original or extracted mask, as well as observable SCC. This extends the guessed-path heuristic; it has not been verified against the seven remaining title shaders in issue #4.
+* **Computed pixel buffers.** Scalar and vector dword loads through linear descriptors with a known control word use the pool page table at the computed address. The descriptor supplies the stride, record count and bounds mode. The Metal host binds that table for the fragment stage, as for compute. The translator requires proof that the descriptor's swizzle flags are clear. Vector byte/halfword loads (`buffer_load_ubyte`, `sbyte`, `ushort`, `sshort`) also use this path, with zero/sign extension and bounds checked at the element width. Each byte is resolved separately, so halfwords can cross dword/page boundaries and carry into the address high word. Bounds mode 0 checks each component's starting offset against the stride; mode 3 checks its end. Bounds mode 2 skips range checks but still treats a zero record count as out of bounds. Alignment is a guess: these subword reads assume `SH_MEM_CONFIG.alignment_mode = UNALIGNED`; the register is not yet decoded, so DWORD/strict modes are not emulated. See the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture), sections 8.1.5 and 8.1.7 and the MUBUF opcode table. Hand-assembled translation tests and Windows GPU/WARP value tests cover this extension; it is not evidence that any of issue #4's seven title shaders now works.
 * **Missing vertex stage.** When both vertex piece pairs are empty, skip the slot. A vertex-only slot can still draw depth. Mesh pipelines still need their stage registers decoded. Pixel shaders with opaque lane masks, system inputs the signature lacks, and vertex fetches with other formats are refused (see the frame log).
 * **Debugging.** `cargo run -p victory-shader --example disasm` (`VICTORY_PIECE=<piece>`) disassembles a dumped code piece; `--example guess` (`VICTORY_STAGE=vs|ps VICTORY_CODE VICTORY_META`) runs the guessed translation on a pair.
 
@@ -346,7 +360,7 @@ Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which tit
 
 #### Rectangle lists, dropped-command counters, variants (guessed path)
 
-* Rectangle lists (topology 17) of a guessed pipeline are drawn as instances of four vertices (a triangle strip): the vertex shader is translated again with `Options::rect_list`, which reads each fetched attribute for the rectangle's three corners (stage-in elements of corner 0 to 2, index `corner << 28 | slot << 16 | offset`, instance-stepped with three times the bound stride) and picks a corner by vertex id, the fourth being v1 + v2 - v0 (so only affine vertex shaders are right; a uint attribute takes corner 2). Indexed rectangle lists are dropped.
+* Rectangle lists (topology 17) of a guessed pipeline are drawn as instances of four vertices (a triangle strip): the vertex shader is translated again with `Options::rect_list`, which reads each fetched attribute for the rectangle's three corners (stage-in elements of corner 0 to 2, index `corner << 28 | slot << 16 | offset`, instance-stepped with three times the bound stride) and picks a corner by vertex id, the fourth being the two other corners less the right-angle one (so only affine vertex shaders are right; a uint attribute takes a stored corner; see "Rectangle-list corners" below). Indexed rectangle lists are dropped.
 * The 64-frame log line counts dropped command kinds: `mesh`, `mesh_indirect`, `indirect`, `texture_copies`. Frames 2 to ~1000 show 0 of each: no mesh dispatches, indirect executions, texture copies or resolves, in the boot frames. The Bink DLL (`bink2scarlett.dll`) is loaded at start-up, but no compute dispatch or texture copy happens before frame ~695 (so no GPU or upload-based video decode before then); calls into its exports are title code and are not counted.
 * State variants (device slot 0x1b8, `native/gfx-state`) of a guessed base inherit its shaders; their decoded blend/raster/depth state replaces the guessed defaults, and `Graphics::for_draw` adds the inferred vertex layout and bound targets. With them every draw of the boot frames has a host pipeline (`no_pipeline=0`), still all black through frame ~1000.
 * Keep large-frame code out of `PresentX`'s call chain (`queue.rs`, `glue::present`): enlarging its stack frame crashed the title under Rosetta ("unexpectedly need to EmulateForward"); the draw-counter log and the present trace are `#[inline(never)]` helpers for that reason.
@@ -441,3 +455,51 @@ dispatches, texture copies and resolves, and indirect executions (one warning
 per signature). A texture in a format the host cannot realize warns once per
 format value, with its size and flags. No switch is needed; `RUST_LOG` filters
 them as usual.
+
+#### Rectangle-list corners and the Brightness logo (open)
+
+* The right-angle corner is no longer assumed to be v1: the first two-channel-or-wider float fetch (the position) picks it as the corner opposite the longest side, and the strip is p, r, p + q - r, q (r the right angle). With the title's data (top-left, bottom-left, bottom-right) this is the old rule. A value two corners share is copied to the fourth exactly, not through float arithmetic (packed or NaN bits survive).
+* A rectangle-list draw whose pipeline is not guessed (a described pipeline) is drawn as a plain strip without its fourth corner, and now warns once.
+* `VICTORY_TRACE_RECTS=1` logs the first three rectangle-list draws of each pipeline with the first three vertices as floats.
+* The Brightness logo (half a rectangle, the cut along one diagonal) is a guessed pipeline (`vertex 511484f3`: float3 position, unorm8x4 colour at 12, float2 uv at 16, 24-byte vertices) drawing one rectangle at (+-0.2, +-0.325) with corners top-left, bottom-left, bottom-right, which is the order the rule expects. Its matrices flip y, so the visible half is the strip's first triangle (which holds the computed corner), and the second triangle is lost. Both triangles wind alike, so culling does not explain it; the next suspects are the guessed depth state (less-equal with writes, `VICTORY_DEBUG_NO_DEPTH`) and the pixel shader on the second triangle. Not settled: the game runs needed were stopped.
+
+#### Raster, depth, stencil and write mask from the register image
+
+In all 23,022 images the registers just before the eight `CB_BLEND<n>_CONTROL` sit at the same
+offsets back from them (the field layouts below match the values seen):
+
+| Bytes before the blend block | Register | Seen |
+|---|---|---|
+| 0x30 | `PA_SU_SC_MODE_CNTL` | 0x201a40 no cull (11,341), 0x201a42 cull back (11,621), 0x201a41 cull front (58), 0x201a46 cull back with clockwise front (2) |
+| 0x2c, 0x28 | constant 0x8, 0x1000 | |
+| 0x24 to 0x1c | floats (polygon offset: 0.003, 29.0, 16.0, 1.0) | not used yet |
+| 0x18 | `DB_DEPTH_CONTROL` | 0x7007f0 depth off (6,895), 0x7007e2 test GREATER_EQUAL without writes (4,999), 0x7007e7 GREATER_EQUAL with writes and stencil (3,325), 0x700796 LESS with writes, 0x7007b6 LESS_EQUAL with writes, 0x2002f1 stencil EQUAL only |
+| 0x14 | `DB_STENCIL_CONTROL` | 0 (keep), 0x30030 pass REPLACE, 0x80080 pass increment-wrap |
+| 0x10, 0xc | `DB_STENCILREFMASK`, `_BF` | 0x100ff00 (read mask 0xff, write mask 0), 0x1ffff00 (both 0xff) |
+| 0x4 | `CB_TARGET_MASK` | 0xffffffff, 0 (depth only), 0xf, 0x3ffff |
+
+`Graphics::guess_from` now reads all of these over the guessed defaults: cull (FACE 0 = counter-clockwise front), depth enable, write and function (hardware + 1 = D3D12), stencil enable, read and write masks, front and back ops and functions (the back face's only with BACKFACE_ENABLE), and each target's write mask. Most depth tests are GREATER_EQUAL (reversed Z), where the guess was LESS_EQUAL with writes. The polygon offset floats are not mapped. `VICTORY_GUESS_BLEND_ONLY=1` keeps the earlier blend-only reading, for comparison. A run past setup to the loading screen gave the same presented images, byte for byte, as without this change. The setup screens were not checked: runs now skip them, probably because the profile is saved.
+
+#### Texture formats the host lacked
+
+The title's texture formats are DXGI numbers (`resource::pc_format` only renames the console's depth views 118 to 120). The first warnings ("a title texture format the host does not represent") named ten of them; once those were mapped, the run reached more textures and named fifteen more. All of them but two now map to a Metal format of the same element size (`descriptors::format`, tested against `resource::element` in `host_formats_have_the_title_formats_element_size`):
+
+| DXGI | Format | First texture seen (flags: 1 render target, 2 depth, 4 unordered access) | Metal |
+|---|---|---|---|
+| 42 | R32_UINT | 1280x720, unordered access (a compute output) | R32Uint |
+| 26 | R11G11B10_FLOAT | 1280x720, unordered access (a compute output) | RG11B10Float |
+| 67 | R9G9B9E5_SHAREDEXP | 1280x720, read only | RGB9E5Float |
+| 16 | R32G32_FLOAT | 160x90, unordered access | RG32Float |
+| 62 | R8_UINT | 640x360, render target and unordered access | R8Uint |
+| 34, 35 | R16G16_FLOAT, R16G16_UNORM | 256x256, 127x128, render targets | RG16Float, RG16Unorm |
+| 24 | R10G10B10A2_UNORM | 32x32 | RGB10A2Unorm |
+| 30 | R8G8B8A8_UINT | 1x1 | RGBA8Uint |
+| 99, 72, 78 | BC7, BC1, BC3 UNORM_SRGB | 512x512, 32x32, 512x512 | the `_sRGB` BC formats |
+| 53 | R16_TYPELESS | 2048x8192 depth (a shadow map) | Depth16Unorm (R16Unorm when not depth) |
+| 55 | D16_UNORM | (its depth views) | Depth16Unorm |
+| 3, 17, 36, 51, 57 | R32G32B32A32, R32G32, R16G16, R8G8, R16 UINT | 128x128 to 2560x1440 | the matching Uint formats |
+| 11, 13 | R16G16B16A16_UNORM, _SNORM | 128x4, 256x256 | RGBA16Unorm, RGBA16Snorm |
+| 49, 50 | R8G8_TYPELESS, _UNORM | 16x16, 64x64 | RG8Unorm |
+| 54 | R16_FLOAT | 512x512 | R16Float |
+
+Integer render targets never blend (Metal refuses a pipeline that blends one), whatever the state says. B5G5R5A1_UNORM (86, a 1024x4096 render target) and B4G4R4A4_UNORM (115, a 2560x1440 render target) map to Metal's packed formats. A GPU test (`victory-metal` `packed_16_bit_channel_order`) pins their bit order. `BGR5A1Unorm` matches DXGI: blue in bits 0-4, green in 5-9, red in 10-14, alpha in bit 15. `ABGR4Unorm` holds alpha in bits 0-3, blue in 4-7, green in 8-11 and red in 12-15, where DXGI has blue, green, red, alpha from the low nibble up. So title bytes of format 115 are rotated left by 4 bits as they are uploaded (`textures::to_host`). The host's own render writes and samples agree with each other, and host textures never go back to title memory, so only uploads need the conversion. Before the story loads, no draw or dispatch binds any of these textures (the targets traced are formats 28, 29 and 19), so which shaders write and read them is still to be seen. With the mapping, the presented images up to the loading screen look the same.
