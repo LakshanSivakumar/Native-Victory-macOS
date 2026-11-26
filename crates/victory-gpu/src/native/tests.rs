@@ -120,6 +120,36 @@ fn compute_dispatch_writes_title_memory() {
     );
 }
 
+/// `ExecuteIndirect` of one dispatch: a GPU copy earlier in the list writes the group counts
+/// [2, 1, 1] into title memory (zero before it), the dispatch reads them there when it runs, so
+/// exactly two groups of 64 write.
+#[test]
+fn an_indirect_dispatch_reads_its_group_counts_from_title_memory() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (counts, staged, src, dst) = (0, 64, 16384, 32768);
+    pool.write(counts, &[0u32; 3]);
+    pool.write(staged, &[2u32, 1, 1]);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    pool.write(dst, &[0xEEEE_EEEEu32; N]);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+
+    let mut l = NativeList::default();
+    l.copy_buffer_region(pool.va(counts), pool.va(staged), 12);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[5, 7]);
+    l.set_compute_root_view(1, pool.va(src));
+    l.set_compute_root_view(2, pool.va(dst));
+    l.dispatch_indirect(pool.va(counts)).unwrap();
+    run(&h, &[&l]);
+
+    let out: Vec<u32> = pool.read(dst, N);
+    let want: Vec<u32> = (0..N as u32)
+        .map(|i| if i < 128 { i * 5 + 7 } else { 0xEEEE_EEEE })
+        .collect();
+    assert_eq!(out, want);
+}
+
 fn fixture_affine() -> Vec<u8> {
     let p = format!(
         "{}/../victory-metal/tests/affine.dxil",

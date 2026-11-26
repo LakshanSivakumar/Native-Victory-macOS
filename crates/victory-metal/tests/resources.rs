@@ -36,6 +36,7 @@ fn srv_and_uav_through_a_descriptor_table() {
             },
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
+            indirect: None,
         }];
         run(&m, &w);
         let out: Vec<u32> = a.read(half, N);
@@ -102,6 +103,7 @@ impl Grid<'_> {
                 self.z,
             ],
             threads_per_group: [4, 4, 1],
+            indirect: None,
         }];
         run(m, &w);
         let f: Vec<f32> = a.read(0, cells * 4);

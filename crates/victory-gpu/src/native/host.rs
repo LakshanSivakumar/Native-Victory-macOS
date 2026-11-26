@@ -80,6 +80,8 @@ struct Prep<B: GraphicsBackend> {
     blit: Vec<(Rc<B::Buffer>, *const u8)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
+    /// Where an indirect dispatch's group counts are.
+    indirect: Option<(Rc<B::Buffer>, *const u8)>,
 }
 
 enum Group {
@@ -818,11 +820,21 @@ impl<B: GraphicsBackend> NativeHost<B> {
             index: None,
             blit: vec![],
             heap: None,
+            indirect: None,
         };
         match cmd {
             Cmd::Dispatch {
-                root, pso, heaps, groups, ..
+                root,
+                pso,
+                heaps,
+                groups,
+                indirect,
             } => {
+                if let Some(at) = indirect {
+                    let (buf, ptr) = self.resolve(*at, 12)?;
+                    p.bufs.push(buf.clone());
+                    p.indirect = Some((buf, ptr));
+                }
                 tracing::debug!(?groups, "dispatch");
                 if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
                     static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1028,6 +1040,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             },
                             groups: *groups,
                             threads_per_group: pso.threads,
+                            indirect: preps[k].indirect.as_ref().map(|(b, at)| (&**b, *at)),
                         }
                     })
                     .collect(),

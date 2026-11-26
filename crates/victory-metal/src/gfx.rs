@@ -968,7 +968,24 @@ impl Metal {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
-            e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group));
+            match d.indirect {
+                Some((b, at)) => {
+                    let offset = at as usize - b.base as usize;
+                    // SAFETY: the buffer holds the three group counts at `offset` (resolved in
+                    // title memory, 4-byte aligned as D3D12 requires of indirect arguments).
+                    unsafe {
+                        e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                            &b.buf,
+                            offset,
+                            size(d.threads_per_group),
+                        )
+                    };
+                }
+                None => e.dispatchThreadgroups_threadsPerThreadgroup(
+                    size(d.groups),
+                    size(d.threads_per_group),
+                ),
+            }
         }
         if let Some((f, started)) = order {
             e.updateFence(f);

@@ -281,6 +281,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
         },
         groups: [W / 4, W / 4, 1],
         threads_per_group: [4, 4, 1],
+        indirect: None,
     }];
     s.submit(&[
         s.pass(vec![quad, tri], [0.0, 0.0, 0.0, 1.0]),

@@ -493,6 +493,16 @@ per signature). A texture in a format the host cannot realize warns once per
 format value, with its size and flags. No switch is needed; `RUST_LOG` filters
 them as usual.
 
+One kind of indirect execution runs: an `ExecuteIndirect` of one record whose
+signature holds one dispatch argument (type 2, or the console's single-pass
+dispatch, type 105, run as a plain dispatch as on Windows), with no count
+buffer. The native list records a dispatch whose group counts the GPU reads
+from the title's memory when it runs (`NativeList::dispatch_indirect`, Metal's
+`dispatchThreadgroupsWithIndirectBuffer` on the pool buffer the address
+resolves to). Several records, a count buffer, draws (strides 16 and 20 in
+tester report #99) and signatures with other arguments are still dropped and
+counted.
+
 Two more kinds are dropped one command at a time when a piece is submitted
 (`NativeHost::execute`), where the whole piece used to be refused: a draw or
 dispatch that reads a root parameter the title never set, and a draw or clear

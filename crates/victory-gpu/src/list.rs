@@ -1972,6 +1972,15 @@ extern "system" fn execute_indirect(
             count.is_null() || counter.is_some()
         ));
     }
+    #[cfg(target_os = "macos")]
+    if let Some(address) = address
+        && one_dispatch(args, max, !count.is_null())
+    {
+        crate::native::glue::dispatch_indirect(this, address);
+        ran = true;
+    }
+    #[cfg(not(windows))]
+    let _ = counter;
     if ran {
         return;
     }
@@ -1989,6 +1998,20 @@ extern "system" fn execute_indirect(
             "indirect execution dropped (first time for this signature)"
         );
     }
+}
+
+/// Whether the native host runs this `ExecuteIndirect`: one record of one dispatch argument
+/// (type 2, or the console's single-pass dispatch, 105, whose flags live in the signature and
+/// which runs as a plain dispatch, as on Windows) and no count buffer. Its group counts are read
+/// by the GPU from the title's memory.
+// shortcut: several records (`max` > 1), a count buffer, and signatures with other arguments
+// (root constants or views before the dispatch) are dropped and counted; take them when titles
+// are seen to use them.
+#[cfg(any(target_os = "macos", test))]
+fn one_dispatch(args: &[[u32; 4]], max: u32, counted: bool) -> bool {
+    const DISPATCH: u32 = 2;
+    const DISPATCH_SINGLE: u32 = 105;
+    matches!(args, [[DISPATCH | DISPATCH_SINGLE, ..]]) && max == 1 && !counted
 }
 
 /// Indirect executions dropped since the last call.
@@ -2426,6 +2449,27 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// What the native host runs of `ExecuteIndirect`: one dispatch record, no count buffer; the
+    /// rest (tester report #99: draws of stride 16 and 20) stays dropped.
+    #[test]
+    fn only_single_dispatches_execute_indirectly_on_the_native_host() {
+        let dispatch = [2, 0, 0, 0];
+        let single = [105, 0, 0, 0];
+        assert!(one_dispatch(&[dispatch], 1, false));
+        assert!(one_dispatch(&[single], 1, false));
+        assert!(!one_dispatch(&[dispatch], 1, true), "a count buffer");
+        assert!(!one_dispatch(&[dispatch], 2, false), "several records");
+        assert!(!one_dispatch(&[dispatch], 0, false));
+        assert!(!one_dispatch(&[[0, 0, 0, 0]], 1, false), "a draw");
+        assert!(!one_dispatch(&[[1, 0, 0, 0]], 1, false), "an indexed draw");
+        let constants = [4, 0, 0, 1];
+        assert!(
+            !one_dispatch(&[constants, dispatch], 1, false),
+            "root constants first"
+        );
+        assert!(!one_dispatch(&[], 1, false));
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the
