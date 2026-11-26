@@ -240,8 +240,6 @@ mod synthetic_tests;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
-#[cfg(test)]
-mod walk_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
@@ -420,11 +418,6 @@ pub struct Options {
     /// memory (module notes, "Wave64 on a 32-lane host"). Implies
     /// [`Self::narrow_waves`]. Off for D3D12.
     pub wave32_host: bool,
-    /// With [`Self::wave32_host`]: a wave64 program whose group is one
-    /// console wave and whose halves cannot meet (an exchange or an LDS read
-    /// in a per-lane branch) is refused, as before the walk ([`widened`]:
-    /// the branches around those places taken by the whole wave).
-    pub no_wave_walk: bool,
     /// The host's title memory is the memory the GPU reads and writes (the native Metal
     /// host: one buffer per pool, no copies): accesses at computed addresses still go through
     /// the page table of "Title memory" to find the host view, but mark nothing, so the
@@ -601,15 +594,7 @@ pub fn emit_with(
         copy_params: options.copy_params,
     };
     let guessed = graphics::is_guessed(c);
-    let base = parts(st, res);
-    let lowered = match lower::lower_graphics(&base, guessed) {
-        // A wave64 program whose halves are apart somewhere: the per-lane
-        // branches around those places taken by the whole wave, as the
-        // console takes them.
-        Err(e) => widened(&base, options).ok_or(e),
-        l => l,
-    };
-    let l = match lowered {
+    let l = match lower::lower_graphics(&parts(st, res), guessed) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
@@ -651,62 +636,6 @@ pub fn emit_with(
         splits: l.splits,
         table_entries: l.table_entries,
     })
-}
-
-/// The lowering of `p` (a wave64 compute program whose group is one console
-/// wave, on a 32-lane host: [`Options::wave32_host`]) with the per-lane
-/// branches around the places where its halves have to meet and cannot taken
-/// by the whole wave ([`structure::structure_wide`], [`lower::branches_around`]):
-/// the halves exchange each such decision and go the same way, so they are
-/// together inside. Branches are added while the halves are still apart
-/// somewhere new; those to the program's end last. `None` if that does not
-/// lower either, or with [`Options::no_wave_walk`].
-fn widened(base: &lower::Parts, options: Options) -> Option<lower::Lowered> {
-    let (native, p, st) = (base.native, base.p, base.st);
-    let crate::native::StageIo::Cs(cs) = native.io else {
-        return None;
-    };
-    if !options.wave32_host
-        || options.no_wave_walk
-        || !native.wave64
-        || cs.threads.iter().product::<u32>() != 64
-        || !st.wide.is_empty()
-    {
-        return None;
-    }
-    let mut wide = structure::Set::default();
-    let mut ending = false;
-    let mut needs = lower::take_needs();
-    let mut st_now = None;
-    for _ in 0..64 {
-        let at = st_now.as_ref().unwrap_or(st);
-        let mut more = lower::branches_around(p, at, &needs, ending);
-        if more.is_empty() && !ending {
-            ending = true;
-            more = lower::branches_around(p, at, &needs, ending);
-        }
-        if more.is_empty() {
-            return None;
-        }
-        wide.extend(more);
-        let st = structure::structure_wide(p, &wide).ok()?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
-        let parts = lower::Parts {
-            st: &st,
-            res: &res,
-            inputs: base.inputs.clone(),
-            outputs: base.outputs.clone(),
-            prims: base.prims.clone(),
-            ..*base
-        };
-        // (compute: never a guessed graphics program)
-        if let Ok(l) = lower::lower_graphics(&parts, false) {
-            return Some(l);
-        }
-        needs = lower::take_needs();
-        st_now = Some(st);
-    }
-    None
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
