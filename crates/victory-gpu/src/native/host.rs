@@ -248,14 +248,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
         } else {
             count
         };
+        // Shaders that take buffer views at indices they compute read the view-stride table and,
+        // where it holds 0, the null views at the end of `HEAP_VIEWS` (`victory_shader::emit`,
+        // "Buffer views at computed heap indices"): the heap reaches that far when they fit
+        // past the title's entries and the contract's.
+        let views = victory_shader::emit::HEAP_VIEWS as usize;
+        let strided = kind == HeapKind::Resource && entries + 2 <= views;
+        let entries = if strided { views } else { entries };
+        let backend_heap = self.backend.create_heap(kind, entries)?;
+        let strides = if strided {
+            for i in [views - 2, views - 1] {
+                self.backend.clear_entry(&backend_heap, i);
+            }
+            Some(Rc::new(addr::Pages::new(&self.backend, views * 4)?))
+        } else {
+            None
+        };
         let heap = Rc::new(NativeHeap {
-            heap: self.backend.create_heap(kind, entries)?,
+            heap: backend_heap,
             kind,
             start,
             count,
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            strides,
         });
         self.heaps.borrow_mut().push(heap.clone());
         Ok(heap)
@@ -301,8 +318,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(false);
         };
         let Some(view) = crate::descriptor::view(handle) else {
+            set_stride(&heap, index, 0);
             return Ok(false);
         };
+        set_stride(&heap, index, stride_word(&view));
         let resources = self.resources.borrow();
         let buffer_of = |r: usize| match resources.get(&r) {
             Some(Res::Buffer(a, n)) => Some((*a, *n)),
@@ -319,6 +338,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     self.unmapped.borrow_mut().remove(&handle);
                 }
                 Err(e) => {
+                    // Shaders taking it at a computed index read the null view instead.
+                    set_stride(&heap, index, 0);
                     self.views.borrow_mut().remove(&(heap.start, index));
                     self.unmapped.borrow_mut().insert(handle);
                     // Left as it was, the entry would still name the memory its last view
@@ -449,6 +470,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
             args = args.constants(&values);
         }
         for &(slot, _) in &b.views {
+            if slot == victory_shader::emit::VIEW_STRIDES {
+                // The view-stride table of the resource heap the work indexes.
+                let h = p.heap.clone().or_else(|| heap.cloned());
+                let table = h
+                    .as_ref()
+                    .and_then(|h| h.strides.clone())
+                    .ok_or("a shader reads the view-stride table and its heap has none")?;
+                let gpu = self.backend.gpu_address(&table.buf, table.ptr().cast_const());
+                p.bufs.push(table.buf.clone());
+                args = args.address(gpu);
+                continue;
+            }
             let Root::View(a) = set(slot)? else {
                 return Err(format!("root parameter {slot} is not a root view"));
             };
@@ -584,6 +617,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             pairs: Default::default(),
             table: Default::default(),
             mirrored: Default::default(),
+            strides: None,
         });
         self.contract.borrow_mut().heap = Some(heap.clone());
         Ok(heap)
@@ -1173,6 +1207,54 @@ fn table_check_count(slot: usize, binding: Option<&Binding>, floor: usize) -> us
         }
     }
     count
+}
+
+/// Enters dword `index` of `heap`'s view-stride table (if it has one).
+fn set_stride<B: GraphicsBackend>(heap: &NativeHeap<B>, index: usize, word: u32) {
+    if let Some(t) = &heap.strides
+        && index < victory_shader::emit::HEAP_VIEWS as usize
+    {
+        // SAFETY: the table has a dword per index below `HEAP_VIEWS`.
+        unsafe { (t.ptr() as *mut u32).add(index).write_volatile(word) };
+    }
+}
+
+/// What the view-stride table holds for a view (as `descriptor::host` does on Windows, from the
+/// view description's words): a buffer view's element size, at least 1 (its structure stride, 4
+/// for a raw one, else its format's size), with `VIEW_INTEGER` (and `VIEW_SIGNED`) for a typed
+/// one of an integer format; 0 for anything else.
+fn stride_word(view: &crate::descriptor::View) -> u32 {
+    use crate::descriptor::View;
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    let (unordered, w): (bool, &[u32]) = match view {
+        View::Constant(..) => return 4,
+        View::Shader(_, Some(d)) => (false, &d[..]),
+        View::Unordered(_, _, Some(d)) => (true, &d[..]),
+        View::Placed(unordered, resource, d) if resource[0] == 1 => (*unordered, &d[..10]),
+        _ => return 0,
+    };
+    // The view dimension: buffer (1).
+    if w.get(1) != Some(&1) {
+        return 0;
+    }
+    let format = w[0];
+    // D3D12_SHADER_RESOURCE_VIEW_DESC: Buffer at byte 16 (stride word 7, flags 8);
+    // D3D12_UNORDERED_ACCESS_VIEW_DESC: Buffer at byte 8 (stride word 5, flags 8).
+    let (stride, flags) = if unordered { (w[5], w[8]) } else { (w[7], w[8]) };
+    let raw = flags & 1 != 0;
+    let (element, typed) = if stride > 0 {
+        (stride, false)
+    } else if raw {
+        (4, false)
+    } else {
+        (crate::resource::element(format).map_or(0, |(bytes, _)| bytes as u32), true)
+    };
+    let kind = match typed.then_some(format) {
+        Some(3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62) => VIEW_INTEGER,
+        Some(4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64) => VIEW_INTEGER | VIEW_SIGNED,
+        _ => 0,
+    };
+    element.max(1) | kind
 }
 
 #[cfg(test)]

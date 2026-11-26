@@ -1864,7 +1864,34 @@ impl<'a> Lower<'a> {
             }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => {
+                // TG_SIZE: bits 5:0 the group's console wave count, bits 11:6 this
+                // wave's index in it (its threads' flat id over the wave size).
+                let Some([x, y, z]) = self.s.threads else {
+                    return Val::Missing("the thread-group info SGPR");
+                };
+                let wave = self.wave();
+                let waves = (x * y * z).div_ceil(wave).min(63);
+                let e = self.s.entry;
+                let flat = if self.console_lanes {
+                    self.console_flat()
+                } else {
+                    self.s.op(
+                        e,
+                        "flattenedThreadIdInGroup.i32",
+                        Attr::ReadNone,
+                        self.s.t.i32,
+                        96,
+                        &[],
+                    )
+                };
+                let shift = self.s.m.i32(wave.trailing_zeros());
+                let index = self.s.m.bin(e, Bin::LShr, flat, shift);
+                let six = self.s.m.i32(6);
+                let index = self.s.m.bin(e, Bin::Shl, index, six);
+                let count = self.s.m.i32(waves);
+                return Val::I32(self.s.m.bin(e, Bin::Or, index, count));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -5149,6 +5176,12 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.cmp(c, p, a, b);
                 // SCC: whether the first operand was chosen (RDNA2 ISA).
                 (self.s.m.select(c, t, a, b), Some(t))
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let k = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let up = self.s.m.bin(c, Bin::Shl, a, k);
+                (self.s.m.bin(c, Bin::AShr, up, k), None)
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;

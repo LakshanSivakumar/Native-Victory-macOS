@@ -23,6 +23,12 @@ pub struct NativeHeap<B: GraphicsBackend> {
     pub table: std::cell::RefCell<Option<(u64, Rc<super::addr::Pages<B>>)>>,
     /// The title record (tag, view index, generation) each entry was last mirrored from.
     pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
+    /// The view-stride table translated shaders read as root SRV
+    /// `victory_shader::emit::VIEW_STRIDES`: a dword per entry up to `HEAP_VIEWS` (the element
+    /// size of the buffer view there, with the integer-format bits of a typed one; 0 for no
+    /// buffer view, where those shaders read the null view at `NULL_BUFFER_VIEW`). Resource heaps
+    /// with room for the null views at the end of `HEAP_VIEWS` only.
+    pub strides: Option<Rc<super::addr::Pages<B>>>,
 }
 
 /// How a translated title shader's arguments are laid out (`victory_shader::emit::HostShader`):

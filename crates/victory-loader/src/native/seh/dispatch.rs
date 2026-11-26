@@ -398,7 +398,11 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                     );
                 }
             }
-            if r.code == 0x8000_0003 {
+            // A breakpoint (the title's asserts), or a write to address 0 (its watchdog's
+            // deliberate crash): with VICTORY_DUMP_THREADS=0, what every thread is doing.
+            if r.code == 0x8000_0003
+                || (r.code == 0xc000_0005 && r.information[0] == 1 && r.information[1] == 0)
+            {
                 super::super::dump::report_at_break();
             }
             // Debugging aid: VICTORY_PEEK=rva,rva,... prints those qwords of
