@@ -191,7 +191,8 @@ pub fn find_jump_tables_ext(
             let lea_at = ins[..ld_at]
                 .iter()
                 .rposition(|i| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.op0_register() == base_reg)?;
-            feeds_jump(ins, ld_at, n, base_reg, &labels, &mut InstructionInfoFactory::new()).then(|| (ld, &ins[lea_at]))
+            let base_va = ins[lea_at].ip_rel_memory_address();
+            feeds_jump(ins, ld_at, n, base_reg, base_va, &labels, &mut InstructionInfoFactory::new()).then(|| (ld, &ins[lea_at]))
         }) else {
             continue;
         };
@@ -258,25 +259,27 @@ pub fn find_jump_tables_ext(
 }
 
 /// Whether the table load `ins[ld_at]` makes the target of the `jmp reg` at `ins[n]`: the loaded offset is added to
-/// the table's base (`add off, base` into the jump's register, or `add base, off` when the jump takes the base), and
-/// on the way from the load to the jump nothing writes those registers otherwise, breaks the flow (the code after an
-/// unconditional jump or a return is not reached from the load) or joins another path (a branch target, the jump
-/// included). Else the jump is another one through a register: a virtual call in tail position right after a
-/// switch (rva 0x1ffa572, `mov rax, [rcx]` / `mov rax, [rax + 0x78]` / `jmp rax` behind the switch's own `jmp rax`)
-/// was taken for the switch, and its target trapped as a case out of the table.
+/// the table's base (`add off, base` into the jump's register, or `add base, off` when the jump takes the base; the
+/// base the load's own base register, or one an `lea` of the same address set since: MSVC's Bink loads the offset
+/// over its base, `mov edx, [rdx + 4*rcx + table]`, then `lea rcx, [__ImageBase]` / `add rdx, rcx`), and on the way
+/// from the load to the jump nothing writes the offset (before the add) or the target (after it) otherwise, breaks
+/// the flow (the code after an unconditional jump or a return is not reached from the load) or joins another path
+/// (a branch target, the jump included). Else the jump is another one through a register: a virtual call in tail
+/// position right after a switch (rva 0x1ffa572, `mov rax, [rcx]` / `mov rax, [rax + 0x78]` / `jmp rax` behind the
+/// switch's own `jmp rax`) was taken for the switch, and its target trapped as a case out of the table.
 fn feeds_jump(
     ins: &[Instruction],
     ld_at: usize,
     n: usize,
     base_reg: Register,
+    base_va: u64,
     labels: &HashSet<u64>,
     facts: &mut InstructionInfoFactory,
 ) -> bool {
-    let (off, base, jr) = (
-        ins[ld_at].op0_register().full_register(),
-        base_reg.full_register(),
-        ins[n].op0_register().full_register(),
-    );
+    let (off, jr) = (ins[ld_at].op0_register().full_register(), ins[n].op0_register().full_register());
+    // The registers that hold the base.
+    let mut bases: Vec<Register> = vec![base_reg.full_register()];
+    bases.retain(|&b| b != off);
     let mut added = false;
     for i in &ins[ld_at + 1..=n] {
         if labels.contains(&i.ip()) {
@@ -297,20 +300,25 @@ fn feeds_jump(
             && i.op1_kind() == OpKind::Register
             && {
                 let (d, s) = (i.op0_register().full_register(), i.op1_register().full_register());
-                (d == off && s == base && jr == off) || (d == base && s == off && jr == base)
+                (d == off && bases.contains(&s) && jr == off) || (bases.contains(&d) && s == off && jr == d)
             };
         if add {
             added = true;
             continue;
         }
-        // Before the add, the offset and the base must stay; after it, the target.
-        let watched: &[Register] = if added { &[jr] } else { &[off, base] };
-        let writes = facts.info(i).used_registers().iter().any(|u| {
-            matches!(u.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite)
-                && watched.contains(&u.register().full_register())
-        });
-        if writes {
-            return false;
+        let same_base = i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.ip_rel_memory_address() == base_va;
+        for u in facts.info(i).used_registers() {
+            if !matches!(u.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite) {
+                continue;
+            }
+            let w = u.register().full_register();
+            if (!added && w == off) || (added && w == jr) {
+                return false;
+            }
+            bases.retain(|&b| b != w);
+            if same_base {
+                bases.push(w);
+            }
         }
     }
     added
@@ -1333,6 +1341,45 @@ mod tests {
         assert_eq!(tables.len(), 1, "{tables:x?}");
         assert_eq!(tables[0].jmp_rva, switch);
         assert_eq!(tables[0].targets[0], case0);
+    }
+
+    #[test]
+    fn the_base_may_come_back_in_another_register() {
+        // Bink (rva 0x1751d of its DLL): the offset is loaded over the base register, and the base set again in
+        // another one for the add: `mov edx, [rdx + 4*rcx + table]` / `lea rcx, [__ImageBase]` / `add rdx, rcx`.
+        let ins = decode(
+            &CodeAssembler::new(64)
+                .and_then(|mut a| {
+                    let mut image = a.create_label();
+                    a.set_label(&mut image)?;
+                    a.lea(rdx, ptr(image))?;
+                    a.mov(edx, dword_ptr(rdx + rcx * 4 + 0x40))?;
+                    a.lea(rcx, ptr(image))?;
+                    a.add(rdx, rcx)?;
+                    a.jmp(rdx)?;
+                    a.assemble(CODE)
+                })
+                .unwrap(),
+        );
+        let labels = HashSet::new();
+        let base_va = ins[0].ip_rel_memory_address();
+        assert!(feeds_jump(&ins, 1, 4, Register::RDX, base_va, &labels, &mut InstructionInfoFactory::new()));
+        // A base the add takes from a register that no longer holds it does not.
+        let ins = decode(
+            &CodeAssembler::new(64)
+                .and_then(|mut a| {
+                    let mut image = a.create_label();
+                    a.set_label(&mut image)?;
+                    a.lea(rdx, ptr(image))?;
+                    a.mov(edx, dword_ptr(rdx + rcx * 4 + 0x40))?;
+                    a.mov(rcx, qword_ptr(rsp + 8))?;
+                    a.add(rdx, rcx)?;
+                    a.jmp(rdx)?;
+                    a.assemble(CODE)
+                })
+                .unwrap(),
+        );
+        assert!(!feeds_jump(&ins, 1, 4, Register::RDX, base_va, &labels, &mut InstructionInfoFactory::new()));
     }
 
     #[test]
