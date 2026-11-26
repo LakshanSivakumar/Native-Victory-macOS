@@ -233,6 +233,8 @@ Provided (`victory_hle::modules::xmem_physical`, branch `native/host-mem`):
 
 The windowed n26 run of `d5a3ca0` logged 3,000 buffer views rejected as outside a mapped pool. All of the reported ranges crossed a 64 KiB page boundary, and 1,336 were at most one page long. The physical-page observer can report each page of a scatter mapping separately. `PoolTable::resolve` now follows adjacent mappings when they cover consecutive bytes of the same pool, so a view can use the corresponding span of the pool's Metal buffer. The regression test also covers holes, repeated physical pages and transitions between pools.
 
+At draw counter 6,144, n27 on `4c255d6` had logged 33 buffer-view rejections, compared with 3,000 by that counter in n26. n27 reached prologue prestreaming, then exited with an access violation. Its 16 GPU address descriptions were all unavailable. The crash hook now reads pool and mirrored buffer-view metadata through separate nonblocking lookups outside the title lock. Each table is reported as unavailable when it cannot be read, so a busy table can still leave a partial address report.
+
 ## Interfaces for the recompiler
 
 The recompiler produces arm64 code for the title's functions and runs it in an arm64 host process with the same loader, runtime and HLE. What it can rely on:

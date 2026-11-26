@@ -10,7 +10,7 @@
 //! forward per method; this crate does not depend on `victory-hle`.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// `xmem_physical::PoolInfo`.
 #[derive(Clone, Debug)]
@@ -82,6 +82,36 @@ impl Inner {
             }
         }
     }
+
+    fn resolve(&self, addr: usize, len: usize) -> Option<(&PoolInfo, *const u8)> {
+        let end = addr.checked_add(len)?;
+        let (&start, first) = self.maps.range(..=addr).next_back()?;
+        let mut covered = start.checked_add(first.len)?;
+        if addr >= covered {
+            return None;
+        }
+        if end > covered {
+            // Scatter maps can report one mapping per page, even for consecutive pool pages.
+            for (&at, next) in self.maps.range(covered..end) {
+                if at != covered
+                    || next.pool != first.pool
+                    || next.offset != first.offset.checked_add(at - start)?
+                {
+                    return None;
+                }
+                covered = at.checked_add(next.len)?;
+            }
+            if covered < end {
+                return None;
+            }
+        }
+        let pool = self.pools.get(&first.pool)?;
+        let offset = first.offset.checked_add(addr - start)?;
+        if offset.checked_add(len)? > pool.len {
+            return None;
+        }
+        Some((pool, pool.base.checked_add(offset)? as *const u8))
+    }
 }
 
 /// The title page to pool table. Thread safe: the observer is called from title threads.
@@ -102,34 +132,15 @@ impl PoolTable {
             usize::try_from(addr).ok()?,
             usize::try_from(len.max(1)).ok()?,
         );
-        let end = addr.checked_add(len)?;
-        let g = self.lock();
-        let (&start, first) = g.maps.range(..=addr).next_back()?;
-        let mut covered = start.checked_add(first.len)?;
-        if addr >= covered {
-            return None;
-        }
-        if end > covered {
-            // Scatter maps can report one mapping per page, even for consecutive pool pages.
-            for (&at, next) in g.maps.range(covered..end) {
-                if at != covered
-                    || next.pool != first.pool
-                    || next.offset != first.offset.checked_add(at - start)?
-                {
-                    return None;
-                }
-                covered = at.checked_add(next.len)?;
-            }
-            if covered < end {
-                return None;
-            }
-        }
-        let pool = g.pools.get(&first.pool)?;
-        let offset = first.offset.checked_add(addr - start)?;
-        if offset.checked_add(len)? > pool.len {
-            return None;
-        }
-        Some((pool.clone(), pool.base.checked_add(offset)? as *const u8))
+        let memory = self.lock();
+        let (pool, address) = memory.resolve(addr, len)?;
+        Some((pool.clone(), address))
+    }
+
+    fn try_contains(&self, addr: u64) -> Option<bool> {
+        let addr = usize::try_from(addr).ok()?;
+        let memory = self.inner.try_lock().ok()?;
+        Some(memory.resolve(addr, 1).is_some())
     }
 
     /// A number that changes whenever a pool or a mapping does: what a table built from
@@ -152,6 +163,73 @@ impl PoolTable {
     /// Pools released since the last call; the host drops their buffers.
     pub fn take_released(&self) -> Vec<usize> {
         std::mem::take(&mut self.lock().released)
+    }
+}
+
+type BufferViews = BTreeMap<u64, BTreeMap<usize, (u64, u64)>>;
+
+/// Pool and descriptor metadata that a crash report can read independently of the native host.
+pub(crate) struct CrashAddresses {
+    memory: Arc<PoolTable>,
+    views: Mutex<BufferViews>,
+}
+
+impl CrashAddresses {
+    pub(crate) fn new(memory: Arc<PoolTable>) -> Self {
+        Self {
+            memory,
+            views: Mutex::default(),
+        }
+    }
+
+    fn lock_views(&self) -> MutexGuard<'_, BufferViews> {
+        self.views.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn set_buffer_view(&self, heap: u64, index: usize, address: u64, len: u64) {
+        self.lock_views()
+            .entry(heap)
+            .or_default()
+            .insert(index, (address, len));
+    }
+
+    pub(crate) fn remove_buffer_view(&self, heap: u64, index: usize) {
+        if let Some(slots) = self.lock_views().get_mut(&heap) {
+            slots.remove(&index);
+        }
+    }
+
+    pub(crate) fn remove_heap(&self, heap: u64) {
+        self.lock_views().remove(&heap);
+    }
+
+    /// Report the parts of the metadata available without waiting on a lock.
+    pub(crate) fn describe(&self, at: u64) -> String {
+        let pool = match self.memory.try_contains(at) {
+            Some(true) => "in a pool",
+            Some(false) => "in no pool",
+            None => "pool mapping table unavailable",
+        };
+        let Ok(views) = self.views.try_lock() else {
+            return format!("{pool}, buffer view table unavailable");
+        };
+        let over: Vec<String> = views
+            .iter()
+            .flat_map(|(&heap, slots)| {
+                slots
+                    .iter()
+                    .filter(move |&(_, &(start, len))| at >= start && at - start < len)
+                    .map(move |(&index, &(start, len))| {
+                        format!("heap {heap:#x}[{index}] {start:#x}+{len:#x}")
+                    })
+            })
+            .take(8)
+            .collect();
+        format!(
+            "{pool}, {} buffer views over it {}",
+            over.len(),
+            over.join(", ")
+        )
     }
 }
 
@@ -252,6 +330,39 @@ mod tests {
 
         t.unmapped(base + PAGE, PAGE);
         assert!(t.resolve(start, len).is_none());
+    }
+
+    #[test]
+    fn a_crash_report_can_read_either_table_while_the_other_is_locked() {
+        let memory = Arc::new(PoolTable::default());
+        let address = 0x7000_0000;
+        memory.mapped(address as usize, 0x1_0000, &pool(1), 0);
+        let info = CrashAddresses::new(memory.clone());
+        let heap = 0x8000_0000;
+        info.set_buffer_view(heap, 3, address, 64);
+
+        {
+            let _pool_lock = memory.lock();
+            let report = info.describe(address);
+            assert!(
+                report.starts_with("pool mapping table unavailable,"),
+                "{report}"
+            );
+            assert!(report.contains("heap 0x80000000[3]"), "{report}");
+        }
+        {
+            let _view_lock = info.lock_views();
+            assert_eq!(
+                info.describe(address),
+                "in a pool, buffer view table unavailable"
+            );
+        }
+
+        info.remove_buffer_view(heap, 3);
+        assert!(info.describe(address).contains("0 buffer views"));
+        info.set_buffer_view(heap, 4, address, 64);
+        info.remove_heap(heap);
+        assert!(info.describe(address).contains("0 buffer views"));
     }
 
     #[test]

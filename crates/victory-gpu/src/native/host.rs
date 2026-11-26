@@ -8,7 +8,7 @@
 use super::addr::{self, Mapping, Pages, Pairs};
 use super::descriptors::{Decoded, decode};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
-use super::memory::PoolTable;
+use super::memory::{CrashAddresses, PoolTable};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
@@ -31,9 +31,7 @@ pub struct NativeHost<B: GraphicsBackend> {
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
-    /// The title memory each heap entry's buffer view names, by (heap start, index): for crash
-    /// reports (which views cover an address).
-    views: RefCell<std::collections::BTreeMap<(u64, usize), (u64, u64)>>,
+    crash_addresses: Arc<CrashAddresses>,
     /// Descriptor slots whose buffer view named memory no pool held when the title wrote it
     /// (views made before the title maps their pages): tried again when pools change.
     unmapped: RefCell<std::collections::BTreeSet<u64>>,
@@ -114,12 +112,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
     pub fn with_memory(backend: B, memory: Arc<PoolTable>) -> Self {
         NativeHost {
             backend,
+            crash_addresses: Arc::new(CrashAddresses::new(memory.clone())),
             memory,
             buffers: RefCell::default(),
             resources: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
-            views: RefCell::default(),
             unmapped: RefCell::default(),
             unmapped_tried: std::cell::Cell::new(0),
         }
@@ -150,15 +148,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// For crash reports: whether a pool holds `at`, and the buffer views over it.
     pub fn describe(&self, at: u64) -> String {
-        let pool = if self.memory.resolve(at, 1).is_some() { "in a pool" } else { "in no pool" };
-        let views = self.views.borrow();
-        let over: Vec<String> = views
-            .iter()
-            .filter(|&(_, &(a, n))| at >= a && at < a.saturating_add(n))
-            .take(8)
-            .map(|(&(h, i), &(a, n))| format!("heap {h:#x}[{i}] {a:#x}+{n:#x}"))
-            .collect();
-        format!("{pool}, {} buffer views over it {}", over.len(), over.join(", "))
+        self.crash_addresses.describe(at)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn crash_addresses(&self) -> Arc<CrashAddresses> {
+        self.crash_addresses.clone()
     }
 
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
@@ -290,6 +285,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The title released the heap whose descriptors start at `start`.
     pub fn drop_heap(&self, start: u64) {
         self.heaps.borrow_mut().retain(|h| h.start != start);
+        self.crash_addresses.remove_heap(start);
     }
 
     /// The title released resource object `key`: later views naming it decode to nothing.
@@ -335,18 +331,18 @@ impl<B: GraphicsBackend> NativeHost<B> {
             Decoded::Buffer { addr, size } => match self.resolve(addr, u64::from(size)) {
                 Ok((buf, ptr)) => {
                     self.backend.write_buffer(&heap.heap, index, &buf, ptr, size);
-                    self.views.borrow_mut().insert((heap.start, index), (addr, u64::from(size)));
+                    self.crash_addresses.set_buffer_view(heap.start, index, addr, u64::from(size));
                     self.unmapped.borrow_mut().remove(&handle);
                 }
                 Err(e) => {
                     // Shaders taking it at a computed index read the null view instead.
                     set_stride(&heap, index, 0);
-                    self.views.borrow_mut().remove(&(heap.start, index));
                     self.unmapped.borrow_mut().insert(handle);
                     // Left as it was, the entry would still name the memory its last view
                     // named, which the title may have handed to something else since: the
                     // GPU's writes through it land there (title data overwritten).
                     self.backend.clear_entry(&heap.heap, index);
+                    self.crash_addresses.remove_buffer_view(heap.start, index);
                     heap.mirrored.borrow_mut().insert(index, record_at(handle));
                     return Err(e);
                 }
@@ -374,6 +370,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
                 }
+                self.crash_addresses.remove_buffer_view(heap.start, index);
             }
             Decoded::Sampler { desc, lod_bias } => {
                 let s = self.backend.create_sampler(&desc)?;

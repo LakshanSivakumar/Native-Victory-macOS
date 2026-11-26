@@ -8,7 +8,7 @@
 //! it. The GPU never waits on the lock: submissions are asynchronous, and a timer thread moves held
 //! work and fence values along.
 
-use super::memory::{PoolObserver, PoolTable};
+use super::memory::{CrashAddresses, PoolObserver, PoolTable};
 use super::state::Graphics;
 use super::title::{Guessed, Pipe, TargetFormats, Title, TitleList, Wait};
 use crate::object::This;
@@ -28,6 +28,7 @@ unsafe impl Send for Shared {}
 static TITLE: Mutex<Option<Shared>> = Mutex::new(None);
 static FAILED: AtomicBool = AtomicBool::new(false);
 static POOLS: OnceLock<Arc<PoolTable>> = OnceLock::new();
+static CRASH_ADDRESSES: OnceLock<Arc<CrashAddresses>> = OnceLock::new();
 
 /// The table of the title's memory pools. Feed it through [`pool_observer`].
 pub fn pools() -> &'static Arc<PoolTable> {
@@ -60,10 +61,9 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
 }
 
 /// For crash reports: whether a pool holds title address `at` and which buffer views cover it.
-/// Never blocks (none if another thread holds the host).
+/// Reads the metadata without taking the title lock or waiting on the metadata locks.
 pub fn describe(at: u64) -> Option<String> {
-    let guard = TITLE.try_lock().ok()?;
-    guard.as_ref().map(|t| t.0.host.describe(at))
+    CRASH_ADDRESSES.get().map(|addresses| addresses.describe(at))
 }
 
 /// Runs `f` on the native host, made on first use; `None` if there is no Metal device (the call
@@ -77,7 +77,9 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
         match Metal::new() {
             Ok(metal) => {
                 tracing::info!("native host: Metal");
-                *guard = Some(Shared(Title::new(metal, pools().clone())));
+                let title = Title::new(metal, pools().clone());
+                let _ = CRASH_ADDRESSES.set(title.host.crash_addresses());
+                *guard = Some(Shared(title));
                 start_timer();
             }
             Err(e) => {
@@ -1119,4 +1121,38 @@ pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
 /// Counters of the host for tests and the frame line.
 pub fn stats() -> Option<super::title::Stats> {
     with_title(|t| t.stats.clone())
+}
+
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+    use crate::native::memory::PoolInfo;
+
+    #[test]
+    fn reports_a_mapped_address_with_the_title_lock_held() {
+        let Some((memory, addresses)) =
+            with_title(|t| (t.host.memory(), t.host.crash_addresses()))
+        else {
+            return;
+        };
+        let address = 0x7000_0000;
+        let heap = 0x8000_0000;
+        let pool = PoolInfo {
+            id: usize::MAX,
+            base: 0x1000_0000,
+            len: 0x1_0000,
+            memory_entry: None,
+        };
+        memory.mapped(address, pool.len, &pool, 0);
+        addresses.set_buffer_view(heap, 3, address as u64, 64);
+        let description = {
+            let _title = lock();
+            describe(address as u64)
+        };
+        addresses.remove_heap(heap);
+        memory.pool_released(&pool);
+        let description = description.expect("a crash address report");
+        assert!(description.starts_with("in a pool,"), "{description}");
+        assert!(description.contains("heap 0x80000000[3]"), "{description}");
+    }
 }
