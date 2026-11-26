@@ -191,17 +191,7 @@ pub fn find_jump_tables_ext(
             let lea_at = ins[..ld_at]
                 .iter()
                 .rposition(|i| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.op0_register() == base_reg)?;
-            // The loaded offset is added to the base into the register the `jmp` takes (anything else, a vtable
-            // call through a register, say, is not a switch).
-            let jr = j.op0_register().full_register();
-            let added = ins[ld_at + 1..n].iter().any(|i| {
-                i.mnemonic() == iced_x86::Mnemonic::Add
-                    && i.op0_kind() == OpKind::Register
-                    && i.op1_kind() == OpKind::Register
-                    && i.op0_register().full_register() == jr
-                    && (i.op1_register().full_register() == base_reg.full_register() || jr == base_reg.full_register())
-            });
-            added.then(|| (ld, &ins[lea_at]))
+            feeds_jump(ins, ld_at, n, base_reg, &labels, &mut InstructionInfoFactory::new()).then(|| (ld, &ins[lea_at]))
         }) else {
             continue;
         };
@@ -265,6 +255,65 @@ pub fn find_jump_tables_ext(
         }
     }
     out
+}
+
+/// Whether the table load `ins[ld_at]` makes the target of the `jmp reg` at `ins[n]`: the loaded offset is added to
+/// the table's base (`add off, base` into the jump's register, or `add base, off` when the jump takes the base), and
+/// on the way from the load to the jump nothing writes those registers otherwise, breaks the flow (the code after an
+/// unconditional jump or a return is not reached from the load) or joins another path (a branch target, the jump
+/// included). Else the jump is another one through a register: a virtual call in tail position right after a
+/// switch (rva 0x1ffa572, `mov rax, [rcx]` / `mov rax, [rax + 0x78]` / `jmp rax` behind the switch's own `jmp rax`)
+/// was taken for the switch, and its target trapped as a case out of the table.
+fn feeds_jump(
+    ins: &[Instruction],
+    ld_at: usize,
+    n: usize,
+    base_reg: Register,
+    labels: &HashSet<u64>,
+    facts: &mut InstructionInfoFactory,
+) -> bool {
+    let (off, base, jr) = (
+        ins[ld_at].op0_register().full_register(),
+        base_reg.full_register(),
+        ins[n].op0_register().full_register(),
+    );
+    let mut added = false;
+    for i in &ins[ld_at + 1..=n] {
+        if labels.contains(&i.ip()) {
+            return false;
+        }
+        if i.ip() == ins[n].ip() {
+            break;
+        }
+        if matches!(
+            i.flow_control(),
+            FlowControl::UnconditionalBranch | FlowControl::IndirectBranch | FlowControl::Return | FlowControl::Interrupt
+        ) {
+            return false;
+        }
+        let add = !added
+            && i.mnemonic() == Mnemonic::Add
+            && i.op0_kind() == OpKind::Register
+            && i.op1_kind() == OpKind::Register
+            && {
+                let (d, s) = (i.op0_register().full_register(), i.op1_register().full_register());
+                (d == off && s == base && jr == off) || (d == base && s == off && jr == base)
+            };
+        if add {
+            added = true;
+            continue;
+        }
+        // Before the add, the offset and the base must stay; after it, the target.
+        let watched: &[Register] = if added { &[jr] } else { &[off, base] };
+        let writes = facts.info(i).used_registers().iter().any(|u| {
+            matches!(u.access(), OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite)
+                && watched.contains(&u.register().full_register())
+        });
+        if writes {
+            return false;
+        }
+    }
+    added
 }
 
 /// How a jump table's entries name their cases.
@@ -1237,6 +1286,53 @@ mod tests {
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].targets, handlers);
         assert!(!tables[0].bounded);
+    }
+
+    #[test]
+    fn a_jump_through_a_register_after_a_switch_is_not_the_switch() {
+        // rva 0x1ffa540: the switch's `jmp rax`, then in a case a virtual call in tail position, `jmp rax` again
+        // within 40 instructions of the switch's load and add.
+        let mut words: Vec<u32> = vec![0; 2];
+        let (bytes, f, switch, case0) = loop {
+            let mut a = CodeAssembler::new(64).unwrap();
+            let (mut table, mut def, mut c0, mut c1) = (a.create_label(), a.create_label(), a.create_label(), a.create_label());
+            a.cmp(rax, 1).unwrap();
+            a.ja(def).unwrap();
+            a.lea(r8, ptr(table)).unwrap();
+            a.movsxd(rax, dword_ptr(r8 + rax * 4)).unwrap();
+            a.add(rax, r8).unwrap();
+            a.jmp(rax).unwrap();
+            a.set_label(&mut c0).unwrap();
+            a.mov(rax, qword_ptr(rcx)).unwrap();
+            a.mov(rax, qword_ptr(rax + 0x78)).unwrap();
+            a.jmp(rax).unwrap();
+            a.set_label(&mut c1).unwrap();
+            a.nop().unwrap();
+            a.set_label(&mut def).unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut table).unwrap();
+            a.dd(&words).unwrap();
+            let r = a.assemble_options(CODE, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+            let ip = |l: &CodeLabel| r.label_ip(l).unwrap();
+            let t = ip(&table);
+            let want = vec![ip(&c0).wrapping_sub(t) as u32, ip(&c1).wrapping_sub(t) as u32];
+            if want == words {
+                let rva = |x: u64| (x - BASE) as u32;
+                let f = Func { begin: rva(CODE), end: rva(t), unwind: 0, chained: false };
+                let (switch, case0) = (rva(ip(&c0)) - 2, rva(ip(&c0)));
+                break (r.inner.code_buffer, f, switch, case0);
+            }
+            words = want;
+        };
+        let read = |rva: u32| {
+            let o = (rva - f.begin) as usize;
+            bytes.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let ins = decode(&bytes[..(f.end - f.begin) as usize]);
+        let tables = find_jump_tables_with(BASE, &read, &f, &ins);
+        assert_eq!(tables.len(), 1, "{tables:x?}");
+        assert_eq!(tables[0].jmp_rva, switch);
+        assert_eq!(tables[0].targets[0], case0);
     }
 
     #[test]
