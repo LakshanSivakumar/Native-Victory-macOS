@@ -468,6 +468,8 @@ fn hand_out(
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     make::early(&host);
+    #[cfg(target_os = "macos")]
+    crate::native::shaders::prefetch(&shaders);
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],

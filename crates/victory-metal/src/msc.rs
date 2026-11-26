@@ -143,6 +143,40 @@ impl Msc {
         entry: Option<&str>,
         layout: Option<&RootLayout>,
     ) -> Result<(i32, Vec<u8>), ConvError> {
+        let key = memo_key(dxil, entry, layout);
+        if let Some(done) = memo().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(done.clone());
+        }
+        let made = self.convert_uncached(dxil, entry, layout)?;
+        memo().lock().unwrap_or_else(|e| e.into_inner()).insert(key, made.clone());
+        Ok(made)
+    }
+
+    /// [`Self::convert_with`] done ahead (on a thread of the caller's), so the call that needs
+    /// it finds the library made: a scene's first frame binds hundreds of new pipelines.
+    pub fn prefetch(&self, dxil: &[u8], entry: Option<&str>, layout: Option<&RootLayout>) {
+        // Libraries made ahead are kept up to this many bytes (those made for a call always).
+        const AHEAD: usize = 1 << 30;
+        static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if KEPT.load(std::sync::atomic::Ordering::Relaxed) > AHEAD {
+            return;
+        }
+        let key = memo_key(dxil, entry, layout);
+        if memo().lock().unwrap_or_else(|e| e.into_inner()).contains_key(&key) {
+            return;
+        }
+        if let Ok(made) = self.convert_uncached(dxil, entry, layout) {
+            KEPT.fetch_add(made.1.len(), std::sync::atomic::Ordering::Relaxed);
+            memo().lock().unwrap_or_else(|e| e.into_inner()).insert(key, made);
+        }
+    }
+
+    fn convert_uncached(
+        &self,
+        dxil: &[u8],
+        entry: Option<&str>,
+        layout: Option<&RootLayout>,
+    ) -> Result<(i32, Vec<u8>), ConvError> {
         let h = self.h;
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
@@ -248,4 +282,32 @@ impl Msc {
             res
         }
     }
+}
+
+/// Conversions made so far, by their input (a library a conversion makes is the same every time).
+fn memo() -> &'static std::sync::Mutex<std::collections::HashMap<[u64; 3], (i32, Vec<u8>)>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<[u64; 3], (i32, Vec<u8>)>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// Two independent 64-bit hashes of the input and its length: a key whose collision would need
+/// both to collide at the same length.
+fn memo_key(dxil: &[u8], entry: Option<&str>, layout: Option<&RootLayout>) -> [u64; 3] {
+    use std::hash::{Hash, Hasher};
+    let mut a = std::collections::hash_map::DefaultHasher::new();
+    let mut b = std::collections::hash_map::DefaultHasher::new();
+    0xA5u8.hash(&mut b);
+    for h in [&mut a, &mut b] {
+        dxil.hash(h);
+        entry.hash(h);
+        layout.hash(h);
+    }
+    [a.finish(), b.finish(), dxil.len() as u64]
+}
+
+/// A converter for threads of their own ([`Msc::prefetch`]).
+pub fn shared() -> &'static Msc {
+    static SHARED: std::sync::OnceLock<Msc> = std::sync::OnceLock::new();
+    SHARED.get_or_init(Msc::open_default)
 }

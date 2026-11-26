@@ -287,3 +287,56 @@ impl<B: PresentBackend> Title<B> {
         self.shaders.refuse(name, format!("translation: {reason}"));
     }
 }
+
+/// Translates new pipelines' shaders on threads of their own as the title creates them (and,
+/// for compute, converts them to Metal libraries), so the draw or dispatch that first binds them
+/// finds the work done. A scene's first frame binds about a thousand new pipelines; made one by
+/// one under the host's lock on the title's render threads they kept those threads in host calls
+/// past the title's 30-second watchdog. `VICTORY_PREFETCH=0`: off; `=<n>`: n threads.
+pub(crate) fn prefetch(shaders: &[std::sync::Arc<crate::pipeline::Shader>]) {
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
+    type Job = Arc<crate::pipeline::Shader>;
+    static QUEUE: OnceLock<Option<Mutex<mpsc::Sender<Job>>>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let threads = match std::env::var("VICTORY_PREFETCH").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(0) => return None,
+            Some(n) => n.min(32),
+            None => std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(6).clamp(2, 8)),
+        };
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..threads {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("victory shader prefetch {i}"))
+                .stack_size(64 << 20)
+                .spawn(move || {
+                    loop {
+                        let job = { rx.lock().unwrap_or_else(|e| e.into_inner()).recv() };
+                        let Ok(shader) = job else { return };
+                        static DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n.is_multiple_of(1000) {
+                            tracing::info!(n, "shaders translated ahead");
+                        }
+                        let Ok(host) = shader.native() else { continue };
+                        if shader.stage == "compute" && unsupported(host, true).is_none() {
+                            let msc = victory_metal::msc::shared();
+                            match Binding::of(host).layout() {
+                                Some(l) => msc.prefetch(&host.dxil, None, Some(&l)),
+                                None => msc.prefetch(&host.dxil, None, None),
+                            }
+                        }
+                    }
+                });
+        }
+        tracing::info!(threads, "shaders are translated ahead on threads of their own");
+        Some(Mutex::new(tx))
+    });
+    if let Some(tx) = queue {
+        let tx = tx.lock().unwrap_or_else(|e| e.into_inner());
+        for s in shaders {
+            let _ = tx.send(s.clone());
+        }
+    }
+}
