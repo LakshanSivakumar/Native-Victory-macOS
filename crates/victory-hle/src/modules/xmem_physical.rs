@@ -388,6 +388,48 @@ pub(super) fn back_with_pool(base: usize, len: usize) -> bool {
     map(&mut physical(), base, len, slice)
 }
 
+/// Backs the parts of `[base, base + len)` (inside a reservation, page
+/// aligned) that no view shows and nothing has committed yet with pools of
+/// their own, as [`back_with_pool`] does for a whole reservation: memory the
+/// title reserves first and commits later is GPU memory too. Parts already
+/// committed otherwise are left as they are. False if a part could not be
+/// backed (it is then committed plainly by the caller).
+#[cfg(not(windows))]
+pub(super) fn back_uncovered_with_pools(base: usize, len: usize) -> bool {
+    let mut physical = physical();
+    let end = base + len;
+    let mut at = base;
+    let mut all = true;
+    while at < end {
+        // A view showing `at`: skip it.
+        if let Some((v, vlen)) = physical.views.range(..=at).next_back().map(|(&v, (l, _))| (v, *l))
+            && at < v + vlen
+        {
+            at = v + vlen;
+            continue;
+        }
+        let next = physical.views.range(at + 1..end).next().map_or(end, |(&v, _)| v);
+        // Committed by other means already (a plain commit): leave it.
+        let region = mem::query(at);
+        if let Some(r) = region.as_ref().filter(|r| r.protect != mem::Protect::NO_ACCESS) {
+            at = (r.base + r.len).min(next).max(at + mem::page_size());
+            continue;
+        }
+        let run_end = region.map_or(next, |r| (r.base + r.len).min(next)).max(at + mem::page_size()).min(end);
+        let run = run_end - at;
+        let backed = Pool::new(run).ok().is_some_and(|pool| {
+            let slice = Slice {
+                pool: Arc::new(pool),
+                index: 0,
+            };
+            map(&mut physical, at, run, slice)
+        });
+        all &= backed;
+        at = run_end;
+    }
+    all
+}
+
 /// Gives back what [`back_with_pool`] mapped, before the range is released.
 #[cfg(not(windows))]
 pub(super) fn release_pool_backing(base: usize, len: usize) {

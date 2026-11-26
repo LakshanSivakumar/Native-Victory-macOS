@@ -141,15 +141,26 @@ pub extern "system" fn XMemVirtualAlloc(
     } else if commit {
         let page = mem::page_size();
         let start = at & !(page - 1);
-        // SAFETY: the title commits inside a reservation of its own.
-        unsafe {
-            mem::commit(
-                start as *mut u8,
-                (at + size).next_multiple_of(page) - start,
-                prot,
-            )
+        let end = (at + size).next_multiple_of(page);
+        // Pool-backed where it can be, so the GPU reaches it (memory the title
+        // reserved before: without it, views of it were "not in a mapped pool").
+        if pool_commits() && super::xmem_physical::back_uncovered_with_pools(start, end - start) {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, at = format_args!("{at:#x}"), size, "XMemVirtualAlloc: commits in a reservation backed by pools");
+            }
+            let protected = if prot != Protect::READ_WRITE {
+                // SAFETY: the range just backed.
+                unsafe { mem::protect(start as *mut u8, end - start, prot) }.map(|_| ())
+            } else {
+                Ok(())
+            };
+            protected.map(|()| at as *mut u8)
+        } else {
+            // SAFETY: the title commits inside a reservation of its own.
+            unsafe { mem::commit(start as *mut u8, end - start, prot) }.map(|()| at as *mut u8)
         }
-        .map(|()| at as *mut u8)
     } else {
         return std::ptr::null_mut();
     };
@@ -420,4 +431,11 @@ mod tests {
             assert_eq!(find_export(base, c"gamma"), None);
         }
     }
+}
+
+/// Whether commits inside a reservation are backed by pools (`VICTORY_POOL_COMMITS=0`: plainly).
+fn pool_commits() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_POOL_COMMITS").is_none_or(|v| v != "0"));
+    *ON
 }
