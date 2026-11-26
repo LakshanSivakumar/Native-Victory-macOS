@@ -160,13 +160,21 @@ pub fn find_jump_tables_ext(
     for (n, j) in ins.iter().enumerate() {
         if j.code() == Code::Jmp_rm64 && j.op0_kind() == OpKind::Memory {
             // `jmp qword ptr [base + 8*idx]`: a table of 64-bit addresses (an interpreter's handlers, each ending in
-            // the same dispatch: rva 0x3de2612, 530 of them), its base an `lea base, [rip + table]` of the function,
-            // the last one before (else the first after: the interpreter sets the register once, at its top).
+            // the same dispatch: rva 0x3de2612, 530 of them), its base an `lea base, [rip + table]` of the function.
+            // Every such `lea` of the register names a table the jump may take: an interpreter with two opcode
+            // tables sets one or the other and jumps to the same dispatch (rva 0x5141259: 0x6681790 on the way in,
+            // 0x6681640 from 0x51415f8), so the jump's cases are those of all of them.
             let b = j.memory_base();
             if j.memory_index_scale() == 8 && j.memory_index() != Register::None && b != Register::None && !j.is_ip_rel_memory_operand() {
-                let is_lea = |i: &&Instruction| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.op0_register() == b;
-                if let Some(lea) = ins[..n].iter().rev().find(is_lea).or_else(|| ins[n..].iter().find(is_lea)) {
-                    let lea_rva = (lea.ip_rel_memory_address().wrapping_sub(base)) as u32;
+                let mut bases: Vec<u64> = ins
+                    .iter()
+                    .filter(|i| i.code() == Code::Lea_r64_m && i.is_ip_rel_memory_operand() && i.op0_register() == b)
+                    .map(|i| i.ip_rel_memory_address())
+                    .collect();
+                bases.sort_unstable();
+                bases.dedup();
+                for va in bases {
+                    let lea_rva = (va.wrapping_sub(base)) as u32;
                     let table_rva = lea_rva.wrapping_add(j.memory_displacement64() as u32);
                     found.push(((j.ip() - base) as u32, table_rva, lea_rva, Entry::Abs64, None));
                 }
@@ -1294,6 +1302,55 @@ mod tests {
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].targets, handlers);
         assert!(!tables[0].bounded);
+    }
+
+    #[test]
+    fn a_dispatch_takes_every_table_its_base_register_is_set_to() {
+        // rva 0x5141259: two opcode tables, the dispatch entered with either in rdx.
+        let mut words: Vec<u64> = vec![0; 4];
+        let (bytes, f, want) = loop {
+            let mut a = CodeAssembler::new(64).unwrap();
+            let (mut t1, mut t2, mut dispatch, mut other) = (a.create_label(), a.create_label(), a.create_label(), a.create_label());
+            let mut h: Vec<CodeLabel> = (0..4).map(|_| a.create_label()).collect();
+            a.test(ecx, ecx).unwrap();
+            a.jne(other).unwrap();
+            a.lea(rdx, ptr(t1)).unwrap();
+            a.set_label(&mut dispatch).unwrap();
+            a.movzx(eax, byte_ptr(rsi)).unwrap();
+            a.jmp(qword_ptr(rdx + rax * 8)).unwrap();
+            a.set_label(&mut other).unwrap();
+            a.lea(rdx, ptr(t2)).unwrap();
+            a.jmp(dispatch).unwrap();
+            for l in h.iter_mut() {
+                a.set_label(l).unwrap();
+                a.inc(rsi).unwrap();
+                a.jmp(dispatch).unwrap();
+            }
+            a.set_label(&mut t1).unwrap();
+            a.dq(&words[..2]).unwrap();
+            a.set_label(&mut t2).unwrap();
+            a.dq(&words[2..]).unwrap();
+            let r = a.assemble_options(CODE, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS).unwrap();
+            let ip = |l: &CodeLabel| r.label_ip(l).unwrap();
+            let now: Vec<u64> = h.iter().map(|l| ip(l)).collect();
+            if now == words {
+                let rva = |x: u64| (x - BASE) as u32;
+                let f = Func { begin: rva(CODE), end: rva(ip(&t1)), unwind: 0, chained: false };
+                let want: Vec<u32> = now.iter().map(|&x| rva(x)).collect();
+                break (r.inner.code_buffer, f, want);
+            }
+            words = now;
+        };
+        let read = |rva: u32| {
+            let o = (rva - f.begin) as usize;
+            bytes.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let ins = decode(&bytes[..(f.end - f.begin) as usize]);
+        let tables = find_jump_tables_with(BASE, &read, &f, &ins);
+        let all: Vec<u32> = tables.iter().flat_map(|t| t.targets.iter().copied()).collect();
+        assert_eq!(tables.len(), 2, "{tables:x?}");
+        assert_eq!(tables[0].jmp_rva, tables[1].jmp_rva);
+        assert_eq!(all, want);
     }
 
     #[test]

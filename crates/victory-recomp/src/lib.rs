@@ -20,15 +20,12 @@ type Tables = BTreeMap<u64, Vec<u64>>;
 
 fn tables_for(img: &Image, f: &Func, ins: &[iced_x86::Instruction]) -> Tables {
     let base = img.info.image_base;
-    analyze::find_jump_tables(img, f, ins)
-        .iter()
-        .map(|t| {
-            (
-                base + t.jmp_rva as u64,
-                t.targets.iter().map(|&r| base + r as u64).collect(),
-            )
-        })
-        .collect()
+    // A jump may take several tables (an interpreter's dispatch with one per opcode set): their cases together.
+    let mut out = Tables::new();
+    for t in analyze::find_jump_tables(img, f, ins) {
+        out.entry(base + t.jmp_rva as u64).or_default().extend(t.targets.iter().map(|&r| base + r as u64));
+    }
+    out
 }
 
 /// Entry-point functions with their chained `.pdata` parts attached (cold blocks and funclets
