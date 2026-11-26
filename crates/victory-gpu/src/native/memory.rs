@@ -9,8 +9,28 @@
 //! observer's shape, so the host implements `PoolObserver` for [`PoolTable`] with a one-line
 //! forward per method; this crate does not depend on `victory-hle`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Bytes of a title page of the GPU's page table ([`super::addr::PAGE`]).
+const TABLE_PAGE: usize = 1 << 16;
+
+/// Mapping changes kept for page tables that are behind ([`PoolTable::pages_since`]); a table
+/// further behind than the oldest one kept is built again whole.
+const JOURNAL: usize = if cfg!(test) { 64 } else { 1 << 18 };
+
+/// What a 64 KiB title page shows, for the page table ([`super::addr::Table`]): the pool, and where
+/// in it the page starts. A page shows a pool only when all of it shows one run of that pool (one
+/// mapping, or mappings that follow each other in title memory and in the pool).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageTarget {
+    pub pool: usize,
+    /// The pool's own mapping ([`PoolInfo::base`]).
+    pub base: usize,
+    pub pool_len: u64,
+    /// The page's offset in the pool.
+    pub pool_at: u64,
+}
 
 /// `xmem_physical::PoolInfo`.
 #[derive(Clone, Debug)]
@@ -46,12 +66,41 @@ struct Inner {
     released: Vec<usize>,
     /// Counts every change to pools and mappings ([`PoolTable::generation`]).
     generation: u64,
+    /// The title ranges whose mappings changed, with the generation of each change, oldest first.
+    journal: VecDeque<(u64, usize, usize)>,
+    /// The generation of the newest change dropped from `journal` (0: none dropped).
+    journal_lost: u64,
 }
 
 impl Inner {
+    /// Keeps `[at, at + len)` as changed at the current generation.
+    fn note(&mut self, at: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        if self.journal.len() >= JOURNAL
+            && let Some((g, _, _)) = self.journal.pop_front()
+        {
+            self.journal_lost = g;
+        }
+        self.journal.push_back((self.generation, at, len));
+    }
+
+    /// What the 64 KiB title page at `page` shows now.
+    fn page_target(&self, page: usize) -> Option<PageTarget> {
+        let (pool, ptr) = self.resolve(page, TABLE_PAGE)?;
+        Some(PageTarget {
+            pool: pool.id,
+            base: pool.base,
+            pool_len: pool.len as u64,
+            pool_at: (ptr as usize - pool.base) as u64,
+        })
+    }
+
     /// Removes `[at, at + len)` from the mappings, keeping what is left of any it cuts.
     fn cut(&mut self, at: usize, len: usize) {
         self.generation += 1;
+        self.note(at, len);
         let end = at + len;
         // Only the immediate predecessor can overlap the start of the cut.
         let mut preceding = self
@@ -168,6 +217,55 @@ impl PoolTable {
         (g.generation, maps)
     }
 
+    /// Every 64 KiB title page a mapping shows all of, and what it shows (a page table built whole),
+    /// with the generation that is current for.
+    pub fn pages(&self) -> (u64, Vec<(u64, PageTarget)>) {
+        let g = self.lock();
+        let mut out = Vec::new();
+        // Mappings come in address order and never overlap: a page two of them share is seen twice
+        // in a row, and looked at once.
+        let mut last = None;
+        for (&at, m) in &g.maps {
+            let end = at + m.len;
+            let mut page = at & !(TABLE_PAGE - 1);
+            while page < end {
+                if last.is_none_or(|l| page > l) {
+                    last = Some(page);
+                    if let Some(t) = g.page_target(page) {
+                        out.push((page as u64, t));
+                    }
+                }
+                page += TABLE_PAGE;
+            }
+        }
+        (g.generation, out)
+    }
+
+    /// The 64 KiB title pages whose mappings changed after generation `since`, and what each shows
+    /// now (`None`: nothing, or not all of it one run of one pool), with the generation that is
+    /// current for. `None` when changes that old are no longer kept: build the table whole
+    /// ([`PoolTable::pages`]).
+    pub fn pages_since(&self, since: u64) -> Option<(u64, Vec<(u64, Option<PageTarget>)>)> {
+        let g = self.lock();
+        if since < g.journal_lost {
+            return None;
+        }
+        let from = g.journal.partition_point(|&(generation, _, _)| generation <= since);
+        let mut pages: Vec<usize> = Vec::new();
+        for &(_, at, len) in g.journal.range(from..) {
+            let end = at + len;
+            let mut page = at & !(TABLE_PAGE - 1);
+            while page < end {
+                pages.push(page);
+                page += TABLE_PAGE;
+            }
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        let out = pages.into_iter().map(|p| (p as u64, g.page_target(p))).collect();
+        Some((g.generation, out))
+    }
+
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn mapping_snapshots(&self) -> usize {
         self.mapping_snapshots
@@ -258,7 +356,16 @@ impl PoolObserver for PoolTable {
         let mut g = self.lock();
         g.generation += 1;
         g.pools.remove(&pool.id);
-        g.maps.retain(|_, m| m.pool != pool.id);
+        let gone: Vec<(usize, usize)> = g
+            .maps
+            .iter()
+            .filter(|(_, m)| m.pool == pool.id)
+            .map(|(&at, m)| (at, m.len))
+            .collect();
+        for (at, len) in gone {
+            g.maps.remove(&at);
+            g.note(at, len);
+        }
         g.released.push(pool.id);
     }
 
@@ -422,6 +529,72 @@ mod tests {
         // An address in the empty mapping is in no mapping.
         t.unmapped(0x7000_0000, 0x1_0000);
         assert!(t.resolve(0x7001_0000, 1).is_none());
+    }
+
+    #[test]
+    fn pages_since_names_the_pages_that_changed_and_what_they_show() {
+        const P: usize = TABLE_PAGE;
+        let t = PoolTable::default();
+        let p = pool(1);
+        t.pool_created(&p);
+        for i in 0..4 {
+            t.mapped(0x7000_0000 + i * P, P, &p, i * P);
+        }
+        let at = |pool_at: usize| PageTarget {
+            pool: 1,
+            base: p.base,
+            pool_len: p.len as u64,
+            pool_at: pool_at as u64,
+        };
+        let (g, pages) = t.pages();
+        assert_eq!(pages.len(), 4);
+        assert_eq!(pages[2], (0x7002_0000, at(2 * P)));
+        assert_eq!(t.pages_since(g).unwrap(), (g, vec![]));
+
+        // An unmap, a remap to another pool offset, a quarter page (not all of a page) and a pool
+        // creation (no page).
+        t.unmapped(0x7001_0000, P);
+        t.mapped(0x7003_0000, P, &p, 8 * P);
+        t.mapped(0x7010_4000, 0x4000, &p, 0x4000);
+        t.pool_created(&pool(2));
+        let (g2, changed) = t.pages_since(g).unwrap();
+        assert!(g2 > g);
+        assert_eq!(
+            changed,
+            vec![(0x7001_0000, None), (0x7003_0000, Some(at(8 * P))), (0x7010_0000, None)]
+        );
+        assert_eq!(t.pages_since(g2).unwrap(), (g2, vec![]));
+
+        // The three quarters left, in pool order: now all of the page shows the pool.
+        for i in [0, 2, 3] {
+            t.mapped(0x7010_0000 + i * 0x4000, 0x4000, &p, i * 0x4000);
+        }
+        let (g3, changed) = t.pages_since(g2).unwrap();
+        assert_eq!(changed, vec![(0x7010_0000, Some(at(0)))]);
+
+        // A released pool takes its pages with it.
+        t.pool_released(&p);
+        let (_, changed) = t.pages_since(g3).unwrap();
+        assert_eq!(
+            changed,
+            vec![(0x7000_0000, None), (0x7002_0000, None), (0x7003_0000, None), (0x7010_0000, None)]
+        );
+        assert_eq!(t.pages().1, vec![]);
+    }
+
+    #[test]
+    fn a_table_further_behind_than_the_journal_is_built_again() {
+        let t = PoolTable::default();
+        let p = pool(1);
+        t.pool_created(&p);
+        let start = t.generation();
+        for i in 0..JOURNAL + 1 {
+            t.mapped(0x7000_0000 + (i % 8) * TABLE_PAGE, TABLE_PAGE, &p, 0);
+        }
+        assert!(t.pages_since(start).is_none());
+        // A table current a few changes ago is still told what changed.
+        let recent = t.generation() - 3;
+        assert_eq!(t.pages_since(recent).unwrap().1.len(), 3);
     }
 
     #[test]

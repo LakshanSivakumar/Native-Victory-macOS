@@ -56,8 +56,63 @@ pub(crate) fn signal_event(event: usize) {
     }
 }
 
-fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
-    TITLE.lock().unwrap_or_else(|e| e.into_inner())
+/// The title lock, held: since when and by which call, for the log of long holds.
+struct Held {
+    guard: std::sync::MutexGuard<'static, Option<Shared>>,
+    since: std::time::Instant,
+    by: &'static std::panic::Location<'static>,
+}
+
+impl std::ops::Deref for Held {
+    type Target = Option<Shared>;
+    fn deref(&self) -> &Option<Shared> {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Option<Shared> {
+        &mut self.guard
+    }
+}
+
+/// Holds of the title lock, and waits for it, this long or longer are logged: every title thread's
+/// GPU call (recording, submissions, fences) and the host's timer queue behind one hold, and the
+/// title's watchdog ends the run when one of them waits 30 s.
+const LONG_HOLD: std::time::Duration = std::time::Duration::from_millis(200);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let held = self.since.elapsed();
+        if held >= LONG_HOLD {
+            long_lock("held", held, self.by);
+        }
+    }
+}
+
+/// The first 200 long holds or waits, then every 100th.
+fn long_lock(what: &str, d: std::time::Duration, by: &std::panic::Location<'_>) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 200 || n.is_multiple_of(100) {
+        tracing::warn!(ms = d.as_millis() as u64, at = %by, n, "the native host's title lock was {what} long");
+    }
+}
+
+#[track_caller]
+fn lock() -> Held {
+    let by = std::panic::Location::caller();
+    let asked = std::time::Instant::now();
+    let guard = TITLE.lock().unwrap_or_else(|e| e.into_inner());
+    let waited = asked.elapsed();
+    if waited >= LONG_HOLD {
+        long_lock("waited for", waited, by);
+    }
+    Held {
+        guard,
+        since: std::time::Instant::now(),
+        by,
+    }
 }
 
 /// For crash reports: whether a pool holds title address `at` and which buffer views cover it.
@@ -68,6 +123,7 @@ pub fn describe(at: u64) -> Option<String> {
 
 /// Runs `f` on the native host, made on first use; `None` if there is no Metal device (the call
 /// is then ignored, as when there is no host GPU on Windows).
+#[track_caller]
 pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
     let mut guard = lock();
     if guard.is_none() {
@@ -126,6 +182,7 @@ fn refresh(t: &mut MetalTitle) {
 }
 
 /// Runs `f` on the native host and a title list's recording.
+#[track_caller]
 pub(crate) fn with_list<R>(
     this: This,
     f: impl FnOnce(&mut MetalTitle, &mut MetalList) -> R,

@@ -10,7 +10,7 @@ use super::descriptors::{Decoded, decode};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::{CrashAddresses, PoolTable};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
@@ -52,27 +52,46 @@ const NEVER_SET: &str = "was never set";
 /// The host's side of the pool-offset contract ([`super::addr`]).
 struct Contract<B: GraphicsBackend> {
     pairs: Pairs,
-    /// Superseded tables, kept while submissions that read them may still run.
-    // shortcut: the GPU is assumed not to be more than `RETIRED` table rebuilds behind.
-    retired: VecDeque<Rc<Pages<B>>>,
+    /// Tables replaced by one built whole (the changes they lacked were no longer kept), for the
+    /// work that may still read them.
+    // shortcut: kept for good; that happens only to a table that fell a whole journal behind.
+    retired: Vec<addr::Table<B>>,
     /// The memory the null view (pair 0) has, with size 0.
     null: Option<Rc<Pages<B>>>,
     /// A resource heap of the host's own, for shaders that need the pairs and the title bound none.
     heap: Option<Rc<NativeHeap<B>>>,
+    /// What the page tables did, for the log ([`NativeHost::log_tables`]).
+    stats: TableStats,
+    /// Tables built whole and brought up to date in place, for the life of the host.
+    builds: u64,
+    updates: u64,
 }
 
 impl<B: GraphicsBackend> Default for Contract<B> {
     fn default() -> Self {
         Contract {
             pairs: Pairs::default(),
-            retired: VecDeque::new(),
+            retired: Vec::new(),
             null: None,
             heap: None,
+            stats: TableStats::default(),
+            builds: 0,
+            updates: 0,
         }
     }
 }
 
-const RETIRED: usize = 8;
+/// Page-table work since the last log line.
+#[derive(Default)]
+struct TableStats {
+    /// Tables brought up to date in place, and the pages they rewrote.
+    updates: u64,
+    pages: u64,
+    /// Tables built whole, and how many of those because the changes they needed were dropped.
+    builds: u64,
+    lost: u64,
+    logged: Option<std::time::Instant>,
+}
 
 /// What one command resolved to: title addresses are made into buffers here, kept alive until the
 /// submission has been handed over.
@@ -520,8 +539,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(())
     }
 
-    /// The page table of the pool-offset contract for `heap` and the pool table as it is now:
-    /// rebuilt, into a buffer of its own, when a pool or a mapping changed since it was made.
+    /// The page table of the pool-offset contract for `heap`, current for the pool table as it is
+    /// now: built whole the first time, then brought up to date in place, rewriting the pages whose
+    /// mappings changed since ([`addr::Table`]).
     fn memory_table(&self, heap: &NativeHeap<B>) -> Result<Rc<Pages<B>>, String> {
         if !addr::fits(heap.count) {
             return Err(format!(
@@ -529,34 +549,81 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.count
             ));
         }
-        if let Some((g, t)) = &*heap.table.borrow()
-            && *g == self.memory.generation()
-        {
-            return Ok(t.clone());
-        }
-        let (generation, mappings) = self.memory.mappings();
-        let maps: Vec<Mapping> = mappings
-            .iter()
-            .map(|(at, len, pool, offset)| Mapping {
-                at: *at as u64,
-                len: *len as u64,
-                pool: pool.id,
-                base: pool.base,
-                pool_len: pool.len as u64,
-                offset: *offset as u64,
-            })
-            .collect();
+        let mut slot = heap.table.borrow_mut();
         let mut c = self.contract.borrow_mut();
-        let words = addr::build(&maps, &mut c.pairs, heap.count as u32);
-        let table = Rc::new(Pages::new(&self.backend, words.len() * 4)?);
-        table.write(&words);
-        if let Some((_, old)) = heap.table.borrow_mut().replace((generation, table.clone())) {
-            c.retired.push_back(old);
-            while c.retired.len() > RETIRED {
-                c.retired.pop_front();
+        let c = &mut *c;
+        if let Some(t) = slot.as_mut() {
+            if t.generation == self.memory.generation() {
+                return Ok(t.buffer().clone());
+            }
+            if let Some((generation, pages)) = self.memory.pages_since(t.generation) {
+                for &(page, target) in &pages {
+                    t.set(&self.backend, page, target, &mut c.pairs)?;
+                }
+                t.generation = generation;
+                c.stats.updates += 1;
+                c.stats.pages += pages.len() as u64;
+                c.updates += 1;
+                return Ok(t.buffer().clone());
+            }
+            c.stats.lost += 1;
+        }
+        let (generation, pages) = self.memory.pages();
+        let table = addr::Table::new(&self.backend, heap.count as u32, generation, &pages, &mut c.pairs)?;
+        c.stats.builds += 1;
+        c.builds += 1;
+        let buffer = table.buffer().clone();
+        if let Some(old) = slot.replace(table) {
+            c.retired.push(old);
+        }
+        Ok(buffer)
+    }
+
+    /// Page tables built whole and brought up to date in place so far.
+    pub fn page_table_work(&self) -> (u64, u64) {
+        let c = self.contract.borrow();
+        (c.builds, c.updates)
+    }
+
+    /// At most every five seconds, a line on what the page tables did since the last one.
+    fn log_tables(&self) {
+        let mut c = self.contract.borrow_mut();
+        let c = &mut *c;
+        let s = &mut c.stats;
+        if s.logged.is_some_and(|t| t.elapsed().as_secs() < 5) || s.updates + s.builds == 0 {
+            return;
+        }
+        let (mut blocks, mut grown, mut unpaired) = (0, 0, 0);
+        for h in self.heaps.borrow().iter().chain(c.heap.iter()) {
+            if let Some(t) = &*h.table.borrow() {
+                let (b, g) = t.size();
+                blocks += b;
+                grown += g;
+                unpaired += t.unpaired;
             }
         }
-        Ok(table)
+        tracing::info!(
+            updates = s.updates,
+            pages = s.pages,
+            builds = s.builds,
+            lost = s.lost,
+            pairs = c.pairs.keys.len(),
+            unpaired,
+            blocks,
+            grown,
+            retired = c.retired.len(),
+            "page tables"
+        );
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        if unpaired > 0 {
+            WARNED.call_once(|| {
+                tracing::warn!(pairs = c.pairs.keys.len(), "page tables: no view pair was left for some pools; their pages read as null");
+            });
+        }
+        *s = TableStats {
+            logged: Some(std::time::Instant::now()),
+            ..TableStats::default()
+        };
     }
 
     /// Writes the view pairs the table names into `heap`'s reserved entries (those it lacks).
@@ -1242,6 +1309,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             cmds.len(),
             names[..names.len().min(40)].join(", ")
         );
+        self.log_tables();
         self.backend.submit_passes(
             queue,
             &PassSubmission {

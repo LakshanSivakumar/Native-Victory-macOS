@@ -220,20 +220,24 @@ fn computed_addresses_read_and_write_the_pool_at_its_title_addresses() {
     dispatch(&mut t, &cs, &[a, b, c, d], false);
     check_computed(&f, 0x2_0000, 0x6_0000);
 
-    // The same heap and unchanged mappings can use the existing page table.
+    assert_eq!(t.host.page_table_work(), (1, 0), "built whole once");
+
+    // The same heap and unchanged mappings use the table as it is.
     prepare_computed(&f, 0x2_0000, 0x6_0000);
     dispatch(&mut t, &cs, &[a, b, c, d], false);
     check_computed(&f, 0x2_0000, 0x6_0000);
-    assert_eq!(t.host.memory().mapping_snapshots(), 1);
+    assert_eq!(t.host.page_table_work(), (1, 0));
 
-    // Remapping must still rebuild that heap's table.
+    // A remap is written into that table in place: the GPU follows it, nothing is built again, and no
+    // snapshot of every mapping is taken.
     t.host.memory().mapped(VA_A as usize, 0x8_0000, &f.info, 0x4_0000);
     f.put(0, &[CANARY; POOL / 4]);
     prepare_computed(&f, 0x4_0000, 0x8_0000);
     dispatch(&mut t, &cs, &[a, b, c, d], false);
     check_computed(&f, 0x4_0000, 0x8_0000);
     assert_eq!(f.get(0x6_0000, 64), [CANARY; 64]);
-    assert_eq!(t.host.memory().mapping_snapshots(), 2);
+    assert_eq!(t.host.page_table_work(), (1, 1));
+    assert_eq!(t.host.memory().mapping_snapshots(), 0);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
@@ -383,4 +387,79 @@ fn only_the_zero_copy_option_drops_the_page_marks() {
     let host = shader(COMPUTED, 4);
     assert!(host.memory && !host.memory_writes);
     assert_ne!(d3d12.dxil, host.dxil);
+}
+
+/// A table kept current in place agrees with one built whole, page for page: after unmaps, remaps to
+/// another pool, and pages made of 16 KiB pieces (a whole page when they follow each other in the
+/// pool, none when they do not). Its mappings reach more 256 MiB regions than a table has blocks for
+/// at first, so it grows on the way, and keeps the buffer it outgrew.
+#[test]
+fn a_table_kept_in_place_matches_one_built_whole() {
+    use crate::native::addr::{CHUNK, Pairs, Table, lookup};
+    use crate::native::memory::PoolTable;
+    let Ok(metal) = Metal::new() else {
+        eprintln!("skipped: no Metal device");
+        return;
+    };
+    const P: usize = 1 << 16;
+    const REGION: usize = 1 << 28;
+    const AT: usize = 0x10_0000_0000;
+    let pool = |id: usize, len: usize| PoolInfo {
+        id,
+        base: 0x100_0000_0000 * id,
+        len,
+        memory_entry: None,
+    };
+    let (p, q) = (pool(1, 1 << 30), pool(2, 1 << 26));
+    let m = PoolTable::default();
+    m.pool_created(&p);
+    m.pool_created(&q);
+    for r in 0..70 {
+        m.mapped(AT + r * REGION, P, &p, r * P);
+    }
+    let first = 1000;
+    let mut pairs = Pairs::default();
+    let (g, pages) = m.pages();
+    let mut t = Table::new(&metal, first, g, &pages, &mut pairs).unwrap();
+    assert_eq!(t.size(), (71, 1), "70 blocks and the null one, after growing once");
+
+    for r in (0..70).step_by(3) {
+        m.unmapped(AT + r * REGION, P);
+    }
+    for r in (1..70).step_by(3) {
+        m.mapped(AT + r * REGION, P, &q, r * P);
+    }
+    for i in 0..4 {
+        m.mapped(0x20_0000_0000 + i * 0x4000, 0x4000, &q, 0x10_0000 + i * 0x4000);
+        m.mapped(0x20_0001_0000 + i * 0x4000, 0x4000, &q, 0x20_0000 + (3 - i) * 0x4000);
+    }
+    let (g2, changed) = m.pages_since(t.generation).unwrap();
+    for (page, target) in changed {
+        t.set(&metal, page, target, &mut pairs).unwrap();
+    }
+    t.generation = g2;
+
+    let (g3, pages) = m.pages();
+    assert_eq!(g3, g2);
+    let whole = Table::new(&metal, first, g3, &pages, &mut pairs).unwrap();
+    let (kept, built) = (t.words(), whole.words());
+    let addresses: Vec<u64> = (0..70)
+        .map(|r| (AT + r * REGION + 0x1234) as u64)
+        .chain([0x20_0000_0100, 0x20_0001_0100, 0x30_0000_0000, 0x10_0001_0000])
+        .collect();
+    for &va in &addresses {
+        assert_eq!(lookup(&kept, va), lookup(&built, va), "{va:#x}");
+    }
+    // What the lookups say, by pool and offset in it.
+    let target = |va: u64| {
+        lookup(&kept, va).map(|(view, offset)| {
+            let key = pairs.keys[((view - first) / 2 - 1) as usize];
+            (key.pool, key.chunk * CHUNK + u64::from(offset))
+        })
+    };
+    assert_eq!(target((AT + 0x1234) as u64), None, "unmapped");
+    assert_eq!(target((AT + REGION + 0x1234) as u64), Some((2, (P + 0x1234) as u64)), "remapped");
+    assert_eq!(target((AT + 2 * REGION + 0x1234) as u64), Some((1, (2 * P + 0x1234) as u64)), "as it was");
+    assert_eq!(target(0x20_0000_0100), Some((2, 0x10_0100)), "quarters in pool order");
+    assert_eq!(target(0x20_0001_0100), None, "quarters out of order");
 }
