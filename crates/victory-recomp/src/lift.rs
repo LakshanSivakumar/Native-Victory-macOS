@@ -199,9 +199,50 @@ struct L<'a> {
     y: bool,
     /// Addresses of this function's instructions: the only valid `goto` targets.
     ips: std::collections::HashSet<u64>,
+    /// Stack reads that are shared accesses all the same ([`spin_reads`]).
+    spin: std::collections::HashSet<u64>,
 }
 
 type R<T> = Result<T, String>;
+
+/// Reads of a fixed stack slot (`[rsp + d]`) in a polling loop: a short loop that only reads memory and tests what
+/// it read (loads, compares, branches; no call, no store, no register arithmetic, so nothing of its own changes from
+/// one turn to the next). Only another thread can end it: a waiter spins on a counter it handed out by address
+/// (rva 0x9dd0da: workers `lock inc` it, the waiter does `mov eax, [rsp + 0x48]` / `cmp eax, 8` / `jne` back), and
+/// as a plain access clang takes the read as loop-invariant and the loop as endless (`b .`). These are emitted as
+/// shared accesses, which it must repeat (and which order what follows them, as the spin's exit must). (A loop
+/// with `pause` keeps its reads in any case: `pause` is a compiler barrier.)
+fn spin_reads(ins: &[Instruction]) -> std::collections::HashSet<u64> {
+    use iced_x86::FlowControl as FC;
+    let at: std::collections::HashMap<u64, usize> = ins.iter().enumerate().map(|(k, i)| (i.ip(), k)).collect();
+    let mut out = std::collections::HashSet::new();
+    for (b, j) in ins.iter().enumerate() {
+        if !matches!(j.flow_control(), FC::ConditionalBranch | FC::UnconditionalBranch) || j.op0_kind() != OpKind::NearBranch64 {
+            continue;
+        }
+        let t = j.near_branch_target();
+        let Some(&s) = at.get(&t).filter(|_| t <= j.ip()) else { continue };
+        let body = &ins[s..=b];
+        let polls = body.len() <= 16
+            && body.iter().all(|i| {
+                let load = matches!(i.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd)
+                    && i.op0_kind() == OpKind::Register
+                    && i.op1_kind() == OpKind::Memory;
+                load || matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Nop)
+                    || matches!(i.flow_control(), FC::ConditionalBranch | FC::UnconditionalBranch)
+                        && i.op0_kind() == OpKind::NearBranch64
+            });
+        if polls {
+            out.extend(
+                body.iter()
+                    .filter(|i| i.memory_base() == Register::RSP && i.memory_index() == Register::None)
+                    .filter(|i| (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory))
+                    .map(|i| i.ip()),
+            );
+        }
+    }
+    out
+}
 
 fn gpr(r: Register) -> R<(usize, u32, bool)> {
     if !r.is_gpr() {
@@ -737,7 +778,7 @@ impl L<'_> {
     fn insn(&mut self, i: &Instruction, labels: &BTreeSet<u64>) -> R<()> {
         let start = self.o.len();
         self.insn_inner(i, labels)?;
-        let local = i.segment_prefix() == Register::GS || i.memory_base() == Register::RSP;
+        let local = (i.segment_prefix() == Register::GS || i.memory_base() == Register::RSP) && !self.spin.contains(&i.ip());
         if !local && (0..i.op_count()).any(|n| i.op_kind(n) == OpKind::Memory) {
             let tail = shared_accesses(&self.o[start..]);
             self.o.truncate(start);
@@ -766,7 +807,10 @@ impl L<'_> {
             return Ok(());
         }
         match m {
-            M::Nop | M::Pause => {}
+            M::Nop => {}
+            // A spin-wait hint: ARM's own, and a compiler barrier, so a waiting loop reads memory again on every turn
+            // (clang would otherwise keep a plain read of a loop that writes nothing in a register, and spin forever).
+            M::Pause => self.emit("__asm__ volatile(\"yield\" ::: \"memory\");"),
             M::Mfence | M::Sfence | M::Lfence => self.emit("__atomic_thread_fence(__ATOMIC_SEQ_CST);"),
             M::Int3 | M::Ud2 => self.emit("rt_trap(\"int3/ud2\");"),
             M::Mov => {
@@ -1192,6 +1236,7 @@ fn lift_core(ctx: &Ctx, f: &FuncIn, all: bool) -> (String, Vec<String>) {
         o: String::new(),
         y,
         ips: f.ins.iter().map(|i| i.ip()).collect(),
+        spin: spin_reads(f.ins),
     };
     let mut errs = vec![];
     let prologue = if y { "FUNC_PROLOGUE_Y()" } else { "FUNC_PROLOGUE()" };
@@ -1316,5 +1361,83 @@ mod tests {
         let f = FuncIn { entries: vec![entry + 1], ..f };
         let c = lift_function(&ctx, &f).unwrap();
         assert!(c.contains(&format!("void f_{:x}(Cpu *c) {{ (void)c; rt_trap(", entry + 1 - BASE)), "{c}");
+    }
+
+    fn lifted(build: impl FnOnce(&mut CodeAssembler) -> Result<(), IcedError>) -> String {
+        const BASE: u64 = 0x1_4000_0000;
+        let at = BASE + 0x1000;
+        let mut a = CodeAssembler::new(64).unwrap();
+        build(&mut a).unwrap();
+        let bytes = a.assemble(at).unwrap();
+        let ins: Vec<Instruction> = Decoder::with_ip(64, &bytes, at, DecoderOptions::NONE).iter().collect();
+        let is_func = move |va: u64| va == at;
+        let ctx = Ctx { image_base: BASE, is_func: &is_func };
+        let f = FuncIn {
+            begin_va: at,
+            end_va: at + bytes.len() as u64,
+            ins: &ins,
+            tables: BTreeMap::new(),
+            extra: vec![],
+            landing_pads: vec![],
+            entries: vec![],
+        };
+        lift_function(&ctx, &f).unwrap()
+    }
+
+    #[test]
+    fn a_stack_slot_a_loop_spins_on_is_read_as_shared() {
+        // rva 0x9dd0da: the workers' counter, handed out by address, on the waiter's stack.
+        let c = lifted(|a| {
+            let mut spin = a.create_label();
+            a.mov(dword_ptr(rsp + 0x48), 0)?;
+            a.set_label(&mut spin)?;
+            a.mov(eax, dword_ptr(rsp + 0x48))?;
+            a.cmp(eax, 8)?;
+            a.jne(spin)?;
+            a.mov(ecx, dword_ptr(rsp + 0x50))?;
+            a.ret()
+        });
+        assert!(c.contains("r0 = (u32)((u64)sld32((u8*)(r4 + (u64)(s64)72ll)));"), "{c}");
+        // Outside the loop, and in one that writes the slot or calls, the stack stays plain.
+        assert!(c.contains("ld32((u8*)(r4 + (u64)(s64)80ll))") && !c.contains("sld32((u8*)(r4 + (u64)(s64)80ll))"), "{c}");
+        let c = lifted(|a| {
+            let mut again = a.create_label();
+            a.set_label(&mut again)?;
+            a.mov(eax, dword_ptr(rsp + 0x48))?;
+            a.inc(dword_ptr(rsp + 0x48))?;
+            a.cmp(eax, 8)?;
+            a.jne(again)?;
+            a.ret()
+        });
+        assert!(!c.contains("sld32"), "{c}");
+        let c = lifted(|a| {
+            let (mut again, mut callee) = (a.create_label(), a.create_label());
+            a.set_label(&mut again)?;
+            a.call(callee)?;
+            a.mov(eax, dword_ptr(rsp + 0x48))?;
+            a.cmp(eax, 8)?;
+            a.jne(again)?;
+            a.set_label(&mut callee)?;
+            a.ret()
+        });
+        assert!(!c.contains("sld32"), "{c}");
+        // A search: the loop counts (its own state changes), its reads are its business.
+        let c = lifted(|a| {
+            let mut again = a.create_label();
+            a.set_label(&mut again)?;
+            a.mov(rdx, qword_ptr(rsp + 0x28))?;
+            a.cmp(dword_ptr(rdx + rcx * 4), eax)?;
+            a.inc(rcx)?;
+            a.cmp(rcx, qword_ptr(rsp + 0x40))?;
+            a.jb(again)?;
+            a.ret()
+        });
+        assert!(!c.contains("sld64((u8*)(r4"), "{c}");
+        // `pause` is a compiler barrier.
+        let c = lifted(|a| {
+            a.pause()?;
+            a.ret()
+        });
+        assert!(c.contains("__asm__ volatile(\"yield\" ::: \"memory\");"), "{c}");
     }
 }
