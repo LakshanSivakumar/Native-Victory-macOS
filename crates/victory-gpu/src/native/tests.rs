@@ -24,6 +24,8 @@ mod state_tests;
 mod texture_tests;
 #[path = "title_tests.rs"]
 mod title_tests;
+#[path = "walk_tests.rs"]
+mod walk_tests;
 
 fn host() -> Option<Host> {
     if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()

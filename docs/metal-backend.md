@@ -661,8 +661,22 @@ group-shared memory, `WaveSize(32)`.
 Group barriers need every thread, so these operations are lowered only where each thread runs the block exactly
 once, or (group of one console wave) behind uniform scalar branches outside loops. In EXEC-divergent code or
 per-lane loops the value is left unknown and the program is refused if anything uses it; LDS shared without a
-barrier in divergent code is refused too. 16-bit wave reductions across the halves are refused. Fixing the
-divergent case needs if-conversion of the region so both halves always arrive (not done).
+barrier in divergent code is refused too. 16-bit wave reductions across the halves are refused.
+
+The divergent case, for a group of one console wave: such a program is made again with the per-lane
+branches around the places where the halves are apart taken by the whole wave, as the console's scalar
+unit takes them (`emit::widened`, `structure::structure_wide`): the wave goes into an `if` where some
+lane's EXEC bit is set, round a loop while some lane is, and EXEC stays a guard on every vector
+instruction inside. Each host wave asks its lanes (`WaveActiveAnyTrue`, or `AllTrue` for `execz` and
+`vccz`) and the halves exchange the answers through `xchg`, so both go the same way and are together
+inside, where the exchanges and LDS barriers then go (also in loops whose every branch is scalar or taken
+wave-wide). The branches are found from the blocks the lowering reports apart (`lower::take_needs`,
+`lower::branches_around`; those to the program's end last) and added until none is. Refused still: a
+scalar branch the halves meet at that tests a value they may hold differently (a join after a per-lane
+branch, or a first-lane read, which is each half's own: `lower::scalar_parting`), and groups of several
+console waves. `VICTORY_WAVE_WALK=0` on the native host refuses those programs as before
+(`Options::no_wave_walk`). Tests: `emit/walk_tests.rs` (refused without, 32-lane waves with), and
+`native/walk_tests.rs` in victory-gpu runs them on the GPU against the console's results.
 
 Verified: unit tests with synthetic programs (`emit/wave32_tests.rs`); the lowered containers pass
 `metal-shaderconverter` (no IRError 6). Not measured: the 528 corpus shaders (the cache holds translated DXIL,

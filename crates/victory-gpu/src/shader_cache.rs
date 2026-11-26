@@ -170,6 +170,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         narrow_waves: narrow_waves(),
         // The host's waves are the console's size.
         wave32_host: false,
+        // (only with `wave32_host`)
+        no_wave_walk: false,
         // The D3D12 host copies title memory: it needs the pages marked.
         zero_copy_memory: false,
         rect_list: false,
