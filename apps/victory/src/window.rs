@@ -260,19 +260,24 @@ impl Hud {
     }
 }
 
-/// `VICTORY_SHOTS=<dir>,<seconds>`: every that many seconds, the last frame presented, a quarter
-/// of its size, as `<dir>/s<seconds since start>.ppm` (for runs nobody watches).
+/// `VICTORY_SHOTS=<dir>,<seconds>[,<step>]`: every that many seconds, the last frame presented,
+/// every `step`th pixel (4: a quarter of its size), as `<dir>/s<seconds since start>.ppm` (for
+/// runs nobody watches).
 fn shot() {
     use std::sync::{LazyLock, Mutex};
-    static CONF: LazyLock<Option<(String, u64)>> = LazyLock::new(|| {
+    static CONF: LazyLock<Option<(String, u64, usize)>> = LazyLock::new(|| {
         let v = std::env::var("VICTORY_SHOTS").ok()?;
-        let (dir, every) = v.split_once(',')?;
+        let mut parts = v.split(',');
+        let dir = parts.next()?;
+        let every = parts.next()?.trim().parse().ok().filter(|&n| n > 0)?;
+        let step = parts.next().and_then(|s| s.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(4);
         let _ = std::fs::create_dir_all(dir);
-        Some((dir.to_owned(), every.trim().parse().ok().filter(|&n| n > 0)?))
+        Some((dir.to_owned(), every, step))
     });
     static NEXT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
-    let Some((dir, every)) = CONF.as_ref() else { return };
+    let Some((dir, every, step)) = CONF.as_ref() else { return };
+    let step = *step;
     let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
     if next.is_some_and(|n| now < n) {
@@ -280,12 +285,12 @@ fn shot() {
     }
     *next = Some(now + std::time::Duration::from_secs(*every));
     let Some((w, h, bgra)) = victory_gpu::native::last_frame() else { return };
-    let (sw, sh) = (w / 4, h / 4);
+    let (sw, sh) = (w / step, h / step);
     let mut out = format!("P6\n{sw} {sh}\n255\n").into_bytes();
     out.reserve(sw * sh * 3);
     for y in 0..sh {
         for x in 0..sw {
-            let i = ((y * 4) * w + x * 4) * 4;
+            let i = ((y * step) * w + x * step) * 4;
             out.extend_from_slice(&[bgra[i + 2], bgra[i + 1], bgra[i]]);
         }
     }
