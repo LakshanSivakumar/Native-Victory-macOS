@@ -189,6 +189,8 @@ pub enum Cmd<B: GraphicsBackend> {
         root: Vec<Option<Root<B>>>,
         heaps: Heaps<B>,
         groups: [usize; 3],
+        /// `ExecuteIndirect`: the title address of the group counts (`groups` unused).
+        indirect: Option<u64>,
     },
     Copy {
         dst: u64,
@@ -226,11 +228,13 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 root,
                 heaps,
                 groups,
+                indirect,
             } => Cmd::Dispatch {
                 pso: pso.clone(),
                 root: root.clone(),
                 heaps: heaps.clone(),
                 groups: *groups,
+                indirect: *indirect,
             },
             Cmd::Copy { dst, src, len } => Cmd::Copy {
                 dst: *dst,
@@ -454,6 +458,25 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.compute_root.clone(),
             heaps: self.state.heaps.clone(),
             groups: [x as usize, y as usize, z as usize],
+            indirect: None,
+        });
+        Ok(())
+    }
+
+    /// A dispatch of `ExecuteIndirect`: the group counts are the three `u32`s at title address
+    /// `arguments`, read on the GPU when the work runs. Needs the compute pipeline set.
+    pub fn dispatch_indirect(&mut self, arguments: u64) -> Result<(), String> {
+        let pso = self
+            .state
+            .compute
+            .clone()
+            .ok_or("indirect dispatch without a compute pipeline")?;
+        self.cmds.push(Cmd::Dispatch {
+            pso,
+            root: self.state.compute_root.clone(),
+            heaps: self.state.heaps.clone(),
+            groups: [0; 3],
+            indirect: Some(arguments),
         });
         Ok(())
     }

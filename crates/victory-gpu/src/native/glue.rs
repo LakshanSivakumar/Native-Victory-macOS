@@ -766,6 +766,19 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     });
 }
 
+/// A dispatch of `ExecuteIndirect`: the group counts at title address `arguments`, read by the GPU.
+pub(crate) fn dispatch_indirect(this: This, arguments: u64) {
+    with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+        Pipe::Compute(pso) => {
+            l.list.set_compute_pipeline(&pso);
+            if let Err(e) = l.list.dispatch_indirect(arguments) {
+                tracing::warn!(error = %e, "indirect dispatch");
+            }
+        }
+        _ => dropped("a dispatch without a host compute pipeline"),
+    });
+}
+
 /// `IASetPrimitiveTopology`.
 pub(crate) fn topology(this: This, topology: u32) {
     with_list(this, |_, l| l.topology = topology);

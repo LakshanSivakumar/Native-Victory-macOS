@@ -62,6 +62,9 @@ pub struct Dispatch<'a, B: ComputeBackend + ?Sized> {
     pub heaps: Heaps<'a, B>,
     pub groups: [usize; 3],
     pub threads_per_group: [usize; 3],
+    /// `ExecuteIndirect` of a dispatch: the group counts are read on the GPU from the buffer at
+    /// this title address (three `u32`s), and `groups` is unused.
+    pub indirect: Option<(&'a B::Buffer, *const u8)>,
 }
 
 /// The descriptor heaps a draw or dispatch binds (`SetDescriptorHeaps`): slot 0 and slot 1.

@@ -634,6 +634,7 @@ impl<'a> Lower<'a> {
                     let n = i.name();
                     n.starts_with("ds_swizzle")
                         || n.contains("permute")
+                        || n.starts_with("v_permlane")
                         || n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -8067,6 +8068,43 @@ impl<'a> Lower<'a> {
                 };
                 int(self, r)
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Lane l reads lane pick | base: pick is nibble (l & 15) of {src2, src1}, base
+                // the lane's own row of 16 (x16: the other row of its 32). It never leaves the
+                // lane's 32, so it stays in one host wave. (Inactive source lanes: read as is;
+                // the FI and bound_ctrl bits are not followed.)
+                let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                self.cross_lane(false)?;
+                let me = self.lane_index();
+                let (k7, k8, k15, k16, k2) = (
+                    self.s.m.i32(7),
+                    self.s.m.i32(8),
+                    self.s.m.i32(15),
+                    self.s.m.i32(16),
+                    self.s.m.i32(2),
+                );
+                let i = self.s.m.bin(c, Bin::And, me, k15);
+                let low = self.s.m.cmp(c, pred::IULT, i, k8);
+                let word = self.s.m.select(c, low, s1, s2);
+                let sh = self.s.m.bin(c, Bin::And, i, k7);
+                let sh = self.s.m.bin(c, Bin::Shl, sh, k2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let base = if name == "v_permlanex16_b32" {
+                    // (l & ~31) | ((l & 16) ^ 16)
+                    let not31 = self.s.m.i32(!31);
+                    let half = self.s.m.bin(c, Bin::And, me, not31);
+                    let row = self.s.m.bin(c, Bin::And, me, k16);
+                    let row = self.s.m.bin(c, Bin::Xor, row, k16);
+                    self.s.m.bin(c, Bin::Or, half, row)
+                } else {
+                    let not15 = self.s.m.i32(!15);
+                    self.s.m.bin(c, Bin::And, me, not15)
+                };
+                let src = self.s.m.bin(c, Bin::Or, base, pick);
+                let r = self.read_in_half(a, src);
+                int(self, r)
+            }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
@@ -9147,6 +9185,32 @@ impl<'a> Lower<'a> {
                 let hole = self.s.m.bin(c, Bin::Xor, hole, ones);
                 let d = self.s.m.bin(c, Bin::And, d, hole);
                 self.s.m.bin(c, Bin::Or, d, x)
+            }
+            "v_cvt_pknorm_u16_f32" | "v_cvt_pknorm_i16_f32" => {
+                // Each source clamped to [0, 1] ([-1, 1]; NaN gives 0), scaled to 16 bits and
+                // rounded to nearest even: src0 into the low half, src1 into the high.
+                let signed = name == "v_cvt_pknorm_i16_f32";
+                let (lo, hi, scale) = if signed {
+                    (-1.0f32, 1.0f32, 32767.0f32)
+                } else {
+                    (0.0, 1.0, 65535.0)
+                };
+                let mut halves = Vec::with_capacity(2);
+                for n in 0..2 {
+                    let f = self.fsrc(inst, n)?;
+                    let (l, h) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(hi.to_bits()));
+                    let f = self.binary(35, f, l);
+                    let f = self.binary(36, f, h);
+                    let sc = self.s.m.f32(scale.to_bits());
+                    let f = self.s.m.bin(c, Bin::Mul, f, sc);
+                    let f = self.unary(26, f);
+                    let x = self.s.m.cast(c, Cast::FpToSi, f, self.s.t.i32);
+                    let ffff = k(self, 0xFFFF);
+                    halves.push(self.s.m.bin(c, Bin::And, x, ffff));
+                }
+                let sh = k(self, 16);
+                let high = self.s.m.bin(c, Bin::Shl, halves[1], sh);
+                self.s.m.bin(c, Bin::Or, halves[0], high)
             }
             "v_ffbl_b32" => {
                 // -1 for zero, as DXIL's first-bit-low.

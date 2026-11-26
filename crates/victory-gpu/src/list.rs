@@ -1972,6 +1972,19 @@ extern "system" fn execute_indirect(
             count.is_null() || counter.is_some()
         ));
     }
+    // The native host: dispatches whose count is not in a buffer, each execution's group
+    // counts read by the GPU at its argument record.
+    #[cfg(target_os = "macos")]
+    if let ([[kind, ..]], Some(address)) = (args, address)
+        && (*kind == 2 || *kind == 105)
+        && count.is_null()
+        && max <= 4096
+    {
+        for i in 0..max as u64 {
+            crate::native::glue::dispatch_indirect(this, address + i * stride as u64);
+        }
+        ran = true;
+    }
     if ran {
         return;
     }

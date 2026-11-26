@@ -454,6 +454,12 @@ impl ResourceBackend for Metal {
         self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some(keep));
     }
 
+    fn clear_entry(&self, heap: &Heap, index: usize) {
+        if heap.kind == HeapKind::Resource {
+            self.heap_entry(heap, index, [0, 0, 0], None);
+        }
+    }
+
     fn write_sampler(&self, heap: &Heap, index: usize, s: &Sampler, lod_bias: f32) {
         debug_assert_eq!(heap.kind, HeapKind::Sampler);
         let id = resource_id(s.0.gpuResourceID());
@@ -782,11 +788,18 @@ impl GraphicsBackend for Metal {
             }
         });
         let order = order.as_ref().and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
+        // A pass that cannot be encoded is left out, but the command buffer is still committed:
+        // its queue-order wait is already encoded and the next one waits for its signal, so
+        // dropping it would hold the queue (and the title's fences) for good.
+        let mut failed_pass = None;
         for pass in work.passes {
-            match pass {
-                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order)?,
-                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order)?,
-                Pass::Blit(ops) => self.encode_blit(&cb, ops, order)?,
+            let r = match pass {
+                Pass::Compute(dispatches) => self.encode_compute(&cb, dispatches, set_on_queue, order),
+                Pass::Render(rp) => self.encode_render(&cb, rp, set_on_queue, order),
+                Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
+            };
+            if let Err(e) = r {
+                failed_pass.get_or_insert(e);
             }
         }
         if set_on_queue {
@@ -814,7 +827,7 @@ impl GraphicsBackend for Metal {
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         cb.commit();
-        Ok(())
+        failed_pass.map_or(Ok(()), Err)
     }
 }
 
@@ -900,7 +913,26 @@ impl Metal {
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }
-            e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group));
+            match d.indirect {
+                Some((b, title)) => {
+                    // The group counts are three u32s at the title address, as Metal reads them.
+                    if self.names(b, set_on_queue) {
+                        e.useResource_usage(ProtocolObject::from_ref(&*b.buf), MTLResourceUsage::Read);
+                    }
+                    let off = title as usize - b.base as usize;
+                    // SAFETY: the buffer is live and holds the three counts at `off`.
+                    unsafe {
+                        e.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                            &b.buf,
+                            off,
+                            size(d.threads_per_group),
+                        )
+                    };
+                }
+                None => {
+                    e.dispatchThreadgroups_threadsPerThreadgroup(size(d.groups), size(d.threads_per_group))
+                }
+            }
         }
         if let Some((f, started)) = order {
             e.updateFence(f);
@@ -961,6 +993,35 @@ impl Metal {
                 }
             }
         }
+        // A pass with no targets (pixel shaders that only write UAVs) needs its size set, or Metal
+        // makes no encoder: the draws' viewports (else scissors) give it.
+        let bare = rp.color.is_empty() && rp.depth.is_none();
+        let mut bare_size = (0usize, 0usize);
+        if bare {
+            for d in &rp.draws {
+                let (w, h) = match (d.state.viewport, d.state.scissor) {
+                    (Some(v), _) if v.width > 0.0 && v.height > 0.0 => (
+                        (v.x + v.width).ceil().max(1.0) as usize,
+                        (v.y + v.height).ceil().max(1.0) as usize,
+                    ),
+                    (_, Some([_, _, r, b])) if r > 0 && b > 0 => (r as usize, b as usize),
+                    _ => (0, 0),
+                };
+                bare_size = (bare_size.0.max(w), bare_size.1.max(h));
+            }
+            if bare_size.0 == 0 || bare_size.1 == 0 {
+                // Nothing tells the size: the draws are left out.
+                return Err("a pass without targets and without a viewport".into());
+            }
+            bare_size = (bare_size.0.min(16384), bare_size.1.min(16384));
+            #[allow(unused_unsafe)]
+            // SAFETY: sizes within Metal's limit; one sample, as the pipelines are built.
+            unsafe {
+                desc.setRenderTargetWidth(bare_size.0);
+                desc.setRenderTargetHeight(bare_size.1);
+                desc.setDefaultRasterSampleCount(1);
+            }
+        }
         let e = cb
             .renderCommandEncoderWithDescriptor(&desc)
             .ok_or("no render encoder")?;
@@ -969,12 +1030,16 @@ impl Metal {
         {
             e.waitForFence_beforeStages(f, MTLRenderStages::Vertex);
         }
-        let rt_size = rp
-            .color
-            .first()
-            .map(|c| &c.texture.tex)
-            .or(rp.depth.as_ref().map(|d| &d.texture.tex))
-            .map_or((0, 0), |t| (t.width(), t.height()));
+        let mut no_index: Option<String> = None;
+        let rt_size = if bare {
+            bare_size
+        } else {
+            rp.color
+                .first()
+                .map(|c| &c.texture.tex)
+                .or(rp.depth.as_ref().map(|d| &d.texture.tex))
+                .map_or((0, 0), |t| (t.width(), t.height()))
+        };
         for d in &rp.draws {
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(cb, h);
@@ -1111,9 +1176,12 @@ impl Metal {
                     first_instance,
                     wide,
                 } => {
-                    let (b, title) = d
-                        .index_buffer
-                        .ok_or("indexed draw without an index buffer")?;
+                    // Without an index buffer the draw is left out (the encoder stays open for the
+                    // rest of the pass; returning here would leave it unended).
+                    let Some((b, title)) = d.index_buffer else {
+                        no_index.get_or_insert("indexed draw without an index buffer".to_string());
+                        continue;
+                    };
                     let width = if wide { 4 } else { 2 };
                     let off = title as usize - b.base as usize + first_index as usize * width;
                     dp = [
@@ -1153,7 +1221,7 @@ impl Metal {
             started.set(true);
         }
         e.endEncoding();
-        Ok(())
+        no_index.map_or(Ok(()), Err)
     }
 }
 

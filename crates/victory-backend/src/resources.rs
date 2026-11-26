@@ -165,6 +165,10 @@ pub trait ResourceBackend: ComputeBackend {
     /// A texture SRV or UAV.
     fn write_texture(&self, heap: &Self::Heap, index: usize, tex: &Self::Texture, min_lod: f32);
     fn write_sampler(&self, heap: &Self::Heap, index: usize, s: &Self::Sampler, lod_bias: f32);
+    /// Entry `index` names nothing: a buffer view over no bytes (reads give 0, writes are
+    /// dropped where the shader checks bounds). For a view the host could not make, so the
+    /// entry does not keep naming what it named before.
+    fn clear_entry(&self, _heap: &Self::Heap, _index: usize) {}
 
     fn create_texture(&self, desc: &TextureDesc) -> Result<Self::Texture, String>;
     fn create_texture_view(

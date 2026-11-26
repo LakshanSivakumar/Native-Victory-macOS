@@ -68,6 +68,8 @@ struct Prep<B: GraphicsBackend> {
     vertex: Vec<(Rc<B::Buffer>, *const u8)>,
     index: Option<(Rc<B::Buffer>, *const u8)>,
     blit: Vec<(Rc<B::Buffer>, *const u8)>,
+    /// An indirect dispatch's group counts.
+    indirect: Option<(Rc<B::Buffer>, *const u8)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
 }
@@ -263,11 +265,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(false);
         };
         match decoded {
-            Decoded::Buffer { addr, size } => {
-                let (buf, ptr) = self.resolve(addr, u64::from(size))?;
-                self.backend
-                    .write_buffer(&heap.heap, index, &buf, ptr, size);
-            }
+            Decoded::Buffer { addr, size } => match self.resolve(addr, u64::from(size)) {
+                Ok((buf, ptr)) => self.backend.write_buffer(&heap.heap, index, &buf, ptr, size),
+                Err(e) => {
+                    // Left as it was, the entry would still name the memory its last view
+                    // named, which the title may have handed to something else since: the
+                    // GPU's writes through it land there (title data overwritten).
+                    self.backend.clear_entry(&heap.heap, index);
+                    heap.mirrored.borrow_mut().insert(index, record_at(handle));
+                    return Err(e);
+                }
+            },
             Decoded::Image {
                 resource,
                 mips,
@@ -764,13 +772,17 @@ impl<B: GraphicsBackend> NativeHost<B> {
             vertex: vec![],
             index: None,
             blit: vec![],
+            indirect: None,
             heap: None,
         };
         match cmd {
             Cmd::Dispatch {
-                root, pso, heaps, groups, ..
+                root, pso, heaps, groups, indirect,
             } => {
-                tracing::debug!(?groups, "dispatch");
+                tracing::debug!(?groups, ?indirect, "dispatch");
+                if let Some(a) = indirect {
+                    p.indirect = Some(self.resolve(*a, 12)?);
+                }
                 if std::env::var_os("VICTORY_TRACE_TARGETS").is_some() {
                     static G: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if G.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
@@ -891,6 +903,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             buffers.extend(p.vertex.iter().map(|b| &*b.0));
             buffers.extend(p.index.iter().map(|b| &*b.0));
             buffers.extend(p.blit.iter().map(|b| &*b.0));
+            buffers.extend(p.indirect.iter().map(|b| &*b.0));
         }
         if let Err(e) = self.backend.make_resident(queue, &buffers) {
             tracing::warn!(error = %e, "pool buffers were not made resident");
@@ -923,6 +936,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             },
                             groups: *groups,
                             threads_per_group: pso.threads,
+                            indirect: preps[k].indirect.as_ref().map(|b| (&*b.0, b.1)),
                         }
                     })
                     .collect(),
