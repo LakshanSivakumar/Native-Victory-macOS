@@ -95,24 +95,41 @@ impl PoolTable {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The pool `[addr, addr + len)` lies in, and the pool-mapping address of `addr`. The range must
-    /// lie in one mapping (shortcut: a range over two adjacent mappings of one pool is refused; merge
-    /// them here if a title builds a buffer view across a map boundary).
+    /// The pool `[addr, addr + len)` lies in, and the pool-mapping address of `addr`. The range
+    /// can cross mapping boundaries when the mappings cover consecutive bytes of one pool.
     pub fn resolve(&self, addr: u64, len: u64) -> Option<(PoolInfo, *const u8)> {
         let (addr, len) = (
             usize::try_from(addr).ok()?,
             usize::try_from(len.max(1)).ok()?,
         );
+        let end = addr.checked_add(len)?;
         let g = self.lock();
-        let (&at, m) = g.maps.range(..=addr).next_back()?;
-        if addr + len > at + m.len {
+        let (&start, first) = g.maps.range(..=addr).next_back()?;
+        let mut covered = start.checked_add(first.len)?;
+        if addr >= covered {
             return None;
         }
-        let pool = g.pools.get(&m.pool)?;
-        Some((
-            pool.clone(),
-            (pool.base + m.offset + (addr - at)) as *const u8,
-        ))
+        if end > covered {
+            // Scatter maps can report one mapping per page, even for consecutive pool pages.
+            for (&at, next) in g.maps.range(covered..end) {
+                if at != covered
+                    || next.pool != first.pool
+                    || next.offset != first.offset.checked_add(at - start)?
+                {
+                    return None;
+                }
+                covered = at.checked_add(next.len)?;
+            }
+            if covered < end {
+                return None;
+            }
+        }
+        let pool = g.pools.get(&first.pool)?;
+        let offset = first.offset.checked_add(addr - start)?;
+        if offset.checked_add(len)? > pool.len {
+            return None;
+        }
+        Some((pool.clone(), pool.base.checked_add(offset)? as *const u8))
     }
 
     /// A number that changes whenever a pool or a mapping does: what a table built from
@@ -207,6 +224,34 @@ mod tests {
         t.pool_released(&p);
         assert!(t.resolve(0x7000_1000, 1).is_none());
         assert_eq!(t.take_released(), vec![1]);
+    }
+
+    #[test]
+    fn a_range_can_cross_consecutive_mappings_of_one_pool() {
+        const PAGE: usize = 64 << 10;
+        let t = PoolTable::default();
+        let p = pool(1);
+        let base = 0x7000_0000;
+        t.mapped(base, PAGE, &p, 2 * PAGE);
+        t.mapped(base + PAGE, PAGE, &p, 3 * PAGE);
+        t.mapped(base + 2 * PAGE, PAGE, &p, 4 * PAGE);
+
+        let start = (base + PAGE - 8) as u64;
+        let len = (PAGE + 16) as u64;
+        let (info, ptr) = t.resolve(start, len).unwrap();
+        assert_eq!(info.id, p.id);
+        assert_eq!(ptr as usize, p.base + 3 * PAGE - 8);
+
+        // Repeating the same physical page (as tiled mappings can) is not contiguous.
+        t.mapped(base + PAGE, PAGE, &p, 2 * PAGE);
+        assert!(t.resolve(start, len).is_none());
+
+        let q = pool(2);
+        t.mapped(base + PAGE, PAGE, &q, 3 * PAGE);
+        assert!(t.resolve(start, len).is_none());
+
+        t.unmapped(base + PAGE, PAGE);
+        assert!(t.resolve(start, len).is_none());
     }
 
     #[test]
