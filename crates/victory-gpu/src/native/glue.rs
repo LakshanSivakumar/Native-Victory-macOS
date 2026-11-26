@@ -100,6 +100,7 @@ fn start_timer() {
 
 fn refresh(t: &mut MetalTitle) {
     t.pump();
+    t.drop_retired();
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -1101,17 +1102,25 @@ pub(crate) fn wait_value(this: This, w: Wait) {
     with_list(this, |_, l| l.wait(w));
 }
 
+/// Keeps `what` until the GPU is past all work queues were given so far ([`Title::retire`]);
+/// without a GPU it goes at once.
+pub(crate) fn retire(what: Box<dyn std::any::Any>) {
+    let mut what = Some(what);
+    with_title(|t| t.retire(what.take().expect("once")));
+}
+
 /// `Reset`: forgets what was recorded (the host objects it named go with it, under the lock).
 pub(crate) fn reset_list(this: This) {
     with_list(this, |_, l| l.reset());
 }
 
-/// Drops a list object, whose `Rc`s must be dropped under the lock.
-pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
+/// Drops a list object, whose `Rc`s must be dropped under the lock: `f` gets the host, if there
+/// is one, so that it can retire what the list owned without locking again.
+pub(crate) fn locked<R>(f: impl FnOnce(Option<&mut MetalTitle>) -> R) -> R {
     let mut f = Some(f);
-    match with_title(|_| (f.take().expect("once"))()) {
+    match with_title(|t| (f.take().expect("once"))(Some(t))) {
         Some(r) => r,
-        None => (f.take().expect("not run"))(),
+        None => (f.take().expect("not run"))(None),
     }
 }
 

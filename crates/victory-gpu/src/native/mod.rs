@@ -14,6 +14,8 @@
 //! physical-memory observer forwards to.
 
 pub mod addr;
+#[cfg(target_os = "macos")]
+pub(crate) mod arena;
 pub mod console_state;
 pub mod descriptors;
 #[cfg(target_os = "macos")]

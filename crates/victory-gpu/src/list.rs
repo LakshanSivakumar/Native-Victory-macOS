@@ -497,9 +497,18 @@ extern "system" fn list_release(this: This) -> u32 {
             leave(held, uploads, state);
         }
     }
-    // Its recording holds `Rc`s of the native host: dropped under the host's lock.
+    // Its recording holds `Rc`s of the native host: dropped under the host's lock. Its upload
+    // memory may still be read by work a queue was given: retired by the last release, which
+    // only `release_boxed_before` knows is the last.
     #[cfg(target_os = "macos")]
-    return crate::native::glue::locked(|| object::release_boxed::<List>(this));
+    return crate::native::glue::locked(|t| {
+        object::release_boxed_before::<List>(this, |list| {
+            let uploads = std::mem::take(list.uploads.get_mut().unwrap_or_else(|e| e.into_inner()));
+            if let (Some(t), false) = (t, uploads.is_empty()) {
+                t.retire(Box::new(uploads));
+            }
+        })
+    });
     #[cfg(not(target_os = "macos"))]
     return object::release_boxed::<List>(this);
 }
@@ -532,7 +541,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         drop(state);
         leave(held, uploads, old);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    retire(uploads);
+    #[cfg(not(any(windows, target_os = "macos")))]
     drop(uploads);
     crate::pipeline::bound(pipeline);
     #[cfg(target_os = "macos")]
@@ -1402,14 +1413,27 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// reset. On Windows it lies in [4 GiB, 2^40), where translated shaders
 /// find title memory by address (`crate::memory`; the console's GPU
 /// addresses have 40 bits), and is a buffer of its own to the host copies
-/// (`crate::shadow`), so its copy is exactly it.
+/// (`crate::shadow`), so its copy is exactly it. On macOS it lies there too,
+/// carved from the upload arena's pools (`crate::native::arena`), which the
+/// native host's pool table shows at their own addresses: the GPU reads it
+/// through the buffer over its pool, and shaders through the page table made
+/// from the table's mappings.
 struct Upload {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     at: usize,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     len: usize,
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     block: Vec<u8>,
+}
+
+/// Upload blocks a list gave back, kept until the GPU is past all work
+/// queues were given so far (as `leave` keeps them on Windows).
+#[cfg(target_os = "macos")]
+fn retire(uploads: Vec<Upload>) {
+    if !uploads.is_empty() {
+        crate::native::glue::retire(Box::new(uploads));
+    }
 }
 
 impl Upload {
@@ -1451,7 +1475,16 @@ impl Upload {
         Some(Upload { at, len })
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    fn new(len: usize) -> Option<Upload> {
+        let (at, len) = crate::native::arena::arena()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc(len)?;
+        Some(Upload { at, len })
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn new(len: usize) -> Option<Upload> {
         Some(Upload {
             block: vec![0; len],
@@ -1459,10 +1492,21 @@ impl Upload {
     }
 
     fn start(&self) -> *mut u8 {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         return self.at as *mut u8;
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         return self.block.as_ptr().cast_mut();
+    }
+}
+
+/// Back to the arena: only once the GPU is past every use of it (`retire`).
+#[cfg(target_os = "macos")]
+impl Drop for Upload {
+    fn drop(&mut self) {
+        crate::native::arena::arena()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free(self.at, self.len);
     }
 }
 
@@ -2407,10 +2451,17 @@ mod tests {
         // shaders find title memory), gone at reset.
         let p = allocate_upload(list, 40, 0x100);
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
+        // macOS: the native host finds it by address, as the same bytes.
+        #[cfg(target_os = "macos")]
+        {
+            let pools = crate::native::glue::pools();
+            let (_, at) = pools.resolve(p as u64, 40).expect("a pool");
+            assert_eq!(at, p.cast_const());
+        }
         assert!(
             allocate_upload(list, 8, 0x30).is_null(),
             "not a power of two"
@@ -2423,8 +2474,84 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // Gone once the GPU is past what queues were given (other tests may
+        // have given some).
+        #[cfg(target_os = "macos")]
+        {
+            let start = std::time::Instant::now();
+            while kept(p) {
+                assert!(start.elapsed().as_secs() < 10, "upload block kept");
+                crate::native::glue::with_title(|t| t.drop_retired());
+                std::thread::yield_now();
+            }
+        }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// Whether the upload memory at `p` is still the list's (retired, not yet given back).
+    #[cfg(target_os = "macos")]
+    fn kept(p: *mut u8) -> bool {
+        let arena = crate::native::arena::arena()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        !arena.is_free(p as usize)
+    }
+
+    /// Two releases at once of a list with two references could both see two references, so
+    /// neither retired its upload memory and the last freed it at once, under queued work. The
+    /// release that frees the list retires it now, whichever thread that is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_list_released_from_two_threads_retires_its_upload_memory() {
+        use crate::native::glue;
+        let null = std::ptr::null();
+        if glue::with_title(|_| ()).is_none() {
+            eprintln!("skipped: no Metal device");
+            return;
+        }
+        let (mut allocator, mut list, mut fence) = (null, null, null);
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        let iid = &crate::fence::FENCE_IIDS[0];
+        assert_eq!(crate::fence::create(null, 0, 0, iid, &mut fence), S_OK);
+        // A queue held behind a wait for the fence: nothing it was given has run.
+        static QUEUE: u8 = 0;
+        let queue: This = (&raw const QUEUE).cast();
+        glue::queue_wait(queue, fence, 1);
+        let p = allocate_upload(list, 64, 16);
+        assert!(kept(p));
+        object::add_ref(list);
+        let barrier = std::sync::Barrier::new(2);
+        let at = list as usize;
+        let left: u32 = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        list_release(at as This)
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        assert_eq!(left, 1, "one release left one reference, the other none");
+        assert!(kept(p), "freed under queued work");
+        glue::fence_signal(fence, 1);
+        let start = std::time::Instant::now();
+        while kept(p) {
+            assert!(start.elapsed().as_secs() < 10, "upload memory kept");
+            glue::with_title(|t| t.drop_retired());
+            std::thread::yield_now();
+        }
+        glue::queue_released(queue);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(fence), 0);
         assert_eq!(release(allocator), 0);
     }
 
