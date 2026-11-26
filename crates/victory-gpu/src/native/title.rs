@@ -188,6 +188,9 @@ enum QueuedAction<B: PresentBackend> {
     Present(Rc<B::Queue>, Rc<B::Surface>, Rc<B::Texture>),
 }
 
+/// What [`Title::retire`] keeps, and the values its fences must reach first.
+type Retired<F> = (Vec<(Rc<F>, u64)>, Box<dyn std::any::Any>);
+
 pub struct Title<B: PresentBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
@@ -221,6 +224,9 @@ pub struct Title<B: PresentBackend> {
     requested: HashMap<usize, (u64, std::time::Instant)>,
     /// Unique wait tokens retain fence instances independently of title address reuse.
     waiting: HashMap<usize, Rc<B::Fence>>,
+    /// A fence of our own per queue for [`Title::retire`], and the last value asked of it.
+    retire_fences: HashMap<usize, (Rc<B::Fence>, u64)>,
+    retired: Vec<Retired<B::Fence>>,
     pub stats: Stats,
 }
 
@@ -243,6 +249,8 @@ impl<B: PresentBackend> Title<B> {
             fences: HashMap::new(),
             requested: HashMap::new(),
             waiting: HashMap::new(),
+            retire_fences: HashMap::new(),
+            retired: Vec::new(),
             held: Held::new(),
             actions: HashMap::new(),
             next_action: 0,
@@ -350,6 +358,52 @@ impl<B: PresentBackend> Title<B> {
         if let Err(e) = self.host.execute(&q, &[], &[], &[(&*f, value)]) {
             tracing::warn!(error = %e, "a fence signal was not queued");
         }
+    }
+
+    /// Keeps `what` until the GPU is past all work every queue was given so far, held work
+    /// included, then drops it: memory the title gave back that queued work may still read.
+    pub fn retire(&mut self, what: Box<dyn std::any::Any>) {
+        let mut marks = Vec::new();
+        let queues: Vec<(usize, Rc<B::Queue>)> =
+            self.queues.iter().map(|(k, q)| (*k, q.clone())).collect();
+        for (key, q) in queues {
+            let fence = match self.retire_fences.get(&key) {
+                Some((f, _)) => Ok(f.clone()),
+                None => self.host.backend.create_fence(0).map(Rc::new),
+            };
+            let f = match fence {
+                Ok(f) => f,
+                Err(e) => {
+                    // Kept for good rather than freed under the GPU.
+                    tracing::warn!(error = %e, "retired memory kept: no fence");
+                    std::mem::forget(what);
+                    return;
+                }
+            };
+            let value = self.retire_fences.get(&key).map_or(1, |(_, v)| v + 1);
+            self.retire_fences.insert(key, (f.clone(), value));
+            if self.held.holds_work(key) {
+                let n = self.next_action;
+                self.next_action += 1;
+                self.actions
+                    .insert(n, QueuedAction::Signal(q, f.clone(), value));
+                self.held.push(key, Item::Signal(n, 0));
+            } else if let Err(e) = self.host.execute(&q, &[], &[], &[(&*f, value)]) {
+                tracing::warn!(error = %e, "retired memory kept: its fence was not queued");
+                std::mem::forget(what);
+                return;
+            }
+            marks.push((f, value));
+        }
+        self.retired.push((marks, what));
+        self.drop_retired();
+    }
+
+    /// Drops what [`Title::retire`] kept that the GPU is past.
+    pub fn drop_retired(&mut self) {
+        let backend = &self.host.backend;
+        self.retired
+            .retain(|(marks, _)| marks.iter().any(|(f, v)| backend.completed(f) < *v));
     }
 
     /// Queue waits remain on the CPU until completion, including committed producers.

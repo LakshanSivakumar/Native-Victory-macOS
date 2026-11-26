@@ -497,6 +497,13 @@ extern "system" fn list_release(this: This) -> u32 {
             leave(held, uploads, state);
         }
     }
+    // Its upload memory may still be read by work a queue was given.
+    #[cfg(target_os = "macos")]
+    if !this.is_null() && object::refs(this) == 1 {
+        // SAFETY: the title passes one of our lists.
+        let uploads = unsafe { &(*this.cast::<List>()).uploads };
+        retire(std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner())));
+    }
     // Its recording holds `Rc`s of the native host: dropped under the host's lock.
     #[cfg(target_os = "macos")]
     return crate::native::glue::locked(|| object::release_boxed::<List>(this));
@@ -532,7 +539,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         drop(state);
         leave(held, uploads, old);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    retire(uploads);
+    #[cfg(not(any(windows, target_os = "macos")))]
     drop(uploads);
     crate::pipeline::bound(pipeline);
     #[cfg(target_os = "macos")]
@@ -1402,14 +1411,37 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// reset. On Windows it lies in [4 GiB, 2^40), where translated shaders
 /// find title memory by address (`crate::memory`; the console's GPU
 /// addresses have 40 bits), and is a buffer of its own to the host copies
-/// (`crate::shadow`), so its copy is exactly it.
+/// (`crate::shadow`), so its copy is exactly it. On macOS it lies there too,
+/// in whole 16 KiB pages, and is a pool of its own in the native host's
+/// pool table, shown at its own address: the GPU reads it through the
+/// buffer over that pool, and shaders through the page table made from the
+/// table's mappings.
 struct Upload {
     #[cfg(windows)]
     at: usize,
     #[cfg(windows)]
     len: usize,
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    pool: crate::native::memory::PoolInfo,
+    #[cfg(target_os = "macos")]
+    table: std::sync::Arc<crate::native::memory::PoolTable>,
+    #[cfg(not(any(windows, target_os = "macos")))]
     block: Vec<u8>,
+}
+
+/// Pool ids of upload blocks: bit 63 set. `xmem_physical` numbers the
+/// title's pools from 1 up and never reaches it, so the two never meet in
+/// the pool table or the host's buffers by pool.
+#[cfg(target_os = "macos")]
+const UPLOAD_POOLS: usize = 1 << (usize::BITS - 1);
+
+/// Upload blocks a list gave back, kept until the GPU is past all work
+/// queues were given so far (as `leave` keeps them on Windows).
+#[cfg(target_os = "macos")]
+fn retire(uploads: Vec<Upload>) {
+    if !uploads.is_empty() {
+        crate::native::glue::retire(Box::new(uploads));
+    }
 }
 
 impl Upload {
@@ -1451,7 +1483,47 @@ impl Upload {
         Some(Upload { at, len })
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    fn new(len: usize) -> Option<Upload> {
+        Upload::new_in(crate::native::glue::pools(), len)
+    }
+
+    /// `len` bytes, a pool of `table`'s of their own.
+    #[cfg(target_os = "macos")]
+    fn new_in(
+        table: &std::sync::Arc<crate::native::memory::PoolTable>,
+        len: usize,
+    ) -> Option<Upload> {
+        use crate::native::memory::{PoolInfo, PoolObserver};
+        use victory_platform::mem;
+        // The kernel's page (also under Rosetta, whose pages say 4 KiB): what
+        // a Metal buffer over the block needs, as the title's pools have.
+        const PAGE: usize = 0x4000;
+        static IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let len = len.checked_next_multiple_of(PAGE)?;
+        // SAFETY: fresh address space, released by `drop`.
+        let at = unsafe { mem::reserve_in(1 << 32, (1 << 40) - 1, len, PAGE) }.ok()?;
+        // SAFETY: the reservation just made.
+        if unsafe { mem::commit(at, len, mem::Protect::READ_WRITE) }.is_err() {
+            // SAFETY: as above.
+            let _ = unsafe { mem::release(at, len) };
+            return None;
+        }
+        let pool = PoolInfo {
+            id: UPLOAD_POOLS | IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            base: at as usize,
+            len,
+            memory_entry: None,
+        };
+        table.pool_created(&pool);
+        table.mapped(pool.base, len, &pool, 0);
+        Some(Upload {
+            pool,
+            table: table.clone(),
+        })
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn new(len: usize) -> Option<Upload> {
         Some(Upload {
             block: vec![0; len],
@@ -1461,8 +1533,23 @@ impl Upload {
     fn start(&self) -> *mut u8 {
         #[cfg(windows)]
         return self.at as *mut u8;
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        return self.pool.base as *mut u8;
+        #[cfg(not(any(windows, target_os = "macos")))]
         return self.block.as_ptr().cast_mut();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Upload {
+    fn drop(&mut self) {
+        use crate::native::memory::PoolObserver;
+        let (at, len) = (self.pool.base, self.pool.len);
+        // Out of the table first: no new GPU use, and the host drops its buffer.
+        self.table.unmapped(at, len);
+        self.table.pool_released(&self.pool);
+        // SAFETY: our reservation; the GPU is past every use of it (`retire`).
+        let _ = unsafe { victory_platform::mem::release(at as *mut u8, len) };
     }
 }
 
@@ -2407,10 +2494,17 @@ mod tests {
         // shaders find title memory), gone at reset.
         let p = allocate_upload(list, 40, 0x100);
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
+        // macOS: the native host finds it by address, as the same bytes.
+        #[cfg(target_os = "macos")]
+        {
+            let pools = crate::native::glue::pools();
+            let (_, at) = pools.resolve(p as u64, 40).expect("a pool");
+            assert_eq!(at, p.cast_const());
+        }
         assert!(
             allocate_upload(list, 8, 0x30).is_null(),
             "not a power of two"
@@ -2423,9 +2517,90 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // Gone once the GPU is past what queues were given (other tests may
+        // have given some).
+        #[cfg(target_os = "macos")]
+        {
+            let start = std::time::Instant::now();
+            while crate::native::glue::pools().resolve(p as u64, 40).is_some() {
+                assert!(start.elapsed().as_secs() < 10, "upload block kept");
+                crate::native::glue::with_title(|t| t.drop_retired());
+                std::thread::yield_now();
+            }
+        }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// Issue #15: an upload block was heap memory above 2^40 that the native
+    /// host's pool table did not know, so the BVH builder's shaders read
+    /// zeros there. Now each block is a pool of its own, below 2^40, which
+    /// the host's buffer and page table show at its own address until it
+    /// is freed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn upload_blocks_are_pools_of_their_own() {
+        use crate::native::memory::PoolTable;
+        let table = Arc::new(PoolTable::default());
+        let (a, b) = (
+            Upload::new_in(&table, 40).unwrap(),
+            Upload::new_in(&table, 0x4001).unwrap(),
+        );
+        for (block, len) in [(&a, 0x4000), (&b, 0x8000)] {
+            let at = block.start() as usize;
+            assert!((1 << 32..1 << 40).contains(&at), "{at:#x}");
+            assert!(at.is_multiple_of(0x4000));
+            assert_eq!(block.pool.len, len);
+            assert_ne!(
+                block.pool.id & UPLOAD_POOLS,
+                0,
+                "apart from the title's pools"
+            );
+            // SAFETY: the block's bytes, zeroed.
+            assert_eq!(unsafe { *block.start().add(len - 1) }, 0);
+            // SAFETY: as above.
+            unsafe { block.start().add(8).write(0x5a) };
+            let (pool, p) = table.resolve(at as u64 + 8, 16).expect("a pool");
+            assert_eq!(
+                (pool.id, pool.base, p),
+                (block.pool.id, at, (at + 8) as *const u8)
+            );
+            // SAFETY: what the GPU's buffer shows is the CPU's byte.
+            assert_eq!(unsafe { *p }, 0x5a);
+            assert!(
+                table.resolve(at as u64 + len as u64 - 8, 16).is_none(),
+                "past the end"
+            );
+        }
+        assert_ne!(a.pool.id, b.pool.id);
+        let (at, id) = (a.start() as u64, a.pool.id);
+        drop(a);
+        assert!(table.resolve(at, 1).is_none());
+        assert_eq!(table.take_released(), [id]);
+        assert!(table.resolve(b.start() as u64, 1).is_some());
+        drop(b);
+        assert!(table.mappings().1.is_empty());
+    }
+
+    /// The Metal host wraps an upload block in a buffer, finds an address in
+    /// it, and forgets it when the block goes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_native_host_resolves_upload_blocks() {
+        use crate::native::memory::PoolTable;
+        let Ok(metal) = victory_metal::metal::Metal::new() else {
+            eprintln!("skipped: no Metal device");
+            return;
+        };
+        let table = Arc::new(PoolTable::default());
+        let host = crate::native::Host::with_memory(metal, table.clone());
+        let block = Upload::new_in(&table, 0x100).unwrap();
+        let at = block.start() as u64;
+        let (_, p) = host.resolve(at + 0x40, 0x40).expect("resolved");
+        assert_eq!(p, (at + 0x40) as *const u8);
+        drop(block);
+        assert!(host.resolve(at + 0x40, 0x40).is_err());
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the

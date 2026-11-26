@@ -697,3 +697,45 @@ fn a_released_pool_leaves_the_residency_set() {
     assert_eq!(h.backend.residency_counts().added, 2);
     assert_eq!(second.read::<u32>(4096, 64), (0..64).map(|i| i * 2).collect::<Vec<_>>());
 }
+
+/// What `Title::retire` keeps (a list's upload blocks after its reset) goes only once the GPU is
+/// past what a queue held when it was retired: here a wait for a fence the CPU signals later.
+#[test]
+fn retired_memory_outlives_the_work_queued_before_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let Ok(metal) = Metal::new() else {
+        eprintln!("skipped: no Metal device");
+        return;
+    };
+    let mut t = super::title::Title::new(metal, Default::default());
+    let (queue, fence) = (0x10, 0x20);
+    t.ensure_queue(queue).unwrap();
+    // Nothing queued: gone as soon as the GPU runs the fence signal.
+    let dropped = Arc::new(AtomicBool::new(false));
+    t.retire(Box::new(Flag(dropped.clone())));
+    let wait = |t: &mut super::title::Title<Metal>, dropped: &AtomicBool| {
+        let start = std::time::Instant::now();
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(start.elapsed().as_secs() < 10, "retired memory kept");
+            t.drop_retired();
+            std::thread::yield_now();
+        }
+    };
+    wait(&mut t, &dropped);
+    // Behind held work: kept while the queue waits.
+    t.wait_queue(queue, fence, 0, 1);
+    let dropped = Arc::new(AtomicBool::new(false));
+    t.retire(Box::new(Flag(dropped.clone())));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    t.drop_retired();
+    assert!(!dropped.load(Ordering::SeqCst), "freed under queued work");
+    t.signal_cpu(fence, 0, 1);
+    wait(&mut t, &dropped);
+}
