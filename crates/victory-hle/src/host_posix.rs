@@ -205,6 +205,14 @@ pub extern "system" fn VirtualAlloc(
                 }
             }
             lock(&REGIONS).insert(p as usize, len);
+            // Where the title's own big reservations lie (memory the GPU cannot reach unless
+            // pools back it), for "not in a mapped pool" (the first few).
+            if len >= 1 << 20 {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                    tracing::info!(at = format_args!("{:#x}", p as usize), len = format_args!("{len:#x}"), kind = format_args!("{kind:#x}"), protect = format_args!("{protect:#x}"), "VirtualAlloc: a reservation");
+                }
+            }
             Ok(p)
         })
     } else if kind & MEM_COMMIT != 0 && at != 0 {

@@ -371,6 +371,33 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                 r8 = format_args!("{:#x}", g[8]), r10 = format_args!("{:#x}", g[10]),
                 "first-chance exception"
             );
+            // Every register, and what the GPU host knows of those that look like title
+            // addresses (a crash on data a GPU write may have overwritten). The first few.
+            static FULL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if r.code == 0xc000_0005 && FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                const NAMES: [&str; 16] = [
+                    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10",
+                    "r11", "r12", "r13", "r14", "r15",
+                ];
+                let regs: Vec<String> = NAMES.iter().zip(g.iter()).map(|(n, v)| format!("{n}={v:#x}")).collect();
+                tracing::warn!("registers: {}", regs.join(" "));
+                for (n, &v) in NAMES.iter().zip(g.iter()) {
+                    if !(0x1_0000_0000..0x7f_0000_0000).contains(&v) {
+                        continue;
+                    }
+                    let mut bytes = [0u8; 64];
+                    let read = victory_core::crash::read(v, &mut bytes);
+                    let words: Vec<String> = bytes
+                        .chunks(8)
+                        .map(|w| format!("{:x}", u64::from_le_bytes(w.try_into().unwrap())))
+                        .collect();
+                    tracing::warn!(
+                        "  {n}={v:#x}: {} gpu: {}",
+                        if read { words.join(" ") } else { "(unreadable)".into() },
+                        victory_core::crash::describe(v).unwrap_or_else(|| "-".into())
+                    );
+                }
+            }
             if r.code == 0x8000_0003 {
                 super::super::dump::report_at_break();
             }

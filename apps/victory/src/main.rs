@@ -158,6 +158,9 @@ static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // Crash reports name the GPU memory and views over the addresses a faulting thread held.
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let _ = victory_core::crash::DESCRIBE_ADDRESS.set(victory_gpu::native::describe);
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

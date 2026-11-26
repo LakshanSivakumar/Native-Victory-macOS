@@ -129,13 +129,25 @@ pub extern "system" fn XMemVirtualAlloc(
                         // SAFETY: as above.
                         unsafe { mem::protect(p, len, prot) }?;
                     }
-                } else if let Err(e) = unsafe { mem::commit(p, len, prot) } {
+                } else if let Err(e) = {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                        tracing::info!(at = format_args!("{:#x}", p as usize), len = format_args!("{len:#x}"), "XMemVirtualAlloc: committed without a pool");
+                    }
+                    unsafe { mem::commit(p, len, prot) }
+                } {
                     // SAFETY: as above.
                     unsafe { mem::release(p, len) }?;
                     return Err(e);
                 }
             }
             track(p as usize, len);
+            if !commit && len >= 1 << 20 {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                    tracing::info!(at = format_args!("{:#x}", p as usize), len = format_args!("{len:#x}"), kind = format_args!("{kind:#x}"), flags = format_args!("{flags:#x}"), "XMemVirtualAlloc: a reservation");
+                }
+            }
             Ok(p)
         })
     } else if commit {
@@ -158,6 +170,10 @@ pub extern "system" fn XMemVirtualAlloc(
             };
             protected.map(|()| at as *mut u8)
         } else {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                tracing::info!(at = format_args!("{start:#x}"), len = format_args!("{:#x}", end - start), "XMemVirtualAlloc: a commit in a reservation without a pool");
+            }
             // SAFETY: the title commits inside a reservation of its own.
             unsafe { mem::commit(start as *mut u8, end - start, prot) }.map(|()| at as *mut u8)
         }

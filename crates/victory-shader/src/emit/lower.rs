@@ -5146,6 +5146,35 @@ impl<'a> Lower<'a> {
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
             }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // {S1 half, S0 half}: low (l) or high (h) halves, S0's into the low.
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low, high) = (
+                    self.s.m.i32(16),
+                    self.s.m.i32(0xFFFF),
+                    self.s.m.i32(0xFFFF_0000),
+                );
+                let lo = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low)
+                };
+                let hi = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, lo, hi), None)
+            }
+            "s_absdiff_i32" => {
+                // |S0 - S1| (SCC: whether it is not 0).
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let z = self.s.m.i32(0);
+                let d = self.s.m.bin(c, Bin::Sub, a, b);
+                let neg = self.s.m.cmp(c, pred::SLT, d, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, d);
+                (self.s.m.select(c, neg, n, d), None)
+            }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k31 = self.s.m.i32(31);
@@ -7881,6 +7910,30 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_ldexp_f32" => {
+                // S0 * 2^S1 (S1 an integer): two exact powers of two, so that
+                // exponents past one f32 power's range still scale (results
+                // differ from the console's only in denormal rounding).
+                let a = f(self, 0)?;
+                let e = s(self, 1)?;
+                let (lo, hi) = (self.s.m.i32((-300i32) as u32), self.s.m.i32(300));
+                let below = self.s.m.cmp(c, pred::SLT, e, lo);
+                let e = self.s.m.select(c, below, lo, e);
+                let above = self.s.m.cmp(c, pred::SGT, e, hi);
+                let e = self.s.m.select(c, above, hi, e);
+                let one = self.s.m.i32(1);
+                let half = self.s.m.bin(c, Bin::AShr, e, one);
+                let rest = self.s.m.bin(c, Bin::Sub, e, half);
+                let f32t = self.s.t.f32;
+                let (hf, rf) = (
+                    self.s.m.cast(c, Cast::SiToFp, half, f32t),
+                    self.s.m.cast(c, Cast::SiToFp, rest, f32t),
+                );
+                let (p1, p2) = (self.unary(21, hf), self.unary(21, rf));
+                let r = self.s.m.bin(c, Bin::Mul, a, p1);
+                let r = self.s.m.bin(c, Bin::Mul, r, p2);
+                float(self, r)
+            }
             "v_cvt_pkrtz_f16_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
                 let lo = self.f16_toward_zero(a);
@@ -8985,6 +9038,21 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
             }
+            "v_mad_u32_u16" => {
+                // S0[15:0] * S1[15:0] + S2 (op_sel: a source's high half).
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let opsel = match &inst.fields {
+                    Fields::Valu(v) => v.opsel,
+                    _ => 0,
+                };
+                let (k16, low) = (k(self, 16), k(self, 0xFFFF));
+                let a = if opsel & 1 != 0 { self.s.m.bin(c, Bin::LShr, a, k16) } else { a };
+                let b = if opsel & 2 != 0 { self.s.m.bin(c, Bin::LShr, b, k16) } else { b };
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = self.s.m.bin(c, Bin::And, b, low);
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                self.s.m.bin(c, Bin::Add, m, d)
+            }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let (sh, op) = (
@@ -10084,9 +10152,12 @@ impl<'a> Lower<'a> {
                 return Err("an image store to a mip level");
             }
             // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
+            // float format (the console converts by the view's format). With
+            // some channels (dmask), the data VGPRs hold the enabled ones in
+            // order and the others are written as 0: right for a view with
+            // just those channels (R, RG: the usual case), which drops the rest.
+            if *dmask == 0 {
+                return Ok(());
             }
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
@@ -10097,13 +10168,20 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
+            let mut n = 0u8;
             for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                if *dmask >> k & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
+                // The enabled channels' data, in order; d16: two f16
+                // channels per VGPR, low half first.
+                let (r, high) = if *d16 { (n / 2, n % 2 == 1) } else { (n, false) };
+                n += 1;
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if high {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -11372,8 +11450,10 @@ impl<'a> Lower<'a> {
             let (byte, bytes);
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
+                // of a float format; one of fewer channels writes 0 to the
+                // rest (right for a view with just those channels, which drops
+                // them).
+                if count == 0 || count > 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
@@ -11382,6 +11462,9 @@ impl<'a> Lower<'a> {
                 args.extend([element, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
+                }
+                for _ in count..4 {
+                    args.push(self.s.m.f32(0));
                 }
                 // The element's size is the view's stride (16 bytes at most).
                 (byte, bytes) = match self.s.view_index.get(&h).copied() {

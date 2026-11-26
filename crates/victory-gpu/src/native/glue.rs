@@ -59,6 +59,13 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
     TITLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// For crash reports: whether a pool holds title address `at` and which buffer views cover it.
+/// Never blocks (none if another thread holds the host).
+pub fn describe(at: u64) -> Option<String> {
+    let guard = TITLE.try_lock().ok()?;
+    guard.as_ref().map(|t| t.0.host.describe(at))
+}
+
 /// Runs `f` on the native host, made on first use; `None` if there is no Metal device (the call
 /// is then ignored, as when there is no host GPU on Windows).
 pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {

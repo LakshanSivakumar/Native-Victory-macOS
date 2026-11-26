@@ -31,6 +31,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     resources: RefCell<HashMap<usize, Res<B>>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
+    /// The title memory each heap entry's buffer view names, by (heap start, index): for crash
+    /// reports (which views cover an address).
+    views: RefCell<std::collections::BTreeMap<(u64, usize), (u64, u64)>>,
 }
 
 /// The host's side of the pool-offset contract ([`super::addr`]).
@@ -111,7 +114,21 @@ impl<B: GraphicsBackend> NativeHost<B> {
             resources: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
+            views: RefCell::default(),
         }
+    }
+
+    /// For crash reports: whether a pool holds `at`, and the buffer views over it.
+    pub fn describe(&self, at: u64) -> String {
+        let pool = if self.memory.resolve(at, 1).is_some() { "in a pool" } else { "in no pool" };
+        let views = self.views.borrow();
+        let over: Vec<String> = views
+            .iter()
+            .filter(|&(_, &(a, n))| at >= a && at < a.saturating_add(n))
+            .take(8)
+            .map(|(&(h, i), &(a, n))| format!("heap {h:#x}[{i}] {a:#x}+{n:#x}"))
+            .collect();
+        format!("{pool}, {} buffer views over it {}", over.len(), over.join(", "))
     }
 
     /// The table the pool observer keeps current; register it as (or call it from) the observer.
@@ -266,8 +283,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
         };
         match decoded {
             Decoded::Buffer { addr, size } => match self.resolve(addr, u64::from(size)) {
-                Ok((buf, ptr)) => self.backend.write_buffer(&heap.heap, index, &buf, ptr, size),
+                Ok((buf, ptr)) => {
+                    self.backend.write_buffer(&heap.heap, index, &buf, ptr, size);
+                    self.views.borrow_mut().insert((heap.start, index), (addr, u64::from(size)));
+                }
                 Err(e) => {
+                    self.views.borrow_mut().remove(&(heap.start, index));
                     // Left as it was, the entry would still name the memory its last view
                     // named, which the title may have handed to something else since: the
                     // GPU's writes through it land there (title data overwritten).
