@@ -34,6 +34,11 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// The title memory each heap entry's buffer view names, by (heap start, index): for crash
     /// reports (which views cover an address).
     views: RefCell<std::collections::BTreeMap<(u64, usize), (u64, u64)>>,
+    /// Descriptor slots whose buffer view named memory no pool held when the title wrote it
+    /// (views made before the title maps their pages): tried again when pools change.
+    unmapped: RefCell<std::collections::BTreeSet<u64>>,
+    /// The pool generation `unmapped` was last tried at.
+    unmapped_tried: std::cell::Cell<u64>,
 }
 
 /// The host's side of the pool-offset contract ([`super::addr`]).
@@ -115,6 +120,31 @@ impl<B: GraphicsBackend> NativeHost<B> {
             heaps: RefCell::default(),
             contract: RefCell::default(),
             views: RefCell::default(),
+            unmapped: RefCell::default(),
+            unmapped_tried: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Makes the views that named unmapped memory again once pools have changed (the title maps
+    /// a view's pages after writing it): until then their entries name nothing.
+    fn retry_unmapped(&self) {
+        let generation = self.memory.generation();
+        if generation == self.unmapped_tried.get() || self.unmapped.borrow().is_empty() {
+            return;
+        }
+        self.unmapped_tried.set(generation);
+        let handles: Vec<u64> = self.unmapped.borrow().iter().copied().collect();
+        let mut made = 0usize;
+        for h in handles {
+            if matches!(self.mirror(h), Ok(true)) {
+                made += 1;
+            }
+        }
+        if made > 0 {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                tracing::info!(made, left = self.unmapped.borrow().len(), "views of memory mapped since were made");
+            }
         }
     }
 
@@ -286,9 +316,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 Ok((buf, ptr)) => {
                     self.backend.write_buffer(&heap.heap, index, &buf, ptr, size);
                     self.views.borrow_mut().insert((heap.start, index), (addr, u64::from(size)));
+                    self.unmapped.borrow_mut().remove(&handle);
                 }
                 Err(e) => {
                     self.views.borrow_mut().remove(&(heap.start, index));
+                    self.unmapped.borrow_mut().insert(handle);
                     // Left as it was, the entry would still name the memory its last view
                     // named, which the title may have handed to something else since: the
                     // GPU's writes through it land there (title data overwritten).
@@ -302,6 +334,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 mips,
                 format,
             } => {
+                self.unmapped.borrow_mut().remove(&handle);
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
                     return Ok(false);
                 };
@@ -886,11 +919,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
         waits: &[(&B::Fence, u64)],
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
-        let cmds: Vec<&Cmd<B>> = lists.iter().flat_map(|l| l.cmds.iter()).collect();
-        let preps = cmds
-            .iter()
-            .map(|c| self.prep(c))
-            .collect::<Result<Vec<_>, _>>()?;
+        self.retry_unmapped();
+        // A command the host cannot prepare is left out, not the whole submission: the rest
+        // (other queues' waits on memory it writes, the fence signals) must still run.
+        let mut cmds: Vec<&Cmd<B>> = Vec::new();
+        let mut preps = Vec::new();
+        for c in lists.iter().flat_map(|l| l.cmds.iter()) {
+            match self.prep(c) {
+                Ok(p) => {
+                    cmds.push(c);
+                    preps.push(p);
+                }
+                Err(e) => {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                        tracing::warn!(error = %e, "a command was left out of a submission");
+                    }
+                }
+            }
+        }
 
         let mut groups = vec![];
         let mut i = 0;

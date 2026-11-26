@@ -507,6 +507,11 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     // Root constants: a record names a block's first user SGPR; the block runs to the next
     // parameter's first SGPR, or to the last user SGPR.
     let (mut layout, used) = metadata_resources(meta, FSPX_RECORDS, true)?;
+    // Slot 255 names no root parameter: what fills such a block is not known (refused, as all
+    // compute root constants were before).
+    if layout.iter().any(|p| p.root == RootType::Constants && p.slot == 255) {
+        return Err(Malformed("an FSPX root constant block of no root slot"));
+    }
     let user_sgprs = (u32_at(packet, PACKET_RSRC2)? >> 1 & 0x1F) as u8;
     let starts: Vec<u8> = layout.iter().filter(|p| p.sgprs > 0).map(|p| p.user_data).collect();
     for p in layout.iter_mut().filter(|p| p.root == RootType::Constants) {
