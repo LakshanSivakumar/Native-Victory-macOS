@@ -8,8 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
-// No binding crate links AppKit, so its classes would not be registered without this.
+// No binding crate links AppKit or GameController, so their classes would not be registered
+// without this.
 #[link(name = "AppKit", kind = "framework")]
+#[link(name = "GameController", kind = "framework")]
 unsafe extern "C" {}
 
 use anyhow::{Context, Result};
@@ -112,38 +114,97 @@ unsafe fn open(layer: *mut std::ffi::c_void) -> Result<Retained<AnyObject>> {
     }
 }
 
-/// macOS key code to the Windows virtual key the game's stand-in pad reads (README lists the
-/// mapping); `None` for keys the pad does not use.
+/// macOS Carbon virtual key code (`kVK_*`) to Windows virtual key (`VK_*`).
 fn virtual_key(code: u16) -> Option<u8> {
     Some(match code {
-        36 | 76 => 0x0D, // Return, keypad Enter
-        48 => 0x09,      // Tab
-        49 => 0x20,      // Space
-        51 => 0x08,      // Delete (Backspace)
-        53 => 0x1B,      // Escape
-        123 => 0x25,     // arrows
-        126 => 0x26,
-        124 => 0x27,
-        125 => 0x28,
         0 => b'A',
         1 => b'S',
         2 => b'D',
         3 => b'F',
         4 => b'H',
+        5 => b'G',
         6 => b'Z',
         7 => b'X',
         8 => b'C',
         9 => b'V',
+        11 => b'B',
         12 => b'Q',
         13 => b'W',
         14 => b'E',
+        15 => b'R',
         16 => b'Y',
+        17 => b'T',
+        18 => b'1',
+        19 => b'2',
+        20 => b'3',
+        21 => b'4',
+        22 => b'6',
+        23 => b'5',
+        24 => 0xBB, // =
+        25 => b'9',
+        26 => b'7',
+        27 => 0xBD, // -
+        28 => b'8',
+        29 => b'0',
+        30 => 0xDD, // ]
+        31 => b'O',
+        32 => b'U',
+        33 => 0xDB, // [
         34 => b'I',
-        38 => b'J',
-        40 => b'K',
+        35 => b'P',
+        36 | 76 => 0x0D, // Return, keypad Enter
         37 => b'L',
+        38 => b'J',
+        39 => 0xDE, // '
+        40 => b'K',
+        41 => 0xBA, // ;
+        42 => 0xDC, // \
+        43 => 0xBC, // ,
+        44 => 0xBF, // /
+        45 => b'N',
+        46 => b'M',
+        47 => 0xBE, // .
+        48 => 0x09, // Tab
+        49 => 0x20, // Space
+        51 => 0x08, // Delete (Backspace)
+        53 => 0x1B, // Escape
+        96 => 0x74, // F5
+        97 => 0x75, // F6
+        98 => 0x76, // F7
+        99 => 0x72, // F3
+        100 => 0x77, // F8
+        101 => 0x78, // F9
+        103 => 0x7A, // F11
+        109 => 0x79, // F10
+        111 => 0x7B, // F12
+        115 => 0x24, // Home
+        116 => 0x21, // Page Up
+        117 => 0x2E, // Forward Delete
+        118 => 0x73, // F4
+        119 => 0x23, // End
+        120 => 0x71, // F2
+        121 => 0x22, // Page Down
+        122 => 0x70, // F1
+        123 => 0x25, // Left Arrow
+        124 => 0x27, // Right Arrow
+        125 => 0x28, // Down Arrow
+        126 => 0x26, // Up Arrow
         _ => return None,
     })
+}
+
+/// Maps a macOS Carbon modifier key code (`kVK_*`) to its Windows virtual key
+/// and corresponding `NSEventModifierFlags` bit.
+fn modifier_key(code: u16) -> Option<(u8, usize)> {
+    match code {
+        0x38 => Some((0xA0, 1 << 17)), // Left Shift
+        0x3C => Some((0xA1, 1 << 17)), // Right Shift
+        0x3B => Some((0xA2, 1 << 18)), // Left Control
+        0x3E => Some((0xA3, 1 << 18)), // Right Control
+        0x3A => Some((0xA4, 1 << 19)), // Left Option -> Left Alt
+        0x3D => Some((0xA5, 1 << 19)), // Right Option -> Right Alt
+        _ => None,
+    }
 }
 
 /// Hands a key-down or key-up to the stand-in pad. True when it was one (Command shortcuts
@@ -153,6 +214,16 @@ fn virtual_key(code: u16) -> Option<u8> {
 unsafe fn key_event(event: *mut AnyObject) -> bool {
     // SAFETY: `event` is a live NSEvent; `type` is valid for every event.
     let kind: usize = unsafe { msg_send![event, type] };
+    if kind == 12 {
+        // NSEventTypeFlagsChanged: modifier key pressed or released.
+        // SAFETY: `keyCode` and `modifierFlags` are valid on flags-changed events.
+        let (code, flags): (u16, usize) =
+            unsafe { (msg_send![event, keyCode], msg_send![event, modifierFlags]) };
+        if let Some((vk, mask)) = modifier_key(code) {
+            victory_hle::modules::gameinput::set_live_key(vk, flags & mask != 0);
+        }
+        return false;
+    }
     if !matches!(kind, 10 | 11) {
         return false;
     }
@@ -167,6 +238,89 @@ unsafe fn key_event(event: *mut AnyObject) -> bool {
         victory_hle::modules::gameinput::set_live_key(vk, kind == 10);
     }
     true
+}
+
+/// Polls the first connected `GCController` with an `extendedGamepad` (Xbox,
+/// DualSense, or MFi) and updates `GameInput`. Releases controller state when
+/// no extended gamepad is connected.
+unsafe fn poll_controller() {
+    use victory_hle::modules::gameinput::ControllerSnapshot;
+    // SAFETY: documented GameController framework getters on valid ObjC objects.
+    unsafe {
+        let controllers: *mut AnyObject = msg_send![class!(GCController), controllers];
+        if controllers.is_null() {
+            victory_hle::modules::gameinput::release_live_pad();
+            return;
+        }
+        let count: usize = msg_send![controllers, count];
+        for i in 0..count {
+            let ctrl: *mut AnyObject = msg_send![controllers, objectAtIndex: i];
+            if ctrl.is_null() {
+                continue;
+            }
+            let gp: *mut AnyObject = msg_send![ctrl, extendedGamepad];
+            if gp.is_null() {
+                continue;
+            }
+            let pressed = |btn: *mut AnyObject| -> bool {
+                !btn.is_null() && {
+                    let b: Bool = msg_send![btn, isPressed];
+                    b.as_bool()
+                }
+            };
+            let trigger = |btn: *mut AnyObject| -> f32 {
+                if btn.is_null() { 0.0 } else { msg_send![btn, value] }
+            };
+            let axis = |dpad: *mut AnyObject| -> (f32, f32) {
+                if dpad.is_null() {
+                    return (0.0, 0.0);
+                }
+                let x_axis: *mut AnyObject = msg_send![dpad, xAxis];
+                let y_axis: *mut AnyObject = msg_send![dpad, yAxis];
+                let x: f32 = if x_axis.is_null() { 0.0 } else { msg_send![x_axis, value] };
+                let y: f32 = if y_axis.is_null() { 0.0 } else { msg_send![y_axis, value] };
+                (x, y)
+            };
+            let dpad: *mut AnyObject = msg_send![gp, dpad];
+            let (up, down, left, right) = if dpad.is_null() {
+                (false, false, false, false)
+            } else {
+                (
+                    pressed(msg_send![dpad, up]),
+                    pressed(msg_send![dpad, down]),
+                    pressed(msg_send![dpad, left]),
+                    pressed(msg_send![dpad, right]),
+                )
+            };
+            let (left_x, left_y) = axis(msg_send![gp, leftThumbstick]);
+            let (right_x, right_y) = axis(msg_send![gp, rightThumbstick]);
+            let snap = ControllerSnapshot {
+                a: pressed(msg_send![gp, buttonA]),
+                b: pressed(msg_send![gp, buttonB]),
+                x: pressed(msg_send![gp, buttonX]),
+                y: pressed(msg_send![gp, buttonY]),
+                up,
+                down,
+                left,
+                right,
+                left_shoulder: pressed(msg_send![gp, leftShoulder]),
+                right_shoulder: pressed(msg_send![gp, rightShoulder]),
+                left_stick: pressed(msg_send![gp, leftThumbstickButton]),
+                right_stick: pressed(msg_send![gp, rightThumbstickButton]),
+                menu: pressed(msg_send![gp, buttonMenu]),
+                view: pressed(msg_send![gp, buttonOptions]),
+                left_trigger: trigger(msg_send![gp, leftTrigger]),
+                right_trigger: trigger(msg_send![gp, rightTrigger]),
+                left_x,
+                left_y,
+                right_x,
+                right_y,
+            };
+            victory_hle::modules::gameinput::set_live_pad(snap);
+            return;
+        }
+        victory_hle::modules::gameinput::release_live_pad();
+    }
 }
 
 /// Runs the loop until `finished`, or the window is gone.
@@ -200,6 +354,8 @@ unsafe fn event_loop(window: &AnyObject, finished: impl Fn() -> bool) {
             }
         });
         if !go_on {
+            victory_hle::modules::gameinput::release_live_keys();
+            victory_hle::modules::gameinput::release_live_pad();
             // SAFETY: as above.
             let shown: Bool = unsafe { msg_send![window, isVisible] };
             if shown.as_bool() {
@@ -299,7 +455,7 @@ fn shot() {
 
 #[cfg(test)]
 mod tests {
-    use super::virtual_key;
+    use super::*;
 
     #[test]
     fn keys_map_to_the_pad_keys() {
@@ -307,7 +463,104 @@ mod tests {
         let got = [36, 49, 53, 51, 48, 123, 13, 0, 2, 12, 14, 6, 8].map(virtual_key);
         let want = [0x0D, 0x20, 0x1B, 0x08, 0x09, 0x25, b'W', b'A', b'D', b'Q', b'E', b'Z', b'C'];
         assert_eq!(got, want.map(Some));
-        assert_eq!(virtual_key(10), None); // section sign: not a pad key
+        assert_eq!(virtual_key(10), None); // section sign: not mapped
         assert_eq!(virtual_key(50), None);
+        // Full keyboard additions: digits, function keys, navigation, modifiers.
+        assert_eq!(virtual_key(18), Some(b'1'));
+        assert_eq!(virtual_key(122), Some(0x70)); // F1
+        assert_eq!(virtual_key(117), Some(0x2E)); // Forward Delete
+        assert_eq!(modifier_key(0x38), Some((0xA0, 1 << 17)));
+    }
+
+    /// Exercises `key_event` with real AppKit `NSEvent` objects: key-down,
+    /// key-up, Cmd+Q forwarding, `FlagsChanged` modifiers, and non-key events
+    /// (verifying `keyCode` is never called on non-key events).
+    #[test]
+    fn real_nsevents_update_live_keys_and_ignore_non_key_events() {
+        autoreleasepool(|_| {
+            victory_hle::modules::gameinput::release_live_keys();
+            let make_key = |kind: usize, flags: usize, code: u16| -> *mut AnyObject {
+                let empty = NSString::from_str("");
+                let null: *mut AnyObject = std::ptr::null_mut();
+                // SAFETY: documented AppKit factory for synthetic key NSEvents.
+                unsafe {
+                    msg_send![
+                        class!(NSEvent),
+                        keyEventWithType: kind,
+                        location: NSPoint::new(0.0, 0.0),
+                        modifierFlags: flags,
+                        timestamp: 0.0f64,
+                        windowNumber: 0isize,
+                        context: null,
+                        characters: &*empty,
+                        charactersIgnoringModifiers: &*empty,
+                        isARepeat: Bool::NO,
+                        keyCode: code
+                    ]
+                }
+            };
+
+            // Gameplay key-down (Return = 36 -> 0x0D) is consumed (returns true).
+            let ret_down = make_key(10, 0, 36);
+            assert!(!ret_down.is_null());
+            // SAFETY: real NSEvent just constructed.
+            assert!(unsafe { key_event(ret_down) });
+            assert!(victory_hle::modules::gameinput::is_live_key_down(0x0D));
+
+            // Key-up releases it.
+            let ret_up = make_key(11, 0, 36);
+            // SAFETY: real NSEvent just constructed.
+            assert!(unsafe { key_event(ret_up) });
+            assert!(!victory_hle::modules::gameinput::is_live_key_down(0x0D));
+
+            // Cmd+Q (code 12, Command = 1 << 20) is left to AppKit (returns false).
+            let cmd_q = make_key(10, 1 << 20, 12);
+            // SAFETY: real NSEvent just constructed.
+            assert!(!unsafe { key_event(cmd_q) });
+            assert!(!victory_hle::modules::gameinput::is_live_key_down(b'Q'));
+
+            // FlagsChanged for Left Shift (0x38 -> 0xA0) down then up.
+            let shift_down = make_key(12, 1 << 17, 0x38);
+            // SAFETY: real NSEvent just constructed.
+            assert!(!unsafe { key_event(shift_down) });
+            assert!(victory_hle::modules::gameinput::is_live_key_down(0xA0));
+            let shift_up = make_key(12, 0, 0x38);
+            // SAFETY: real NSEvent just constructed.
+            assert!(!unsafe { key_event(shift_up) });
+            assert!(!victory_hle::modules::gameinput::is_live_key_down(0xA0));
+
+            // Non-key event (NSApplicationDefined = 15) must not raise on keyCode.
+            // SAFETY: documented AppKit factory for synthetic other NSEvents.
+            let other: *mut AnyObject = unsafe {
+                msg_send![
+                    class!(NSEvent),
+                    otherEventWithType: 15usize,
+                    location: NSPoint::new(0.0, 0.0),
+                    modifierFlags: 0usize,
+                    timestamp: 0.0f64,
+                    windowNumber: 0isize,
+                    context: std::ptr::null_mut::<AnyObject>(),
+                    subtype: 0i16,
+                    data1: 0isize,
+                    data2: 0isize
+                ]
+            };
+            assert!(!other.is_null());
+            // SAFETY: real NSEvent just constructed.
+            assert!(!unsafe { key_event(other) });
+
+            victory_hle::modules::gameinput::release_live_keys();
+        });
+    }
+
+    /// Smoke-tests linking `GameController.framework` and querying
+    /// `[GCController controllers]` via `poll_controller` without panicking.
+    #[test]
+    fn poll_controller_queries_game_controller_framework_cleanly() {
+        super::autoreleasepool(|_| {
+            // SAFETY: plain GameController query.
+            unsafe { super::poll_controller() };
+            victory_hle::modules::gameinput::release_live_pad();
+        });
     }
 }

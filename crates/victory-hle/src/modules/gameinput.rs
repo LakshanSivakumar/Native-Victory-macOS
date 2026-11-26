@@ -630,6 +630,108 @@ fn scripted() -> Vec<u8> {
         .collect()
 }
 
+/// Snapshot of a connected macOS `GCExtendedGamepad` (Xbox, DualSense, or MFi),
+/// mapped into `GameInput`'s Xbox button layout and analog axes.
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ControllerSnapshot {
+    pub a: bool,
+    pub b: bool,
+    pub x: bool,
+    pub y: bool,
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub left_shoulder: bool,
+    pub right_shoulder: bool,
+    pub left_stick: bool,
+    pub right_stick: bool,
+    pub menu: bool,
+    pub view: bool,
+    /// Analog triggers, 0.0 to 1.0.
+    pub left_trigger: f32,
+    pub right_trigger: f32,
+    /// Analog sticks, -1.0 to 1.0 (up positive).
+    pub left_x: f32,
+    pub left_y: f32,
+    pub right_x: f32,
+    pub right_y: f32,
+}
+
+#[cfg(not(windows))]
+fn pad_from_snapshot(s: ControllerSnapshot) -> PadState {
+    let mut buttons = 0u32;
+    for (on, bit) in [
+        (s.menu, MENU),
+        (s.view, VIEW),
+        (s.a, A),
+        (s.b, B),
+        (s.x, X),
+        (s.y, Y),
+        (s.up, UP),
+        (s.down, DOWN),
+        (s.left, LEFT),
+        (s.right, RIGHT),
+        (s.left_shoulder, LEFT_SHOULDER),
+        (s.right_shoulder, RIGHT_SHOULDER),
+        (s.left_stick, LEFT_STICK),
+        (s.right_stick, RIGHT_STICK),
+    ] {
+        if on {
+            buttons |= bit;
+        }
+    }
+    let finite = |v: f32, lo: f32, hi: f32| if v.is_finite() { v.clamp(lo, hi) } else { 0.0 };
+    PadState {
+        buttons,
+        left_trigger: finite(s.left_trigger, 0.0, 1.0),
+        right_trigger: finite(s.right_trigger, 0.0, 1.0),
+        left_x: finite(s.left_x, -1.0, 1.0),
+        left_y: finite(s.left_y, -1.0, 1.0),
+        right_x: finite(s.right_x, -1.0, 1.0),
+        right_y: finite(s.right_y, -1.0, 1.0),
+    }
+}
+
+/// Live physical controller state on macOS, updated by the window's event loop.
+#[cfg(not(windows))]
+static LIVE_PAD: Mutex<PadState> = Mutex::new(PadState {
+    buttons: 0,
+    left_trigger: 0.0,
+    right_trigger: 0.0,
+    left_x: 0.0,
+    left_y: 0.0,
+    right_x: 0.0,
+    right_y: 0.0,
+});
+
+/// Updates the live macOS controller state from a `GCExtendedGamepad` snapshot.
+#[cfg(not(windows))]
+pub fn set_live_pad(snapshot: ControllerSnapshot) {
+    *lock(&LIVE_PAD) = pad_from_snapshot(snapshot);
+}
+
+/// Clears the live macOS controller state (on disconnect or window focus loss).
+#[cfg(not(windows))]
+pub fn release_live_pad() {
+    *lock(&LIVE_PAD) = PadState::default();
+}
+
+/// Stand-in pad state: on macOS, merges any live physical `GCController` pad
+/// with the keyboard and `VICTORY_KEYS`; on Windows, keyboard fallback only.
+fn stand_in_pad(keys: &[KeyState]) -> PadState {
+    let kb = fallback(keys);
+    #[cfg(not(windows))]
+    {
+        merge_pad(*lock(&LIVE_PAD), kb)
+    }
+    #[cfg(windows)]
+    {
+        kb
+    }
+}
+
 /// Keys held down in the host window (macOS), kept by its event loop.
 #[cfg(not(windows))]
 static LIVE: Mutex<std::collections::BTreeSet<u8>> = Mutex::new(std::collections::BTreeSet::new());
@@ -651,6 +753,100 @@ pub fn release_live_keys() {
     lock(&LIVE).clear();
 }
 
+/// Whether virtual key `vk` is currently held in the live macOS key set.
+#[cfg(not(windows))]
+pub fn is_live_key_down(vk: u8) -> bool {
+    lock(&LIVE).contains(&vk)
+}
+
+/// PS/2 Set-1 scan code (with `0xE000` extended prefix, matching Windows
+/// `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)`) for standard virtual keys.
+#[cfg(not(windows))]
+fn vk_to_scan_code(vk: u8) -> u32 {
+    match vk {
+        0x1B => 0x01, // Esc
+        b'1' => 0x02,
+        b'2' => 0x03,
+        b'3' => 0x04,
+        b'4' => 0x05,
+        b'5' => 0x06,
+        b'6' => 0x07,
+        b'7' => 0x08,
+        b'8' => 0x09,
+        b'9' => 0x0A,
+        b'0' => 0x0B,
+        0xBD => 0x0C, // -
+        0xBB => 0x0D, // =
+        0x08 => 0x0E, // Backspace
+        0x09 => 0x0F, // Tab
+        b'Q' => 0x10,
+        b'W' => 0x11,
+        b'E' => 0x12,
+        b'R' => 0x13,
+        b'T' => 0x14,
+        b'Y' => 0x15,
+        b'U' => 0x16,
+        b'I' => 0x17,
+        b'O' => 0x18,
+        b'P' => 0x19,
+        0xDB => 0x1A, // [
+        0xDD => 0x1B, // ]
+        0x0D => 0x1C, // Enter
+        0xA2 => 0x1D, // Left Ctrl
+        b'A' => 0x1E,
+        b'S' => 0x1F,
+        b'D' => 0x20,
+        b'F' => 0x21,
+        b'G' => 0x22,
+        b'H' => 0x23,
+        b'J' => 0x24,
+        b'K' => 0x25,
+        b'L' => 0x26,
+        0xBA => 0x27, // ;
+        0xDE => 0x28, // '
+        0xC0 => 0x29, // `
+        0xA0 => 0x2A, // Left Shift
+        0xDC => 0x2B, // \
+        b'Z' => 0x2C,
+        b'X' => 0x2D,
+        b'C' => 0x2E,
+        b'V' => 0x2F,
+        b'B' => 0x30,
+        b'N' => 0x31,
+        b'M' => 0x32,
+        0xBC => 0x33, // ,
+        0xBE => 0x34, // .
+        0xBF => 0x35, // /
+        0xA1 => 0x36, // Right Shift
+        0xA4 => 0x38, // Left Alt
+        0x20 => 0x39, // Space
+        0x70 => 0x3B, // F1
+        0x71 => 0x3C, // F2
+        0x72 => 0x3D, // F3
+        0x73 => 0x3E, // F4
+        0x74 => 0x3F, // F5
+        0x75 => 0x40, // F6
+        0x76 => 0x41, // F7
+        0x77 => 0x42, // F8
+        0x78 => 0x43, // F9
+        0x79 => 0x44, // F10
+        0x7A => 0x57, // F11
+        0x7B => 0x58, // F12
+        0xA3 => 0xE01D, // Right Ctrl
+        0xA5 => 0xE038, // Right Alt
+        0x24 => 0xE047, // Home
+        0x26 => 0xE048, // Up
+        0x21 => 0xE049, // Page Up
+        0x25 => 0xE04B, // Left
+        0x27 => 0xE04D, // Right
+        0x23 => 0xE04F, // End
+        0x28 => 0xE050, // Down
+        0x22 => 0xE051, // Page Down
+        0x2E => 0xE053, // Delete
+        _ => 0,
+    }
+}
+
 /// `scripted` (`VICTORY_KEYS`) and the live keys, OR-ed: each key once.
 #[cfg(not(windows))]
 fn held(mut vks: Vec<u8>) -> Vec<KeyState> {
@@ -659,6 +855,7 @@ fn held(mut vks: Vec<u8>) -> Vec<KeyState> {
     vks.dedup();
     vks.into_iter()
         .map(|vk| KeyState {
+            scan_code: vk_to_scan_code(vk),
             virtual_key: vk,
             ..Default::default()
         })
@@ -1866,8 +2063,14 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    static LIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(not(windows))]
     #[test]
     fn live_keys_drive_the_pad_while_held_and_merge_with_scripted() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_live_keys();
+        release_live_pad();
         let pad_of = |scripted: Vec<u8>| fallback(&held(scripted));
         set_live_key(b'W', true);
         set_live_key(0x20, true); // Space
@@ -1886,6 +2089,149 @@ mod tests {
         assert_eq!(pad_of(vec![]).buttons, B | MENU | RIGHT);
         release_live_keys();
         assert_eq!(pad_of(vec![b'X']), PadState { buttons: X, ..Default::default() });
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn live_keys_report_ps2_scan_codes_through_hub_readings() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_live_keys();
+        release_live_pad();
+        let hub = Hub::new(host());
+        hub.poll();
+
+        set_live_key(0x0D, true); // Enter
+        set_live_key(b'W', true); // Left stick up
+        set_live_key(0x26, true); // Up arrow (extended)
+        set_live_key(0xA0, true); // Left Shift
+        hub.poll();
+
+        let kr = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let Value::Keys(ref ks) = reading(kr).value else {
+            panic!("expected keyboard reading");
+        };
+        assert!(ks.iter().any(|k| k.virtual_key == 0x0D && k.scan_code == 0x1C));
+        assert!(ks.iter().any(|k| k.virtual_key == b'W' && k.scan_code == 0x11));
+        assert!(ks.iter().any(|k| k.virtual_key == 0x26 && k.scan_code == 0xE048));
+        assert!(ks.iter().any(|k| k.virtual_key == 0xA0 && k.scan_code == 0x2A));
+        release(kr);
+
+        let pr = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let ps = pad(pr);
+        assert_eq!(ps.buttons, A | UP);
+        assert_eq!(ps.left_y, 1.0);
+        release(pr);
+
+        release_live_keys();
+        hub.poll();
+        let pr2 = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(pr2), PadState::default());
+        release(pr2);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn controller_snapshot_maps_all_buttons_and_analog_axes() {
+        let snap = ControllerSnapshot {
+            a: true,
+            b: true,
+            x: true,
+            y: true,
+            up: true,
+            down: false,
+            left: true,
+            right: false,
+            left_shoulder: true,
+            right_shoulder: true,
+            left_stick: true,
+            right_stick: true,
+            menu: true,
+            view: true,
+            left_trigger: 0.35,
+            right_trigger: 1.5, // clamped to 1.0
+            left_x: -0.6,
+            left_y: 0.75,
+            right_x: 2.0,     // clamped to 1.0
+            right_y: f32::NAN, // sanitized to 0.0
+        };
+        assert_eq!(
+            pad_from_snapshot(snap),
+            PadState {
+                buttons: MENU
+                    | VIEW
+                    | A
+                    | B
+                    | X
+                    | Y
+                    | UP
+                    | LEFT
+                    | LEFT_SHOULDER
+                    | RIGHT_SHOULDER
+                    | LEFT_STICK
+                    | RIGHT_STICK,
+                left_trigger: 0.35,
+                right_trigger: 1.0,
+                left_x: -0.6,
+                left_y: 0.75,
+                right_x: 1.0,
+                right_y: 0.0,
+            }
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn live_controller_merges_with_keyboard_and_clears_on_release() {
+        let _guard = LIVE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        release_live_keys();
+        release_live_pad();
+        let hub = Hub::new(host());
+        hub.poll();
+
+        // Analog DualSense/Xbox input combined with a keyboard key (Enter -> A).
+        set_live_pad(ControllerSnapshot {
+            x: true,
+            left_trigger: 0.4,
+            left_x: -0.5,
+            right_y: 0.8,
+            ..Default::default()
+        });
+        set_live_key(0x0D, true);
+        hub.poll();
+
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A | X,
+                left_trigger: 0.4,
+                right_trigger: 0.0,
+                left_x: -0.5,
+                left_y: 0.0,
+                right_x: 0.0,
+                right_y: 0.8,
+            }
+        );
+        release(r);
+
+        // Disconnect / focus loss clears controller state cleanly while keeping keyboard separate.
+        release_live_pad();
+        hub.poll();
+        let r2 = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(r2),
+            PadState {
+                buttons: A,
+                ..Default::default()
+            }
+        );
+        release(r2);
+
+        release_live_keys();
+        hub.poll();
+        let r3 = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r3), PadState::default());
+        release(r3);
     }
 
     #[test]
