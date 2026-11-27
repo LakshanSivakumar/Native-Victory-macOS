@@ -1325,13 +1325,25 @@ impl<'a> Lower<'a> {
                     dword(self, at)?
                 }
                 Some((width, signed)) => {
-                    // shortcut: the field is taken not to cross a dword.
+                    // The dword holding the field's first byte; a 16-bit field at a dword's
+                    // last byte continues in the next dword, read at `+ 4` the same way (so
+                    // through the same view), and its low byte is joined to the first's top.
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
                     let w = dword(self, at)?;
                     let byte = self.s.m.bin(c, Bin::And, off, three);
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                    let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    if width == 16 {
+                        let (four, eight, zero) =
+                            (self.s.m.i32(4), self.s.m.i32(8), self.s.m.i32(0));
+                        let next = self.s.m.bin(c, Bin::Add, at, four);
+                        let high = dword(self, next)?;
+                        let high = self.s.m.bin(c, Bin::Shl, high, eight);
+                        let straddles = self.s.m.cmp(c, pred::EQ, byte, three);
+                        let high = self.s.m.select(c, straddles, high, zero);
+                        x = self.s.m.bin(c, Bin::Or, x, high);
+                    }
                     let left = self.s.m.i32(32 - width);
                     let x = self.s.m.bin(c, Bin::Shl, x, left);
                     self.s
@@ -13463,29 +13475,43 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some((width, signed)) = sub {
-            // The dword holding the field, as `global_load_ubyte` and kin.
-            // shortcut: the field is taken not to cross a dword.
+            // The dword holding the field's first byte, as `global_load_ubyte` and kin; a
+            // 16-bit field at a dword's last byte continues in the next dword, which is read
+            // at `+ 4` in the same view and joined to the first's top byte.
             if index.is_some() {
                 return Err("a byte or half buffer load by index");
             }
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
+            let span = if width == 16 { 8 } else { 4 };
+            let (h, at) = self.raw_view(site, src, at, span, (11 | u, 0), false, guard)?;
             let c = self.cur;
             let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, at, iu, mask, align],
-            );
-            let w = self.s.m.extract(c, r, 0);
-            let w = self.as_int(w);
+            let dword = |l: &mut Self, at: V| {
+                let r = l.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    l.s.t.res_ret,
+                    139,
+                    &[h, at, iu, mask, align],
+                );
+                let w = l.s.m.extract(c, r, 0);
+                l.as_int(w)
+            };
+            let w = dword(self, at);
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            let x = self.s.m.bin(c, Bin::LShr, w, sh);
+            let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+            if width == 16 {
+                let (four, eight, zero) = (self.s.m.i32(4), self.s.m.i32(8), self.s.m.i32(0));
+                let next = self.s.m.bin(c, Bin::Add, at, four);
+                let high = dword(self, next);
+                let high = self.s.m.bin(c, Bin::Shl, high, eight);
+                let straddles = self.s.m.cmp(c, pred::EQ, byte, three);
+                let high = self.s.m.select(c, straddles, high, zero);
+                x = self.s.m.bin(c, Bin::Or, x, high);
+            }
             let left = self.s.m.i32(32 - width);
             let x = self.s.m.bin(c, Bin::Shl, x, left);
             let x = self
