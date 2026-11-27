@@ -1805,9 +1805,11 @@ mod state {
         unsafe { std::slice::from_raw_parts(items, count as usize) }
     }
 
-    // shortcut: direct mesh dispatches are dropped (counted, warned once); route them to
-    // `MetalList::dispatch_mesh` when a mesh pipeline needs them.
-    pub(super) use super::dropped_mesh as dispatch_mesh;
+    /// `DispatchMesh(x, y, z)`: the bound mesh pipeline runs those groups (#353).
+    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        super::count_draw();
+        glue::dispatch_mesh(this, x, y, z);
+    }
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;
 
@@ -1887,9 +1889,14 @@ mod state {
         glue::dispatch(this, x, y, z);
     }
     /// `DispatchMeshX`: with `indirect`, a Metal indirect mesh draw of the record at that title
-    /// address (same guess as the D3D12 host's `dispatch_mesh_x`); otherwise dropped.
+    /// address; without, `x` groups of the bound mesh pipeline (#353). Both are the D3D12 host's
+    /// guess in `dispatch_mesh_x` (`docs/native-host.md`): flags and payload are ignored.
     pub(super) extern "system" fn dispatch_mesh_x(this: This, x: u32, flags: u64, indirect: u64, payload: u64) {
-        if indirect != 0 && glue::execute_indirect(this, crate::signature::Command::DispatchMesh, 12, 1, indirect, None) {
+        if indirect == 0 {
+            dispatch_mesh(this, x, 1, 1);
+            return;
+        }
+        if glue::execute_indirect(this, crate::signature::Command::DispatchMesh, 12, 1, indirect, None) {
             super::count_draw();
             return;
         }
@@ -2004,15 +2011,10 @@ fn drop_kind(kind: usize) {
     crate::native::glue::trace_reason(what);
 }
 
+/// An indirect mesh dispatch the host could not run.
 #[cfg(target_os = "macos")]
-extern "system" fn dropped_mesh(this: This, _x: u32, _y: u32, _z: u32) {
-    drop_kind(0);
-    draw(this);
-}
-
-#[cfg(target_os = "macos")]
-extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, indirect: u64, _payload: u64) {
-    drop_kind(if indirect != 0 { 1 } else { 0 });
+extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, _indirect: u64, _payload: u64) {
+    drop_kind(1);
     draw(this);
 }
 

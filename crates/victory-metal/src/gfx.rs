@@ -58,6 +58,8 @@ pub struct Heap {
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
+    /// The set asked to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`): it ends that when dropped.
+    requested: bool,
 }
 
 impl Drop for Heap {
@@ -65,8 +67,11 @@ impl Drop for Heap {
         // MTLResidencySet does not retain allocations: detach everything and commit before
         // `buf` and `refs` are dropped.
         if let Some(set) = self.set.take() {
+            if self.requested {
+                crate::metal::residency_timed("end", Some(&set), || set.endResidency());
+            }
             set.removeAllAllocations();
-            set.commit();
+            crate::metal::residency_timed("drop_commit", Some(&set), || set.commit());
         }
     }
 }
@@ -573,7 +578,7 @@ impl Metal {
             drop(counts);
             if last && let Some(set) = &heap.set {
                 set.removeAllocation(ProtocolObject::from_ref(&*old));
-                set.commit();
+                crate::metal::residency_timed("remove_commit", Some(set), || set.commit());
                 heap.dirty.set(false);
             }
             drop(old_tex_view);
@@ -619,6 +624,22 @@ impl Metal {
         Ok(cb)
     }
 
+    /// With `VICTORY_METAL_REQUEST_RESIDENCY`, asks that a heap's set, as last committed, stay
+    /// resident between the command buffers that use it. Without it the system may make the
+    /// set's allocations non-resident whenever no command buffer in flight uses the set, and
+    /// make them resident again for the next one: in a run on a 48 GB Mac the wired memory fell
+    /// from about 22 GB to 6 GB and came back within 10 s in the world, then command buffers
+    /// timed out (#79). Measured since (`VICTORY_TRACE_RESIDENCY`, docs/native-host.md): the
+    /// wired memory falls only after the host has committed no command buffer for a few seconds,
+    /// this request does not stop that, and making the set resident again cost 0.1 to 0.3 s: the
+    /// fall follows a stall, it does not cause it.
+    fn request(&self, set: &ProtocolObject<dyn MTLResidencySet>) {
+        if self.request_residency {
+            crate::metal::residency_timed("request", Some(set), || set.requestResidency());
+            self.count(|c| c.requests += 1);
+        }
+    }
+
     /// A set covers all passes in the command buffer. Later uses can still commit new entries.
     fn use_heap_cb(
         &self,
@@ -628,7 +649,8 @@ impl Metal {
     ) {
         if let Some(set) = &heap.set {
             if heap.dirty.replace(false) {
-                set.commit();
+                crate::metal::residency_timed("add_commit", Some(set), || set.commit());
+                self.request(set);
                 self.count(|c| {
                     c.heap_entries = c.heap_entries.max(heap.refs.borrow().len() as u64);
                     c.heap_allocations = c.heap_allocations.max(heap.alloc_counts.borrow().len() as u64);
@@ -840,8 +862,9 @@ impl ResourceBackend for Metal {
                 .newResidencySetWithDescriptor_error(&d)
                 .map_err(|e| e.localizedDescription().to_string())?;
             s.addAllocation(ProtocolObject::from_ref(&*buf));
-            s.commit();
-            Some(s)
+            crate::metal::residency_timed("made", Some(&s), || s.commit());
+            self.request(&s);
+            Some(track_residency_set(s))
         } else {
             None
         };
@@ -852,6 +875,7 @@ impl ResourceBackend for Metal {
             refs: RefCell::default(),
             typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
+            requested: set.is_some() && self.request_residency,
             set,
             dirty: Cell::new(false),
         })
@@ -1255,13 +1279,20 @@ impl GraphicsBackend for Metal {
         made.map(|made| made.and_then(|(pso, mesh)| self.finish_render(d, pso, mesh))).transpose()
     }
 
-    fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), String> {
+    fn name_render_pipeline(&self, p: &RenderPipeline, name: &str) {
+        if self.trace_fails {
+            let key = Retained::as_ptr(&p.pso) as *const u8 as usize;
+            self.pipe_names.borrow_mut().insert(key, name.to_string());
+        }
+    }
+
+    fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), SubmitFailure> {
         if self.trace_fails {
             report_in_flight();
             self.trace_enc.borrow_mut().clear();
             self.trace_args.borrow_mut().clear();
         }
-        let mut cb = self.new_command_buffer(queue)?;
+        let mut cb = self.new_command_buffer(queue).map_err(SubmitFailure::uncommitted)?;
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut label = String::new();
         if self.trace_fails {
@@ -1299,8 +1330,10 @@ impl GraphicsBackend for Metal {
         // A pass that cannot be encoded must not take the submission's fence signals and
         // bottom-of-pipe value writes with it: the title's compute queues wait for those writes,
         // and a lost one is `Unsignaled CrossQueueBarrier` (the title then dies). The failing pass
-        // is dropped, the command buffer still commits, and the caller is told.
-        let mut refused: Option<String> = None;
+        // is dropped, the command buffer still commits, and the caller is told which passes were
+        // dropped, so it can pay only their lost work.
+        let mut refused: Vec<usize> = Vec::new();
+        let mut first_error: Option<String> = None;
         let mut attached_heaps = Vec::new();
         // A submission's passes can go in command buffers of at most `passes_per_buffer` passes
         // (`VICTORY_PASSES_PER_BUFFER`; default 0: all in one). macOS stops a command buffer that
@@ -1313,7 +1346,7 @@ impl GraphicsBackend for Metal {
         // later pieces still run and nothing is paid twice.
         let per = self.passes_per_buffer;
         let pieces = if per > 0 && work.passes.len() > per {
-            Some(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?)
+            Some(track_event(self.dev.newSharedEvent().ok_or_else(|| SubmitFailure::uncommitted("newSharedEvent failed"))?))
         } else {
             None
         };
@@ -1336,8 +1369,9 @@ impl GraphicsBackend for Metal {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
                 // whose root arguments were never set) is dropped; the passes after it still run,
                 // so one bad pass does not cost the frame's whole picture.
-                if refused.is_none() {
-                    refused = Some(e);
+                refused.push(n);
+                if first_error.is_none() {
+                    first_error = Some(e);
                 }
             }
             if let Some(event) = &pieces
@@ -1354,7 +1388,19 @@ impl GraphicsBackend for Metal {
                 });
                 self.commit_piece(queue, &cb, owed, piece, tinfo);
                 first = n + 1;
-                cb = self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece)))?;
+                cb = match self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece))) {
+                    Ok(cb) => cb,
+                    Err(e) => {
+                        // The current piece never started: every pass from `first` on was lost,
+                        // and the earlier pieces did commit.
+                        refused.extend(first..work.passes.len());
+                        return Err(SubmitFailure {
+                            committed: true,
+                            refused,
+                            error: e,
+                        });
+                    }
+                };
                 if self.trace_fails {
                     let piece = format!("{label} piece {}", piece + 1);
                     cb.setLabel(Some(&objc2_foundation::NSString::from_str(&piece)));
@@ -1376,7 +1422,8 @@ impl GraphicsBackend for Metal {
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
         let trace = self.trace_fails;
-        let tinfo = trace.then(|| (serial, label, self.trace_enc.borrow().join(" | ")));
+        let tinfo = trace.then(|| (serial, label.clone(), self.trace_enc.borrow().join(" | ")));
+        self.trace_commit(serial, queue_id, &label);
         if let Some((s, l, enc)) = &tinfo {
             IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
             GATED.lock().unwrap().insert(*s, std::mem::take(&mut *self.trace_args.borrow_mut()));
@@ -1385,6 +1432,7 @@ impl GraphicsBackend for Metal {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            trace_done(serial, done);
             landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
                 let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
@@ -1415,10 +1463,14 @@ impl GraphicsBackend for Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
-        cb.commit();
+        crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
-        match refused {
-            Some(e) => Err(e),
+        match first_error {
+            Some(e) => Err(SubmitFailure {
+                committed: true,
+                refused,
+                error: e,
+            }),
             None => Ok(()),
         }
     }
@@ -1498,6 +1550,7 @@ impl Metal {
             cb
         };
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
+        self.trace_commit(serial, queue_id, &format!("piece {piece}"));
         let trace = self.trace_fails;
         let tinfo = tinfo.map(|(d, args)| {
             IN_FLIGHT.lock().unwrap().insert(serial, (std::time::Instant::now(), d.clone()));
@@ -1508,6 +1561,7 @@ impl Metal {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            trace_done(serial, done);
             let error = done.error();
             landed(serial, queue_id, dropped || error.is_some());
             // A piece is traced as a whole command buffer is: slow ones, and what a failed one held
@@ -1542,7 +1596,7 @@ impl Metal {
         });
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
-        cb.commit();
+        crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
     }
 
@@ -1925,6 +1979,135 @@ fn recover_lost_after(behind_a_failure: std::time::Duration, anyway: std::time::
     lost.len()
 }
 
+/// The process's shared events (queue order events, title fences, piece events), weakly, so a
+/// stop can wake every command buffer waiting on one ([`stop_gpu`]).
+struct TrackedEvents(Vec<objc2::rc::Weak<ProtocolObject<dyn MTLSharedEvent>>>);
+// SAFETY: shared events may be used from any thread; the list is only touched under its lock.
+unsafe impl Send for TrackedEvents {}
+static EVENTS: std::sync::Mutex<TrackedEvents> = std::sync::Mutex::new(TrackedEvents(Vec::new()));
+
+/// Remembers `event` for [`stop_gpu`] and returns it.
+pub(crate) fn track_event(
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+) -> Retained<ProtocolObject<dyn MTLSharedEvent>> {
+    let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if events.0.len() % 1024 == 1023 {
+        events.0.retain(|w| w.load().is_some());
+    }
+    events.0.push(objc2::rc::Weak::from_retained(&event));
+    event
+}
+
+/// The process's residency sets (each heap's and the pool's), weakly, so a stop can give back what
+/// they hold before the process exits ([`stop_gpu`]).
+struct TrackedSets(Vec<objc2::rc::Weak<ProtocolObject<dyn MTLResidencySet>>>);
+// SAFETY: residency sets may be used from any thread; the list is only touched under its lock.
+unsafe impl Send for TrackedSets {}
+static SETS: std::sync::Mutex<TrackedSets> = std::sync::Mutex::new(TrackedSets(Vec::new()));
+
+/// Remembers `set` for [`stop_gpu`] and returns it.
+pub(crate) fn track_residency_set(
+    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+) -> Retained<ProtocolObject<dyn MTLResidencySet>> {
+    let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
+    if sets.0.len() % 256 == 255 {
+        sets.0.retain(|w| w.load().is_some());
+    }
+    sets.0.push(objc2::rc::Weak::from_retained(&set));
+    set
+}
+
+/// Empties and commits `sets`: what they held is no longer kept resident. Returns the bytes they
+/// held.
+fn release_sets(sets: &[Retained<ProtocolObject<dyn MTLResidencySet>>]) -> u64 {
+    let mut bytes = 0;
+    for set in sets {
+        bytes += set.allocatedSize();
+        set.removeAllAllocations();
+        set.commit();
+    }
+    bytes
+}
+
+/// A value above any a command buffer waits for: an event raised to it lets every wait on it pass.
+const STOP_VALUE: u64 = 1 << 62;
+
+/// Stops the process's GPU work cleanly before it exits: raises every shared event a command
+/// buffer may wait on ([`track_event`]), waits up to `wait` for the command buffers in flight to
+/// complete, and pays what the ones that did not still owe on the CPU. Returns how many were in
+/// flight and how many of them did not complete.
+///
+/// A process killed while its command buffers sleep in the kernel on events it never signals can
+/// leave the GPU memory they hold allocated after it exits: on macOS 26.5 an M5 Max kept about
+/// 20 GB "in use" by the GPU driver, owned by no process, until a reboot (#357). Woken first, they
+/// finish and the process exits with nothing pending.
+pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
+    let events: Vec<_> = EVENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .iter()
+        .filter_map(objc2::rc::Weak::load)
+        .collect();
+    let drained = wake_and_drain(&events, wait);
+    // Then what the residency sets keep resident is given back before the process goes, not left
+    // to the driver's teardown: a run that hung the GPU at world entry with ~16 GB in its heaps'
+    // sets left 19.7 GB "in use" after it exited (#357). Process exit skips `Heap`'s `Drop`.
+    let sets: Vec<_> = SETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .iter()
+        .filter_map(objc2::rc::Weak::load)
+        .collect();
+    let bytes = release_sets(&sets);
+    tracing::warn!(sets = sets.len(), mb = bytes >> 20, "stop: residency sets emptied");
+    drained
+}
+
+/// [`stop_gpu`] for `events` (the tests wake only their own).
+fn wake_and_drain(
+    events: &[Retained<ProtocolObject<dyn MTLSharedEvent>>],
+    wait: std::time::Duration,
+) -> (usize, usize) {
+    let in_flight = flights().len();
+    for e in events {
+        if e.signaledValue() < STOP_VALUE {
+            e.setSignaledValue(STOP_VALUE);
+        }
+    }
+    let deadline = std::time::Instant::now() + wait;
+    while !flights().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let left: Vec<Flight> = flights().drain(..).collect();
+    for f in &left {
+        f.owed.recover();
+    }
+    (in_flight, left.len())
+}
+
+/// `VICTORY_TRACE_COMMITS=1` (with `VICTORY_TRACE_GPU_FAILS` for the encoder names): a line for
+/// each command buffer as it is committed (serial, queue, its encoders: pipelines by shader hash,
+/// draw counts, dispatch sizes) and one as it completes, so a command buffer the GPU never
+/// finishes is the one committed and never done (#79).
+fn commits_traced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TRACE_COMMITS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The completion line of [`commits_traced`].
+fn trace_done(serial: u64, done: &ProtocolObject<dyn MTLCommandBuffer>) {
+    if commits_traced() {
+        tracing::info!(
+            "cb done #{serial} t={:.3} gpu_ms={:.1} failed={}",
+            crate::metal::since_start(),
+            (done.GPUEndTime() - done.GPUStartTime()) * 1000.0,
+            done.error().is_some()
+        );
+    }
+}
+
 static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -2038,11 +2221,22 @@ fn cap_label_str(mut s: String) -> String {
 
 impl Metal {
     /// The capped label for an encoder, kept for the command buffer's description.
+    /// The command buffer's description keeps the whole label when `VICTORY_TRACE_COMMITS` logs it
+    /// (a capped one hid the end of a 17-dispatch pass, #79).
     fn cap_label(&self, s: String) -> Retained<objc2_foundation::NSString> {
-        let s = cap_label_str(s);
-        let n = objc2_foundation::NSString::from_str(&s);
-        self.trace_enc.borrow_mut().push(s);
+        let capped = cap_label_str(s.clone());
+        let n = objc2_foundation::NSString::from_str(&capped);
+        self.trace_enc.borrow_mut().push(if commits_traced() { s } else { capped });
         n
+    }
+
+    /// The commit line of [`commits_traced`]: this command buffer's encoders, which are then
+    /// forgotten so the next piece lists only its own.
+    fn trace_commit(&self, serial: u64, queue_id: usize, what: &str) {
+        if commits_traced() {
+            let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
+            tracing::warn!("cb commit #{serial} q{queue_id:x} t={:.3} {what} | {enc}", crate::metal::since_start());
+        }
     }
 
     fn encode_blit(
@@ -3076,7 +3270,25 @@ impl Metal {
             started.set(true);
         }
         if self.trace_fails {
-            e.setLabel(Some(&self.cap_label(format!("render: {} draws", rp.draws.len()))));
+            // Each distinct pipeline once, with its draw count: names the pass's shaders.
+            let names = self.pipe_names.borrow();
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            for d in &rp.draws {
+                let k = Retained::as_ptr(&d.pipeline.pso) as *const u8 as usize;
+                match seen.iter_mut().find(|(p, _)| *p == k) {
+                    Some((_, n)) => *n += 1,
+                    None => seen.push((k, 1)),
+                }
+            }
+            let mut l = format!("render: {} draws", rp.draws.len());
+            for (k, n) in seen {
+                match names.get(&k) {
+                    Some(name) => l.push_str(&format!("; {name} x{n}")),
+                    None => l.push_str(&format!("; {k:#x} x{n}")),
+                }
+            }
+            drop(names);
+            e.setLabel(Some(&self.cap_label(l)));
         }
         e.endEncoding();
         Ok(())
@@ -3460,6 +3672,48 @@ mod owed_tests {
         assert!(m.wait(&fence, 4, 5000), "the queue runs on behind the recovered command buffer");
     }
 
+    /// A stop wakes a command buffer asleep on an event nobody signals, as a title's queues are
+    /// when the process is told to stop: it completes on the GPU (its fence is reached by the GPU,
+    /// not paid), and nothing is left in flight.
+    #[test]
+    fn a_stop_wakes_command_buffers_waiting_on_events_nobody_signals() {
+        let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
+        let m = Metal::new().unwrap();
+        let q = m.create_queue().unwrap();
+        let (never, fence) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
+        let (waits, signals) = ([(&never, 1)], [(&fence, 3)]);
+        m.submit_passes(&q, &PassSubmission { waits: &waits, passes: &[], signals: &signals }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(m.completed(&fence), 0, "the command buffer sleeps on its wait");
+        let (in_flight, left) = wake_and_drain(&[never.0.clone(), q.2.clone()], std::time::Duration::from_secs(5));
+        assert!(in_flight >= 1);
+        assert_eq!(left, 0, "every command buffer completed on the GPU");
+        assert_eq!(m.completed(&fence), 3);
+        // The events a stop wakes are tracked as they are made, and let go with them.
+        let tracked = |e: &Retained<ProtocolObject<dyn MTLSharedEvent>>| {
+            EVENTS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(e)))
+        };
+        assert!(tracked(&never.0) && tracked(&q.2));
+    }
+
+    /// A stop empties the residency sets it tracks, so nothing it made stays resident.
+    #[test]
+    fn a_stop_empties_the_residency_sets() {
+        use objc2_foundation::NSObjectProtocol;
+        let m = Metal::new().unwrap();
+        if !m.dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:)) {
+            return;
+        }
+        let set = track_residency_set(m.dev.newResidencySetWithDescriptor_error(&MTLResidencySetDescriptor::new()).unwrap());
+        let buf = m.dev.newBufferWithLength_options(1 << 20, MTLResourceOptions::StorageModePrivate).unwrap();
+        set.addAllocation(ProtocolObject::from_ref(&*buf));
+        set.commit();
+        assert_eq!(set.allocationCount(), 1);
+        assert!(SETS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(&set))));
+        assert!(release_sets(std::slice::from_ref(&set)) >= 1 << 20);
+        assert_eq!(set.allocationCount(), 0);
+    }
+
     #[test]
     fn recovery_writes_the_fills_before_it_signals() {
         struct Send<T>(T);
@@ -3716,6 +3970,30 @@ mod heap_set_tests {
         assert!(!attaches(&mut attached), "once per command buffer");
         let _next = m.next_piece(&q, &[], &mut attached, None).unwrap();
         assert!(attaches(&mut attached), "the next piece is given the heap's set too");
+    }
+
+    /// With `VICTORY_METAL_REQUEST_RESIDENCY` a heap's set asks to stay resident when it is made
+    /// and after each commit a use makes; without it, never.
+    #[test]
+    fn a_heaps_set_asks_to_stay_resident_only_when_switched_on() {
+        for on in [false, true] {
+            let m = Metal::new().unwrap().with_heap_sets().with_requested_residency(on);
+            let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
+            if heap.set.is_none() {
+                eprintln!("skipped: no residency sets on this system");
+                return;
+            }
+            let before = m.residency_counts().requests;
+            let t = m.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+            m.write_texture(&heap, 0, &t, 0.0);
+            let mut attached = Vec::new();
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            m.use_heap_cb(&heap, &mut attached, |_| {});
+            let made = u64::from(on);
+            assert_eq!(before, made, "on={on}: when the set is made");
+            assert_eq!(m.residency_counts().requests, 2 * made, "on={on}: again after the one commit");
+            drop(heap); // ends the residency it asked for
+        }
     }
 
     /// A heap's residency set holds the heap buffer and each allocation its entries name, once,

@@ -428,9 +428,19 @@ With a heap's set, Metal's hazard tracking no longer sees what a pass reaches th
 host orders the queue's work itself (the queue event and the fence under **Residency** below).
 The heap tests run in all three modes (`common::backends()`).
 
+`VICTORY_METAL_REQUEST_RESIDENCY=1` (off by default) makes each heap's set ask to stay resident
+(`requestResidency` when it is made and after each commit; `endResidency` when the heap goes), so
+the system does not make it non-resident between the command buffers that use it and resident
+again for the next. In a 330 s run on a 48 GB Mac the wired memory fell from about 22 GB to 6 GB
+and came back within 10 s twice in the world, and command buffers later timed out (#79); whether
+that churn is the stall is a guess this switch tests. The frame line counts nothing for it; the
+start-up residency line logs `request_residency`.
+
 Not known: how the default does on a Mac with 16 or 18 GB; it was run with 48 GB. The frame line
 (`native draws so far`, every 64 frames) logs `heap_set_mb`, the most bytes one heap's set held
-(pool buffers its entries name count whole), and `heap_allocations`. Not done: an entry that names a
+(pool buffers its entries name count whole), `heap_allocations`, and, to see where the memory is
+when command buffers stall (#79), `metal_mb` (the device's `currentAllocatedSize`) and
+`footprint_mb` (the process's physical footprint). Not done: an entry that names a
 texture the title has released keeps it, alive and in the set, until the title overwrites the entry,
 as naming per encoder did; `useHeap` for `MTLHeap`-placed textures.
 
@@ -459,6 +469,17 @@ Findings:
   be multiples of `minimumLinearTextureAlignmentForPixelFormat` (`linear_alignment`). A CPU write into
   title memory after the texture exists is seen by the next dispatch. Mips, arrays, 3D, BC and the
   console's tiled layouts are not linear, so those still need the compute detile into an `MTLTexture`.
+
+**Dropping the top mip for memory (`VICTORY_TEXTURE_DROP_TOP_MIP=1`, off by default).** For hosts whose
+unified memory cannot hold the title's full texture set (an iPad keeps about 9 GiB before it swaps), a
+sampled-only 2D or array texture whose larger side is at least 1024 texels and that has a level below
+its top is made without that top level (half the width and height, one level fewer: about 75% of the
+texture's memory saved). `detile` (with `skip`) turns title level `m` into host level `m - 1` and never
+detiles level 0; `host_mip_range` maps a view's title levels onto the host's. Render targets, UAV and
+3D textures are never touched. Shortcut, not console behaviour: implicit-LOD sampling simply uses the
+next level (a little blurrier up close), explicit-LOD samples come out one level blurrier, and integer
+texel loads and `GetDimensions` see the smaller texture. Code: `native/textures.rs`; tests
+`drop_top_mip_tests` and `a_texture_made_without_its_top_level_gets_the_lower_levels`.
 
 ### Render passes
 

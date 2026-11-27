@@ -20,6 +20,7 @@ Always start from evidence: dump what was drawn, then form one hypothesis. Keep 
 | `VICTORY_TRACE_PIPES=1` | Logs each guessed pipeline's depth, stencil and blend state |
 | `VICTORY_DUMP_DESC_DIR=<dir>` | Writes each pipeline's register image (device slot 0x1c8) to a file |
 | `VICTORY_DEBUG_PS_RED=1` | Every translated pixel shader writes red (does geometry land at all?). Like the other `VICTORY_DEBUG_*` translation switches, it is part of the shader cache key, so it works on a warm cache |
+| `VICTORY_DEBUG_PS=id` | Every translated pixel shader writes a colour from a hash of its code (which shader drew this pixel?). Read a UNORM target; details in docs/native-host.md |
 | `VICTORY_DEBUG_VS_TRI=1` | Every vertex shader draws a full-target triangle (is the pixel shader right?) |
 | `VICTORY_DEBUG_NO_DEPTH=1` | Disables the depth test |
 

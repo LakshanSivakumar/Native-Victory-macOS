@@ -556,6 +556,15 @@ type UniformBit = (Bool, bool, Vec<(Atom, bool)>);
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// `VICTORY_DEBUG_PS=id`: the colour every float export of a pixel program writes, the low three
+/// bytes (red first) of the 32-bit FNV-1a hash of its console code (a container's `ACCC` code
+/// piece, as the `disasm` example takes it), so a target dump tells which program drew a pixel.
+pub(crate) fn debug_id_colour(code: &[u8]) -> [u8; 3] {
+    let h = code.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    let [r, g, b, _] = h.to_le_bytes();
+    [r, g, b]
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -7342,6 +7351,57 @@ impl<'a> Lower<'a> {
         seen
     }
 
+    /// `buffer_load_dword*` through a descriptor the program builds around its constant table
+    /// (`s_getpc_b64` plus an offset, `records` bytes in dword 2, no stride): the table's
+    /// dwords, and 0 for a dword past `records`, as the console's range check gives. `off` is the
+    /// byte from the descriptor's base, `in_view` the part of it the range check covers (all but
+    /// SOFFSET).
+    // shortcut: every OOB_SELECT mode is taken as a check of each dword's end (mode 3, the one
+    // the console compiler's tables use, RDNA2 ISA table 35); an index (`idxen`) is refused.
+    fn code_buffer_load(
+        &mut self,
+        inst: &Inst,
+        address: &Address,
+        (off, in_view): (V, V),
+        records: u32,
+        indexed: bool,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let count = match inst.name().strip_prefix("buffer_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x3") => 3,
+            Some("x4") => 4,
+            _ => return Err("an access other than a dword load through a descriptor built around a table in the code"),
+        };
+        if indexed {
+            return Err("an indexed load through a descriptor built around a table in the code");
+        }
+        let Fields::Buffer { data: Some(Operand::Vector { reg, .. }), .. } = &inst.fields else {
+            return Err("a buffer result");
+        };
+        let c = self.cur;
+        let mut at = self.s.m.i32(address.offset);
+        if let Some(d) = address.dynamic {
+            let d = self.i32_of(d)?;
+            at = self.s.m.bin(c, Bin::Add, at, d);
+        }
+        let at = self.s.m.bin(c, Bin::Add, at, off);
+        let (zero, limit) = (self.s.m.i32(0), self.s.m.i32(records));
+        for k in 0..count {
+            let c = self.cur;
+            let four = self.s.m.i32(4 * k);
+            let byte = self.s.m.bin(c, Bin::Add, at, four);
+            let x = self.code_dword(byte)?;
+            let end = self.s.m.i32(4 * k + 4);
+            let end = self.s.m.bin(c, Bin::Add, in_view, end);
+            let fits = self.s.m.cmp(c, pred::IULE, end, limit);
+            let x = self.s.m.select(c, fits, x, zero);
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
     /// `s_load_dword*` from the program's constant table.
     fn code_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
         let Fields::Smem {
@@ -13065,8 +13125,15 @@ impl<'a> Lower<'a> {
         if let Some(vo) = voffset {
             off = self.s.m.bin(c, Bin::Add, off, vo);
         }
+        // SOFFSET moves the base, not the bounds (as `computed_buffer`).
+        let in_view = off;
         if let Some(so) = so {
             off = self.s.m.bin(c, Bin::Add, off, so);
+        }
+        if let Source::Built { address, words: [records, _], .. } = src
+            && address.param == CODE
+        {
+            return self.code_buffer_load(inst, address, (off, in_view), *records, index.is_some(), guard);
         }
         if let Some(slot) = self.vertex_table_slot(src) {
             return self.vertex_fetch(inst, slot, typed, count, *format, *offset, index.is_some() && !*offen, guard);
@@ -13862,6 +13929,12 @@ impl<'a> Lower<'a> {
                     }
                 }
                 (true, Some("white")) => self.s.m.f32(1.0f32.to_bits()),
+                // Debug: which pixel program drew a pixel (`debug_id_colour`).
+                (true, Some("id")) => {
+                    let rgb = debug_id_colour(&self.x.native.code);
+                    let v = rgb.get(usize::from(col)).map_or(1.0, |&b| f32::from(b) / 255.0);
+                    self.s.m.f32(v.to_bits())
+                }
                 (true, Some("alpha")) if col == 3 => self.s.m.f32(1.0f32.to_bits()),
                 (true, _) if std::env::var_os("VICTORY_DEBUG_PS_RED").is_some() => {
                     self.s.m.f32(if col == 0 || col == 3 { 1.0f32.to_bits() } else { 0 })
@@ -14401,6 +14474,52 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The one value every edge into the joins of `phi` brings, through copies (`s_mov`, a
+    /// swap's last XOR, an SGPR spill read back): the register holds it on every path, so on
+    /// every lane whichever edge it came by.
+    fn copy_leaf(&self, phi: Value) -> Option<Value> {
+        let p = self.x.p;
+        let copy = |v: Value| match self.x.st.restored.get(&v) {
+            Some(&s) => Some(s),
+            None => crate::structure::copied(self.def_inst(v)?, v, |x| self.def_inst(x)),
+        };
+        let (mut seen, mut todo, mut leaf) = (Set::default(), vec![phi], None);
+        while let Some(mut a) = todo.pop() {
+            while let Some(c) = copy(a) {
+                a = c;
+            }
+            if !seen.insert(a) {
+                continue;
+            }
+            // shortcut: a bounded web, as `Lanes::unchanged` (spilled registers' joins are small).
+            if seen.len() > 64 {
+                return None;
+            }
+            match self.phi_at.get(&a) {
+                Some(&(b, i)) => todo.extend(p.blocks[b].phis[i].args.iter().copied()),
+                None if leaf.is_none_or(|x| x == a) => leaf = Some(a),
+                None => return None,
+            }
+        }
+        leaf
+    }
+
+    /// The number `phi` holds when it is [`Self::copy_leaf`]'s value: that value's, or with
+    /// console lanes a lane mask's ballot.
+    fn copied_number(&mut self, phi: Value) -> Option<V> {
+        let leaf = self.copy_leaf(phi)?;
+        match self.vals.get(&leaf) {
+            Some(&Val::I32(x)) => Some(x),
+            _ if self.mask_data == MaskData::Console => {
+                let was_ok = std::mem::replace(&mut self.mask_ok, true);
+                let x = self.i32_of(leaf);
+                self.mask_ok = was_ok;
+                x.ok()
+            }
+            _ => None,
+        }
+    }
+
     /// The instruction writing `v`.
     fn def_inst(&self, v: Value) -> Option<&'a Inst> {
         let b = *self.def_block.get(&v)?;
@@ -14808,6 +14927,13 @@ impl<'a> Lower<'a> {
                                 continue 'phi;
                             }
                         }
+                    }
+                    // Every edge brings one value round copies (a value swapped through a mask's
+                    // register and back on one arm): it, whichever edges the lanes took.
+                    (Some(Val::Missing(_)), false)
+                        if read && let Some(x) = self.copied_number(phi.value) =>
+                    {
+                        x
                     }
                     (Some(Val::Missing(why)), _) if read => {
                         retry.push((phi.value, why));
@@ -15285,6 +15411,12 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn the_debug_id_colour_is_the_low_bytes_of_fnv1a() {
+        // FNV-1a 32 of "a" is 0xe40c292c (the published test vector).
+        assert_eq!(super::debug_id_colour(b"a"), [0x2c, 0x29, 0x0c]);
+    }
 
     fn interp_copy_chain(moves: usize, arithmetic: bool) -> (bool, usize) {
         let mut words = Vec::new();

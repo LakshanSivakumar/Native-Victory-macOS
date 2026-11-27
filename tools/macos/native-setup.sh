@@ -28,7 +28,12 @@ elif [[ -n "$rustup_found" ]]; then
 else ok "rustup"; fi
 
 MSC="${VICTORY_MSC_DYLIB:-/usr/local/lib/libmetalirconverter.dylib}"
-if [[ -f "$MSC" ]]; then ok "Metal Shader Converter ($MSC)"
+msc_exports=$([[ -f "$MSC" ]] && nm -gU "$MSC" 2>/dev/null || true)
+if [[ -f "$MSC" && "$msc_exports" != *_IRCompilerSetFunctionConstantResourceSpace* ]]; then
+  # Converters before 3.0 lack this export and need array textures, which victory does not bind (#295).
+  warn "the Metal Shader Converter at $MSC is older than 3.0, and victory refuses it"
+  echo "        Install Apple's 3.0 or newer from https://developer.apple.com/metal/shader-converter/"
+elif [[ -f "$MSC" ]]; then ok "Metal Shader Converter ($MSC)"
 else
   warn "Metal Shader Converter not found at $MSC"
   echo "        Download \"Metal shader converter\" from https://developer.apple.com/metal/shader-converter/"

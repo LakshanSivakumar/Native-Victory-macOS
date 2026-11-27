@@ -1226,7 +1226,9 @@ fn pass_present(resource: This) {
             let Some(info) = crate::resource::texture_info(key as This) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
             let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
-            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || info.depth_or_layers > 1 && info.format != 28 {
+            // A 3D texture (a colour grading table) is read whole; arrays are skipped.
+            let d = if info.dimension == victory_formats::texture::Dimension::Tex3d { info.depth_or_layers.max(1) as usize } else { 1 };
+            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || d == 1 && info.depth_or_layers > 1 && info.format != 28 {
                 eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} layers={} skipped", info.format, info.depth_or_layers);
                 continue;
             }
@@ -1234,11 +1236,17 @@ fn pass_present(resource: This) {
                 eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} no host texture", info.format);
                 continue;
             };
-            let mut raw = vec![0u8; w * h * bpp];
+            let mut raw = vec![0u8; w * h * d * bpp];
             victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
-            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h) as f64;
+            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h * d) as f64;
+            let mut slices = String::new();
+            if d > 1 {
+                let lit = raw.chunks_exact(w * h * bpp).filter(|s| s.iter().any(|&b| b != 0)).count();
+                let distinct = raw.chunks_exact(bpp).collect::<std::collections::HashSet<_>>().len();
+                slices = format!(" depth={d} slices_nonzero={lit} distinct_texels={distinct}");
+            }
             let name = format!("p{num}_{key:x}_f{}_{w}x{h}.ppm", info.format);
-            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            let mut out = format!("P6\n{w} {}\n255\n", h * d).into_bytes();
             let mut extra = String::new();
             match info.format {
                 2 | 10 | 24 | 26 => {
@@ -1254,6 +1262,11 @@ fn pass_present(resource: This) {
                         nan16 = raw.chunks_exact(2).filter(|p| u16::from_le_bytes([p[0], p[1]]) & 0x7c00 == 0x7c00).count();
                     }
                     extra = format!(" max={max} min={min} mean={} notfinite={bad} infnan16={nan16} negative={neg}", sum / (rgb.len() * 3).max(1) as f64);
+                    // A few texels of 32-bit floats (exposure and histogram results): every channel, alpha too.
+                    if info.format == 2 && w * h <= 16 {
+                        let v: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                        extra += &format!(" values={v:?}");
+                    }
                     out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
                 }
                 28 | 29 | 87 | 91 => {
@@ -1266,7 +1279,7 @@ fn pass_present(resource: This) {
                 }
             }
             let _ = std::fs::write(std::path::Path::new(dir).join(&name), out);
-            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{extra} file={name}", info.format, info.memory as usize);
+            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{slices}{extra} file={name}", info.format, info.memory as usize);
         }
     });
 }
@@ -1344,12 +1357,17 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let copies_recorded = COPIES[0].load(Ordering::Relaxed);
     let indirect = crate::list::indirect_dropped();
-    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps]) = with_title(|t| {
+    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps], metal_mb) = with_title(|t| {
         let h = &t.host;
-        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64])
+        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64], victory_backend::backend::ComputeBackend::allocated_bytes(&h.backend) >> 20)
     })
     .unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
+    // Where the memory is when command buffers stall (#79): Metal's own count and the process footprint.
+    #[cfg(target_os = "macos")]
+    let footprint_mb = victory_platform::mem::footprint() >> 20;
+    #[cfg(not(target_os = "macos"))]
+    let footprint_mb = 0usize;
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, metal_mb, footprint_mb, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
     if let Some(n) = super::host::heap_set_trace()
         && let Some([all, idle, never]) = with_title(|t| t.host.heap_set_report(n)).flatten()
     {
@@ -1864,6 +1882,31 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
     });
 }
 
+/// A direct mesh dispatch (`DispatchMesh`, or `DispatchMeshX` without an argument address): the
+/// bound mesh pipeline runs `[x, y, z]` groups, as an indirect one runs its record's (#353). With
+/// no mesh pipeline it is dropped for the reason `graphics` gives, and counted in the frame line's
+/// `mesh=` as before.
+pub(crate) fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+    RECORDED.fetch_add(1, Ordering::Relaxed);
+    with_list(this, |t, l| {
+        if graphics(t, l, true).is_none() {
+            crate::list::DROPPED_KINDS[0].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if pass_on() {
+            pass_note_op(l, &format!("mesh[{x},{y},{z}]"), None, None);
+        }
+        match l.list.dispatch_mesh(x, y, z) {
+            Ok(()) => {
+                ENCODED.fetch_add(1, Ordering::Relaxed);
+                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                trace_present_draw(t, l);
+            }
+            Err(e) => tracing::warn!(error = %e, "mesh dispatch"),
+        }
+    });
+}
+
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
@@ -2105,6 +2148,14 @@ fn subresource_mip_slice(info: &super::textures::TextureInfo, subresource: u32) 
     (sub < mips * slices).then(|| (sub % mips, sub / mips))
 }
 
+/// The host texture's level for title level `mip`: `None` for a top level the host texture was
+/// made without (`VICTORY_TEXTURE_DROP_TOP_MIP`). Host level `mip - dropped` has the title level's
+/// size. Shortcut: a copy to or from a dropped level is skipped, not scaled; the switch is off by
+/// default.
+fn host_mip(info: &super::textures::TextureInfo, mip: usize) -> Option<usize> {
+    mip.checked_sub(info.dropped_levels())
+}
+
 fn mip_dims(info: &super::textures::TextureInfo, mip: usize) -> [usize; 3] {
     [
         (info.width as usize >> mip).max(1),
@@ -2263,17 +2314,20 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
         }
         for slice in 0..slices {
             for mip in 0..mips {
+                let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, mip), host_mip(&dst_info, mip)) else {
+                    continue;
+                };
                 let s = mip_dims(&src_info, mip);
                 let d = mip_dims(&dst_info, mip);
                 let size = [s[0].min(d[0]), s[1].min(d[1]), s[2].min(d[2])];
                 l.list.copy_texture_region(
                     &src_tex,
-                    mip,
+                    src_mip,
                     slice,
                     [0, 0, 0],
                     size,
                     &dst_tex,
-                    mip,
+                    dst_mip,
                     slice,
                     [0, 0, 0],
                 );
@@ -2330,6 +2384,9 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
+            let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, src_mip), host_mip(&dst_info, dst_mip)) else {
+                return true;
+            };
             with_list(this, |t, l| {
                 let (Some(src_tex), Some(dst_tex)) =
                     (t.texture_of(src.resource as usize), t.texture_of(dst.resource as usize))
@@ -2380,6 +2437,9 @@ pub(crate) fn copy_texture_region(
             if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
                 return false;
             }
+            let Some(dst_mip) = host_mip(&dst_info, dst_mip) else {
+                return true;
+            };
             let Some((src_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(src.resource, &src.footprint, src_at, size_u32)
             else {
@@ -2421,6 +2481,9 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
+            let Some(src_mip) = host_mip(&src_info, src_mip) else {
+                return true;
+            };
             let size_u32 = size.map(|v| v as u32);
             let Some((dst_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(dst.resource, &dst.footprint, origin, size_u32)

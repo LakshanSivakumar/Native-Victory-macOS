@@ -2883,16 +2883,21 @@ fn whole_wave_sections_refuse_unmodeled_effects_at_the_instruction() {
 /// A wave64 compute program of `threads` lanes with five root-constant SGPRs (`s[2:3]` an
 /// address), through `emit_with` as `translate_with` runs it on a 32-lane host.
 fn emit_wave64_cs(words: &[u32], threads: u32, lds: bool) -> Result<super::HostShader, ShaderError> {
+    emit_cs(words, true, threads, lds)
+}
+
+/// [`emit_wave64_cs`] for a program of either wave size.
+fn emit_cs(words: &[u32], wave64: bool, threads: u32, lds: bool) -> Result<super::HostShader, ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 16,
         layout: vec![root_const(0, 5)],
         used: vec![],
         io: StageIo::Cs(ComputeIo { rsrc2: u32::from(lds) << 15 | 5 << 1, threads: [threads, 1, 1] }),
         code: bytes_of(words),
     };
-    let p = ir::build(&native.code, true, native.vgprs)?;
+    let p = ir::build(&native.code, wave64, native.vgprs)?;
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
@@ -3022,6 +3027,53 @@ fn a_join_read_with_exec_needs_the_data_an_execnz_branch_brings() {
     assert_ne!(w, SKIP);
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("data whose high dword is not known"), "{err:?}");
+}
+
+/// A 32-lane program rotates a value through a lane mask's register by two swaps of three XORs
+/// each, on the path of the lanes below 20 only, and reads it after the join: `s21` is 7 on both
+/// edges (a copy before the branch, a swap's last XOR giving back what an earlier swap's last XOR
+/// gave back), so it is 7 in every lane whichever edge it took. The last XOR's operand was a lane
+/// mask in the structure (an XOR with the mask's register), so the swapped copy was no number and
+/// the join was refused as "a lane mask read as data" (four world compute programs, and pixel and
+/// vertex programs of the same shape).
+const SWAPPED_COPIES: &[u32] = &[
+    0xD4C4_000A,
+    0x0002_0090, // v_cmp_gt_u32 s10, 16, v0
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0xBE94_0387, // s_mov_b32 s20, 7
+    0xBE95_0314, // s_mov_b32 s21, s20
+    0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+    0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+    0xBF88_0006, // s_cbranch_execz JOIN
+    0x890A_140A, // s_xor_b32 s10, s10, s20
+    0x8914_140A, // s_xor_b32 s20, s10, s20
+    0x890A_140A, // s_xor_b32 s10, s10, s20 (s10: 7)
+    0x8915_0A15, // s_xor_b32 s21, s21, s10
+    0x890A_0A15, // s_xor_b32 s10, s21, s10
+    0x8915_0A15, // s_xor_b32 s21, s21, s10 (s21: what s10 held, 7)
+    0x887E_067E, // JOIN: s_or_b32 exec_lo, exec_lo, s6
+    0x7E04_0215, // v_mov_b32 v2, s21
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_join_of_swapped_copies_of_one_value_is_that_value() {
+    if let Err(e) = emit_cs(SWAPPED_COPIES, false, 32, false) {
+        panic!("{e}");
+    }
+}
+
+/// [`SWAPPED_COPIES`] with `s21` set to 8 before the branch: the edges bring 8 and 7, so what the
+/// register holds after the join depends on the path the wave ran last, and it stays refused.
+#[test]
+fn a_join_of_copies_of_two_values_stays_refused() {
+    let w: Vec<u32> =
+        SWAPPED_COPIES.iter().map(|&x| if x == 0xBE95_0314 { 0xBE95_0388 } else { x }).collect();
+    assert_ne!(w, SWAPPED_COPIES);
+    let err = emit_cs(&w, false, 32, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("a lane mask read as data"), "{err:?}");
 }
 
 /// [`SKIP`] with the skip written as `s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1` and the region

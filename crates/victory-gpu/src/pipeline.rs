@@ -140,7 +140,12 @@ fn prewarm(shader: &Arc<Shader>) {
             return false;
         }
         let cores = std::thread::available_parallelism().map_or(8, usize::from);
-        let n = crate::prewarm::pool_size(cores);
+        // `VICTORY_PREWARM_WORKERS=<n>`: the pool's size instead of all cores but two.
+        let n = std::env::var("VICTORY_PREWARM_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| crate::prewarm::pool_size(cores));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("shader-prewarm-{i}")).spawn(|| {
                 crate::prewarm::lower_priority();
@@ -203,6 +208,8 @@ impl Shader {
         self.native
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                // For `victory translate --cache`, once the translator has changed.
+                crate::native::shaders::keep(&container);
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
                 if (made.is_err() || std::env::var_os("VICTORY_DUMP_ALL_SHADERS").is_some())
                     && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")

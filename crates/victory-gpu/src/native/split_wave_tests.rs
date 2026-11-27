@@ -1314,6 +1314,49 @@ fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_wi
     assert_eq!(got[20..], [0; 12]);
 }
 
+/// A 32-lane program that swaps a mask into `s8` by three `s_xor_b64` of SGPR pairs (the tile
+/// classifiers swap their loop masks out of a waterfall loop so) on lanes 0..19, and joins it
+/// with the address the lanes that skip bring in `s8`; the join is ANDed with EXEC before EXEC
+/// is restored, so only the swapped edge's lanes need a bit. `last` is the third XOR.
+fn swapped_mask(last: u32) -> [u32; 17] {
+    [
+        0xBE88_0302, // s_mov_b32 s8, s2
+        0xBE89_0303, // s_mov_b32 s9, s3
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+        skip_execz(5),
+        0xD4C4_0000, 0x0002_008A, // v_cmp_gt_u32 s0, 10, v0
+        0x8988_0008, // s_xor_b64 s[8:9], s[8:9], s[0:1]
+        0x8980_0008, // s_xor_b64 s[0:1], s[8:9], s[0:1]
+        last,
+        0x8708_7E08, // join: s_and_b32 s8, s8, exec_lo
+        0xBEFE_0304, // s_mov_b32 exec_lo, s4
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+    ]
+}
+
+#[test]
+fn a_mask_swapped_into_a_pair_by_64_bit_xors_in_a_32_lane_wave_is_that_mask_at_a_join() {
+    // The swap's last XOR gives the mask back bit for bit, so the join holds lanes 0..9 on the
+    // edge that swapped it (was refused: "data, at a join of several edges").
+    let mut w = swapped_mask(0x8988_0008).to_vec(); // s_xor_b64 s[8:9], s[8:9], s[0:1]
+    w.push(S_ENDPGM);
+    assert_eq!(refusal32(&w), None);
+    // Look-alike: a third XOR with another pair is no swap; `s8` is the mask XORed with data.
+    let mut other = swapped_mask(0x8988_0208).to_vec(); // s_xor_b64 s[8:9], s[8:9], s[2:3]
+    other.push(S_ENDPGM);
+    let why = refusal32(&other);
+    assert!(why.as_ref().is_some_and(|r| r.contains("at a join of several edges")), "{why:?}");
+    let got = run32(&w, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..10], [1; 10]);
+    assert_eq!(got[10..], [0; 22]);
+}
+
 #[test]
 fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
     // 1. `s_bfm_b64` with a dynamic width/offset (`((1 << 10) - 1) << 30 = 0xFF_C000_0000`,

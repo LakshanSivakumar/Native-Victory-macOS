@@ -1089,6 +1089,20 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// The key the last XORs of a swap ([`xored_back`]) give back in `k`, each half, or both
+    /// halves of a 32-lane key.
+    fn copy_key(&self, k: Key) -> Option<Key> {
+        let p = self.p;
+        let def = |x: Value| self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i]);
+        let copy = |v: Value| {
+            let inst = def(v)?;
+            xored_back(inst, inst.writes.iter().position(|&(_, x)| x == v)? as u8, def)
+        };
+        let lo = copy(k.0)?;
+        let hi = if p.wave64 { copy(k.1)? } else { lo };
+        Some((lo, hi))
+    }
+
     /// One step back across a 32-bit value-preserving copy or spill restore.
     fn unwrap_half_step(&self, v: Value) -> Option<Value> {
         if let Some(&s) = self.restored.get(&v) {
@@ -1534,6 +1548,11 @@ impl<'a> Lanes<'a> {
                     && let Some((m, d)) = self.split_wave64(k, 16)
                 {
                     (m, d || exec_w)
+                } else if let Some(src) = self.copy_key(k) {
+                    // The last XOR of a swap (also of a pair a 32-lane program swaps with
+                    // `s_xor_b64`): the mask it gives back, bit for bit. (Moves are `sop`'s.)
+                    let (m, d) = self.mask(src);
+                    (m, d || exec_w)
                 } else {
                     let born = self.born(k.0);
                     (self.b.atom(Atom::Opaque(k.0), born), exec_w)
@@ -1633,20 +1652,8 @@ impl<'a> Lanes<'a> {
             if let Some(&s) = self.restored.get(&v) {
                 return Some(s);
             }
-            let &(b, i) = self.defs.get(&v)?;
-            let inst = &p.blocks[b].insts[i];
-            let half = inst.writes.iter().position(|&(_, x)| x == v)? as u8;
-            match (inst.name(), &inst.fields) {
-                ("s_mov_b32" | "s_mov_b64", Fields::Sop { src, .. }) => match src.as_slice() {
-                    [Operand::Scalar { code, .. }] if *code != NULL => {
-                        inst.read(Reg::S(code + half))
-                    }
-                    _ => None,
-                },
-                _ => xored_back(inst, half, |x| {
-                    self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i])
-                }),
-            }
+            let def = |x: Value| self.defs.get(&x).map(|&(b, i)| &p.blocks[b].insts[i]);
+            copied(def(v)?, v, def)
         };
         let phi_args = |k: Key| -> Option<Vec<Key>> {
             let (&(b, i), &(hb, hi)) = (self.phis.get(&k.0)?, self.phis.get(&k.1)?);
@@ -2221,6 +2228,24 @@ fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), 
             what: "irreducible control flow",
         }),
         None => Ok(()),
+    }
+}
+
+/// What `v`, which `inst` writes, is a copy of: the SGPR an `s_mov` moves (each dword of a pair
+/// on its own), or what a swap's last XOR gives back ([`xored_back`]). `def` gives a value's
+/// instruction.
+pub(crate) fn copied<'a>(
+    inst: &Inst,
+    v: Value,
+    def: impl Fn(Value) -> Option<&'a Inst>,
+) -> Option<Value> {
+    let half = inst.writes.iter().position(|&(_, x)| x == v)? as u8;
+    match (inst.name(), &inst.fields) {
+        ("s_mov_b32" | "s_mov_b64", Fields::Sop { src, .. }) => match src.as_slice() {
+            [Operand::Scalar { code, .. }] if *code != NULL => inst.read(Reg::S(code + half)),
+            _ => None,
+        },
+        _ => xored_back(inst, half, def),
     }
 }
 
