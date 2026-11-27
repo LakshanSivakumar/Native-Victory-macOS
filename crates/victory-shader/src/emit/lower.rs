@@ -304,6 +304,10 @@ struct Lower<'a> {
     unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
     /// [`Lower::load_use`], made at the first descriptor load read as data.
     load_uses: std::cell::OnceCell<Map<Site, (Site, u8)>>,
+    /// Divergent loops in the fast path, made lazily on first mask read.
+    divergent_loops: std::cell::OnceCell<Vec<DivergentLoop>>,
+    /// Memoized safe `(loop header, wave_wide, value)` pairs for [`Lower::check_loop_mask`].
+    loop_mask_ok: std::cell::RefCell<Set<(usize, bool, Value)>>,
     data_phis: Vec<(V, usize, usize)>,
     /// [`Lower::spill_slot`]: the phi made for lane `.1` of VGPR phi `.0`, and those whose
     /// incoming values are still to fill (block, phi index, lane).
@@ -530,6 +534,13 @@ struct MemoryEntry {
     miss: V,
 }
 
+struct DivergentLoop {
+    header: usize,
+    in_loop: Vec<bool>,
+    reachable_from: Vec<bool>,
+    exec_unwidened: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaskData {
     /// Compute: host lane n is console lane n (the program declares the
@@ -555,6 +566,8 @@ type UniformBit = (Bool, bool, Vec<(Atom, bool)>);
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+/// A lane mask updated across passes of a divergent loop and read after it.
+const LOOP_MASK_EXIT: Why = "a loop-carried lane mask read after a divergent loop";
 
 /// `VICTORY_DEBUG_PS=id`: the colour every float export of a pixel program writes, the low three
 /// bytes (red first) of the 32-bit FNV-1a hash of its console code (a container's `ACCC` code
@@ -1096,6 +1109,8 @@ impl<'a> Lower<'a> {
             pending_masks: Vec::new(),
             unneeded: std::cell::OnceCell::new(),
             load_uses: std::cell::OnceCell::new(),
+            divergent_loops: std::cell::OnceCell::new(),
+            loop_mask_ok: std::cell::RefCell::new(Set::default()),
             data_phis: Vec::new(),
             spill_phis: Map::default(),
             pending_spills: Vec::new(),
@@ -2488,6 +2503,8 @@ impl<'a> Lower<'a> {
             return self.mask_dword(v).map(Val::I32);
         }
         if let (Some(Val::Missing(_)), Some(&u)) = (found, self.uniform_scc.get(&v)) {
+            let def_b = self.def_block.get(&v).copied().unwrap_or(0);
+            self.check_loop_mask(u, def_b, false)?;
             let at = match self.def_block.get(&v) {
                 None => self.s.entry,
                 Some(&b) if b == self.cur_ir => self.cur,
@@ -2500,6 +2517,22 @@ impl<'a> Lower<'a> {
         if let (Some(Val::Missing(_)), Some((m, not, fixed))) =
             (found, self.uniform_bits.get(&v).cloned())
         {
+            let def_b = self.def_block.get(&v).copied().unwrap_or(0);
+            if let Some(inst) = self.def_inst(v)
+                && let Fields::Sop { src, .. } = &inst.fields
+            {
+                for op in src {
+                    if let Operand::Scalar { code, .. } = *op
+                        && code != NULL
+                        && let Some(arg) = inst.read(Reg::S(code))
+                        && (self.x.st.masks.contains_key(&arg)
+                            || self.x.st.other.contains_key(&arg)
+                            || self.x.st.highs.contains_key(&arg))
+                    {
+                        self.check_loop_mask(arg, def_b, false)?;
+                    }
+                }
+            }
             let at = match self.def_block.get(&v) {
                 None => self.s.entry,
                 Some(&b) if b == self.cur_ir => self.cur,
@@ -2514,6 +2547,8 @@ impl<'a> Lower<'a> {
             return Ok(Val::Bit(x));
         }
         if let (Some(Val::Missing(_)), Some(&(lo, hi))) = (found, self.mask_scc.get(&v)) {
+            let def_b = self.def_block.get(&v).copied().unwrap_or(0);
+            self.check_loop_mask(lo, def_b, true)?;
             // SCC of a mask operation read as data: some lane in the result.
             // Emit in the defining block so caching in `vals` dominates all uses,
             // and allow reading the mask dwords even when the consumer does not
@@ -2722,6 +2757,11 @@ impl<'a> Lower<'a> {
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
+        self.mask_dword_at(v, self.cur_ir)
+    }
+
+    /// [`Self::mask_dword`] checked at consumer block `use_b`.
+    fn mask_dword_at(&mut self, v: Value, use_b: usize) -> Result<V, Why> {
         let (lo, high) = match self.x.st.highs.get(&v) {
             Some(&lo) => (lo, true),
             None => (v, false),
@@ -2736,6 +2776,7 @@ impl<'a> Lower<'a> {
             .support(m)
             .iter()
             .any(|a| matches!(a, Atom::Quad(_)));
+        self.check_loop_mask(lo, use_b, true)?;
         if (!self.x.st.active.contains(&lo) || has_quad) && !self.ballots.contains_key(&lo) {
             let xy = self.mask_number(lo)?;
             self.ballots.insert(lo, xy);
@@ -3672,6 +3713,7 @@ impl<'a> Lower<'a> {
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
+                self.check_loop_mask(v, self.cur_ir, false)?;
                 let hi = match self.pair_high(v) {
                     Some(h) => Some(self.get(h)?),
                     None => None,
@@ -3690,6 +3732,7 @@ impl<'a> Lower<'a> {
             // `1 << s_ff1(mask)`, `mask & -mask`, `mask & (mask - 1)`,
             // `s_bitset0(mask, s_ff1(mask))`, uniform all-0/all-1 masks).
             Atom::Opaque(v) if self.mask_data == MaskData::Host => {
+                self.check_loop_mask(v, self.cur_ir, false)?;
                 let hi_val = self.pair_high(v);
                 if !self.is_host_wave_mask(v, hi_val, &mut Set::default()) {
                     return Err("an opaque lane mask");
@@ -5405,7 +5448,7 @@ impl<'a> Lower<'a> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Err(why) if effect || why == LOOP_MASK_EXIT => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
@@ -5479,6 +5522,25 @@ impl<'a> Lower<'a> {
             || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
             || self.is_mask(lo)
         {
+            if inst.write(Reg::S(EXEC)).is_some()
+                || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some())
+            {
+                let exec_in = inst.read(Reg::S(EXEC));
+                let exec_hi_in = self.x.native.wave64.then(|| inst.read(Reg::S(EXEC + 1))).flatten();
+                for op in src {
+                    if let Operand::Scalar { code, .. } = *op
+                        && code != NULL
+                        && let Some(u) = inst.read(Reg::S(code))
+                        && Some(u) != exec_in
+                        && Some(u) != exec_hi_in
+                        && (self.x.st.masks.contains_key(&u)
+                            || self.x.st.other.contains_key(&u)
+                            || self.x.st.highs.contains_key(&u))
+                    {
+                        self.check_loop_mask(u, self.cur_ir, false)?;
+                    }
+                }
+            }
             if let Some(scc) = scc {
                 // The result is EXEC when written, else the destination.
                 let pair = |l: u8| {
@@ -9401,8 +9463,8 @@ impl<'a> Lower<'a> {
             "v_cndmask_b32" => {
                 let cond = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => {
-                        let m = inst
-                            .read(Reg::S(code))
+                        let mask_val = inst.read(Reg::S(code));
+                        let m = mask_val
                             .and_then(|m| {
                                 self.x
                                     .st
@@ -9412,6 +9474,9 @@ impl<'a> Lower<'a> {
                                     .copied()
                             })
                             .ok_or("a select on an untracked mask")?;
+                        if let Some(mv) = mask_val {
+                            self.check_loop_mask(mv, self.cur_ir, false)?;
+                        }
                         self.boolean(m, c)?
                     }
                     Some(&Operand::Const(k)) => {
@@ -9472,13 +9537,16 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
+                    let mask_val = match v.src.get(2) {
                         Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                         _ => None,
                     };
-                    let m = m
+                    let m = mask_val
                         .and_then(|m| self.x.st.masks.get(&m).copied())
                         .ok_or("a carry-in from an untracked mask")?;
+                    if let Some(mv) = mask_val {
+                        self.check_loop_mask(mv, self.cur_ir, false)?;
+                    }
                     Some(self.boolean(m, c)?)
                 } else {
                     None
@@ -11613,6 +11681,1047 @@ impl<'a> Lower<'a> {
             }
         }
         false
+    }
+
+    fn is_mask_sop(name: &str) -> bool {
+        let base = name
+            .strip_suffix("_b32")
+            .or_else(|| name.strip_suffix("_b64"))
+            .or_else(|| name.strip_suffix("_u32"))
+            .or_else(|| name.strip_suffix("_u64"))
+            .or_else(|| name.strip_suffix("_i32"));
+        matches!(
+            name,
+            "s_movk_i32" | "s_cmovk_i32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
+        ) || matches!(
+            base,
+            Some(
+                "s_mov"
+                    | "s_not"
+                    | "s_and"
+                    | "s_or"
+                    | "s_xor"
+                    | "s_andn2"
+                    | "s_orn2"
+                    | "s_nand"
+                    | "s_nor"
+                    | "s_xnor"
+                    | "s_cselect"
+                    | "s_cmov"
+                    | "s_wqm"
+                    | "s_and_saveexec"
+                    | "s_or_saveexec"
+                    | "s_xor_saveexec"
+                    | "s_andn2_saveexec"
+                    | "s_orn2_saveexec"
+                    | "s_nand_saveexec"
+                    | "s_nor_saveexec"
+                    | "s_xnor_saveexec"
+                    | "s_andn2_wrexec"
+                    | "s_cmp_eq"
+                    | "s_cmp_lg"
+                    | "s_bitcmp0"
+                    | "s_bitcmp1"
+            )
+        )
+    }
+
+    /// Whether `arg` is `EXEC` on an edge out of `q -> b` that is only taken when `EXEC == 0`.
+    fn is_exec_zero_edge(&self, q: usize, b: usize, arg: Value) -> bool {
+        let Some(last) = self.x.p.blocks[q].insts.last() else {
+            return false;
+        };
+        let is_exec_val = last.read(Reg::S(EXEC)) == Some(arg)
+            || (self.x.native.wave64 && last.read(Reg::S(EXEC + 1)) == Some(arg));
+        if !is_exec_val {
+            return false;
+        }
+        let LaneExit::Branch { taken, not_taken, .. } = self.x.st.exits[q] else {
+            return false;
+        };
+        match last.name() {
+            "s_cbranch_execnz" => not_taken == b && taken != b,
+            "s_cbranch_execz" => taken == b && not_taken != b,
+            _ => false,
+        }
+    }
+
+    /// Every natural loop in the fast path that has at least one divergent
+    /// exit (where lanes can leave on different passes).
+    fn divergent_loops(&self) -> &[DivergentLoop] {
+        self.divergent_loops.get_or_init(|| {
+            if self.x.st.lockstep {
+                return Vec::new();
+            }
+            let p = self.x.p;
+            let mut out = Vec::new();
+            for h in 0..p.blocks.len() {
+                if self.block[h].is_none() {
+                    continue;
+                }
+                let backs: Vec<usize> = p.blocks[h]
+                    .preds
+                    .iter()
+                    .copied()
+                    .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+                    .collect();
+                if backs.is_empty() {
+                    continue;
+                }
+                let mut in_loop = vec![false; p.blocks.len()];
+                in_loop[h] = true;
+                let mut stack = backs;
+                while let Some(x) = stack.pop() {
+                    if std::mem::replace(&mut in_loop[x], true) {
+                        continue;
+                    }
+                    for &q in &p.blocks[x].preds {
+                        if self.block[q].is_some() && !in_loop[q] {
+                            stack.push(q);
+                        }
+                    }
+                }
+                if self.is_divergent_loop(h, &in_loop) {
+                    let mut reachable_from = vec![false; p.blocks.len()];
+                    let mut rstack: Vec<usize> = (0..p.blocks.len())
+                        .filter(|&b| in_loop[b])
+                        .flat_map(|b| p.blocks[b].exit.successors())
+                        .filter(|&s| !in_loop[s] && self.block[s].is_some())
+                        .collect();
+                    while let Some(x) = rstack.pop() {
+                        if std::mem::replace(&mut reachable_from[x], true) {
+                            continue;
+                        }
+                        for s in p.blocks[x].exit.successors() {
+                            if self.block[s].is_some() && !reachable_from[s] {
+                                rstack.push(s);
+                            }
+                        }
+                    }
+                    let exec_unwidened = self.exec_unwidened(&in_loop);
+                    out.push(DivergentLoop {
+                        header: h,
+                        in_loop,
+                        reachable_from,
+                        exec_unwidened,
+                    });
+                }
+            }
+            out
+        })
+    }
+
+    /// Whether a natural loop `in_loop` (with header `h`) can let surviving lanes
+    /// exit on different passes.
+    ///
+    /// Why a loop for which this returns `false` cannot let lanes leave on different
+    /// passes: every block exiting `in_loop` either is a pixel `discard` kill-exit
+    /// (`st.discards`, taken only when all lanes in the wave have discarded so no
+    /// surviving lane exits there), has a single successor or a `Uniform`-only exit
+    /// condition (all active lanes agree on leaving on that pass), and no intra-loop
+    /// non-uniform branch can send one arm out of an exit block while another arm
+    /// skips that exit within the same iteration (`reach_b` ignoring back-edges to `h`).
+    fn is_divergent_loop(&self, h: usize, in_loop: &[bool]) -> bool {
+        let p = self.x.p;
+        let st = self.x.st;
+        let non_uniform =
+            |w: Bool| st.bools.support(w).iter().any(|a| !matches!(a, Atom::Uniform(_)));
+        let is_discard_exit = |b: usize| {
+            p.blocks[b]
+                .insts
+                .len()
+                .checked_sub(1)
+                .is_some_and(|last| st.discards.contains_key(&(b, last)))
+        };
+        for (b, &inside) in in_loop.iter().enumerate() {
+            if !inside || is_discard_exit(b) {
+                continue;
+            }
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = st.exits[b]
+                && taken != not_taken
+                && (!in_loop[taken] || !in_loop[not_taken])
+                && non_uniform(when)
+            {
+                return true;
+            }
+            // An exit block reached asymmetrically under a divergent `if` inside the same pass.
+            let has_exit = p.blocks[b].exit.successors().into_iter().any(|s| !in_loop[s]);
+            if has_exit
+                && st
+                    .exits
+                    .iter()
+                    .enumerate()
+                    .any(|(u, exit)| {
+                        in_loop[u]
+                            && !is_discard_exit(u)
+                            && match *exit {
+                                LaneExit::Branch {
+                                    when,
+                                    taken,
+                                    not_taken,
+                                } if taken != not_taken && non_uniform(when) => {
+                                    let reach_b = |start: usize| -> bool {
+                                        let mut seen = vec![false; p.blocks.len()];
+                                        let mut work = vec![start];
+                                        while let Some(x) = work.pop() {
+                                            if x == b {
+                                                return true;
+                                            }
+                                            if !in_loop[x] || std::mem::replace(&mut seen[x], true) {
+                                                continue;
+                                            }
+                                            for s in p.blocks[x].exit.successors() {
+                                                if s != h {
+                                                    work.push(s);
+                                                }
+                                            }
+                                        }
+                                        false
+                                    };
+                                    reach_b(taken) != reach_b(not_taken)
+                                }
+                                _ => false,
+                            }
+                    })
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether every write to EXEC inside `in_loop` only narrows or restores an
+    /// active subset saved inside `in_loop` (so exited lanes stay off).
+    fn exec_unwidened(&self, in_loop: &[bool]) -> bool {
+        let p = self.x.p;
+        let mut saved_memo: Map<Value, bool> = Map::default();
+        let mut saved_visiting: Set<Value> = Set::default();
+        fn saved_in_loop(
+            lower: &Lower<'_>,
+            v: Value,
+            in_loop: &[bool],
+            memo: &mut Map<Value, bool>,
+            visiting: &mut Set<Value>,
+        ) -> bool {
+            if let Some(&res) = memo.get(&v) {
+                return res;
+            }
+            if !visiting.insert(v) {
+                return false;
+            }
+            let res = if let Some(&(pb, pi)) = lower.phi_at.get(&v) {
+                in_loop[pb]
+                    && (lower.x.st.active.contains(&v) || {
+                        let block = &lower.x.p.blocks[pb];
+                        let phi = &block.phis[pi];
+                        let mut has_pred = false;
+                        let mut all_ok = true;
+                        for (n, &q) in block.preds.iter().enumerate() {
+                            if lower.block[q].is_none() || lower.never_taken(q, pb) {
+                                continue;
+                            }
+                            if lower.rpo[q] >= lower.rpo[pb] {
+                                all_ok = false;
+                                break;
+                            }
+                            has_pred = true;
+                            if !saved_in_loop(lower, phi.args[n], in_loop, memo, visiting) {
+                                all_ok = false;
+                                break;
+                            }
+                        }
+                        has_pred && all_ok
+                    })
+            } else if let Some(&orig) = lower.x.st.restored.get(&v) {
+                saved_in_loop(lower, orig, in_loop, memo, visiting)
+            } else if let Some(&db) = lower.def_block.get(&v)
+                && in_loop[db]
+                && let Some(inst) = lower.def_inst(v)
+            {
+                if let Some(copies) = lower.xor_copies(inst)
+                    && let Some(&(_, orig)) = copies.iter().find(|&&(w, _)| w == v)
+                {
+                    saved_in_loop(lower, orig, in_loop, memo, visiting)
+                } else if inst.read(Reg::S(EXEC)).is_some()
+                    && matches!(
+                        inst.name(),
+                        "s_and_saveexec_b32"
+                            | "s_and_saveexec_b64"
+                            | "s_mov_b32"
+                            | "s_mov_b64"
+                    )
+                {
+                    true
+                } else if let Fields::Sop { src, .. } = &inst.fields {
+                    let half = inst.writes.iter().position(|w| w.1 == v).unwrap_or(0) as u8;
+                    let is_saved_op = |op: &Operand,
+                                       memo: &mut Map<Value, bool>,
+                                       visiting: &mut Set<Value>| {
+                        match *op {
+                            Operand::Scalar { code, .. } if code != NULL => {
+                                code == EXEC
+                                    || (lower.x.native.wave64 && code == EXEC + 1)
+                                    || inst.read(Reg::S(code + half)).is_some_and(|next| {
+                                        saved_in_loop(lower, next, in_loop, memo, visiting)
+                                    })
+                            }
+                            _ => false,
+                        }
+                    };
+                    match (inst.name(), src.as_slice()) {
+                        ("s_andn2_b32" | "s_andn2_b64", [a, _]) => {
+                            is_saved_op(a, memo, visiting)
+                        }
+                        ("s_and_b32" | "s_and_b64", [a, c]) => {
+                            is_saved_op(a, memo, visiting) || is_saved_op(c, memo, visiting)
+                        }
+                        ("s_mov_b32" | "s_mov_b64", [Operand::Scalar { code, .. }])
+                            if *code != NULL =>
+                        {
+                            inst.read(Reg::S(*code + half)).is_some_and(|next| {
+                                saved_in_loop(lower, next, in_loop, memo, visiting)
+                            })
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            visiting.remove(&v);
+            memo.insert(v, res);
+            res
+        }
+        let is_exec = |code: u8| code == EXEC || (self.x.native.wave64 && code == EXEC + 1);
+        for (b, &inside) in in_loop.iter().enumerate() {
+            if !inside {
+                continue;
+            }
+            let discard_block = p.blocks[b]
+                .insts
+                .len()
+                .checked_sub(1)
+                .is_some_and(|last| self.x.st.discards.contains_key(&(b, last)));
+            for (idx, inst) in p.blocks[b].insts.iter().enumerate() {
+                let writes_exec = inst.write(Reg::S(EXEC)).is_some()
+                    || (self.x.native.wave64 && inst.write(Reg::S(EXEC + 1)).is_some());
+                if !writes_exec {
+                    continue;
+                }
+                let name = inst.name();
+                if name.starts_with("v_cmpx_") {
+                    continue;
+                }
+                // `s_wqm` immediately before a `st.discards` exit only widens for `s_cbranch_execz`
+                // and cannot run vector compares on exited lanes.
+                if matches!(name, "s_wqm_b32" | "s_wqm_b64")
+                    && discard_block
+                    && idx + 2 == p.blocks[b].insts.len()
+                {
+                    continue;
+                }
+                let Fields::Sop { src, .. } = &inst.fields else {
+                    return false;
+                };
+                let ok = match (name, src.as_slice()) {
+                    (n, _)
+                        if n.starts_with("s_and_saveexec_")
+                            || n.starts_with("s_andn2_wrexec_") =>
+                    {
+                        true
+                    }
+                    ("s_and_b32" | "s_and_b64", [a, c]) => {
+                        matches!(a, Operand::Scalar { code, .. } if is_exec(*code))
+                            || matches!(c, Operand::Scalar { code, .. } if is_exec(*code))
+                    }
+                    ("s_andn2_b32" | "s_andn2_b64", [a, _]) => {
+                        matches!(a, Operand::Scalar { code, .. } if is_exec(*code))
+                    }
+                    ("s_mov_b32" | "s_mov_b64", [Operand::Scalar { code, .. }])
+                        if *code != NULL =>
+                    {
+                        is_exec(*code)
+                            || inst.read(Reg::S(*code)).is_some_and(|u| {
+                                saved_in_loop(self, u, in_loop, &mut saved_memo, &mut saved_visiting)
+                            })
+                    }
+                    ("s_or_b32" | "s_or_b64", [a, c]) => {
+                        let mut ok_op = |op: &Operand| match *op {
+                            Operand::Scalar { code, .. } if is_exec(code) => true,
+                            Operand::Scalar { code, .. } if code != NULL => {
+                                inst.read(Reg::S(code)).is_some_and(|u| {
+                                    saved_in_loop(
+                                        self,
+                                        u,
+                                        in_loop,
+                                        &mut saved_memo,
+                                        &mut saved_visiting,
+                                    )
+                                })
+                            }
+                            _ => false,
+                        };
+                        ok_op(a) && ok_op(c)
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Refuses reading a lane mask at `use_b` across the exit of a divergent
+    /// loop when later loop passes can change its bits (or for wave-wide reads,
+    /// other lanes' bits) after a lane has already left.
+    fn check_loop_mask(&self, v: Value, use_b: usize, wave_wide: bool) -> Result<(), Why> {
+        let loops = self.divergent_loops();
+        if loops.is_empty() {
+            return Ok(());
+        }
+        let hi = self.pair_high(v);
+        for l in loops {
+            if l.in_loop[use_b] || !l.reachable_from[use_b] {
+                continue;
+            }
+            self.check_one_loop_mask(v, l, wave_wide, &mut Set::default())?;
+            if let Some(h) = hi {
+                self.check_one_loop_mask(h, l, wave_wide, &mut Set::default())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_one_loop_mask(
+        &self,
+        v: Value,
+        l: &DivergentLoop,
+        wave_wide: bool,
+        seen: &mut Set<Value>,
+    ) -> Result<(), Why> {
+        if self.loop_mask_ok.borrow().contains(&(l.header, wave_wide, v)) || !seen.insert(v) {
+            return Ok(());
+        }
+        let p = self.x.p;
+        if let Some(&(pb, pi)) = self.phi_at.get(&v) {
+            if self.dominates(pb, l.header) && pb != l.header {
+                self.loop_mask_ok.borrow_mut().insert((l.header, wave_wide, v));
+                return Ok(());
+            }
+            if !l.in_loop[pb] {
+                let phi = &p.blocks[pb].phis[pi];
+                for (n, &q) in p.blocks[pb].preds.iter().enumerate() {
+                    if self.block[q].is_some()
+                        && !self.never_taken(q, pb)
+                        && !self.unneeded_edges().contains(&(v, n))
+                        && !self.is_exec_zero_edge(q, pb, phi.args[n])
+                    {
+                        self.check_one_loop_mask(phi.args[n], l, wave_wide, seen)?;
+                    }
+                }
+                self.loop_mask_ok.borrow_mut().insert((l.header, wave_wide, v));
+                return Ok(());
+            }
+            return if self.loop_value_safe(v, l, wave_wide) {
+                self.loop_mask_ok.borrow_mut().insert((l.header, wave_wide, v));
+                Ok(())
+            } else {
+                Err(LOOP_MASK_EXIT)
+            };
+        }
+        if let Some(&orig) = self.x.st.restored.get(&v) {
+            self.check_one_loop_mask(orig, l, wave_wide, seen)?;
+            self.loop_mask_ok.borrow_mut().insert((l.header, wave_wide, v));
+            return Ok(());
+        }
+        let Some(&db) = self.def_block.get(&v) else {
+            self.loop_mask_ok.borrow_mut().insert((l.header, wave_wide, v));
+            return Ok(());
+        };
+        if !l.in_loop[db] {
+            if self.dominates(db, l.header) {
+                self.loop_mask_ok.borrow_mut().insert((l.header, wave_wide, v));
+                return Ok(());
+            }
+            if let Some(inst) = self.def_inst(v)
+                && Self::is_mask_sop(inst.name())
+                && let Fields::Sop { src, .. } = &inst.fields
+            {
+                let half = inst.writes.iter().position(|w| w.1 == v).unwrap_or(0) as u8;
+                let same_half = matches!(
+                    inst.name(),
+                    "s_mov_b64"
+                        | "s_and_b64"
+                        | "s_or_b64"
+                        | "s_xor_b64"
+                        | "s_andn2_b64"
+                        | "s_orn2_b64"
+                        | "s_nand_b64"
+                        | "s_nor_b64"
+                        | "s_xnor_b64"
+                        | "s_not_b64"
+                        | "s_cselect_b64"
+                        | "s_cmov_b64"
+                );
+                for op in src {
+                    if let Operand::Scalar { code, .. } = *op
+                        && code != NULL
+                    {
+                        let reg = if same_half {
+                            Reg::S(code + half)
+                        } else {
+                            Reg::S(code)
+                        };
+                        if let Some(u) = inst.read(reg)
+                            && (self.x.st.masks.contains_key(&u)
+                                || self.x.st.other.contains_key(&u)
+                                || self.x.st.highs.contains_key(&u))
+                        {
+                            self.check_one_loop_mask(u, l, wave_wide, seen)?;
+                        }
+                    }
+                }
+            }
+            self.loop_mask_ok.borrow_mut().insert((l.header, wave_wide, v));
+            return Ok(());
+        }
+        if self.loop_value_safe(v, l, wave_wide) {
+            self.loop_mask_ok.borrow_mut().insert((l.header, wave_wide, v));
+            Ok(())
+        } else {
+            Err(LOOP_MASK_EXIT)
+        }
+    }
+
+    fn loop_value_safe(&self, v: Value, l: &DivergentLoop, wave_wide: bool) -> bool {
+        let mut inv_memo = Map::default();
+        let mut inv_visiting = Set::default();
+        if self.loop_invariant_mask(v, l, &mut inv_memo, &mut inv_visiting) {
+            return true;
+        }
+        if wave_wide {
+            return false;
+        }
+        let mut trace_memo = Map::default();
+        let mut trace_visiting = Set::default();
+        let mut zero_memo = Map::default();
+        let mut zero_visiting = Set::default();
+        let Some(target) = self.trace_preserved_phi(
+            v,
+            None,
+            l,
+            &mut trace_memo,
+            &mut trace_visiting,
+            &mut zero_memo,
+            &mut zero_visiting,
+        ) else {
+            return false;
+        };
+        let &(hb, hi) = &self.phi_at[&target];
+        let phi = &self.x.p.blocks[hb].phis[hi];
+        self.x.p.blocks[hb]
+            .preds
+            .iter()
+            .copied()
+            .zip(phi.args.iter().copied())
+            .all(|(q, arg)| {
+                !l.in_loop[q]
+                    || self.trace_preserved_phi(
+                        arg,
+                        Some(target),
+                        l,
+                        &mut trace_memo,
+                        &mut trace_visiting,
+                        &mut zero_memo,
+                        &mut zero_visiting,
+                    ) == Some(target)
+            })
+    }
+
+    fn loop_invariant_mask(
+        &self,
+        v: Value,
+        l: &DivergentLoop,
+        memo: &mut Map<Value, bool>,
+        visiting: &mut Set<Value>,
+    ) -> bool {
+        if let Some(&ok) = memo.get(&v) {
+            return ok;
+        }
+        if !visiting.insert(v) {
+            return false;
+        }
+        let ok = if let Some(&orig) = self.x.st.restored.get(&v) {
+            self.loop_invariant_mask(orig, l, memo, visiting)
+        } else if let Some(&(pb, _)) = self.phi_at.get(&v) {
+            !l.in_loop[pb] && self.dominates(pb, l.header) && pb != l.header
+        } else if let Some(&db) = self.def_block.get(&v) {
+            if !l.in_loop[db] {
+                self.dominates(db, l.header)
+            } else if let Some(inst) = self.def_inst(v) {
+                if let Some(copies) = self.xor_copies(inst)
+                    && let Some(&(_, orig)) = copies.iter().find(|&&(w, _)| w == v)
+                {
+                    self.loop_invariant_mask(orig, l, memo, visiting)
+                } else {
+                    match &inst.fields {
+                        Fields::Sop { src, .. }
+                            if matches!(
+                                inst.name(),
+                                "s_mov_b32"
+                                    | "s_movk_i32"
+                                    | "s_mov_b64"
+                                    | "s_not_b32"
+                                    | "s_not_b64"
+                                    | "s_and_b32"
+                                    | "s_and_b64"
+                                    | "s_or_b32"
+                                    | "s_or_b64"
+                                    | "s_xor_b32"
+                                    | "s_xor_b64"
+                                    | "s_andn2_b32"
+                                    | "s_andn2_b64"
+                                    | "s_orn2_b32"
+                                    | "s_orn2_b64"
+                                    | "s_cselect_b32"
+                                    | "s_cselect_b64"
+                            ) && inst.read(Reg::S(EXEC)).is_none()
+                                && inst.read(Reg::S(EXEC + 1)).is_none() =>
+                        {
+                            let half = inst.writes.iter().position(|w| w.1 == v).unwrap_or(0) as u8;
+                            let scc_ok = inst.read(Reg::Scc).is_none_or(|scc| {
+                                self.def_block
+                                    .get(&scc)
+                                    .is_some_and(|&sb| !l.in_loop[sb] && self.dominates(sb, l.header))
+                            });
+                            scc_ok
+                                && src.iter().all(|op| match *op {
+                                    Operand::Scalar { code: NULL, .. }
+                                    | Operand::Const(_)
+                                    | Operand::Literal(_) => true,
+                                    Operand::Scalar { code, .. } => {
+                                        code != EXEC
+                                            && (!self.x.native.wave64 || code != EXEC + 1)
+                                            && inst
+                                                .read(Reg::S(code + half))
+                                                .is_some_and(|u| self.loop_invariant_mask(u, l, memo, visiting))
+                                    }
+                                    _ => false,
+                                })
+                        }
+                        _ => false,
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        visiting.remove(&v);
+        memo.insert(v, ok);
+        ok
+    }
+    /// Walks `v` inside `l` through bit-preserving updates back to a loop-header
+    /// phi (`target`, or discovering it when `target` is `None`).
+    #[allow(clippy::too_many_arguments)]
+    fn trace_preserved_phi(
+        &self,
+        v: Value,
+        target: Option<Value>,
+        l: &DivergentLoop,
+        memo: &mut Map<(Value, Option<Value>), Option<Value>>,
+        visiting: &mut Set<Value>,
+        zero_memo: &mut Map<Value, bool>,
+        zero_visiting: &mut Set<Value>,
+    ) -> Option<Value> {
+        if target == Some(v) {
+            return Some(v);
+        }
+        if let Some(&cached) = memo.get(&(v, target)) {
+            return cached;
+        }
+        if !visiting.insert(v) {
+            return None;
+        }
+        let res = (|| {
+            if let Some(&(pb, pi)) = self.phi_at.get(&v) {
+                if !l.in_loop[pb] {
+                    return None;
+                }
+                if pb == l.header {
+                    return target.is_none().then_some(v);
+                }
+                let phi = &self.x.p.blocks[pb].phis[pi];
+                let mut found = target;
+                for (n, &q) in self.x.p.blocks[pb].preds.iter().enumerate() {
+                    if self.block[q].is_none() || self.never_taken(q, pb) {
+                        continue;
+                    }
+                    let t = self.trace_preserved_phi(
+                        phi.args[n],
+                        found,
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    if found.is_some_and(|prev| prev != t) {
+                        return None;
+                    }
+                    found = Some(t);
+                }
+                return found;
+            }
+            if let Some(&orig) = self.x.st.restored.get(&v) {
+                return self.trace_preserved_phi(
+                    orig,
+                    target,
+                    l,
+                    memo,
+                    visiting,
+                    zero_memo,
+                    zero_visiting,
+                );
+            }
+            let db = *self.def_block.get(&v)?;
+            if !l.in_loop[db] {
+                return None;
+            }
+            let inst = self.def_inst(v)?;
+            if let Some(copies) = self.xor_copies(inst)
+                && let Some(&(_, orig)) = copies.iter().find(|&&(w, _)| w == v)
+            {
+                return self.trace_preserved_phi(
+                    orig,
+                    target,
+                    l,
+                    memo,
+                    visiting,
+                    zero_memo,
+                    zero_visiting,
+                );
+            }
+            let Fields::Sop { dst, src, .. } = &inst.fields else {
+                return None;
+            };
+            let half = inst.writes.iter().position(|w| w.1 == v)? as u8;
+            let read_half = |op: Option<&Operand>| match *op? {
+                Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code + half)),
+                _ => None,
+            };
+            match inst.name() {
+                "s_mov_b32" | "s_mov_b64" => self.trace_preserved_phi(
+                    read_half(src.first())?,
+                    target,
+                    l,
+                    memo,
+                    visiting,
+                    zero_memo,
+                    zero_visiting,
+                ),
+                "s_cselect_b32" | "s_cselect_b64" => {
+                    let a = self.trace_preserved_phi(
+                        read_half(src.first())?,
+                        target,
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    let c = self.trace_preserved_phi(
+                        read_half(src.get(1))?,
+                        Some(a),
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    (a == c).then_some(a)
+                }
+                "s_cmov_b32" | "s_cmov_b64" => {
+                    let a = self.trace_preserved_phi(
+                        read_half(src.first())?,
+                        target,
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    let old = self.trace_preserved_phi(
+                        read_half(dst.as_ref())?,
+                        Some(a),
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    (a == old).then_some(a)
+                }
+                "s_or_b32" | "s_or_b64" | "s_xor_b32" | "s_xor_b64" => {
+                    if self.is_zero_when_exited_op(
+                        src.get(1),
+                        inst,
+                        half,
+                        l,
+                        zero_memo,
+                        zero_visiting,
+                    ) && let Some(u) = read_half(src.first())
+                        && let Some(t) = self.trace_preserved_phi(
+                            u,
+                            target,
+                            l,
+                            memo,
+                            visiting,
+                            zero_memo,
+                            zero_visiting,
+                        )
+                    {
+                        return Some(t);
+                    }
+                    if self.is_zero_when_exited_op(
+                        src.first(),
+                        inst,
+                        half,
+                        l,
+                        zero_memo,
+                        zero_visiting,
+                    ) && let Some(u) = read_half(src.get(1))
+                        && let Some(t) = self.trace_preserved_phi(
+                            u,
+                            target,
+                            l,
+                            memo,
+                            visiting,
+                            zero_memo,
+                            zero_visiting,
+                        )
+                    {
+                        return Some(t);
+                    }
+                    None
+                }
+                "s_andn2_b32" | "s_andn2_b64" => {
+                    if self.is_zero_when_exited_op(
+                        src.get(1),
+                        inst,
+                        half,
+                        l,
+                        zero_memo,
+                        zero_visiting,
+                    ) {
+                        return self.trace_preserved_phi(
+                            read_half(src.first())?,
+                            target,
+                            l,
+                            memo,
+                            visiting,
+                            zero_memo,
+                            zero_visiting,
+                        );
+                    }
+                    None
+                }
+                "s_and_b32" | "s_and_b64" => {
+                    if self.is_one_when_exited_op(
+                        src.get(1),
+                        inst,
+                        half,
+                        l,
+                        zero_memo,
+                        zero_visiting,
+                    ) && let Some(u) = read_half(src.first())
+                        && let Some(t) = self.trace_preserved_phi(
+                            u,
+                            target,
+                            l,
+                            memo,
+                            visiting,
+                            zero_memo,
+                            zero_visiting,
+                        )
+                    {
+                        return Some(t);
+                    }
+                    if self.is_one_when_exited_op(
+                        src.first(),
+                        inst,
+                        half,
+                        l,
+                        zero_memo,
+                        zero_visiting,
+                    ) && let Some(u) = read_half(src.get(1))
+                        && let Some(t) = self.trace_preserved_phi(
+                            u,
+                            target,
+                            l,
+                            memo,
+                            visiting,
+                            zero_memo,
+                            zero_visiting,
+                        )
+                    {
+                        return Some(t);
+                    }
+                    None
+                }
+                _ => None,
+            }
+        })();
+        visiting.remove(&v);
+        memo.insert((v, target), res);
+        res
+    }
+
+    fn is_zero_when_exited_op(
+        &self,
+        op: Option<&Operand>,
+        inst: &Inst,
+        half: u8,
+        l: &DivergentLoop,
+        memo: &mut Map<Value, bool>,
+        visiting: &mut Set<Value>,
+    ) -> bool {
+        let Some(&op) = op else { return false };
+        match op {
+            Operand::Scalar { code: NULL, .. } => true,
+            Operand::Const(c) => crate::resource::inline(c) == Some(0),
+            Operand::Literal(0) => true,
+            Operand::Scalar { code, .. } => inst
+                .read(Reg::S(code + half))
+                .is_some_and(|u| self.zero_when_exited(u, inst, l, memo, visiting)),
+            _ => false,
+        }
+    }
+
+    fn is_one_when_exited_op(
+        &self,
+        op: Option<&Operand>,
+        inst: &Inst,
+        half: u8,
+        l: &DivergentLoop,
+        memo: &mut Map<Value, bool>,
+        visiting: &mut Set<Value>,
+    ) -> bool {
+        let Some(&op) = op else { return false };
+        match op {
+            Operand::Const(c) => crate::resource::inline(c) == Some(u32::MAX),
+            Operand::Literal(x) => x == u32::MAX,
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code + half)).is_some_and(|u| {
+                let Some(def) = self.def_inst(u) else {
+                    return false;
+                };
+                if matches!(def.name(), "s_not_b32" | "s_not_b64")
+                    && let Fields::Sop { src, .. } = &def.fields
+                {
+                    let h = def.writes.iter().position(|w| w.1 == u).unwrap_or(0) as u8;
+                    return self.is_zero_when_exited_op(src.first(), def, h, l, memo, visiting);
+                }
+                false
+            }),
+            _ => false,
+        }
+    }
+
+    /// Whether `v` (used by `user_inst` inside `l`) is guaranteed 0 in every
+    /// lane that has already exited `l`.
+    fn zero_when_exited(
+        &self,
+        v: Value,
+        user_inst: &Inst,
+        l: &DivergentLoop,
+        memo: &mut Map<Value, bool>,
+        visiting: &mut Set<Value>,
+    ) -> bool {
+        if !l.exec_unwidened {
+            return false;
+        }
+        if user_inst.read(Reg::S(EXEC)) == Some(v)
+            || (self.x.native.wave64 && user_inst.read(Reg::S(EXEC + 1)) == Some(v))
+        {
+            return true;
+        }
+        if let Some(&ok) = memo.get(&v) {
+            return ok;
+        }
+        if !visiting.insert(v) {
+            return false;
+        }
+        let ok = if let Some(&orig) = self.x.st.restored.get(&v) {
+            self.zero_when_exited(orig, user_inst, l, memo, visiting)
+        } else if let Some(&(pb, pi)) = self.phi_at.get(&v) {
+            l.in_loop[pb] && pb != l.header && {
+                let block = &self.x.p.blocks[pb];
+                let phi = &block.phis[pi];
+                let mut has_pred = false;
+                let mut all_ok = true;
+                for (n, &q) in block.preds.iter().enumerate() {
+                    if self.block[q].is_none() || self.never_taken(q, pb) {
+                        continue;
+                    }
+                    has_pred = true;
+                    if self.rpo[q] >= self.rpo[pb]
+                        || !self.zero_when_exited(phi.args[n], user_inst, l, memo, visiting)
+                    {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                has_pred && all_ok
+            }
+        } else if let Some(&db) = self.def_block.get(&v)
+            && l.in_loop[db]
+            && let Some(inst) = self.def_inst(v)
+        {
+            if let Some(copies) = self.xor_copies(inst)
+                && let Some(&(_, orig)) = copies.iter().find(|&&(w, _)| w == v)
+            {
+                self.zero_when_exited(orig, user_inst, l, memo, visiting)
+            } else if inst.name().starts_with("v_cmp") && !inst.name().starts_with("v_cmpx") {
+                true
+            } else if let Fields::Sop { dst, src, .. } = &inst.fields {
+                let half = inst.writes.iter().position(|w| w.1 == v).unwrap_or(0) as u8;
+                match inst.name() {
+                    "s_mov_b32" | "s_mov_b64" | "s_andn2_b32" | "s_andn2_b64" => {
+                        self.is_zero_when_exited_op(src.first(), inst, half, l, memo, visiting)
+                    }
+                    "s_and_b32" | "s_and_b64" => {
+                        self.is_zero_when_exited_op(src.first(), inst, half, l, memo, visiting)
+                            || self.is_zero_when_exited_op(src.get(1), inst, half, l, memo, visiting)
+                    }
+                    "s_or_b32" | "s_or_b64" | "s_xor_b32" | "s_xor_b64" | "s_cselect_b32"
+                    | "s_cselect_b64" => {
+                        self.is_zero_when_exited_op(src.first(), inst, half, l, memo, visiting)
+                            && self.is_zero_when_exited_op(src.get(1), inst, half, l, memo, visiting)
+                    }
+                    "s_cmov_b32" | "s_cmov_b64" => {
+                        self.is_zero_when_exited_op(src.first(), inst, half, l, memo, visiting)
+                            && self.is_zero_when_exited_op(dst.as_ref(), inst, half, l, memo, visiting)
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        visiting.remove(&v);
+        memo.insert(v, ok);
+        ok
     }
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
@@ -14042,6 +15151,42 @@ impl<'a> Lower<'a> {
                 taken,
                 not_taken,
             } => {
+                if let Some(last) = self.x.p.blocks[b].insts.last() {
+                    if matches!(last.name(), "s_cbranch_vccz" | "s_cbranch_vccnz")
+                        && let Some(mv) = last.read(Reg::S(crate::ir::VCC))
+                    {
+                        self.check_loop_mask(mv, b, false)
+                            .map_err(|w| unsupported(offset, w))?;
+                    }
+                    if let Some(scc) = last.read(Reg::Scc)
+                        && self
+                            .x
+                            .st
+                            .bools
+                            .support(when)
+                            .iter()
+                            .any(|a| !matches!(a, Atom::Uniform(_)))
+                        && let Some(def) = self.def_inst(scc)
+                        && Self::is_mask_sop(def.name())
+                        && let Fields::Sop { src, .. } = &def.fields
+                    {
+                        let def_b = self.def_block.get(&scc).copied().unwrap_or(b);
+                        for op in src {
+                            if let Operand::Scalar { code, .. } = *op
+                                && code != NULL
+                                && code != EXEC
+                                && (!self.x.native.wave64 || code != EXEC + 1)
+                                && let Some(mv) = def.read(Reg::S(code))
+                                && (self.x.st.masks.contains_key(&mv)
+                                    || self.x.st.other.contains_key(&mv)
+                                    || self.x.st.highs.contains_key(&mv))
+                            {
+                                self.check_loop_mask(mv, def_b, false)
+                                    .map_err(|w| unsupported(offset, w))?;
+                            }
+                        }
+                    }
+                }
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
@@ -14920,7 +16065,7 @@ impl<'a> Lower<'a> {
                             || self.x.st.highs.contains_key(&arg))
                         && self.uniform_join(b, |_| true) =>
                     {
-                        match self.mask_dword(arg) {
+                        match self.mask_dword_at(arg, b) {
                             Ok(x) => x,
                             Err(why) => {
                                 retry.push((phi.value, why));
@@ -15002,6 +16147,13 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if !self.never_taken(q, b)
+                    && !self.unneeded_edges().contains(&(phi.value, n))
+                    && !self.is_exec_zero_edge(q, b, arg)
+                {
+                    self.check_loop_mask(arg, b, false)
+                        .map_err(|w| unsupported(offset, w))?;
+                }
                 // Each way out names what the mask is joined with, so a refusal log says which
                 // is missing.
                 const HOST_LANES: Why =
@@ -17131,5 +18283,592 @@ mod tests {
             "deep SGPR phi chain took {:?}",
             started.elapsed()
         );
+    }
+
+    /// The forms of a loop's mask update that keep the bits of lanes that left (one rule each),
+    /// accepted, and a near form of each that does not, refused. Each program sets `s8 = 0`,
+    /// updates it in a loop lanes leave one pass apart (`v3` from `31 - v0`, plus 8 a pass, until
+    /// 32), and reads it per lane after the loop. Assembled with `llvm-mc -mcpu=gfx1030`.
+    #[test]
+    fn loop_masks_whose_updates_keep_the_bits_of_lanes_that_left_translate() {
+        let refusal = |words: &[u32]| match lowers(words, 1 << 15) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        // `s_cselect` of two values that both keep the header phi's bits of lanes that left.
+        let cselect_same_phi = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8809_7E08, // s_or_b32 s9, s8, exec_lo
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0x8508_0809, // s_cselect_b32 s8, s9, s8
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&cselect_same_phi), None, "cselect_same_phi");
+        // `s_cmov` of such a value over the phi itself.
+        let cmov_same_phi = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8809_7E08, // s_or_b32 s9, s8, exec_lo
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBE88_0509, // s_cmov_b32 s8, s9
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&cmov_same_phi), None, "cmov_same_phi");
+        // `s_and` with `~vcc` of a compare made in the pass: all ones for lanes that left.
+        let and_not_compare = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0xBE89_076A, // s_not_b32 s9, vcc_lo
+            0x8708_0908, // s_and_b32 s8, s8, s9
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&and_not_compare), None, "and_not_compare");
+        // `s_andn2` with that compare: 0 for lanes that left.
+        let andn2_compare = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0x8A08_6A08, // s_andn2_b32 s8, s8, vcc_lo
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&andn2_compare), None, "andn2_compare");
+        // `s_xor` with EXEC: 0 for lanes that left.
+        let xor_exec = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8908_7E08, // s_xor_b32 s8, s8, exec_lo
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&xor_exec), None, "xor_exec");
+        // A join inside the loop whose two arms each OR in EXEC or a compare.
+        let join_in_loop = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 other
+            0x8808_7E08, // s_or_b32 s8, s8, exec_lo
+            0xBF82_0002, // s_branch join
+            // other:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0x8808_6A08, // s_or_b32 s8, s8, vcc_lo
+            // join:
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFF7, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&join_in_loop), None, "join_in_loop");
+        // `s_cmov` of -1 sets the bits of lanes that left.
+        let neg_cmov_all = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBE88_05C1, // s_cmov_b32 s8, -1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_cmov_all), Some(super::LOOP_MASK_EXIT), "neg_cmov_all");
+        // `s_and` with the compare clears them.
+        let neg_and_compare = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0x8708_6A08, // s_and_b32 s8, s8, vcc_lo
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_and_compare), Some(super::LOOP_MASK_EXIT), "neg_and_compare");
+        // `s_andn2` with -1 clears them.
+        let neg_andn2_all = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8A08_C108, // s_andn2_b32 s8, s8, -1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_andn2_all), Some(super::LOOP_MASK_EXIT), "neg_andn2_all");
+        // `s_xor` with 1 flips lane 0's bit after it may have left.
+        let neg_xor_one = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8908_8108, // s_xor_b32 s8, s8, 1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_xor_one), Some(super::LOOP_MASK_EXIT), "neg_xor_one");
+        // One arm ORs in 1, set for lanes that left.
+        let neg_join_in_loop = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 other
+            0x8808_7E08, // s_or_b32 s8, s8, exec_lo
+            0xBF82_0001, // s_branch join
+            // other:
+            0x8808_8108, // s_or_b32 s8, s8, 1
+            // join:
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFF8, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_join_in_loop), Some(super::LOOP_MASK_EXIT), "neg_join_in_loop");
+        // An OR of the compare with 1 is not 0 for lanes that left.
+        let neg_or_compare_or = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0x8809_816A, // s_or_b32 s9, vcc_lo, 1
+            0x8808_0908, // s_or_b32 s8, s8, s9
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_or_compare_or), Some(super::LOOP_MASK_EXIT), "neg_or_compare_or");
+    }
+
+    #[test]
+    fn a_loop_carried_mask_changing_exited_lanes_is_refused_after_divergent_loop() {
+        let refusal = |words: &[u32]| match lowers(words, 1 << 15) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        // `s_orn2_b32 s8, s8, exec_lo` sets exited lanes' bits on pass 2 while those
+        // lanes already left on pass 1: refused rather than reading 0 instead of 1.
+        let orn2_div = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            0x8B08_7E08, // s_orn2_b32 s8, s8, exec_lo
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&orn2_div), Some(super::LOOP_MASK_EXIT));
+
+        // `s_cselect_b32 s8, -1, s8` sets all bits on pass 2 after early lanes exit.
+        let cselect_div = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0xBE8E_0380, // s_mov_b32 s14, 0
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            0xBF07_800E, // s_cmp_lg_u32 s14, 0
+            0x8508_08C1, // s_cselect_b32 s8, -1, s8
+            0x800E_810E, // s_add_u32 s14, s14, 1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&cselect_div), Some(super::LOOP_MASK_EXIT));
+
+        // Accumulating only active lanes (`s_or_b32 s8, s8, exec_lo`) preserves
+        // exited lanes' bits for a per-lane read, while a wave-wide `s_bcnt1`
+        // read after the divergent loop is still refused.
+        let or_per_lane = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x7E06_0300, // v_mov_b32 v3, v0
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0x8808_7E08, // s_or_b32 s8, s8, exec_lo
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&or_per_lane), None);
+
+        let or_bcnt = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x7E06_0300, // v_mov_b32 v3, v0
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0x8808_7E08, // s_or_b32 s8, s8, exec_lo
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xBE8C_0F08, // s_bcnt1_i32_b32 s12, s8
+            0x7E04_020C, // v_mov_b32 v2, s12
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&or_bcnt), Some(super::LOOP_MASK_EXIT));
+
+        // In a uniform loop every lane takes every pass together, so `s_cselect` works.
+        let cselect_uniform = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8E_0380, // s_mov_b32 s14, 0
+            0xBF07_800E, // s_cmp_lg_u32 s14, 0
+            0x8508_08C1, // s_cselect_b32 s8, -1, s8
+            0x800E_810E, // s_add_u32 s14, s14, 1
+            0xBF0A_820E, // s_cmp_lt_u32 s14, 2
+            0xBF85_FFFB, // s_cbranch_scc1 loop
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&cselect_uniform), None);
+
+        // Negatives on the accept side:
+        // 1) OR with an operand that is non-zero for exited lanes (`1`).
+        let neg_or_nonzero = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            0x8808_8108, // s_or_b32 s8, s8, 1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&neg_or_nonzero), Some(super::LOOP_MASK_EXIT));
+
+        // 2) `s_cselect` whose arms come from two different loop-header phis (`s8` vs `s9`).
+        let neg_cselect_diff_phis = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_03C1, // s_mov_b32 s9, -1
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0x8508_0809, // s_cselect_b32 s8, s9, s8
+            0x8909_7E09, // s_xor_b32 s9, s9, exec_lo
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&neg_cselect_diff_phis), Some(super::LOOP_MASK_EXIT));
+
+        // 3) An EXEC write inside the loop restores pre-loop `s10`, re-enabling exited lanes before
+        // `v_cmp` / `s_or`.
+        let neg_exec_widens = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            0xBE8B_037E, // s_mov_b32 s11, exec_lo
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10 (widens to pre-loop EXEC!)
+            0xD4C4_006A, 0x0201_0100, // v_cmp_gt_u32 vcc_lo, v0, 0
+            0x8808_6A08, // s_or_b32 s8, s8, vcc_lo
+            0xBEFE_030B, // s_mov_b32 exec_lo, s11
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFF7, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&neg_exec_widens), Some(super::LOOP_MASK_EXIT));
+
+        let neg_exec_widens_s_not = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            0xBE8B_037E, // s_mov_b32 s11, exec_lo
+            0xBE8C_070B, // s_not_b32 s12, s11 (flips exited lanes to 1!)
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0xD4C4_006A, 0x0201_0100, // v_cmp_gt_u32 vcc_lo, v0, 0
+            0x8808_6A08, // s_or_b32 s8, s8, vcc_lo
+            0xBEFE_030B, // s_mov_b32 exec_lo, s11
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFF6, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&neg_exec_widens_s_not), Some(super::LOOP_MASK_EXIT));
+
+        // 4) A loop with a uniform latch and a second divergent exit.
+        let neg_second_exit = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x8B08_7E08, // s_orn2_b32 s8, s8, exec_lo
+            0x8109_8109, // s_add_i32 s9, s9, 1
+            0xBF04_8409, // s_cmp_lt_i32 s9, 4
+            0xBF84_0004, // s_cbranch_scc0 out
+            0xD4C4_006A, 0x0201_0900, // v_cmp_gt_u32 vcc_lo, v0, 4
+            0x8A7E_6A7E, // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFF8, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&neg_second_exit), Some(super::LOOP_MASK_EXIT));
+
+        // 5) An in-loop `v_cmp` read after the divergent loop: later passes overwrite exited
+        // lanes' bits with 0 on the console, whereas each host lane keeps its last compare.
+        let neg_in_loop_v_cmp = [
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7D86_06A0, // v_cmp_le_u32_e32 vcc_lo, 32, v3
+            0x8A7E_6A7E, // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x01A9_0280, // v_cndmask_b32 v2, 0, 1, vcc_lo
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&neg_in_loop_v_cmp), Some(super::LOOP_MASK_EXIT));
+
+        // Restoring EXEC after a divergent loop with `s_or exec_lo, exec_lo, s10` when no
+        // loop-carried mask is read remains accepted.
+        let pos_or_restore_exec = [
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            0xD525_0002, 0x0201_0302, // v_add_nc_u32 v2, v2, 1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+            0xD4C4_006A, 0x0201_0102, // v_cmp_gt_u32 vcc_lo, v2, 0
+            0xBF87_0001, // s_cbranch_vccnz end
+            0x7E04_0281, // v_mov_b32 v2, 1
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&pos_or_restore_exec), None);
+    }
+
+    #[test]
+    fn a_wave64_loop_carried_mask_changing_exited_lanes_falls_back_to_lockstep() {
+        let words = [
+            0xBE88_0480u32, // s_mov_b64 s[8:9], 0
+            0xBE8A_047E,    // s_mov_b64 s[10:11], exec
+            0x4C06_00BF,    // v_sub_nc_u32 v3, 63, v0
+            0x8B88_7E08,    // s_orn2_b64 s[8:9], s[8:9], exec
+            0x4A06_0690,    // v_add_nc_u32 v3, 16, v3
+            0x7DA8_06C0,    // v_cmpx_gt_u32 64, v3
+            0xBF89_FFFC,    // s_cbranch_execnz loop
+            0xBEFE_040A,    // s_mov_b64 exec, s[10:11]
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+            0x3402_0082,    // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 32).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let fast_err = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: true,
+            zero_copy_memory: false,
+            rect_list: false,
+            copy_params: [0; 32],
+        })
+        .err()
+        .expect("fast path refuses cross-exit loop mask mutation");
+        assert!(fast_err.to_string().contains(super::LOOP_MASK_EXIT), "{fast_err}");
+
+        let opts = super::super::Options {
+            wave32_host: true,
+            ..Default::default()
+        };
+        let empty = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&empty).unwrap();
+        crate::emit::emit_with(&c, &native, &p, &st, &io, &res, opts)
+            .expect("lockstep fallback translates");
+
+        // Regression guard for `loop_invariant_mask` reading `Reg::S(code + half)` on 64-bit
+        // SOPs: `s6` stays loop-invariant while `s7` mutates, so `s_and_b64 s[12:13], s[6:7], s[8:9]`
+        // must inspect `s7` (not `s6`) for the high half and refuse (without the `s7` mutation it
+        // translates).
+        let high_half_mutated = [
+            0x7D88_00B0u32, // v_cmp_gt_u32 vcc, 48, v0
+            0xBE86_046A,    // s_mov_b64 s[6:7], vcc
+            0xBE88_03C1,    // s_mov_b32 s8, -1
+            0xBE89_03C1,    // s_mov_b32 s9, -1
+            0xBE8A_047E,    // s_mov_b64 s[10:11], exec
+            0x4C06_00BF,    // v_sub_nc_u32 v3, 63, v0
+            0x8B07_7F07,    // s_orn2_b32 s7, s7, exec_hi
+            0x878C_0806,    // s_and_b64 s[12:13], s[6:7], s[8:9]
+            0x4A06_0690,    // v_add_nc_u32 v3, 16, v3
+            0x7DA8_06C0,    // v_cmpx_gt_u32 64, v3
+            0xBF89_FFFB,    // s_cbranch_execnz loop
+            0xBEFE_040A,    // s_mov_b64 exec, s[10:11]
+            0xD501_0002, 0x0031_0280, // v_cndmask_b32 v2, 0, 1, s[12:13]
+            0x3402_0082,    // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        let run_hi = |code_words: &[u32]| {
+            let hi_code: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let hi_native = NativeProgram { code: hi_code, ..native.clone() };
+            let hi_p = ir::build(&hi_native.code, true, 32).unwrap();
+            let hi_st = structure::structure(&hi_p).unwrap();
+            let hi_res =
+                resource::track(&hi_p, &hi_native.layout, hi_native.stage, Some(&hi_st)).unwrap();
+            let hi_io = io::raise(&hi_p, &hi_native).unwrap();
+            lower(&Parts {
+                native: &hi_native,
+                p: &hi_p,
+                st: &hi_st,
+                io: &hi_io,
+                res: &hi_res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+                atomic_locks: false,
+                bias_as_gradients: false,
+                narrow_waves: false,
+                wave32_host: true,
+                zero_copy_memory: false,
+                rect_list: false,
+                copy_params: [0; 32],
+            })
+        };
+        let hi_err = run_hi(&high_half_mutated)
+            .err()
+            .expect("mutated high half of b64 op must be refused");
+        assert!(hi_err.to_string().contains(super::LOOP_MASK_EXIT), "{hi_err}");
+        let mut high_half_invariant = high_half_mutated;
+        high_half_invariant[6] = 0xBF80_0000; // s_nop 0 in place of s_orn2_b32 s7, s7, exec_hi
+        run_hi(&high_half_invariant).expect("invariant high half of b64 op must translate");
     }
 }
