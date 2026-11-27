@@ -557,6 +557,25 @@ unsafe fn noncontinuable(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     dispatch_exception(ctx, &mut record, 0)
 }
 
+/// What runs once before the process ends on an exception nobody took ([`set_fatal_hook`]).
+static FATAL_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Sets what runs once, on the faulting thread, before the process ends on an unhandled
+/// exception (the title's filter, its exit, or the abort that follows): the app stops the GPU's
+/// work there, as it does on a signal, so a fatal fault does not leave the GPU's memory allocated.
+pub fn set_fatal_hook(hook: fn()) {
+    let _ = FATAL_HOOK.set(hook);
+}
+
+fn run_fatal_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Some(hook) = FATAL_HOOK.get() {
+            hook();
+        }
+    });
+}
+
 /// Nobody took the exception: the unhandled-exception filter, then the end.
 unsafe fn unhandled(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     let filter = *UNHANDLED.lock().unwrap_or_else(|e| e.into_inner());
@@ -564,6 +583,7 @@ unsafe fn unhandled(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     let (code, address) = unsafe { ((*rec).code, (*rec).address) };
     // Before the filter, which may end the process.
     super::super::dump::report_at_fault(code, true);
+    run_fatal_hook();
     if let Some(handler) = filter {
         let mut ptrs = ExceptionPointers {
             record: rec,
@@ -881,5 +901,26 @@ pub mod api {
             };
         }
         EXCEPTION_CONTINUE_SEARCH_DISPOSITION
+    }
+}
+
+#[cfg(test)]
+mod fatal_hook_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static RUNS: AtomicU32 = AtomicU32::new(0);
+
+    /// The hook a fatal fault runs (the app's GPU stop) runs once, however many threads fault.
+    #[test]
+    fn the_fatal_hook_runs_once() {
+        super::set_fatal_hook(|| {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+        });
+        let threads: Vec<_> = (0..4).map(|_| std::thread::spawn(super::run_fatal_hook)).collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        super::run_fatal_hook();
+        assert_eq!(RUNS.load(Ordering::Relaxed), 1);
     }
 }
