@@ -14,8 +14,8 @@
 //!
 //! What reaches across the two halves goes through group-shared memory (the
 //! `xchg` array, one dword per thread) between two group barriers: a ballot
-//! of a mask read as data, `v_readlane_b32` and the reductions and prefixes
-//! of whole-wave sections. A ballot is each
+//! of a mask read as data, `v_readlane_b32`, `ds_append` / `ds_consume` and the
+//! reductions and prefixes of whole-wave sections. A ballot is each
 //! half's 32 bits, joined; a lane read is a load at the source lane's slot;
 //! a reduction is each half's result, combined; a prefix combines the lower
 //! half's total with each upper lane's prefix. Lanes the group lacks (a group
@@ -292,6 +292,68 @@ impl Lower<'_> {
         Ok(match self.xchg_written(c, hi_at, 5) {
             Some(there) => self.s.m.select(c, there, both, lo),
             None => both,
+        })
+    }
+
+    /// `ds_append` / `ds_consume` across a console wave split into two 32-lane
+    /// host waves: gathers the 64-lane active count via [`Self::wide_ballot`],
+    /// has the console wave's first active lane atomically update `LDS[m0 + offset]`
+    /// once and publish the old value through `xchg[wave]`, and returns `outside`
+    /// for inactive lanes.
+    pub(super) fn wide_append(
+        &mut self,
+        guard: Option<V>,
+        m0: V,
+        offset: u32,
+        op: crate::emit::bitcode::Rmw,
+        outside: V,
+    ) -> Result<V, Why> {
+        let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+        let (lo, hi) = self.wide_ballot(self.cur, self.cur_ir, on)?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let nx = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[lo]);
+        let ny = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[hi]);
+        let n = self.s.m.bin(c, Bin::Add, nx, ny);
+        let (z, k32, k63, six) = (
+            self.s.m.i32(0),
+            self.s.m.i32(32),
+            self.s.m.i32(63),
+            self.s.m.i32(6),
+        );
+        let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let has_lo = self.s.m.cmp(c, pred::NE, lo, z);
+        let lead_lane = self.s.m.select(c, has_lo, flo, fhi);
+        let f = self.console_flat();
+        let pair = self.s.m.bin(c, Bin::LShr, f, six);
+        let my_lane = self.s.m.bin(c, Bin::And, f, k63);
+        let has_any = self.s.m.cmp(c, pred::NE, n, z);
+        let is_lead = self.s.m.cmp(c, pred::EQ, my_lane, lead_lane);
+        let do_atomic = self.s.m.bin(c, Bin::And, has_any, is_lead);
+        let o = self.s.m.i32(offset);
+        let at = self.s.m.bin(c, Bin::Add, m0, o);
+
+        let lead = self.begin_guarded(Some(do_atomic));
+        let bc = self.cur;
+        let two = self.s.m.i32(2);
+        let idx = self.s.m.bin(bc, Bin::LShr, at, two);
+        let lds = self.s.lds();
+        let p = self.s.m.element(bc, lds, idx);
+        let old = self.s.m.atomic(bc, op, p, n);
+        let slot = self.xchg_slot(bc, pair);
+        self.s.m.store(bc, slot, old);
+        self.end_guarded(lead, &[]);
+
+        let jc = self.cur;
+        self.xchg_barrier(jc);
+        let slot = self.xchg_slot(jc, pair);
+        let r = self.s.m.load(jc, slot);
+        self.xchg_barrier(jc);
+        Ok(match guard {
+            Some(g) => self.s.m.select(jc, g, r, outside),
+            None => r,
         })
     }
 }

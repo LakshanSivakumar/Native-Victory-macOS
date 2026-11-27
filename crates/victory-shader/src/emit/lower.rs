@@ -5423,16 +5423,25 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // One atomic for the console's wave: a host wave must be all of it.
+        // One atomic for the console's wave: when the host splits a console
+        // wave into two 32-lane waves (`halves.rs`), both halves meet at an
+        // exchange and the console wave's first active lane updates the
+        // counter once.
         let lanes: u32 = self.s.threads.map_or(0, |t| t.iter().product());
-        if self.halves || self.host32 && lanes > 32 {
-            return Err("ds_append or ds_consume in a console wave the host splits");
-        }
         let reg = dst_reg.ok_or("an append result")?;
         let outside = match inst.read(Reg::V(reg)) {
             Some(v) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
+        let op = if name == "ds_append" { Rmw::Add } else { Rmw::Sub };
+        if self.halves {
+            let r = self.wide_append(guard, m0, offset, op, outside)?;
+            self.write(inst, Reg::V(reg), r, None);
+            return Ok(());
+        }
+        if self.host32 && lanes > 32 {
+            return Err("ds_append or ds_consume in a console wave the host splits");
+        }
         let g = self.begin_guarded(guard);
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -5451,7 +5460,6 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Add, m0, o);
         let lead = self.begin_guarded(Some(first));
         let p = dword(self, at);
-        let op = if name == "ds_append" { Rmw::Add } else { Rmw::Sub };
         let old = self.s.m.atomic(self.cur, op, p, n);
         let zero = self.s.m.i32(0);
         let old = self.end_guarded(lead, &[(old, zero)])[0];
