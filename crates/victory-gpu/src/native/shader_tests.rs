@@ -207,3 +207,66 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
     assert!(t.shaders.refused.iter().any(|(why, _)| why.starts_with("args") && why.contains("root signature")));
     assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("layout lacks")));
 }
+
+#[test]
+fn known_16bit_halves_draw_across_mix_pack_joins_and_odd_compressed_exports() {
+    use crate::native::list::NativeList;
+    use victory_backend::resources::{Format, ResourceBackend, TextureDesc, Topology};
+
+    let mut ms_words = super::mesh_tests::TRIANGLE.to_vec();
+    let at = ms_words.iter().position(|&w| w == 0xF800_08CF).unwrap();
+    // Two f16 1.0 halves in `v8` so `packed_params` exports `HALF0` for the pixel f16 interp.
+    ms_words.splice(at..at, [0x7E10_02FF, 0x3C00_3C00, 0xF800_0201, 0x0000_0008]);
+    let ms = super::mesh_tests::translate(HwStage::Vs, &ms_words);
+
+    // Pixel program: `v2` holds a first interpolation half, `s0` picks 1.0 or 0.5 for `v2`'s low
+    // half across a branch join, `v0` gets 0.5 in its high half over a barycentric, `v_pack_b32_f16`
+    // and `v_pk_mul_f16` read those halves, and `v1` gets only `v_fma_mixlo_f16` (1.0) for a
+    // 3-channel compressed export (`en = 0xf`).
+    let ps_words: &[u32] = &[
+        0xD742_0002, 0x0202_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+        0xD75A_0003, 0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0003, // s_cbranch_scc1 else (+3 dwords)
+        0xCC21_0002, 0x0A01_E503, // v_fma_mixlo_f16 v2, sel_lo(v3), 1.0, 0
+        0xBF82_0002, // s_branch join (+2 dwords)
+        0xCC21_0002, 0x0A01_E103, // else: v_fma_mixlo_f16 v2, sel_lo(v3), 0.5, 0
+        0xCC22_0000, 0x0A01_E103, // join: v_fma_mixhi_f16 v0, sel_lo(v3), 0.5, 0
+        0xD711_1004, 0x0202_0102, // v_pack_b32_f16 v4, v2, v0 op_sel:[0,1,0]
+        0xCC10_4004, 0x0A02_0504, // v_pk_mul_f16 v4, v4, v2 op_sel_hi:[1,0]
+        0xCC21_0001, 0x0201_E4F2, // v_fma_mixlo_f16 v1, 1.0, 1.0, 0
+        0xF800_1C0F, 0x0000_0104, // exp mrt0 v4, v4, v1, v1 done compr vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2;
+    let ps_bytes: Vec<_> = ps_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ps_c = victory_shader::emit::graphics::container(HwStage::Ps, &ps_bytes, &meta).unwrap();
+    let ps = shaders::translate(&ps_c).unwrap();
+
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "half16") else {
+        panic!("{:?}", t.shaders);
+    };
+    for (s0, want) in [(1u32, [255u8, 128, 255, 0]), (0, [64, 64, 255, 0])] {
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+        desc.render_target = true;
+        let color = t.host.texture(&desc).unwrap();
+        let mut list = NativeList::default();
+        list.set_render_targets(std::slice::from_ref(&color), None);
+        list.clear_render_target(&color, [0.0; 4]);
+        list.set_graphics_pipeline(&pso, Topology::Triangles);
+        list.set_graphics_binding(binding.clone());
+        list.set_graphics_root_constants(0, &[s0]);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        let mut raw = [0u8; 8 * 8 * 4];
+        t.host.backend.read_texture(&color, 0, 0, &mut raw, 8 * 4, 0);
+        for px in raw.chunks_exact(4) {
+            assert_eq!(px, want, "s0={s0}");
+        }
+    }
+}

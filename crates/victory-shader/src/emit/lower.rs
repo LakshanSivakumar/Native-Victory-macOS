@@ -3236,18 +3236,313 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// VGPR source `k` read for its low 16 bits alone, when only those are
-    /// known (`low16`); the caller applies the modifiers and selects.
-    fn low16_src(&self, inst: &Inst, k: usize) -> Option<V> {
+    /// VGPR source `k` read for one 16-bit half alone (`high`: bits 16..32),
+    /// when only that half is known (`low16` or `high16`); the caller applies
+    /// the modifiers and selects.
+    fn half16_src(&self, inst: &Inst, k: usize, high: bool) -> Option<V> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
         match v.src.get(k) {
-            Some(&Operand::Vector { reg, .. }) if v.dpp.is_none() => inst
-                .read(Reg::V(reg))
-                .and_then(|o| self.low16.get(&o).copied()),
+            Some(&Operand::Vector { reg, .. }) if v.dpp.is_none() => {
+                let o = inst.read(Reg::V(reg))?;
+                if high {
+                    self.high16.get(&o)
+                } else {
+                    self.low16.get(&o)
+                }
+                .copied()
+            }
             _ => None,
         }
+    }
+
+    fn value_half(&mut self, v: Value, high: bool) -> Result<V, Why> {
+        match self.i32_of(v) {
+            Ok(x) => Ok(x),
+            Err(why) => if high {
+                self.high16.get(&v)
+            } else {
+                self.low16.get(&v)
+            }
+            .copied()
+            .ok_or(why),
+        }
+    }
+
+    fn const_u32(op: &Operand) -> Option<u32> {
+        match *op {
+            Operand::Const(k) => crate::resource::inline(k),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    fn mask_half(mask: u32) -> Option<bool> {
+        if mask & 0xFFFF_0000 == 0 {
+            Some(false)
+        } else if mask & 0x0000_FFFF == 0 {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    fn phi_half_only(&self, live: &Set<(Value, usize)>, root: Value) -> Option<bool> {
+        [false, true]
+            .into_iter()
+            .find(|&high| self.only_reads_half(live, root, high))
+    }
+
+    fn only_reads_half(&self, live: &Set<(Value, usize)>, root: Value, high: bool) -> bool {
+        let p = self.x.p;
+        let mut seen = Set::default();
+        let mut stack = vec![root];
+        while let Some(val) = stack.pop() {
+            if !seen.insert(val) {
+                continue;
+            }
+            for (bb, block) in p.blocks.iter().enumerate() {
+                if self.block[bb].is_none() {
+                    continue;
+                }
+                for other in &block.phis {
+                    for (n, &arg) in other.args.iter().enumerate() {
+                        if arg != val {
+                            continue;
+                        }
+                        let q = block.preds[n];
+                        if self.tail[q].is_none()
+                            || !live.contains(&(other.value, n))
+                            || self.never_taken(q, bb)
+                            || self.dead_on_edge(bb, n, other.reg)
+                        {
+                            continue;
+                        }
+                        if !matches!(other.reg, Reg::V(_)) {
+                            return false;
+                        }
+                        stack.push(other.value);
+                    }
+                }
+                for (ii, inst) in block.insts.iter().enumerate() {
+                    if inst.reads.iter().any(|&(_, v)| v == val)
+                        && !self.inst_reads_only_half((bb, ii), inst, val, high, &mut stack)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn inst_reads_only_half(
+        &self,
+        site: Site,
+        inst: &Inst,
+        val: Value,
+        high: bool,
+        stack: &mut Vec<Value>,
+    ) -> bool {
+        match &inst.fields {
+            Fields::Exp { .. } => {
+                let Some(e) = self.exports.get(&site) else {
+                    return false;
+                };
+                let (true, Target::Color(n)) = (e.compressed, e.target) else {
+                    return false;
+                };
+                let Some(id) = self
+                    .s
+                    .outputs
+                    .iter()
+                    .position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
+                else {
+                    return true;
+                };
+                let o = &self.s.outputs[id];
+                if o.comp != 9 {
+                    return false;
+                }
+                for ch in 0..4u8 {
+                    if e.values[usize::from(ch)] == Some(val) && ch >= o.col && ch < o.col + o.cols
+                    {
+                        let ch_high = ch & 1 == 1;
+                        let trailing_pad =
+                            !high && ch_high && self.guessed && ch + 1 == o.col + o.cols;
+                        if ch_high != high && !trailing_pad {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            Fields::Valu(v) => {
+                if v.dpp.is_some() {
+                    return false;
+                }
+                let name = inst.name();
+                let unguarded = self.x.st.guards[site.0][site.1].is_none();
+                let dst_reg = match v.dst {
+                    Some(Operand::Vector { reg, dwords: 1 }) => Some(reg),
+                    Some(_) => return false,
+                    None => None,
+                };
+                for &(r, rv) in &inst.reads {
+                    if rv != val {
+                        continue;
+                    }
+                    let Reg::V(vreg) = r else {
+                        return false;
+                    };
+                    let mut in_src = false;
+                    for (k, &op) in v.src.iter().enumerate() {
+                        let Operand::Vector { reg: sreg, dwords } = op else {
+                            continue;
+                        };
+                        if !(sreg..sreg + dwords).contains(&vreg) {
+                            continue;
+                        }
+                        if dwords != 1 || k == 0 && self.src0.is_some() {
+                            return false;
+                        }
+                        in_src = true;
+                        if name == "v_mov_b32"
+                            && unguarded
+                            && v.abs == 0
+                            && v.neg == 0
+                            && !v.clamp
+                            && v.omod == 0
+                            && v.sdwa.is_none()
+                        {
+                            let Some(dreg) = dst_reg else { return false };
+                            let Some(w) = inst.write(Reg::V(dreg)) else {
+                                return false;
+                            };
+                            stack.push(w);
+                            continue;
+                        }
+                        if name == "v_cndmask_b32"
+                            && k < 2
+                            && unguarded
+                            && v.abs == 0
+                            && v.neg == 0
+                            && v.sdwa.is_none()
+                        {
+                            let Some(dreg) = dst_reg else { return false };
+                            let Some(w) = inst.write(Reg::V(dreg)) else {
+                                return false;
+                            };
+                            stack.push(w);
+                            continue;
+                        }
+                        if let Some((sel, _)) = Self::sdwa_src(inst, k) {
+                            if matches!(sel, 2 | 3 | 5) != high {
+                                return false;
+                            }
+                            continue;
+                        }
+                        if v.sdwa.is_some() {
+                            return false;
+                        }
+                        let ok = match name {
+                            "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
+                                v.opsel_hi >> k & 1 != 0 && (v.opsel >> k & 1 != 0) == high
+                            }
+                            "v_pack_b32_f16" => (v.opsel >> k & 1 != 0) == high,
+                            "v_mad_u32_u16" if k < 2 => (v.opsel >> k & 1 != 0) == high,
+                            "v_cmp_class_f16" | "v_cmpx_class_f16" if k == 0 => {
+                                (v.opsel >> k & 1 != 0) == high
+                            }
+                            _ if (name.starts_with("v_cmp_") || name.starts_with("v_cmpx_"))
+                                && (name.ends_with("_f16")
+                                    || name.ends_with("_u16")
+                                    || name.ends_with("_i16"))
+                                && k < 2 =>
+                            {
+                                (v.opsel >> k & 1 != 0) == high
+                            }
+                            _ if Self::is_half16_valu_src(name, k) => {
+                                (v.opsel >> k & 1 != 0) == high
+                            }
+                            _ if name.starts_with("v_pk_") && name != "v_pk_fmac_f16" => {
+                                (v.opsel >> k & 1 != 0) == high
+                                    && (v.opsel_hi >> k & 1 != 0) == high
+                            }
+                            "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32"
+                                if k == 1 && v.abs == 0 && v.neg == 0 =>
+                            {
+                                v.src.first().and_then(Self::const_u32).is_some_and(|by| {
+                                    by & 31 >= 16 && (name != "v_lshlrev_b32") == high
+                                })
+                            }
+                            "v_and_b32" if k < 2 && v.abs == 0 && v.neg == 0 => v
+                                .src
+                                .get(1 - k)
+                                .and_then(Self::const_u32)
+                                .is_some_and(|m| Self::mask_half(m) == Some(high)),
+                            _ => false,
+                        };
+                        if !ok {
+                            return false;
+                        }
+                    }
+                    if dst_reg == Some(vreg) {
+                        if !unguarded || Self::sdwa_dst(inst).is_some() {
+                            return false;
+                        }
+                        let dst_ok = match name {
+                            "v_fma_mixlo_f16" => high,
+                            "v_fma_mixhi_f16" => !high,
+                            "v_fmac_f16" | "v_mac_f16" | "v_pk_fmac_f16" | "v_fmac_f32"
+                            | "v_mac_f32" | "v_fmac_legacy_f32" | "v_swap_b32"
+                            | "v_swaprel_b32" | "v_movreld_b32" | "v_writelane_b32"
+                            | "v_permlane16_b32" | "v_permlanex16_b32" | "v_cvt_pk_u8_f32" => {
+                                false
+                            }
+                            _ if name.starts_with("v_interp_") => {
+                                self.interps.contains_key(&site)
+                                    && (!name.ends_with("_f16")
+                                        || (v.opsel >> 3 & 1 == 0) == high)
+                            }
+                            _ if Self::writes_single_half(name) => {
+                                (v.opsel >> 3 & 1 == 0) == high
+                            }
+                            _ => true,
+                        };
+                        if !dst_ok {
+                            return false;
+                        }
+                    } else if !in_src {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn is_half16_valu_src(name: &str, k: usize) -> bool {
+        match name {
+            "v_cvt_f32_f16" | "v_rcp_f16" | "v_sqrt_f16" | "v_rsq_f16" | "v_log_f16"
+            | "v_exp_f16" | "v_frexp_mant_f16" | "v_frexp_exp_i16_f16" | "v_floor_f16"
+            | "v_fract_f16" | "v_trunc_f16" | "v_ceil_f16" | "v_rndne_f16" | "v_sin_f16"
+            | "v_cos_f16" | "v_cvt_f16_u16" | "v_cvt_f16_i16" | "v_cvt_u16_f16"
+            | "v_cvt_i16_f16" | "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16" => k == 0,
+            "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_mul_f16" | "v_max_f16"
+            | "v_min_f16" | "v_ldexp_f16" | "v_fmac_f16" | "v_mac_f16" | "v_add_nc_i16"
+            | "v_sub_nc_i16" | "v_add_nc_u16" | "v_sub_nc_u16" | "v_subrev_nc_u16"
+            | "v_mul_lo_u16" | "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16"
+            | "v_max_u16" | "v_max_i16" | "v_min_u16" | "v_min_i16" => k < 2,
+            "v_fma_f16" | "v_mad_f16" | "v_max3_f16" | "v_min3_f16" | "v_med3_f16" => k < 3,
+            _ => false,
+        }
+    }
+
+    fn writes_single_half(name: &str) -> bool {
+        name == "v_cvt_f16_f32" || (name != "v_cvt_f32_f16" && Self::is_half16_valu_src(name, 0))
     }
 
     fn as_float(&mut self, x: V) -> V {
@@ -3295,7 +3590,15 @@ impl<'a> Lower<'a> {
         let mut f = match op {
             _ if selected.is_some() => {
                 let (sel, sext) = selected.expect("checked");
-                let x = self.operand(inst, &op)?;
+                let high = matches!(sel, 2 | 3 | 5);
+                let x = match self
+                    .half16_src(inst, k, high)
+                    .filter(|_| !(k == 0 && self.src0.is_some()))
+                {
+                    Some(x) => x,
+                    None if k == 0 && self.src0.is_some() => self.src0.expect("checked"),
+                    None => self.operand(inst, &op)?,
+                };
                 let x = self.select_bits(x, sel, sext);
                 self.as_float(x)
             }
@@ -3347,9 +3650,9 @@ impl<'a> Lower<'a> {
             Some(x) if k == 0 => Ok(x),
             _ => {
                 let sel = Self::sdwa_src(inst, k);
-                // A byte or word select within the low half.
-                let low = matches!(sel, Some((0 | 1 | 4, _)));
-                let x = match self.low16_src(inst, k).filter(|_| low) {
+                // A byte or word select within one 16-bit half.
+                let half = sel.map(|(s, _)| matches!(s, 2 | 3 | 5));
+                let x = match half.and_then(|h| self.half16_src(inst, k, h)) {
                     Some(x) => x,
                     None => self.operand(inst, &op)?,
                 };
@@ -3359,6 +3662,22 @@ impl<'a> Lower<'a> {
                 })
             }
         }
+    }
+
+    fn src_half(&mut self, inst: &Inst, k: usize, high: Option<bool>) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs >> k & 1 == 0
+            && v.neg >> k & 1 == 0
+            && v.sdwa.is_none()
+            && !(k == 0 && self.src0.is_some())
+            && let Some(h) = high
+            && let Some(x) = self.half16_src(inst, k, h)
+        {
+            return Ok(x);
+        }
+        self.src(inst, k)
     }
 
     fn unary(&mut self, op: u32, f: V) -> V {
@@ -5280,7 +5599,12 @@ impl<'a> Lower<'a> {
                     "_b16" => 16,
                     _ => return Err("an LDS write of bytes or halves"),
                 };
-                let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                let reg = match data.first() {
+                    Some(&Operand::Vector { reg, .. }) => reg,
+                    _ => return Err("an LDS write"),
+                };
+                let v = inst.read(Reg::V(reg)).ok_or("an LDS write")?;
+                let x = self.value_half(v, rest.ends_with("_d16_hi"))?;
                 let x = if rest.ends_with("_d16_hi") {
                     let k16 = self.s.m.i32(16);
                     self.s.m.bin(c, Bin::LShr, x, k16)
@@ -9221,8 +9545,33 @@ impl<'a> Lower<'a> {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
-                int(self, a)
+                match s(self, 0) {
+                    Ok(a) => int(self, a),
+                    Err(w)
+                        if guard.is_none()
+                            && v.sdwa.is_none()
+                            && v.dpp.is_none()
+                            && self.src0.is_none()
+                            && let Some(Operand::Vector { reg: dreg, .. }) = v.dst =>
+                    {
+                        for high in [false, true] {
+                            if let Some(x) = self.half16_src(inst, 0, high) {
+                                self.write(inst, Reg::V(dreg), x, None);
+                                if let Some(new) = inst.write(Reg::V(dreg)) {
+                                    self.vals.insert(new, Val::Missing(w));
+                                    if high {
+                                        self.high16.insert(new, x);
+                                    } else {
+                                        self.low16.insert(new, x);
+                                    }
+                                }
+                                return Ok(());
+                            }
+                        }
+                        Err(w)
+                    }
+                    Err(w) => Err(w),
+                }
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
             | "v_max_f32" | "v_min_f32" => {
@@ -9423,8 +9772,8 @@ impl<'a> Lower<'a> {
                 let mut xs = Vec::new();
                 for i in 0..3 {
                     let op = v.src.get(i).ok_or("a missing operand")?;
-                    let low = v.opsel_hi >> i & 1 != 0 && v.opsel >> i & 1 == 0;
-                    let x = match self.low16_src(inst, i).filter(|_| low) {
+                    let half = (v.opsel_hi >> i & 1 != 0).then_some(v.opsel >> i & 1 != 0);
+                    let x = match half.and_then(|h| self.half16_src(inst, i, h)) {
                         Some(x) => x,
                         None => self.operand(inst, op)?,
                     };
@@ -9592,7 +9941,11 @@ impl<'a> Lower<'a> {
                 let mut halves = Vec::new();
                 for k in 0..2 {
                     let op = v.src.get(k).ok_or("a missing operand")?;
-                    let mut x = self.operand(inst, op)?;
+                    let high = v.opsel >> k & 1 != 0;
+                    let mut x = match self.half16_src(inst, k, high) {
+                        Some(x) => x,
+                        None => self.operand(inst, op)?,
+                    };
                     if v.opsel >> k & 1 != 0 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
@@ -9680,9 +10033,42 @@ impl<'a> Lower<'a> {
                     let r = self.s.m.select(c, cond, xs[1], xs[0]);
                     return int(self, r);
                 }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
-                let r = self.s.m.select(c, cond, bb, a);
-                int(self, r)
+                match (s(self, 0), s(self, 1)) {
+                    (Ok(a), Ok(bb)) => {
+                        let r = self.s.m.select(c, cond, bb, a);
+                        int(self, r)
+                    }
+                    (r0, r1) => {
+                        let w = r0.err().or_else(|| r1.err()).expect("one failed");
+                        if guard.is_none()
+                            && v.sdwa.is_none()
+                            && v.dpp.is_none()
+                            && let Some(Operand::Vector { reg: dreg, .. }) = v.dst
+                        {
+                            for high in [false, true] {
+                                if let (Ok(a), Ok(bb)) = (
+                                    self.src_half(inst, 0, Some(high)),
+                                    self.src_half(inst, 1, Some(high)),
+                                ) {
+                                    let r = self.s.m.select(c, cond, bb, a);
+                                    let m = self.s.m.i32(if high { 0xFFFF_0000 } else { 0xFFFF });
+                                    let r = self.s.m.bin(c, Bin::And, r, m);
+                                    self.write(inst, Reg::V(dreg), r, None);
+                                    if let Some(new) = inst.write(Reg::V(dreg)) {
+                                        self.vals.insert(new, Val::Missing(w));
+                                        if high {
+                                            self.high16.insert(new, r);
+                                        } else {
+                                            self.low16.insert(new, r);
+                                        }
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(w)
+                    }
+                }
             }
             "v_add_co_u32" | "v_sub_co_u32" | "v_subrev_co_u32" | "v_add_co_ci_u32"
             | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => {
@@ -9998,7 +10384,7 @@ impl<'a> Lower<'a> {
         }
         let x = match self.src0 {
             Some(x) if k == 0 => x,
-            _ => match self.low16_src(inst, k).filter(|_| !high) {
+            _ => match self.half16_src(inst, k, high) {
                 Some(x) => x,
                 None => self.f16_operand(inst, &op)?,
             },
@@ -10058,9 +10444,9 @@ impl<'a> Lower<'a> {
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
+        let old = match inst.read(Reg::V(reg)).filter(|_| keep) {
+            Some(o) => self.value_half(o, !high).unwrap_or_else(|_| self.s.m.i32(0)),
+            None => self.s.m.i32(0),
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
         let x = self.s.m.bin(c, Bin::And, x, low);
@@ -10195,7 +10581,10 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
                 };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let x = self.value_half(
+                    inst.read(Reg::V(reg)).ok_or("an accumulator")?,
+                    v.opsel >> 3 & 1 != 0,
+                )?;
                 let x = if v.opsel >> 3 & 1 != 0 {
                     let k16 = self.s.m.i32(16);
                     self.s.m.bin(c, Bin::LShr, x, k16)
@@ -10440,10 +10829,10 @@ impl<'a> Lower<'a> {
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
-        let x = if float {
-            self.f16_operand(inst, &op)?
-        } else {
-            self.operand(inst, &op)?
+        let x = match self.half16_src(inst, k, sel) {
+            Some(x) => x,
+            None if float => self.f16_operand(inst, &op)?,
+            None => self.operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if sel {
@@ -10605,7 +10994,19 @@ impl<'a> Lower<'a> {
         Ok(match name {
             "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
             | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let (a, b) = if name == "v_and_b32" {
+                    let Fields::Valu(v) = &inst.fields else {
+                        unreachable!()
+                    };
+                    let c0 = v.src.first().and_then(Self::const_u32);
+                    let c1 = v.src.get(1).and_then(Self::const_u32);
+                    (
+                        self.src_half(inst, 0, c1.and_then(Self::mask_half))?,
+                        self.src_half(inst, 1, c0.and_then(Self::mask_half))?,
+                    )
+                } else {
+                    (s(self, 0)?, s(self, 1)?)
+                };
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
@@ -10644,17 +11045,15 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, a, ones)
             }
             "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32" => {
-                // A left shift by 16 or more reads the low half alone.
+                // A shift by 16 or more reads one 16-bit half alone.
                 let Fields::Valu(v) = &inst.fields else {
                     unreachable!()
                 };
-                let by = v.src.first().and_then(|&o| crate::resource::lane_of(o));
-                let low =
-                    name == "v_lshlrev_b32" && v.sdwa.is_none() && by.is_some_and(|n| n & 31 >= 16);
-                let a = match self.low16_src(inst, 1).filter(|_| low) {
-                    Some(x) => x,
-                    None => s(self, 1)?,
-                };
+                let by = v.src.first().and_then(Self::const_u32);
+                let half = by
+                    .filter(|&n| n & 31 >= 16)
+                    .map(|_| name != "v_lshlrev_b32");
+                let a = self.src_half(inst, 1, half)?;
                 let sh = s(self, 0)?;
                 let sh = m31(self, sh);
                 let op = match name {
@@ -10666,7 +11065,23 @@ impl<'a> Lower<'a> {
             }
             "v_lshl_add_u32" | "v_lshl_or_b32" | "v_add_lshl_u32" | "v_and_or_b32"
             | "v_or3_b32" | "v_xad_u32" | "v_add3_u32" | "v_xor3_b32" => {
-                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let c0 = v.src.first().and_then(Self::const_u32);
+                let c1 = v.src.get(1).and_then(Self::const_u32);
+                let (h0, h1) = match name {
+                    "v_lshl_add_u32" | "v_lshl_or_b32" => {
+                        (c1.filter(|&n| n & 31 >= 16).map(|_| false), None)
+                    }
+                    "v_and_or_b32" => (c1.and_then(Self::mask_half), c0.and_then(Self::mask_half)),
+                    _ => (None, None),
+                };
+                let (a, b, d) = (
+                    self.src_half(inst, 0, h0)?,
+                    self.src_half(inst, 1, h1)?,
+                    s(self, 2)?,
+                );
                 match name {
                     "v_lshl_add_u32" | "v_lshl_or_b32" => {
                         let b = m31(self, b);
@@ -10725,12 +11140,32 @@ impl<'a> Lower<'a> {
                 self.mul_hi(a, b, signed)
             }
             "v_bfe_u32" | "v_bfe_i32" => {
-                let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let half = match (
+                    v.src.get(1).and_then(Self::const_u32),
+                    v.src.get(2).and_then(Self::const_u32),
+                ) {
+                    (_, Some(w)) if w & 31 == 0 => Some(false),
+                    (Some(off), _) if off & 31 >= 16 => Some(true),
+                    (Some(off), Some(w)) if (off & 31) + (w & 31) <= 16 => Some(false),
+                    _ => None,
+                };
+                let (a, off, w) = (self.src_half(inst, 0, half)?, s(self, 1)?, s(self, 2)?);
                 let w = m31(self, w);
                 self.bfe(a, off, w, name == "v_bfe_i32")
             }
             "v_bfi_b32" => {
-                let (m, a, b) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                let cm = v.src.first().and_then(Self::const_u32);
+                let (m, a, b) = (
+                    s(self, 0)?,
+                    self.src_half(inst, 1, cm.and_then(Self::mask_half))?,
+                    self.src_half(inst, 2, cm.and_then(|m| Self::mask_half(!m)))?,
+                );
                 let ones = k(self, u32::MAX);
                 let nm = self.s.m.bin(c, Bin::Xor, m, ones);
                 let x = self.s.m.bin(c, Bin::And, m, a);
@@ -10942,7 +11377,23 @@ impl<'a> Lower<'a> {
                         return Ok(r);
                     }
                 };
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let perm_half = |base: u32, signs: u32| -> Option<Option<bool>> {
+                    let (mut lo, mut hi) = (false, false);
+                    for i in 0..4 {
+                        let pick = sel >> (8 * i) & 0xFF;
+                        lo |= pick == base || pick == base + 1 || pick == signs;
+                        hi |= pick == base + 2 || pick == base + 3 || pick == signs + 1;
+                    }
+                    (lo || hi).then_some((lo != hi).then_some(hi))
+                };
+                let a = match perm_half(4, 10) {
+                    Some(h) => self.src_half(inst, 0, h)?,
+                    None => k(self, 0),
+                };
+                let b = match perm_half(0, 8) {
+                    Some(h) => self.src_half(inst, 1, h)?,
+                    None => k(self, 0),
+                };
                 let mut r = k(self, 0);
                 for i in 0..4 {
                     let pick = sel >> (8 * i) & 0xFF;
@@ -11923,9 +12374,9 @@ impl<'a> Lower<'a> {
     /// results keep the register's high half (GFX10).
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) => o,
-            _ => self.s.m.i32(0),
+        let old = match inst.read(Reg::V(reg)) {
+            Some(o) => self.value_half(o, true).unwrap_or_else(|_| self.s.m.i32(0)),
+            None => self.s.m.i32(0),
         };
         let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
         let old = self.s.m.bin(c, Bin::And, old, high);
@@ -12093,12 +12544,19 @@ impl<'a> Lower<'a> {
                 .get(if packed { whole + (k - whole) / 2 } else { k })
                 .ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
-            let x = l.i32_of(v)?;
             if !packed {
-                return Ok(x);
+                let low_bias = *a16
+                    && k == usize::from(name.ends_with("_o"))
+                    && name.trim_end_matches("_o") == "image_sample_b";
+                return if low_bias {
+                    l.value_half(v, false)
+                } else {
+                    l.i32_of(v)
+                };
             }
             let c = l.cur;
             let half = (k - whole) as u32 % 2;
+            let x = l.value_half(v, half != 0)?;
             let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
@@ -12288,7 +12746,7 @@ impl<'a> Lower<'a> {
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
                 vals.push(if *d16 {
-                    let mut x = self.i32_of(v)?;
+                    let mut x = self.value_half(v, k % 2 == 1)?;
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
@@ -14141,8 +14599,11 @@ impl<'a> Lower<'a> {
                 return Err("a compressed export to an integer target");
             }
             for ch in 0..4u8 {
-                if let (Some(id), Some(value)) = (id, e.values[usize::from(ch)]) {
-                    stores.push((id, ch, value, Some(ch & 1 == 1)));
+                if let (Some(id), Some(value)) = (id, e.values[usize::from(ch)])
+                    && ch >= outputs[id].col
+                    && ch < outputs[id].col + outputs[id].cols
+                {
+                    stores.push((id, ch - outputs[id].col, value, Some(ch & 1 == 1)));
                 }
             }
         }
@@ -14156,8 +14617,13 @@ impl<'a> Lower<'a> {
             let found = match e.target {
                 Target::Color(n) => outputs
                     .iter()
-                    .position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
-                    .map(|id| (id, ch)),
+                    .position(|o| {
+                        o.kind == 16
+                            && o.row == Some(u32::from(n))
+                            && ch >= o.col
+                            && ch < o.col + o.cols
+                    })
+                    .map(|id| (id, ch - outputs[id].col)),
                 Target::Position(0) => by_kind(3).map(|id| (id, ch)),
                 Target::Depth => match ch {
                     0 => by_kind(17)
@@ -14308,7 +14774,28 @@ impl<'a> Lower<'a> {
         // programs whose outputs a pixel stage reads.
         let mut ready: Vec<(usize, u8, &'static str, V)> = Vec::with_capacity(stores.len());
         for (id, col, value, half) in stores {
-            let mut x = self.i32_of(value)?;
+            let cols = elements(self, primitive)[id].cols;
+            let mut x = match half {
+                Some(high) => match self.value_half(value, high) {
+                    Ok(x) => x,
+                    // Guess: GFX10 `exp ... compr` enables register pairs (`en` 0x3 or 0xf), so a
+                    // guessed 1- or 3-channel colour target gets a 2- or 4-channel signature; when
+                    // `v_fma_mixlo_f16` wrote only the low half of the final pair, the trailing
+                    // high half is unused by the target.
+                    Err(_)
+                        if high
+                            && self.guessed
+                            && e.compressed
+                            && matches!(e.target, Target::Color(_))
+                            && col + 1 == cols
+                            && self.low16.contains_key(&value) =>
+                    {
+                        self.s.m.i32(0)
+                    }
+                    Err(why) => return Err(why),
+                },
+                None => self.i32_of(value)?,
+            };
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
@@ -15333,6 +15820,7 @@ impl<'a> Lower<'a> {
         'phi: for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            let mut half_only: Option<Option<bool>> = None;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
@@ -15352,9 +15840,12 @@ impl<'a> Lower<'a> {
                     }
                     // An input an unguarded counted `v_movreld` loop overwrites
                     // before anything reads it (PR #457).
-                    (Some(Val::Missing("barycentrics read directly")), false)
-                        if read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
-                    {
+                    (
+                        Some(Val::Missing(
+                            "barycentrics read directly" | "the first half of an interpolation",
+                        )),
+                        false,
+                    ) if read && self.overwritten_movreld_edge(b, phi, n).is_some() => {
                         self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Bit(_)), false) if read => {
@@ -15386,6 +15877,14 @@ impl<'a> Lower<'a> {
                     // register and back on one arm): it, whichever edges the lanes took.
                     (Some(Val::Missing(_)), false)
                         if read && let Some(x) = self.copied_number(phi.value) =>
+                    {
+                        x
+                    }
+                    (Some(Val::Missing(_)), false)
+                        if read
+                            && let Some(high) = *half_only
+                                .get_or_insert_with(|| self.phi_half_only(&live, phi.value))
+                            && let Ok(x) = self.value_half(arg, high) =>
                     {
                         x
                     }

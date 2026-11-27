@@ -497,11 +497,19 @@ writes the pair. The kept half has no DXIL form. A `v_fma_mixlo_f16` already rec
 as unknown, with the low half it made in `low16`, but `v_fma_mixhi_f16` refused it outright.
 
 Now either one records the half it writes (`low16` or `high16`) when the half it keeps is unknown,
-and the other one, finding that entry, keeps the known half and makes the value whole. Entries
-exist only for those `mix` results, so anything else that reads such a value is refused as before.
-So is a kept half that is exported or read: 2 shaders now name the other half's input, the first
-half of an interpolation, where they named the barycentric before, and some of the corpus's
-shaders export `v0` after a `mixlo` alone.
+and the other one (or a 16-bit `write_half` operation) keeps that known half and makes the value
+whole. Operations that read only the known 16-bit half (`v_fma_mix*` `op_sel_hi`, `v_pack_b32_f16`,
+`v_pk_*`, 16-bit VALU and SDWA word/byte selects, half-shifts, half-masks, `v_bfi_b32`, `v_bfe_*`,
+`v_perm_b32`, `a16`/`d16` image and LDS half accesses, unguarded `v_mov_b32`/`v_cndmask_b32` copies,
+phis whose transitive readers only touch that half, and compressed exports within the signature's
+`SV_Target` columns) take `low16` or `high16` directly (#455; tests:
+`export_tests::compressed_exports_and_half_ops_follow_known_16bit_halves`,
+`export_tests::half_only_phis_and_overwritten_movreld_loops_translate_while_other_half_reads_refuse`,
+and `shader_tests::known_16bit_halves_draw_across_mix_pack_joins_and_odd_compressed_exports`).
+Guess: because GFX10 `exp ... compr` enables register pairs (`en` 0x3 or 0xf), a guessed 1- or
+3-channel colour target gets a 2- or 4-channel signature; when `v_fma_mixlo_f16` wrote only the low
+half of the final pair, the trailing high half is padded with 0 (while a missing half anywhere else,
+or in a non-guessed 4-channel signature, stays refused).
 
 Over a 12,020-shader corpus (Series S boot to the menus, 27 November), 91 shaders now translate
 (90 pixel, 1 vertex), and no other output changes. They were refused as:
