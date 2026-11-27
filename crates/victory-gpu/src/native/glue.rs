@@ -386,7 +386,7 @@ fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 3]>) {
 
 /// `VICTORY_DUMP_TARGETS=<dir>,<seconds>`: once, at the first present after that many seconds,
 /// every 8-bit colour target drawn to since the last present is written as `<dir>/t<n>.ppm`; HDR
-/// and 10-bit targets (DXGI 2, 10, 24, 26) are tone-mapped into `..._f<format>.ppm`, their range logged.
+/// and 10-bit targets (DXGI 2, 10, 24, 26, 67) are tone-mapped into `..._f<format>.ppm`, their range logged.
 fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
     use std::sync::atomic::AtomicBool;
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -412,10 +412,9 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
         for (n, key) in stats.keys().enumerate() {
             let Some(info) = crate::resource::texture_info(*key as This) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
-            if matches!(info.format, 2 | 10 | 24 | 26) {
+            if let Some(bpp) = hdr_target_bpp(info.format) {
                 // HDR and 10-bit targets: tone-mapped to 8 bits, with their range logged.
                 let Some(tex) = t.texture_of(*key) else { continue };
-                let bpp = match info.format { 2 => 16, 10 => 8, _ => 4 };
                 let mut raw = vec![0u8; w * h * bpp];
                 victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
                 let rgb: Vec<[f32; 3]> = raw.chunks_exact(bpp).map(|p| decode_hdr(info.format, p)).collect();
@@ -452,7 +451,26 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
     });
 }
 
-/// One texel of an HDR or 10-bit colour target (DXGI 2, 10, 24, 26) as linear RGB.
+fn hdr_target_bpp(format: u32) -> Option<usize> {
+    match format {
+        2 => Some(16),
+        10 => Some(8),
+        24 | 26 | 67 => Some(4),
+        _ => None,
+    }
+}
+
+#[test]
+fn hdr_dump_decodes_rgb9e5() {
+    assert_eq!(hdr_target_bpp(67), Some(4));
+    let word = 256u32 | (128 << 9) | (64 << 18) | (16 << 27);
+    assert_eq!(decode_hdr(67, &word.to_le_bytes()), [1.0, 0.5, 0.25]);
+    assert_eq!(decode_hdr(67, &1u32.to_le_bytes()), [2f32.powi(-24), 0.0, 0.0]);
+    assert_eq!(decode_hdr(67, &(31u32 << 27).to_le_bytes()), [0.0; 3]);
+    assert_eq!(decode_hdr(67, &u32::MAX.to_le_bytes()), [65_408.0; 3]);
+}
+
+/// One texel of an HDR or 10-bit colour target as linear RGB.
 fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
     let word = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
     // An unsigned small float: `mbits` mantissa bits over a 5-bit exponent.
@@ -468,6 +486,11 @@ fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
             if h >> 15 == 1 { -v } else if (h >> 10) & 0x1f == 0x1f { f32::NAN } else { v }
         }),
         24 => [0, 10, 20].map(|s| ((word(0) >> s) & 0x3ff) as f32 / 1023.0),
+        67 => {
+            let v = word(0);
+            let scale = 2f32.powi((v >> 27) as i32 - 24);
+            [0, 9, 18].map(|shift| ((v >> shift) & 0x1ff) as f32 * scale)
+        }
         _ => {
             let v = word(0);
             [small(v & 0x7ff, 6), small((v >> 11) & 0x7ff, 6), small(v >> 22, 5)]
@@ -1250,7 +1273,8 @@ fn pass_present(resource: This) {
         for key in keys {
             let Some(info) = crate::resource::texture_info(key as This) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
-            let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
+            let hdr_bpp = hdr_target_bpp(info.format);
+            let bpp = hdr_bpp.unwrap_or(match info.format { 11 | 16 => 8, 28 | 29 | 34 | 41 | 42 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 });
             // A 3D texture (a colour grading table) is read whole; arrays are skipped.
             let d = if info.dimension == victory_formats::texture::Dimension::Tex3d { info.depth_or_layers.max(1) as usize } else { 1 };
             if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || d == 1 && info.depth_or_layers > 1 && info.format != 28 {
@@ -1274,7 +1298,7 @@ fn pass_present(resource: This) {
             let mut out = format!("P6\n{w} {}\n255\n", h * d).into_bytes();
             let mut extra = String::new();
             match info.format {
-                2 | 10 | 24 | 26 => {
+                _ if hdr_bpp.is_some() => {
                     let rgb: Vec<[f32; 3]> = raw.chunks_exact(bpp).map(|p| decode_hdr(info.format, p)).collect();
                     let (mut max, mut min, mut sum, mut bad, mut neg) = (f32::MIN, f32::MAX, 0f64, 0usize, 0usize);
                     for v in rgb.iter().flatten() {
