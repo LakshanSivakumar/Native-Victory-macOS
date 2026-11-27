@@ -7217,9 +7217,12 @@ impl<'a> Lower<'a> {
     /// dwords 1-3 (width, height, first and last level, type: size queries
     /// of a texture the program never samples). They come from the host's
     /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four dwords
-    /// per heap index. The table gives every other field as 0, so a program
-    /// that can see one of their bits (`seen_bits`) is refused: a buffer's
-    /// stride and swizzle (dword 1 bits 16-31) and dwords 2-3, an image's
+    /// per heap index: a buffer's stride and record count and a nominal format
+    /// and type word too (the host's `descriptors::buffer_words`: programs
+    /// size loops by the record count, or make a raw view of a structured one
+    /// by clearing the stride and setting OOB_SELECT in dword 3). The table
+    /// gives every other field as 0, so a program that can see one of their
+    /// bits (`seen_bits`) is refused: a buffer's swizzle (dword 1 bits 30-31), an image's
     /// base address, minimum level and format (dword 0, dword 1 bits 0-29),
     /// dword 2 bits 30-31, tiling (dword 3 bits 20-27) and dwords 4-7.
     // shortcut: the swizzle reads as the identity; the kind of view is the
@@ -7228,15 +7231,24 @@ impl<'a> Lower<'a> {
     // multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         // What the table holds of each dword, and why reading the rest stops the program.
-        const BUFFER: [(u32, Why); 2] = [
+        // A buffer's: the address (dword 0, dword 1 bits 0-15), the stride (dword 1 bits 16-29),
+        // the record count (dword 2) and the host's nominal format and type word (dword 3), as
+        // `descriptors::buffer_words` writes them. A program that sees dword 1's top bits stays
+        // refused: four dwords at a per-lane heap index can be a texture's (#407), whose dword 1
+        // the table holds as the width's low bits only, so a test of the whole dword against 0
+        // would take a texture of some widths for a null view.
+        const BUFFER: [(u32, Why); 4] = [
             (!0, ""),
             (
-                0xFFFF,
-                "a view address field the table gives as 0: a buffer's stride or swizzle",
+                0x3FFF_FFFF,
+                "a view address field the table gives as 0: a buffer's swizzle (or a texture's \
+                 dword 1, #407)",
             ),
+            (!0, ""),
+            (!0, ""),
         ];
         const BUFFER_REST: Why =
-            "a view address field the table gives as 0: a buffer's record count or format";
+            "a view address field the table gives as 0: a dword past a buffer's descriptor";
         const IMAGE: [(u32, Why); 4] = [
             (
                 0,

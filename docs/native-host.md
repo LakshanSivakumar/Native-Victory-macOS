@@ -1809,7 +1809,8 @@ root SRV `t1` of the memory space (`victory_shader::emit`, "View addresses"; `Ho
 view_addresses`). The native host bound no such table and refused every such program ("needs view
 addresses or write marks"; write marks stay refused, as "needs write marks"). Each resource heap now
 has one (`NativeHost::view_addresses`, `NativeHeap::addresses`): four dwords per title entry, a
-buffer view's title address (dword 0, and the low 16 bits of dword 1), a texture view's size fields
+buffer view's title address (dword 0, and the low 16 bits of dword 1; its stride, record count and
+type word since, below), a texture view's size fields
 (`descriptor::texture_words`, the D3D12 path's, now shared), zeros for anything else. It is made
 the first time a shader reads it, from the heap's records as they are then, and kept current by
 every mirrored write (`NativeHost::mirror`). It follows the page table in the argument buffer
@@ -1874,6 +1875,29 @@ check, a read of a buffer's whole dword 1 translated.
 
 shortcut: the kind of view is the load's (eight dwords at a whole descriptor are an image), and the
 swizzle reads as the identity.
+
+**A buffer's stride, record count and type word (27 November).** The view addresses now hold the
+first three dwords of the console's buffer descriptor and a nominal fourth, and the translator's
+per-dword masks (`seen_bits`) take a buffer's dword 1 bits 0-29 and dwords 0, 2 and 3 as held
+(`descriptors::buffer_words`): the base address (dword 0, dword 1 bits 0-15), the stride (dword 1
+bits 16-29: the element size, 0 for a raw view), `NUM_RECORDS` (dword 2: elements, or bytes for a
+raw view) and dword 3 (identity channel selects, a 32-bit float format, RESOURCE_LEVEL 1, OOB_SELECT
+3 for a raw view or 0),. The
+console compiler reads these to size a loop (`GetDimensions`) or to make a raw view of a structured
+one: keep dword 0, clear dword 1's stride (`and 0xc000ffff`), multiply the record count by the stride
+for the size in bytes, and set OOB_SELECT to raw in dword 3 (`and 0xcfffffff`, `or 0x30000000`).
+Programs doing either were refused, "a descriptor read only as data". Guesses, marked in the code:
+the console's driver writes a structured view's stride and element count, a typed view's element
+size and count, and a raw view's stride 0 and size in bytes; dword 3's format field is not the
+view's own (programs read it to rebuild a descriptor, not to choose a format). Measured on a corpus
+of the 19,173 shaders one run registered (Series S, through the story load), against main
+b998bb65: 53 more translate (52 vertex, 1 compute: reads of a buffer's record count), 0 regress, 54
+that translated before change output (they load a buffer descriptor's dwords 2-3, now read from the
+view addresses, and leave them unused). A buffer's swizzle bits (dword 1 bits 30-31) stay refused:
+four dwords at a per-lane heap index can be a texture's first four (#407), whose dword 1 the table
+holds as the width's low bits only, so a test of the whole dword against 0 would take a texture of
+some widths for a null view. Tests: `descriptors::tests::buffer_views_give_the_console_descriptor_words`,
+`gfx_refusal_tests::a_buffer_descriptors_record_count_and_type_word_read_as_numbers_translate`.
 
 ## Descriptor dwords read as data
 

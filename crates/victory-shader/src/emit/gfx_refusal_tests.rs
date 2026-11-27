@@ -82,6 +82,35 @@ fn joins_without_a_value_are_found_in_one_pass() {
     }
 }
 
+/// A buffer descriptor read only as numbers takes its record count (dword 2) and its format and
+/// type word (dword 3) from the host's view addresses: the console compiler reads them to size a
+/// loop (`GetDimensions`) or to make a raw view of a structured one (stride cleared, OOB_SELECT
+/// set to raw). Both used to refuse the program ("a descriptor read only as data").
+#[test]
+fn a_buffer_descriptors_record_count_and_type_word_read_as_numbers_translate() {
+    use crate::native::tests::{fspx, fspx_resource};
+    let code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (the UAV the results go to)
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (an SRV read only as numbers)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E00_020E, // v_mov_b32 v0, s14 (record count)
+        0x7E02_020F, // v_mov_b32 v1, s15 (format and type)
+        0xE070_0000,
+        0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+        0xE070_0004,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0 offset:4
+        0xBF81_0000, // s_endpgm
+    ];
+    let table = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 1)];
+    let part = fspx(&bytes_of(&code), 5 << 1, [1, 1, 1], true, &table);
+    let shader = translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default())
+        .expect("dwords 2 and 3 of a buffer descriptor read as numbers translate");
+    assert!(shader.view_addresses, "they are read from the host's view addresses");
+}
+
 #[test]
 fn guessed_pixel_computed_buffer_loads_use_title_memory() {
     let mut meta = [0u8; 0x30];
@@ -874,9 +903,9 @@ fn descriptor_dwords_read_as_data_say_which() {
 }
 
 /// A descriptor read only as data takes its dwords from the view addresses (`t1`), which hold a
-/// buffer's address and an image's size fields and give every other field as 0: a program that
-/// can see a bit of those is refused naming the field, and one that keeps only the address or
-/// the sizes translates.
+/// buffer's address, stride, record count and type word and an image's size fields and give every
+/// other field as 0: a program that can see a bit of those is refused naming the field, and one
+/// that keeps only what the table holds translates.
 #[test]
 fn view_address_fields_the_table_gives_as_0_are_refused() {
     use crate::native::tests::{fspx, fspx_resource};
@@ -913,6 +942,12 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
         (false, mov(12)),
         (false, and(13, 0xFFFF)),
         (false, shifted(0xFF)),
+        // The stride (dword 1 bits 16-29), the record count and the type word.
+        (false, and(13, 0x3FFF_0000)),
+        (false, shifted(0xFFFF)),
+        (false, mov(14)),
+        (false, mov(15)),
+
         (true, and(13, 0xC000_0000)),
         (true, and(14, 0x3FFF_FFFF)),
         (true, and(15, 0xF00F_FFFF)),
@@ -928,10 +963,9 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
     let prefix = "a view address field the table gives as 0: ";
     let dword_1 = "an image's base address, minimum level or format (dword 1)";
     let refused = [
-        (false, mov(13), "a buffer's stride or swizzle"),
-        (false, and(13, 0x3FFF_0000), "a buffer's stride or swizzle"),
-        (false, shifted(0xFFFF), "a buffer's stride or swizzle"),
-        (false, mov(14), "a buffer's record count or format"),
+        (false, mov(13), "a buffer's swizzle (or a texture's dword 1, #407)"),
+        (false, and(13, 0xC000_FFFF), "a buffer's swizzle (or a texture's dword 1, #407)"),
+
         (true, mov(12), "an image's base address"),
         (true, and(13, 0xFF), dword_1),
         (true, and(13, 0x1FF0_0000), dword_1),

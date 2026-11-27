@@ -68,6 +68,74 @@ fn buffer_view(
     Some((base + first * element, size as u32))
 }
 
+/// The first three dwords of the console's buffer descriptor (V#) for a buffer view, as
+/// [`buffer_view`] reads it, and dword 3 as 0: the base address (dword 0, and dword 1 bits 0-15),
+/// the stride (dword 1 bits 16-29: the element size, 0 for a raw view) and `NUM_RECORDS` (dword 2:
+/// elements, or bytes for a raw view, as the hardware counts them). Programs read dword 2 as the
+/// buffer's size (`GetDimensions`).
+// Guess: the console's driver writes a structured view's stride and element count, a typed view's
+// element size and count, and a raw view's stride 0 and size in bytes, as RDNA's buffer
+// descriptors take them (docs/native-host.md, "View addresses").
+fn buffer_view_words(base: u64, format: u32, stride: u32, flags: u32, first: u64, count: u32) -> Option<[u32; 4]> {
+    let raw = stride == 0 && flags & FLAG_RAW != 0;
+    let (addr, size) = buffer_view(base, format, stride, flags, first, count)?;
+    let element = if raw { 0 } else { size.checked_div(count).unwrap_or(stride) };
+    let records = if raw { size } else { count };
+    Some([addr as u32, (addr >> 32) as u32 & 0xFFFF | (element & 0x3FFF) << 16, records, buffer_dword3(raw)])
+}
+
+/// Dword 3 of a buffer descriptor: the identity channel selects (DST_SEL x, y, z, w), a 32-bit
+/// float format, RESOURCE_LEVEL 1 and OOB_SELECT 3 for a raw view or 0 (structured) otherwise.
+// Guess: what the console's driver writes for a view the title made through D3D12 (the format
+// field is not the view's own; programs read it to rebuild the descriptor, as the raw view of a
+// structured one, not to choose a format).
+fn buffer_dword3(raw: bool) -> u32 {
+    const DST_SEL: u32 = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    const FORMAT_32_FLOAT: u32 = 22 << 12;
+    const RESOURCE_LEVEL: u32 = 1 << 24;
+    DST_SEL | FORMAT_32_FLOAT | RESOURCE_LEVEL | if raw { 3 << 28 } else { 0 }
+}
+
+/// [`buffer_view_words`] for `view`, when it is a buffer view (as [`decode`] takes them); a view
+/// of a whole buffer or a constant buffer is raw.
+pub(super) fn buffer_words<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Option<[u32; 4]> {
+    let raw = |addr: u64, size: u64| {
+        let size = size.min(u64::from(u32::MAX)) as u32;
+        [addr as u32, (addr >> 32) as u32 & 0xFFFF, size, buffer_dword3(true)]
+    };
+    let buffer_base = |r: &usize| match resources.get(r)? {
+        Res::Buffer(addr, _) => Some(*addr),
+        Res::Texture(_) => None,
+    };
+    match view {
+        View::Constant(addr, size) => Some(raw(*addr, u64::from(*size))),
+        View::Shader(r, Some(d)) if d[1] == BUFFER => {
+            let first = u64::from(d[4]) | u64::from(d[5]) << 32;
+            buffer_view_words(buffer_base(r)?, d[0], d[7], d[8], first, d[6])
+        }
+        View::Unordered(r, _, Some(d)) if d[1] == BUFFER => {
+            let first = u64::from(d[2]) | u64::from(d[3]) << 32;
+            buffer_view_words(buffer_base(r)?, d[0], d[5], d[8], first, d[4])
+        }
+        View::Placed(unordered, res, d) if res[0] == BUFFER => {
+            let base = u64::from(d[10]) | u64::from(d[11]) << 32;
+            let w: &[u32] = &d[..10];
+            if *unordered {
+                let first = u64::from(w[2]) | u64::from(w[3]) << 32;
+                buffer_view_words(base, w[0], w[5], w[8], first, w[4])
+            } else {
+                let first = u64::from(w[4]) | u64::from(w[5]) << 32;
+                buffer_view_words(base, w[0], w[7], w[8], first, w[6])
+            }
+        }
+        View::Shader(r, None) | View::Unordered(r, _, None) => match *resources.get(r)? {
+            Res::Buffer(addr, size) => Some(raw(addr, size)),
+            Res::Texture(_) => None,
+        },
+        _ => None,
+    }
+}
+
 /// The DXGI formats of textures the native host knows.
 pub fn format(dxgi: u32) -> Option<Format> {
     Some(match crate::resource::pc_format(dxgi) {
@@ -575,6 +643,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn buffer_views_give_the_console_descriptor_words() {
+        let base = Resources::from([(7, Res::Buffer(0x12_3456_7000, 0x1_0000))]);
+        let structured = super::buffer_dword3(false);
+        let raw = super::buffer_dword3(true);
+        // OOB_SELECT (bits 28-29) tells raw (3) from structured (0); RESOURCE_LEVEL is set.
+        assert_eq!((structured >> 28 & 3, raw >> 28 & 3, raw >> 24 & 1), (0, 3, 1));
+        // A structured SRV: 100 elements of 16 bytes from element 2: the stride in dword 1
+        // bits 16-29, the element count in dword 2.
+        let mut srv = [0u32; 10];
+        srv[1] = BUFFER;
+        srv[4] = 2;
+        srv[6] = 100;
+        srv[7] = 16;
+        let addr = 0x12_3456_7000u64 + 32;
+        assert_eq!(
+            buffer_words(&View::Shader(7, Some(srv)), &base),
+            Some([addr as u32, (addr >> 32) as u32 | 16 << 16, 100, structured])
+        );
+        // A raw view: stride 0 and the size in bytes, as the hardware counts raw records.
+        srv[4] = 0;
+        srv[7] = 0;
+        srv[8] = FLAG_RAW;
+        assert_eq!(
+            buffer_words(&View::Shader(7, Some(srv)), &base),
+            Some([0x3456_7000, 0x12, 400, raw])
+        );
+        // A typed R32_FLOAT view: the element size is the stride, the count the records.
+        srv[0] = 41;
+        srv[8] = 0;
+        assert_eq!(
+            buffer_words(&View::Shader(7, Some(srv)), &base),
+            Some([0x3456_7000, 0x12 | 4 << 16, 100, structured])
+        );
+        // A view of the whole buffer and a constant buffer are raw; a texture view has none.
+        assert_eq!(buffer_words(&View::Shader(7, None), &base), Some([0x3456_7000, 0x12, 0x1_0000, raw]));
+        assert_eq!(buffer_words(&View::Constant(0x2000, 256), &base), Some([0x2000, 0, 256, raw]));
+        assert_eq!(buffer_words(&View::Shader(8, None), &base), None);
     }
 
     #[test]
