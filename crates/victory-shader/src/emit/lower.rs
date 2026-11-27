@@ -302,8 +302,8 @@ struct Lower<'a> {
     pending_masks: Vec<(V, usize, usize)>,
     /// [`Lower::unneeded_edges`], made at the first join that asks.
     unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
-    /// [`Lower::load_use`], made at the first descriptor load read as data.
-    load_uses: std::cell::OnceCell<Map<Site, (Site, u8)>>,
+    /// [`Lower::load_uses`], made at the first descriptor load read as data.
+    load_uses: std::cell::OnceCell<Map<Site, Vec<(Site, u8)>>>,
     data_phis: Vec<(V, usize, usize)>,
     /// [`Lower::spill_slot`]: the phi made for lane `.1` of VGPR phi `.0`, and those whose
     /// incoming values are still to fill (block, phi index, lane).
@@ -552,6 +552,13 @@ enum MaskData {
 
 /// A mesh SCC's lane function, whether SCC is its complement, and the atoms EXEC decides.
 type UniformBit = (Bool, bool, Vec<(Atom, bool)>);
+
+/// Rebuilt size/count dwords of one resource descriptor ([`Lower::descriptor_words`]).
+struct DescriptorWords {
+    is_image: bool,
+    dwords: u32,
+    words: Vec<(u32, V)>,
+}
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
@@ -6471,104 +6478,80 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Where the program uses the descriptor that load `site` reads, and the load's first
-    /// dword of it: the first resource descriptor (in their order) with that load among its
-    /// sources. One table for all loads: searching every descriptor's sources for each load
-    /// read as data, and again for each load of the same address, took a pixel shader with
-    /// some hundreds of each tens of seconds.
-    fn load_use(&self, site: Site) -> Option<(Site, u8)> {
+    /// Every distinct `(use_site, first)` pair for resource descriptors whose sources include
+    /// scalar load `site` (`Source::Loaded { load: site, first }`), in descriptor order (keeping
+    /// the first use per `first` dword offset). Wide loads (`s_load_dwordx8`, `s_load_dwordx16`)
+    /// can load more than one descriptor at once. One table for all loads: searching every
+    /// descriptor's sources for each load read as data, and again for each load of the same
+    /// address, took a pixel shader with some hundreds of each tens of seconds.
+    fn load_uses(&self, site: Site) -> &[(Site, u8)] {
         let uses = self.load_uses.get_or_init(|| {
-            let mut uses = Map::default();
-            for d in self.x.res.descriptors.iter().filter(|d| d.role == Role::Resource) {
+            let mut uses: Map<Site, Vec<(Site, u8)>> = Map::default();
+            for d in self
+                .x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+            {
                 for l in d.source.leaves() {
                     if let Source::Loaded { load, first } = *l {
-                        uses.entry(load).or_insert((d.site, first));
+                        let list = uses.entry(load).or_default();
+                        if !list.iter().any(|&(_, f)| f == first) {
+                            list.push((d.site, first));
+                        }
                     }
                 }
             }
             uses
         });
-        uses.get(&site).copied()
+        uses.get(&site).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
-    /// the code also reads as numbers: the console compiler computes sizes
-    /// from descriptor bits (an image's width, height, depth, levels; a
-    /// buffer's record count) instead of querying them. Those fields are
-    /// rebuilt from the host view's dimensions in the GFX10 layout (image
-    /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
-    /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
-    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
-    // shortcut: the base level reads 0 (the host view starts at its own
-    // level 0, so sizes the code shifts by it come out right) and the other
-    // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
-    fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        // What the host has no value for, by dword, so a refusal log says which is read.
-        const BUFFER_ADDRESS: Why =
-            "a descriptor's address or format read as data: a buffer's base address (dword 0)";
-        const BUFFER_DWORD1: Why = "a descriptor's address or format read as data: a buffer's \
-                                    dword 1 (address high bits, stride, swizzle)";
-        const BUFFER_FORMAT: Why =
-            "a descriptor's address or format read as data: a buffer's dword 3 (format and type)";
-        const IMAGE_ADDRESS: Why =
-            "a descriptor's address or format read as data: an image's base address (dword 0)";
-        const IMAGE_REST: Why =
-            "a descriptor's address or format read as data: an image's dwords 5 to 7";
-        const OUTSIDE: Why =
-            "a descriptor's address or format read as data: a dword outside the descriptor";
-        let Fields::Smem {
-            data: Some(Operand::Scalar { code, .. }),
-            ..
-        } = inst.fields
-        else {
-            return Err("a scalar memory read as data");
-        };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
-        };
-        // How the program uses the descriptor tells the view's kind; a load
-        // read only as data takes it from a load of the same descriptor that
-        // the program uses (the compiler loads a descriptor again rather than
-        // keep it, and queries sizes in loops of their own).
-        let use_of = |site: Site| self.load_use(site);
-        // The VGPR a waterfall loop reads the first lane of.
-        let lane_source = |v: Value| {
-            let i = self.def_inst(v)?;
-            match i.fields {
-                Fields::Valu(ref f) if i.name() == "v_readfirstlane_b32" => match f.src[..] {
-                    [Operand::Vector { reg, .. }] => i.read(Reg::V(reg)),
-                    _ => None,
-                },
-                _ => None,
+    /// Whether scalar value `v` (written by a descriptor load) is read anywhere other than as a
+    /// descriptor operand of `image_*`, `buffer_*` or `s_buffer_load_*`.
+    fn descriptor_dword_read_as_data(&self, v: Value) -> bool {
+        for b in &self.x.p.blocks {
+            if b.phis.iter().any(|ph| ph.args.contains(&v)) {
+                return true;
             }
-        };
-        let same = |a: &Address, b: &Address| {
-            a.param == b.param
-                && a.offset == b.offset
-                && (a.dynamic == b.dynamic
-                    || a.dynamic.and_then(lane_source).is_some()
-                        && a.dynamic.and_then(lane_source) == b.dynamic.and_then(lane_source))
-        };
-        let address = self.scalar.get(&site);
-        let use_at = use_of(site).or_else(|| {
-            self.x
-                .res
-                .scalar
-                .iter()
-                .filter(|&(s, a)| *s != site && address.is_some_and(|b| same(a, b)))
-                .find_map(|&(s, _)| use_of(s))
-        });
-        let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
+            for u in &b.insts {
+                if !u.reads.iter().any(|r| r.1 == v) {
+                    continue;
+                }
+                let data_read = match &u.fields {
+                    Fields::Image { .. } => false,
+                    Fields::Buffer { soffset, .. } => matches!(
+                        *soffset,
+                        Operand::Scalar { code, .. }
+                            if code != NULL && u.read(Reg::S(code)) == Some(v)
+                    ),
+                    Fields::Smem { soffset, .. } if u.name().starts_with("s_buffer_load_") => {
+                        matches!(
+                            *soffset,
+                            Operand::Scalar { code, .. }
+                                if code != NULL && u.read(Reg::S(code)) == Some(v)
+                        )
+                    }
+                    _ => true,
+                };
+                if data_read {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Rebuild the queryable size/count dwords of one resource descriptor used at `at` and
+    /// addressed through `src`.
+    fn descriptor_words(
+        &mut self,
+        site: Site,
+        at: Site,
+        src: &Source,
+    ) -> Result<DescriptorWords, Why> {
+        let used = self.used_kind(src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
         let uav = un.contains("store")
@@ -6620,7 +6603,7 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
-        let h = self.handle(site, &src, false, props)?;
+        let h = self.handle(site, src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -6674,23 +6657,231 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
-        for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
-                None => {
-                    let why = match (image.is_some(), rel) {
-                        (false, 0) => BUFFER_ADDRESS,
-                        (false, 1) => BUFFER_DWORD1,
-                        (false, 3) => BUFFER_FORMAT,
-                        (true, 0) => IMAGE_ADDRESS,
-                        (true, 5..=7) => IMAGE_REST,
-                        _ => OUTSIDE,
+        let is_image = image.is_some();
+        Ok(DescriptorWords {
+            is_image,
+            dwords: if is_image { 8 } else { 4 },
+            words,
+        })
+    }
+
+    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
+    /// the code also reads as numbers: the console compiler computes sizes
+    /// from descriptor bits (an image's width, height, depth, levels; a
+    /// buffer's record count) instead of querying them. Those fields are
+    /// rebuilt from the host view's dimensions in the GFX10 layout (image
+    /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
+    /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
+    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
+    // shortcut: the base level reads 0 (the host view starts at its own
+    // level 0, so sizes the code shifts by it come out right) and the other
+    // dwords (addresses, formats, tiling) have no host value: reading them
+    // stops the program.
+    fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        // What the host has no value for, by dword, so a refusal log says which is read.
+        const BUFFER_ADDRESS: Why =
+            "a descriptor's address or format read as data: a buffer's base address (dword 0)";
+        const BUFFER_DWORD1: Why = "a descriptor's address or format read as data: a buffer's \
+                                    dword 1 (address high bits, stride, swizzle)";
+        const BUFFER_FORMAT: Why =
+            "a descriptor's address or format read as data: a buffer's dword 3 (format and type)";
+        const IMAGE_ADDRESS: Why =
+            "a descriptor's address or format read as data: an image's base address (dword 0)";
+        const IMAGE_REST: Why =
+            "a descriptor's address or format read as data: an image's dwords 5 to 7";
+        const OUTSIDE: Why =
+            "a descriptor's address or format read as data: a dword outside the descriptor";
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar memory read as data");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar memory read as data"),
+        };
+        let desc_len = |at: Site| -> Option<i32> {
+            match self.x.p.blocks[at.0].insts[at.1].fields {
+                Fields::Image { .. } => Some(8),
+                Fields::Buffer { .. } | Fields::Smem { .. } => Some(4),
+                _ => None,
+            }
+        };
+        // How the program uses each descriptor tells the view's kind; a wide load
+        // (`s_load_dwordx8`/`x16`) can carry more than one descriptor, and a load read only as
+        // data takes it from another load of the same descriptor (including a partial reload of
+        // its size dwords or a reload of one descriptor out of a wider load).
+        let mut matched: Vec<(Site, i32, u8)> = self
+            .load_uses(site)
+            .iter()
+            .map(|&(at, first)| (at, i32::from(first), first))
+            .collect();
+        let all_covered = (0..count as i32).all(|k| {
+            matched.iter().any(|&(at, delta, _)| {
+                let len = desc_len(at).unwrap_or(0);
+                k >= delta && k < delta + len
+            })
+        });
+        if !all_covered
+            && let Some(a_site) = self.scalar.get(&site).copied()
+        {
+            // The VGPR a waterfall loop reads the first lane of.
+            let lane_source = |v: Value| {
+                let i = self.def_inst(v)?;
+                match i.fields {
+                    Fields::Valu(ref f) if i.name() == "v_readfirstlane_b32" => match f.src[..] {
+                        [Operand::Vector { reg, .. }] => i.read(Reg::V(reg)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            let same_base = |a: &Address, b: &Address| {
+                a.param == b.param
+                    && (a.dynamic == b.dynamic
+                        || a.dynamic.and_then(lane_source).is_some()
+                            && a.dynamic.and_then(lane_source) == b.dynamic.and_then(lane_source))
+            };
+            let mut extra = Vec::new();
+            for &(s, a_s) in &self.x.res.scalar {
+                if s == site || !same_base(&a_s, &a_site) {
+                    continue;
+                }
+                for &(at, first_s) in self.load_uses(s) {
+                    let d_byte = a_s.offset.wrapping_add(4 * u32::from(first_s));
+                    let diff = d_byte.wrapping_sub(a_site.offset) as i32;
+                    if diff & 3 != 0 {
+                        continue;
+                    }
+                    let delta = diff >> 2;
+                    let d_len = desc_len(at);
+                    let overlaps = match d_len {
+                        Some(len) => delta < count as i32 && delta + len > 0,
+                        None => diff == 0,
                     };
-                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(why));
+                    if !overlaps {
+                        continue;
+                    }
+                    let first_for_handle = if delta >= 0 {
+                        delta as u8
+                    } else if d_byte >> 5 == a_site.offset >> 5 {
+                        // A partial reload starting inside the descriptor (e.g. `s_load_dword` at
+                        // `+8` for a buffer's record count): only claim it when `site` covers at
+                        // least one size/count dword this path rebuilds, so a read of dword 1's
+                        // address bits still reaches `view_addresses`.
+                        let has_rebuilt = match d_len {
+                            Some(8) => delta + 1 < count as i32 && delta + 5 > 0,
+                            Some(4) => delta + 2 >= 0 && delta + 2 < count as i32,
+                            _ => false,
+                        };
+                        if !has_rebuilt {
+                            continue;
+                        }
+                        0
+                    } else {
+                        continue;
+                    };
+                    if !matched.iter().any(|&(_, d, _)| d == delta)
+                        && !extra.iter().any(|&(_, d, _)| d == delta)
+                    {
+                        extra.push((at, delta, first_for_handle));
                     }
                 }
+            }
+            matched.extend(extra);
+        }
+        if matched.is_empty() {
+            return self.view_addresses(inst, site, code, count);
+        }
+        let mut filled = vec![false; count as usize];
+        let multi = matched.len() > 1;
+        for (idx, &(at, delta, first_for_handle)) in matched.iter().enumerate() {
+            let d_len = desc_len(at);
+            // For additional descriptors in a wide load, only emit `getDimensions` when at least
+            // one of that descriptor's dwords is read as data: loads that use a second descriptor
+            // only as a resource keep their existing DXIL unchanged.
+            if multi && idx > 0 {
+                let len = d_len.unwrap_or(count as i32);
+                let any_data = (0..count).any(|k| {
+                    let rel = k as i32 - delta;
+                    rel >= 0
+                        && rel < len
+                        && inst
+                            .write(Reg::S(code + k as u8))
+                            .is_some_and(|v| self.descriptor_dword_read_as_data(v))
+                });
+                if !any_data {
+                    continue;
+                }
+            }
+            let src = Source::Loaded {
+                load: site,
+                first: first_for_handle,
+            };
+            match self.descriptor_words(site, at, &src) {
+                Ok(DescriptorWords {
+                    is_image,
+                    dwords: len,
+                    words,
+                }) => {
+                    for k in 0..count {
+                        if filled[k as usize] {
+                            continue;
+                        }
+                        let rel = k as i32 - delta;
+                        if rel < 0 || rel >= len as i32 {
+                            continue;
+                        }
+                        filled[k as usize] = true;
+                        let rel = rel as u32;
+                        match words.iter().find(|w| w.0 == rel) {
+                            Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                            None => {
+                                let why = match (is_image, rel) {
+                                    (false, 0) => BUFFER_ADDRESS,
+                                    (false, 1) => BUFFER_DWORD1,
+                                    (false, 3) => BUFFER_FORMAT,
+                                    (true, 0) => IMAGE_ADDRESS,
+                                    (true, 5..=7) => IMAGE_REST,
+                                    _ => OUTSIDE,
+                                };
+                                if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                                    self.vals.insert(v, Val::Missing(why));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(why) if !multi => return Err(why),
+                Err(why) => {
+                    let len = d_len.unwrap_or(count as i32);
+                    for k in 0..count {
+                        if filled[k as usize] {
+                            continue;
+                        }
+                        let rel = k as i32 - delta;
+                        if rel < 0 || rel >= len {
+                            continue;
+                        }
+                        filled[k as usize] = true;
+                        if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                            self.vals.insert(v, Val::Missing(why));
+                        }
+                    }
+                }
+            }
+        }
+        for k in 0..count {
+            if !filled[k as usize]
+                && let Some(v) = inst.write(Reg::S(code + k as u8))
+            {
+                self.vals.insert(v, Val::Missing(OUTSIDE));
             }
         }
         Ok(())
