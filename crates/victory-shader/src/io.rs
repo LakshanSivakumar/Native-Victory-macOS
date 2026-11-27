@@ -328,6 +328,13 @@ pub(crate) fn raise_graphics(
                 .iter()
                 .find(|p| p.slot == crate::emit::graphics::VERTEX_TABLE)
                 .map(|p| p.user_data.saturating_add(2)),
+            // A mesh (NGG) program: the eight system SGPRs, then its user SGPRs from s8, of which
+            // the hardware has at most 32 (LLVM's `AMDGPU::getMaxNumUserSGPRs` on GFX9 and later;
+            // the user SGPR count of `SPI_SHADER_PGM_RSRC2_GS` is 6 bits wide with
+            // `USER_SGPR_MSB`, and the ABI fills no more). Nothing the hardware loads sits at s40
+            // or above; a register there holds what the last wave left, as above compute's and
+            // pixel's own counts.
+            StageIo::Ms(_) => Some(40),
             StageIo::Ps { .. } => {
                 let user = native
                     .layout

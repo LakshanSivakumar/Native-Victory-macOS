@@ -1841,6 +1841,29 @@ mod tests {
         }
     }
 
+    /// A mesh (NGG) program's SGPRs at s40 and above are none the hardware loads (eight system
+    /// SGPRs, then at most 32 user SGPRs): one read before any write holds what the last wave
+    /// left and reads 0, as above compute's and pixel's counts. Below s40, past the root
+    /// parameters, a read is still "a hardware SGPR input".
+    #[test]
+    fn a_mesh_program_reads_zero_from_an_sgpr_no_hardware_loads() {
+        let program = |sgpr: u32| {
+            vec![
+                0xBEFE_0481, // s_mov_b64 exec, 1
+                0x2C0A_0A87, // v_lshrrev_b32 v5, 7, v5
+                0xBEFE_04C1, // s_mov_b64 exec, -1
+                0x7E00_0200 | sgpr, // v_mov_b32 v0, s<sgpr>
+                0xF800_08CF, 0x0000_0000, // exp pos0 v0, v0, v0, v0 done
+                0xF800_0941, 0x0000_0001, // exp prim v1 done
+                ENDPGM,
+            ]
+        };
+        mesh(&program(72)).expect("s72 is no input");
+        mesh(&program(40)).expect("s40 is no input");
+        let e = mesh(&program(39)).unwrap_err();
+        assert!(e.to_string().contains("a hardware SGPR input"), "{e}");
+    }
+
     /// The NGG vertex programs ahead of the G-buffer test EXEC without such a mask: the compare
     /// ANDed with an `s_cselect` of -1 and 0 by SCC, then `s_andn2_b64 sN, exec, mask`, its SCC
     /// kept and branched on (was refused: "a lane mask read as data"). On EXEC the mask is a
