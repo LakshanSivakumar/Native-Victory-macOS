@@ -18,8 +18,10 @@ pub mod dsp;
 pub mod dstorage;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod read_cache;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub mod fidelityfx;
+#[cfg(any(windows, target_os = "macos"))]
+pub mod fidelityfx_common;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
