@@ -767,6 +767,7 @@ pub(crate) fn present(queue: This, planes: &[This]) {
     if tracing_targets() {
         trace_present(resource, planes);
     }
+    PRESENTS.fetch_add(1, Ordering::Relaxed);
     pass_present(resource);
     let shown = with_title(|t| {
         let _ = t.ensure_queue(queue as usize);
@@ -1274,6 +1275,13 @@ fn pass_config(v: &str) -> (String, u64, i64) {
     let skip = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(100);
     let presents = parts.next().and_then(|s| s.trim().parse().ok()).unwrap_or(4);
     (dir, skip, presents)
+}
+
+#[cfg(test)]
+#[test]
+fn skip_draws_takes_full_hashes_only() {
+    assert_eq!(skip_hashes(" 99EFD78FE89B1349,abc,0f8f96e17fabe141x,0f8f96e17fabe141 "), ["99efd78fe89b1349", "0f8f96e17fabe141"]);
+    assert!(skip_hashes("").is_empty());
 }
 
 #[cfg(test)]
@@ -2974,7 +2982,38 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
     r
 }
 
+/// Presents so far ([`skipped_draw`]).
+static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_SKIP_DRAWS=<16-digit hash>,...` (diagnostics): whether a draw whose pipeline has
+/// one of those shaders is dropped; with `VICTORY_SKIP_DRAWS_ALTERNATE=1`, only in frames after
+/// an even number of presents, so that one run's consecutive frames show the scene with and
+/// without them.
+fn skipped_draw(pipeline: usize) -> bool {
+    static SKIP: OnceLock<(Vec<String>, bool)> = OnceLock::new();
+    let (hashes, alternate) = SKIP.get_or_init(|| {
+        let v = std::env::var("VICTORY_SKIP_DRAWS").unwrap_or_default();
+        (skip_hashes(&v), env_set!("VICTORY_SKIP_DRAWS_ALTERNATE"))
+    });
+    !hashes.is_empty()
+        && (!alternate || PRESENTS.load(Ordering::Relaxed) % 2 == 0)
+        && stage_hashes(pipeline).iter().any(|s| s.split(' ').nth(1).is_some_and(|h| hashes.iter().any(|x| x == h)))
+}
+
+/// The 16-digit hex hashes of a comma list, lower case; anything else is left out.
+fn skip_hashes(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
+    if skipped_draw(l.pipeline) {
+        dropped("a draw VICTORY_SKIP_DRAWS names");
+        return None;
+    }
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
         trace_drop(l);
