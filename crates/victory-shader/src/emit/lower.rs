@@ -7057,6 +7057,20 @@ impl<'a> Lower<'a> {
         self.raw_dword(table, at)
     }
 
+    /// The element index of a typed buffer access, with indices of 2^31 and up (past the end of
+    /// any view: the host's are at most 2^26 elements) held at 2^31 - 1, still past the end. The
+    /// host gives a view that starts inside its texture buffer's 16-byte unit an element offset
+    /// in the entry, which the converter (`IRCompilerSupportUnAlignedTypedBuffers`) adds to the
+    /// index in 32 bits before the texture's bounds check: index 0xffffffff (-1, the console's
+    /// "past the end") would wrap to the element just before the view, another object's bytes,
+    /// and a store there overwrite them. The console drops such a store and reads 0.
+    fn typed_index(&mut self, index: V) -> V {
+        let c = self.cur;
+        let top = self.s.m.i32(0x7FFF_FFFF);
+        let past = self.s.m.cmp(c, pred::IUGT, index, top);
+        self.s.m.select(c, past, top, index)
+    }
+
     /// Whether the typed buffer view a handle names has an integer format,
     /// and whether a signed one, from the view-stride table; `None` if the
     /// handle's heap index is not known.
@@ -13386,6 +13400,7 @@ impl<'a> Lower<'a> {
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
                 let element = index.unwrap_or(self.s.m.i32(0));
+                let element = self.typed_index(element);
                 args.push(h);
                 args.extend([element, iu]);
                 for x in vals {
@@ -13509,6 +13524,7 @@ impl<'a> Lower<'a> {
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             typed_h = Some(h);
             let index = index.unwrap_or(self.s.m.i32(0));
+            let index = self.typed_index(index);
             self.s.op(
                 c,
                 "bufferLoad.f32",

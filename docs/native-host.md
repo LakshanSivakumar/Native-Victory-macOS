@@ -1221,6 +1221,8 @@ The "native draws so far" line counts the promotions so far as `typed_views`
 resource heaps as `resource_heaps`, to weigh what the typed views and the
 longer heaps cost.
 
+**Out-of-range indices on a view that starts inside a 16-byte unit.** The converter (`IRCompilerSupportUnAlignedTypedBuffers`) adds the view's element offset to the index in 32 bits before the texture buffer's bounds check, so index 0xffffffff (-1, "past the end" on the console) of a view `skip` elements into its unit would become element `skip - 1`: inside the bounds, the element just before the view, another object's bytes. A store there would overwrite them and a load would read them, where the console drops the store and reads 0. The translator therefore holds every typed buffer load and store index of 2^31 and up at 2^31 - 1 (`Lower::typed_index`, one compare and select per access), still past the end of any view (the host's are at most 2^26 elements). Test: `heap_tests::typed_views_of_every_format_and_offset_keep_to_their_own_elements`.
+
 #### A command buffer the GPU fails still pays its signals and value writes
 
 Observed: the GPU failed a command buffer (`kIOGPUCommandBufferCallbackErrorHang`), and the buffers

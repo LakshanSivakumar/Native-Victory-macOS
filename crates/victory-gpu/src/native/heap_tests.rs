@@ -1828,3 +1828,193 @@ fn typed_views_that_start_inside_a_16_byte_unit_read_and_write_the_titles_elemen
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     drop(records);
 }
+
+/// Lane 0 reads four dwords of data (byte 2048 of the raw entry 1) and three element indices
+/// (bytes 2064, 2068, 2072); stores the data typed at the first index of entry 0
+/// (`buffer_store_format_xyzw ... idxen`), then loads entry 0 typed at the second and third
+/// indices (`buffer_load_format_xyzw ... idxen`) and writes them to entry 1 at bytes 0 and 32.
+const CS_TYPED_STORE_AT_LOAD_AT: &[u32] = &[
+    0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE038_0800, 0x8004_0100, // buffer_load_dwordx4 v[1:4], off, s[16:19], 0 offset:2048
+    0xE030_0810, 0x8004_0A00, // buffer_load_dword v10, off, s[16:19], 0 offset:2064
+    0xE030_0814, 0x8004_0B00, // buffer_load_dword v11, off, s[16:19], 0 offset:2068
+    0xE030_0818, 0x8004_0C00, // buffer_load_dword v12, off, s[16:19], 0 offset:2072
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE01C_2000, 0x8003_010A, // buffer_store_format_xyzw v[1:4], v10, s[12:15], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE00C_2000, 0x8003_060B, // buffer_load_format_xyzw v[6:9], v11, s[12:15], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE078_0000, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0
+    0xE00C_2000, 0x8003_060C, // buffer_load_format_xyzw v[6:9], v12, s[12:15], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE078_0020, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0 offset:32
+    0xBF81_0000, // s_endpgm
+];
+
+/// One format of [`typed_views_of_every_format_and_offset_keep_to_their_own_elements`]: DXGI
+/// format, bytes an element, channels, and how a channel is held (`'u'` unsigned integer, `'f'`
+/// 32-bit float, `'h'` half, `'n'` 8-bit unorm).
+const TYPED_CASES: &[(&str, u32, usize, usize, char)] = &[
+    ("R32_UINT", 42, 4, 1, 'u'),
+    ("R32_FLOAT", 41, 4, 1, 'f'),
+    ("R32G32_FLOAT", 16, 8, 2, 'f'),
+    ("R32G32_UINT", 17, 8, 2, 'u'),
+    ("R16_UINT", 57, 2, 1, 'u'),
+    ("R16G16_UINT", 36, 4, 2, 'u'),
+    ("R16_FLOAT", 54, 2, 1, 'h'),
+    ("R16G16_FLOAT", 34, 4, 2, 'h'),
+    ("R16G16B16A16_FLOAT", 10, 8, 4, 'h'),
+    ("R8_UINT", 62, 1, 1, 'u'),
+    ("R8G8B8A8_UINT", 30, 4, 4, 'u'),
+    ("R8G8B8A8_UNORM", 28, 4, 4, 'n'),
+];
+
+/// Typed buffer views of every format the irradiance cache and its neighbours use, at an aligned
+/// start (16 bytes), at every element start inside a 16-byte unit (the element offset in
+/// the entry's metadata), and inside an element (still a raw entry), in a module converted with
+/// `IRCompilerSupportUnAlignedTypedBuffers` (as every module with typed buffers is now). For each:
+/// a store at element 3 lands there and nowhere else; loads of the first and last element read
+/// the title's; a store one past the end changes nothing (neither the view's last element nor
+/// the bytes after it) and a load there reads 0, and so for element 0xffffffff (no wrap into the
+/// bytes before the view); the element offset never exceeds 15 elements
+/// (the 16-byte unit), far below the metadata's 255. A view inside an element keeps the old
+/// raw-entry behaviour: loads read 0 and stores go nowhere.
+#[test]
+fn typed_views_of_every_format_and_offset_keep_to_their_own_elements() {
+    let mut uav0 = [0u8; 32];
+    uav0[0] = 0x41;
+    uav0[4..6].copy_from_slice(&[3, 3]);
+    uav0[16] = 1;
+    uav0[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut uav1 = uav0;
+    uav1[8] = 8;
+    let cs = shaders::translate(&crate::pipeline::test_compute_container(CS_TYPED_STORE_AT_LOAD_AT, &[uav0, uav1], 7)).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 4];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 4).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut raw_out = [0u32; 16];
+    (raw_out[1], raw_out[4], raw_out[8]) = (1, 1024, 1);
+    [raw_out[10], raw_out[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x1000);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &raw_out, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "typed store and loads") else { panic!("{:?}", t.shaders) };
+
+    let half = |v: f32| -> u16 {
+        // Exact for the values used (small multiples of 1/4).
+        let b = v.to_bits();
+        if v == 0.0 { return 0 }
+        let s = (b >> 16) & 0x8000;
+        let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+        (s | (e as u32) << 10 | (b >> 13) & 0x3ff) as u16
+    };
+    // Channel c of grid element j (title memory from the base, in elements), as the GPU returns it.
+    let value = |kind: char, j: usize, c: usize| -> u32 {
+        match kind {
+            'u' => ((j * 4 + c) % 200 + 1) as u32,
+            'f' | 'h' => (((j * 4 + c) % 64) as f32 * 0.25 + 0.5).to_bits(),
+            _ => ((((j * 4 + c) * 7) % 256) as f32 / 255.0).to_bits(),
+        }
+    };
+    let encode = |kind: char, eb: usize, n: usize, v: &[u32]| -> Vec<u8> {
+        let cb = eb / n;
+        let mut out = Vec::new();
+        for &x in &v[..n] {
+            match (kind, cb) {
+                ('f', 4) | ('u', 4) => out.extend(x.to_le_bytes()),
+                ('h', 2) => out.extend(half(f32::from_bits(x)).to_le_bytes()),
+                ('u', 2) => out.extend((x as u16).to_le_bytes()),
+                ('u', 1) => out.push(x as u8),
+                ('n', 1) => out.push((f32::from_bits(x) * 255.0).round() as u8),
+                _ => unreachable!(),
+            }
+        }
+        out
+    };
+    let base = 0x2_0000usize;
+    let mut failures = Vec::new();
+    for &(name, dxgi, eb, n, kind) in TYPED_CASES {
+        let grid = 64usize;
+        let elem = |j: usize| (0..4).map(|c| value(kind, j, c)).collect::<Vec<u32>>();
+        let memory: Vec<u8> = (0..grid).flat_map(|j| encode(kind, eb, n, &elem(j))).collect();
+        // Element starts at and inside the 16-byte unit at base + 32, then one inside an element.
+        let mut starts: Vec<(usize, bool)> = (0..16 / eb.min(16)).map(|k| (32 + k * eb, true)).collect();
+        if eb > 1 {
+            starts.push((32 + 1, false));
+        }
+        for (offset, own) in starts {
+            let first = offset / eb; // grid element of the view's element 0 (exact when `own`)
+            let count = 8usize;
+            let data: Vec<u32> = match kind {
+                'u' => vec![0x5A, 0x3C, 0x7E, 0x11],
+                'n' => vec![1.0f32.to_bits(), 0, 1.0f32.to_bits(), 0],
+                _ => vec![1.5f32.to_bits(), (-2.0f32).to_bits(), 0.25f32.to_bits(), 4.0f32.to_bits()],
+            };
+            let mut view = [0u32; 16];
+            (view[0], view[1], view[4]) = (dxgi, 1, count as u32);
+            [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A + offset as u64);
+            crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+            assert!(t.host.mirror(start).unwrap());
+            let label = format!("{name} at byte {offset}");
+            // Index 0xffffffff (-1): past the end on the console; with an element offset the
+            // texture index wraps to `skip - 1`, inside the 16-byte unit before the view (another
+            // object's bytes) unless the bounds check comes first.
+            for (store, loads) in [(3usize, [0usize, count - 1]), (count, [count, 1]), (u32::MAX as usize, [u32::MAX as usize, 2])] {
+                f.put(base, &memory);
+                f.put(0x2_1000, &[0u32; 16]);
+                let mut params = data.clone();
+                params.extend([store as u32, loads[0] as u32, loads[1] as u32, 0]);
+                f.put(0x2_1800, &params);
+                let mut l = NativeList::default();
+                l.set_heaps(Some(&heap), None);
+                l.set_compute_pipeline(&pso);
+                l.set_compute_root_table(0, &heap, 0);
+                l.dispatch(1, 1, 1).unwrap();
+                super::run(&t.host, &[&l]);
+                let after = f.get(base, memory.len() / 4);
+                let after: Vec<u8> = after.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let mut want_mem = memory.clone();
+                if own && store < count {
+                    let at = offset + store * eb;
+                    want_mem[at..at + eb].copy_from_slice(&encode(kind, eb, n, &data));
+                }
+                if after != want_mem {
+                    let diff: Vec<usize> = (0..want_mem.len()).filter(|&i| after[i] != want_mem[i]).collect();
+                    failures.push(format!("{label}: store at {store}: bytes changed {:?}..{:?} ({} bytes), want {}", diff.first(), diff.last(), diff.len(), if own && store < count { "only the stored element" } else { "none" }));
+                }
+                let got = f.get(0x2_1000, 16);
+                for (k, &li) in loads.iter().enumerate() {
+                    let want: Vec<u32> = if !own {
+                        // A raw entry has no texture: loads read 0.
+                        vec![0; n]
+                    } else if li >= count {
+                        vec![0; n]
+                    } else if li == store {
+                        // What the store wrote, as the format holds it.
+                        match kind {
+                            'n' => data[..n].iter().map(|&x| ((f32::from_bits(x) * 255.0).round() / 255.0).to_bits()).collect(),
+                            _ => data[..n].to_vec(),
+                        }
+                    } else {
+                        elem(first + li)[..n].to_vec()
+                    };
+                    let have = &got[k * 8..k * 8 + n];
+                    let close = have.iter().zip(&want).all(|(&h, &w)| h == w || kind == 'n' && (f32::from_bits(h) - f32::from_bits(w)).abs() < 1e-6);
+                    if !close {
+                        failures.push(format!("{label}: load of element {li} (after a store at {store}): {have:08x?}, want {want:08x?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    drop(records);
+}
