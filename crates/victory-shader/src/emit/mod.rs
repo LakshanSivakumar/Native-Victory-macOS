@@ -1917,6 +1917,27 @@ mod tests {
         assert!(whole.to_string().contains("first half"), "{whole}");
         let part = program(0x3408_0488).unwrap_err(); // v_lshlrev_b32 v4, 8, v2
         assert!(part.to_string().contains("first half"), "{part}");
+
+        // Same for `write_half` (`v_add_f16` keeping the missing high half over `v_interp_p1ll_f16`):
+        let add16 = |read: u32| {
+            let words = [
+                0xD742_0002u32,
+                0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+                0xD532_0002,
+                0x0201_E8F2, // v_add_f16 v2, 1.0, 2.0
+                read,        // v4 from v2
+                0xF800_180F,
+                0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+                0xBF81_0000,
+            ];
+            let isg1 = rows(&[("TEXCOORD", 0, true)], true);
+            let osg1 = rows(&[("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![texcoord(true)], 1 << 1, &isg1, &osg1)
+        };
+        add16(0x7E08_1702).unwrap(); // v_cvt_f32_f16 v4, v2
+        add16(0x3408_0490).unwrap(); // v_lshlrev_b32 v4, 16, v2
+        let whole16 = add16(0x7E08_0302).unwrap_err(); // v_mov_b32 v4, v2
+        assert!(whole16.to_string().contains("first half"), "{whole16}");
     }
 
     /// A pixel export before the `done` one, both under a lane guard (EXEC

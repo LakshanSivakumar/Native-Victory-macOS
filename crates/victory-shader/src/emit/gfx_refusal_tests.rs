@@ -3159,3 +3159,61 @@ fn a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("lane-mask join") && err.contains("0x48"), "{err:?}");
 }
+
+#[test]
+fn win_back_counterexamples_issue_256() {
+    let ps_in = vec![PsInput {
+        usage: Usage::Generic,
+        row: 0,
+        mask: 1,
+        attr: 0,
+        flat: false,
+        fp16: false,
+        pack2: false,
+        row2: 0,
+    }];
+    let sig_in = vec![sig_el("TEXCOORD", 0, 0, 9, 0, Some(0), 4)];
+    let run = |words: &[u32]| {
+        lower_ps(
+            words,
+            false,
+            vec![],
+            ps_in.clone(),
+            1 << 1,
+            0,
+            sig_in.clone(),
+            false,
+        )
+    };
+    // Rule 1 counter-example: quad DPP reader under a quad-uniform guard (`Quad(c2)`),
+    // where guarded write only overwrote `c2` lanes (`!c2` kept direct barycentric `v0`).
+    let rule1: [u32; 23] = [
+        0xBE82_037E, 0xBEFC_0300, 0xC80C_0000, 0xC80D_0001, 0x7C02_06F0, 0xBE83_3C6A, 0xBF88_0002,
+        0x7E08_0300, 0xBF82_0002, 0xBEFE_0302, 0x7E08_0280, 0xBEFE_0302, 0x7C02_06FF, 0x3E80_0000,
+        0xBE84_3C6A, 0x7E08_02F2, 0xBEFE_097E, 0x080A_08FA, 0xFF00_B104, 0xBEFE_0302, 0xF800_180F,
+        0x0505_0505, 0xBF81_0000,
+    ];
+    let err1 = run(&rule1).err().expect("Rule 1 counter-example must be refused");
+    assert!(err1.to_string().contains("barycentrics"), "{err1}");
+
+    // Rule 2 counter-example: helper lanes in WQM read `v4` where only real pixel lanes (`s6`)
+    // overwrote `v4 = 1.0`, then a real pixel reads the helper lane via `quad_perm`.
+    let rule2: [u32; 26] = [
+        0xBE82_037E, 0xBE86_037E, 0xBEFC_0300, 0xC80C_0000, 0xC80D_0001, 0x7C02_06F0, 0xBE83_3C6A,
+        0xBF88_0002, 0x7E08_0300, 0xBF82_0002, 0xBEFE_0302, 0x7E08_0280, 0xBEFE_0302, 0x7C08_06FF,
+        0x3F40_0000, 0x8A06_6A06, 0xBE87_3C06, 0x7E08_02F2, 0xBEFE_0906, 0x060A_0904, 0x080C_0AFA,
+        0xFF00_B105, 0xBEFE_0306, 0xF800_180F, 0x0606_0606, 0xBF81_0000,
+    ];
+    let err2 = run(&rule2).err().expect("Rule 2 counter-example must be refused");
+    assert!(err2.to_string().contains("barycentrics"), "{err2}");
+
+    // Rule 2 safe subset: helper lanes in WQM compute `v5 = v4 + v4` from kept `old`,
+    // without any quad/implicit-LOD/wave reader, and `exp` exports only real pixels (`s6`).
+    let rule2_safe: [u32; 24] = [
+        0xBE82_037E, 0xBE86_037E, 0xBEFC_0300, 0xC80C_0000, 0xC80D_0001, 0x7C02_06F0, 0xBE83_3C6A,
+        0xBF88_0002, 0x7E08_0300, 0xBF82_0002, 0xBEFE_0302, 0x7E08_0280, 0xBEFE_0302, 0x7C08_06FF,
+        0x3F40_0000, 0x8A06_6A06, 0xBE87_3C06, 0x7E08_02F2, 0xBEFE_0906, 0x060A_0904, 0xBEFE_0306,
+        0xF800_180F, 0x0505_0505, 0xBF81_0000,
+    ];
+    run(&rule2_safe).expect("helper-only WQM read that cannot leak to exports or quad ops stays accepted");
+}

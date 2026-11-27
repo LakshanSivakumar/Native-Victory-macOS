@@ -309,9 +309,13 @@ struct Lower<'a> {
     /// incoming values are still to fill (block, phi index, lane).
     spill_phis: Map<(Value, u32), V>,
     pending_spills: Vec<(V, usize, usize, u32)>,
-    /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
+    /// Phis that code reads. Left a std set: [`Lower::resolve_kept_and_live_edges`] starts
     /// its walk in this set's iteration order, and few phis are read.
     read_phis: HashSet<Value>,
+    /// Guarded/partial VGPR writes (`new -> old`) whose kept old value is checked lane-sensitively.
+    kept_writes: Map<Value, KeptWrite>,
+    /// Genuine reads of [`KeptWrite`] values, checked at `fill_phis`.
+    kept_reads: Vec<ValueRead>,
     params: Map<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -408,8 +412,11 @@ struct Lower<'a> {
     balloting: Set<Value>,
     /// Block writing each value.
     def_block: Map<Value, usize>,
-    /// IR block being lowered.
+    /// IR block and instruction index being lowered (`None` in block exits).
     cur_ir: usize,
+    cur_inst: Option<usize>,
+    /// True while lowering `valu_op` of a DPP instruction whose mask restricted writes.
+    dpp_guarded: bool,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -528,6 +535,37 @@ struct MemoryEntry {
     l1: V,
     /// No host copy holds the page.
     miss: V,
+}
+
+/// What a guarded or partial VGPR write kept: `(old value, optional direct refusal)`.
+type KeptOld = (Value, Option<(usize, Why)>);
+
+/// A guarded or partial VGPR write that kept `old` in inactive lanes or unwritten bits.
+struct KeptWrite {
+    old: Value,
+    /// Present when `old` itself had no DXIL form (`(inst.machine.offset, why)`).
+    missing: Option<(usize, Why)>,
+    reach: Bool,
+    /// Guard under which `new` replaced `old`; lanes keeping `old` satisfy `!guard`.
+    /// `None` when unwritten bits or unmodeled runtime masks leave `old` in any reaching lane.
+    guard: Option<Bool>,
+}
+
+/// A genuine source-operand read of a value that may originate in a [`KeptWrite`].
+struct ValueRead {
+    val: Value,
+    block: usize,
+    inst: Option<usize>,
+    /// Lane constraints at this read (widened across the quad / wave for cross-lane ops).
+    facts: Vec<(Bool, bool)>,
+    cross_lane: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadKind {
+    Lane,
+    Quad,
+    Wave,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1100,6 +1138,8 @@ impl<'a> Lower<'a> {
             spill_phis: Map::default(),
             pending_spills: Vec::new(),
             read_phis: HashSet::new(),
+            kept_writes: Map::default(),
+            kept_reads: Vec::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -1165,6 +1205,8 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            cur_inst: None,
+            dpp_guarded: false,
             sections: HashMap::new(),
             section_out: Set::default(),
             section_lane_reads: Set::default(),
@@ -1616,6 +1658,7 @@ impl<'a> Lower<'a> {
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
+        self.cur_inst = Some(i);
         let inst = &self.x.p.blocks[b].insts[i];
         if super::wave::scalar_alone(inst) {
             return self.inst(b, i);
@@ -2473,10 +2516,121 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.i32(c))
     }
 
+    /// Records a genuine read of `v` (from `kept_writes`) with its lane/quad constraints.
+    fn record_kept_read(&mut self, v: Value) {
+        let b = self.cur_ir;
+        let reach = self.x.st.reach[b];
+        let Some(i) = self.cur_inst else {
+            self.kept_reads.push(ValueRead {
+                val: v,
+                block: b,
+                inst: None,
+                facts: vec![(reach, true)],
+                cross_lane: false,
+            });
+            return;
+        };
+        let inst = &self.x.p.blocks[b].insts[i];
+        let kind = self.read_kind(inst);
+        let facts = match kind {
+            ReadKind::Lane => {
+                let mut f = vec![(reach, true)];
+                if let Some(g) = self.x.st.guards[b][i] {
+                    f.push((g, true));
+                }
+                f
+            }
+            ReadKind::Quad => self.quad_facts(b, i),
+            ReadKind::Wave => Vec::new(),
+        };
+        self.kept_reads.push(ValueRead {
+            val: v,
+            block: b,
+            inst: Some(i),
+            facts,
+            cross_lane: kind != ReadKind::Lane,
+        });
+    }
+
+    fn read_kind(&self, inst: &Inst) -> ReadKind {
+        let name = inst.name();
+        if let Fields::Valu(v) = &inst.fields {
+            if let Some(dpp) = v.dpp {
+                let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+                return if quad && (self.s.pixel || self.s.mesh.is_some()) {
+                    ReadKind::Quad
+                } else {
+                    ReadKind::Wave
+                };
+            }
+            if name.starts_with("v_readfirstlane")
+                || name.starts_with("v_readlane")
+                || name.starts_with("v_permlane")
+            {
+                return ReadKind::Wave;
+            }
+        }
+        if name.starts_with("ds_bpermute") || name.starts_with("ds_permute") {
+            return ReadKind::Wave;
+        }
+        if name.starts_with("ds_swizzle")
+            && let Fields::Ds { offset0, offset1, .. } = inst.fields
+        {
+            let offset = u32::from(offset0) | u32::from(offset1) << 8;
+            let quad = offset & 0x8000 != 0
+                || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
+            return if quad && (self.s.pixel || self.s.mesh.is_some()) {
+                ReadKind::Quad
+            } else {
+                ReadKind::Wave
+            };
+        }
+        if (self.s.pixel || self.s.mesh.is_some())
+            && matches!(
+                name,
+                "image_sample" | "image_sample_b" | "image_sample_c" | "image_get_lod"
+            )
+        {
+            return ReadKind::Quad;
+        }
+        ReadKind::Lane
+    }
+
+    fn quad_facts(&self, b: usize, i: usize) -> Vec<(Bool, bool)> {
+        let is_quad_uniform = |bool_val: Bool| {
+            self.x
+                .st
+                .bools
+                .support(bool_val)
+                .into_iter()
+                .all(|a| matches!(a, Atom::Uniform(_) | Atom::Quad(_)))
+        };
+        let mut facts = Vec::new();
+        let reach = self.x.st.reach[b];
+        if reach != Bool::TRUE && is_quad_uniform(reach) {
+            facts.push((reach, true));
+        }
+        if let Some(g) = self.x.st.guards[b][i]
+            && is_quad_uniform(g)
+        {
+            facts.push((g, true));
+        }
+        facts
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
-        if self.phi_at.contains_key(&v) {
-            self.read_phis.insert(v);
+        self.get_val(v, true)
+    }
+
+    fn get_val(&mut self, v: Value, genuine: bool) -> Result<Val, Why> {
+        if genuine {
+            if self.phi_at.contains_key(&v) {
+                self.read_phis.insert(v);
+            }
+            if self.kept_writes.contains_key(&v) {
+                self.record_kept_read(v);
+            }
         }
         let found = self.vals.get(&v).copied();
         // Most values have a DXIL form, which is the answer whatever they
@@ -4522,37 +4676,95 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Reads `o` as the old value kept by inactive lanes or unwritten bits of
+    /// a write, without marking `o` as genuinely read.
+    fn kept_old_of(&mut self, inst: &Inst, o: Option<Value>) -> (V, Option<KeptOld>) {
+        let Some(o) = o else {
+            return (self.s.m.i32(0), None);
+        };
+        let was_read = self.read_phis.contains(&o);
+        let res = match self.get_val(o, false) {
+            Ok(Val::I32(x)) => Ok(x),
+            Ok(Val::Bit(x)) => Ok(self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)),
+            Ok(Val::Missing(w)) | Err(w) => Err(w),
+        };
+        if !was_read {
+            self.read_phis.remove(&o);
+        }
+        match res {
+            Ok(x) => {
+                let track = self.phi_at.contains_key(&o) || self.kept_writes.contains_key(&o);
+                (x, track.then_some((o, None)))
+            }
+            Err(why) => (
+                self.s.m.i32(0),
+                Some((o, Some((inst.machine.offset, why)))),
+            ),
+        }
+    }
+
+    fn record_kept_write(&mut self, new: Value, kept: KeptOld, keep_all_reaching: bool) {
+        let (old, missing) = kept;
+        let b = self.cur_ir;
+        let guard = if keep_all_reaching || self.dpp_guarded {
+            None
+        } else {
+            self.cur_inst.and_then(|i| self.x.st.guards[b][i])
+        };
+        self.kept_writes.insert(
+            new,
+            KeptWrite {
+                old,
+                missing,
+                reach: self.x.st.reach[b],
+                guard,
+            },
+        );
+    }
+
     /// Writes VGPR `reg` (or the SGPR of a lane read), under `guard`.
     fn write(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
-        let x = match (Self::sdwa_dst(inst), reg) {
-            (Some((sel, unused)), Reg::V(_)) => self.place_bits(inst, reg, x, sel, unused),
-            _ => x,
+        let (x, kept, low16) = match (Self::sdwa_dst(inst), reg) {
+            (Some((sel, unused)), Reg::V(_)) => self.place_bits(inst, reg, x, sel, unused, guard.is_none()),
+            _ => (x, None, None),
         };
-        self.write_placed(inst, reg, x, guard);
+        self.write_placed_with(inst, reg, x, guard, kept, low16);
     }
 
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
+        self.write_placed_with(inst, reg, x, guard, None, None);
+    }
+
+    fn write_placed_with(
+        &mut self,
+        inst: &Inst,
+        reg: Reg,
+        x: V,
+        guard: Option<V>,
+        pre_kept: Option<KeptOld>,
+        low16: Option<V>,
+    ) {
         let Some(new) = inst.write(reg) else { return };
+        let mut kept = pre_kept;
+        let keep_all_reaching = pre_kept.is_some();
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
-                let o = inst.read(reg);
-                let read = o.is_some_and(|o| self.read_phis.contains(&o));
-                let old = match o.map(|o| self.i32_of(o)) {
-                    Some(Ok(o)) => o,
-                    // The validator refuses reads of undef.
-                    _ => self.s.m.i32(0),
-                };
-                // What lanes keep is zero where it has no DXIL form (as
-                // above), so keeping a phi does not make it live.
-                if let Some(o) = o.filter(|_| !read) {
-                    self.read_phis.remove(&o);
+                let (old, g_kept) = self.kept_old_of(inst, inst.read(reg));
+                if kept.is_none() {
+                    kept = g_kept;
                 }
                 self.s.m.select(self.cur, g, x, old)
             }
             _ => x,
         };
         self.vals.insert(new, Val::I32(x));
+        if let Some(low) = low16 {
+            self.low16.insert(new, low);
+        }
+        if let Some(k) = kept {
+            self.record_kept_write(new, k, keep_all_reaching);
+        }
     }
 
     /// The SDWA destination selection: a byte or word, and what the other
@@ -4566,7 +4778,15 @@ impl<'a> Lower<'a> {
     }
 
     /// The low byte or word of `x` placed at `sel` in VGPR `reg`.
-    fn place_bits(&mut self, inst: &Inst, reg: Reg, x: V, sel: u8, unused: u8) -> V {
+    fn place_bits(
+        &mut self,
+        inst: &Inst,
+        reg: Reg,
+        x: V,
+        sel: u8,
+        unused: u8,
+        unguarded: bool,
+    ) -> (V, Option<KeptOld>, Option<V>) {
         let c = self.cur;
         let (width, at) = if sel < 4 {
             (8u32, 8 * u32::from(sel))
@@ -4578,19 +4798,18 @@ impl<'a> Lower<'a> {
         let right = self.s.m.i32(32 - width - at);
         if unused == 1 {
             // Bits below the field shift in as zeros.
-            return self.s.m.bin(c, Bin::AShr, t, right);
+            return (self.s.m.bin(c, Bin::AShr, t, right), None, None);
         }
         let field = self.s.m.bin(c, Bin::LShr, t, right);
         if unused != 2 {
-            return field;
+            return (field, None, None);
         }
-        let old = match inst.read(reg).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) => o,
-            _ => self.s.m.i32(0),
-        };
+        let (old, kept) = self.kept_old_of(inst, inst.read(reg));
         let keep = self.s.m.i32(!((((1u64 << width) - 1) as u32) << at));
         let old = self.s.m.bin(c, Bin::And, old, keep);
-        self.s.m.bin(c, Bin::Or, old, field)
+        let r = self.s.m.bin(c, Bin::Or, old, field);
+        let low16 = (unguarded && sel == 4 && kept.is_some()).then_some(r);
+        (r, kept, low16)
     }
 
     fn write_f(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
@@ -5233,10 +5452,10 @@ impl<'a> Lower<'a> {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,
         };
-        let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
-        let outside = match old_reg {
-            Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
-            None => self.s.m.i32(0),
+        let (outside, ds_kept) = if guard.is_some() {
+            self.kept_old_of(inst, dst_reg.and_then(|r| inst.read(Reg::V(r))))
+        } else {
+            (self.s.m.i32(0), None)
         };
         let p = dword(self, offset);
         let at = self.begin_guarded(guard);
@@ -5250,7 +5469,7 @@ impl<'a> Lower<'a> {
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
-            self.write(inst, Reg::V(reg), r, None);
+            self.write_placed_with(inst, Reg::V(reg), r, None, ds_kept, None);
         }
         Ok(())
     }
@@ -5320,9 +5539,10 @@ impl<'a> Lower<'a> {
             return Err("ds_append or ds_consume in a console wave the host splits");
         }
         let reg = dst_reg.ok_or("an append result")?;
-        let outside = match inst.read(Reg::V(reg)) {
-            Some(v) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
-            None => self.s.m.i32(0),
+        let (outside, ds_kept) = if guard.is_some() {
+            self.kept_old_of(inst, inst.read(Reg::V(reg)))
+        } else {
+            (self.s.m.i32(0), None)
         };
         let g = self.begin_guarded(guard);
         let c = self.cur;
@@ -5349,7 +5569,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let r = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
         let r = self.end_guarded(g, &[(r, outside)])[0];
-        self.write(inst, Reg::V(reg), r, None);
+        self.write_placed_with(inst, Reg::V(reg), r, None, ds_kept, None);
         Ok(())
     }
 
@@ -5367,6 +5587,8 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        self.cur_inst = Some(i);
+        self.dpp_guarded = false;
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
@@ -8555,6 +8777,7 @@ impl<'a> Lower<'a> {
         };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d, self.x.st.guards[b][i])?;
+            self.dpp_guarded = enable.is_some();
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -8562,6 +8785,7 @@ impl<'a> Lower<'a> {
             self.src0 = Some(x);
         }
         let r = self.valu_op(inst, guard);
+        self.dpp_guarded = false;
         self.src0 = None;
         r
     }
@@ -9291,7 +9515,8 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 let h = self.narrow16(r);
-                let (keep, h) = if name == "v_fma_mixhi_f16" {
+                let high = name == "v_fma_mixhi_f16";
+                let (keep, h) = if high {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
                 } else {
@@ -9828,9 +10053,10 @@ impl<'a> Lower<'a> {
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
+        let (old, kept) = if keep {
+            self.kept_old_of(inst, inst.read(Reg::V(reg)))
+        } else {
+            (self.s.m.i32(0), None)
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
         let x = self.s.m.bin(c, Bin::And, x, low);
@@ -9843,7 +10069,8 @@ impl<'a> Lower<'a> {
             let o = self.s.m.bin(c, Bin::And, old, keep);
             self.s.m.bin(c, Bin::Or, o, x)
         };
-        self.write_placed(inst, Reg::V(reg), r, guard);
+        let low16 = (!high && keep && guard.is_none() && kept.is_some()).then_some(r);
+        self.write_placed_with(inst, Reg::V(reg), r, guard, kept, low16);
         Ok(())
     }
 
@@ -14023,6 +14250,7 @@ impl<'a> Lower<'a> {
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
+        self.cur_inst = None;
         let offset = self.x.p.blocks[b]
             .insts
             .last()
@@ -14641,26 +14869,94 @@ impl<'a> Lower<'a> {
     }
 
     /// The incoming edges (phi, predecessor index) over which a value can
-    /// reach a read. A phi that only another read phi consumes is live too
-    /// (else a value with no DXIL form reaching a read through two joins
-    /// would be replaced by zero), but only over edges a lane can take on
-    /// its way there: each step back adds the branch a lane took on that
-    /// edge, and a contradiction (the lane that skipped an arm is not one
-    /// that ran it) leaves the edge dead. A back edge forgets the branches
-    /// (the loop redefines their conditions). Fewer conditions are weaker,
-    /// so keeping only the last few stays sound, and so does walking a phi
-    /// knowing nothing once it has been walked with `MAX_PATHS` sets.
-    fn live_edges(&self) -> Set<(Value, usize)> {
-        const MAX_KNOWN: usize = 4;
+    /// reach a read, plus whether any kept value of a guarded or partial
+    /// write (`kept_writes`) can reach a genuine reader (`kept_reads`).
+    fn resolve_kept_and_live_edges(&self) -> Result<Set<(Value, usize)>, Stop> {
+        const MAX_KNOWN: usize = 6;
         // A branchy pixel shader of the title reached thousands of sets per
         // phi, each compared with all before it, and never finished.
         const MAX_PATHS: usize = 64;
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
+        let uses = (!self.kept_reads.is_empty() && self.s.pixel).then(|| self.build_uses());
+
+        let mut phi_seeds: Vec<(Value, Vec<(Bool, bool)>)> =
             self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        for read in &self.kept_reads {
+            let mut seen_kept: Map<Value, Vec<Vec<(Bool, bool)>>> = Map::default();
+            let mut kept_work = vec![(read.val, read.facts.clone())];
+            let helper_site = (!read.cross_lane && self.s.pixel)
+                .then(|| read.inst.map(|i| (read.block, i)))
+                .flatten();
+            while let Some((v, known)) = kept_work.pop() {
+                if let Some(kw) = self.kept_writes.get(&v) {
+                    let mut combined = known.clone();
+                    if kw.reach != Bool::TRUE {
+                        combined.push((kw.reach, true));
+                    }
+                    if let Some(g) = kw.guard {
+                        combined.push((g, false));
+                    }
+                    combined.drain(..combined.len().saturating_sub(MAX_KNOWN));
+                    if !st.bools.meet(&combined) {
+                        continue;
+                    }
+                    if let (Some(site), Some(u)) = (helper_site, uses.as_ref())
+                        && self.safe_wqm_helper_read(site, &combined, u)
+                    {
+                        continue;
+                    }
+                    let done = seen_kept.entry(v).or_default();
+                    if done.iter().any(|d| d.iter().all(|c| combined.contains(c))) {
+                        continue;
+                    }
+                    let next = if done.len() < MAX_PATHS {
+                        combined
+                    } else {
+                        Vec::new()
+                    };
+                    done.push(next.clone());
+                    if let Some((offset, why)) = kw.missing {
+                        return Err(unsupported(offset, why));
+                    }
+                    kept_work.push((kw.old, next));
+                } else if self.phi_at.contains_key(&v) {
+                    phi_seeds.push((v, known));
+                }
+            }
+        }
+
+        let mut work = phi_seeds;
         let mut live = Set::default();
         let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
         while let Some((v, known)) = work.pop() {
+            if let Some(kw) = self.kept_writes.get(&v) {
+                let mut combined = known;
+                if kw.reach != Bool::TRUE {
+                    combined.push((kw.reach, true));
+                }
+                if let Some(g) = kw.guard {
+                    combined.push((g, false));
+                }
+                combined.drain(..combined.len().saturating_sub(MAX_KNOWN));
+                if !st.bools.meet(&combined) {
+                    continue;
+                }
+                let done = seen.entry(v).or_default();
+                if done.iter().any(|d| d.iter().all(|c| combined.contains(c))) {
+                    continue;
+                }
+                let next = if done.len() < MAX_PATHS {
+                    combined
+                } else {
+                    Vec::new()
+                };
+                done.push(next.clone());
+                if let Some((offset, why)) = kw.missing {
+                    return Err(unsupported(offset, why));
+                }
+                work.push((kw.old, next));
+                continue;
+            }
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
@@ -14699,12 +14995,154 @@ impl<'a> Lower<'a> {
                 }
                 live.insert((v, n));
                 let arg = p.blocks[b].phis[i].args[n];
-                if self.phi_at.contains_key(&arg) {
+                if self.phi_at.contains_key(&arg) || self.kept_writes.contains_key(&arg) {
                     work.push((arg, k));
                 }
             }
         }
-        live
+        Ok(live)
+    }
+
+    fn build_uses(&self) -> Map<Value, Vec<(usize, Option<usize>)>> {
+        let mut uses: Map<Value, Vec<(usize, Option<usize>)>> = Map::default();
+        for (bb, block) in self.x.p.blocks.iter().enumerate() {
+            if self.tail[bb].is_none() {
+                continue;
+            }
+            for phi in &block.phis {
+                for &arg in &phi.args {
+                    uses.entry(arg).or_default().push((bb, None));
+                }
+            }
+            for (ii, inst) in block.insts.iter().enumerate() {
+                for &(_, r) in &inst.reads {
+                    uses.entry(r).or_default().push((bb, Some(ii)));
+                }
+            }
+        }
+        uses
+    }
+
+    /// Whether a pixel shader read at `site` under `facts` is provably isolated
+    /// to helper/dead lanes whose values never reach any quad/implicit-LOD op,
+    /// wave op, export, store, or branch condition.
+    fn safe_wqm_helper_read(
+        &self,
+        site: (usize, usize),
+        facts: &[(Bool, bool)],
+        uses: &Map<Value, Vec<(usize, Option<usize>)>>,
+    ) -> bool {
+        if !self.s.pixel {
+            return false;
+        }
+        let p = self.x.p;
+        let st = &self.x.st;
+        let start = &p.blocks[site.0].insts[site.1];
+        if start.writes.is_empty() || self.read_kind(start) != ReadKind::Lane {
+            return false;
+        }
+        if st.discards.contains_key(&site)
+            || matches!(start.fields, Fields::Exp { .. })
+            || start.writes.iter().any(|&(r, _)| !matches!(r, Reg::V(_)))
+        {
+            return false;
+        }
+        let mut seen = Set::default();
+        let mut work: Vec<Value> = start.writes.iter().map(|&(_, w)| w).collect();
+        while let Some(val) = work.pop() {
+            if !seen.insert(val) {
+                continue;
+            }
+            let Some(list) = uses.get(&val) else { continue };
+            for &(bb, opt_ii) in list {
+                let Some(ii) = opt_ii else {
+                    for phi in &p.blocks[bb].phis {
+                        if phi.args.contains(&val) {
+                            work.push(phi.value);
+                        }
+                    }
+                    continue;
+                };
+                let uinst = &p.blocks[bb].insts[ii];
+                if self.read_kind(uinst) != ReadKind::Lane || st.discards.contains_key(&(bb, ii)) {
+                    return false;
+                }
+                let mut sink_facts = facts.to_vec();
+                if st.reach[bb] != Bool::TRUE {
+                    sink_facts.push((st.reach[bb], true));
+                }
+                if let Some(g) = st.guards[bb][ii] {
+                    sink_facts.push((g, true));
+                }
+                let name = uinst.name();
+                if matches!(uinst.fields, Fields::Exp { .. }) {
+                    let is_null = self
+                        .exports
+                        .get(&(bb, ii))
+                        .is_some_and(|e| matches!(e.target, crate::io::Target::Null));
+                    if !is_null && st.bools.meet(&sink_facts) {
+                        return false;
+                    }
+                    continue;
+                }
+                let mem_effect = (matches!(uinst.fields, Fields::Flat { .. })
+                    && !name.starts_with("global_load_"))
+                    || name.contains("store")
+                    || name.contains("atomic")
+                    || (matches!(uinst.fields, Fields::Ds { .. })
+                        && !(name.starts_with("ds_read")
+                            || name.starts_with("ds_swizzle")
+                            || name.contains("permute")));
+                if mem_effect && st.bools.meet(&sink_facts) {
+                    return false;
+                }
+                if uinst.writes.iter().any(|&(r, _)| !matches!(r, Reg::V(_))) {
+                    return false;
+                }
+                for &(_, w) in &uinst.writes {
+                    if let Some(kw) = self.kept_writes.get(&w)
+                        && kw.old == val
+                        && !Self::inst_reads_as_source(uinst, val)
+                    {
+                        let mut kept_facts = facts.to_vec();
+                        if kw.reach != Bool::TRUE {
+                            kept_facts.push((kw.reach, true));
+                        }
+                        if let Some(g) = kw.guard {
+                            kept_facts.push((g, false));
+                        }
+                        if !st.bools.meet(&kept_facts) {
+                            continue;
+                        }
+                    }
+                    work.push(w);
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether `inst` reads `val` as a non-keep source operand (as opposed to
+    /// solely preserving it as the destination's old value under a guard).
+    fn inst_reads_as_source(inst: &Inst, val: Value) -> bool {
+        let Fields::Valu(v) = &inst.fields else {
+            return true;
+        };
+        let name = inst.name();
+        if name.starts_with("v_mac_")
+            || name.starts_with("v_fmac_")
+            || matches!(
+                name,
+                "v_dot4c_i32_i8" | "v_swap_b32" | "v_movreld_b32"
+            )
+        {
+            return true;
+        }
+        v.src.iter().any(|op| match *op {
+            Operand::Vector { reg, dwords } => (0..dwords.max(1))
+                .any(|k| inst.read(Reg::V(reg + k)) == Some(val)),
+            _ => false,
+        })
     }
 
     /// An unguarded indexed write replaces the incoming value before a
@@ -14874,7 +15312,7 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
-        let live = self.live_edges();
+        let live = self.resolve_kept_and_live_edges()?;
         let mut retry = Vec::new();
         'phi: for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
@@ -16514,6 +16952,65 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(refusal(&kept), None);
+
+        // Guarded write over the phi WITHOUT a covering unguarded write leaves
+        // `v1` holding `s_memtime` in inactive lanes, which the compare reads: refused.
+        let kept_read = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert!(refusal(&kept_read).is_some());
+
+        // Direct non-phi `Val::Missing` kept in `!guard` lanes and read: refused.
+        let non_phi_kept = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001,
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert!(refusal(&non_phi_kept).is_some());
+
+        // Two complementary guarded writes overwrite every lane before the read: accepted.
+        let complement_guarded = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF82_0001, // s_branch
+            0xBE83_0381, // s_mov_b32 s3, 1
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0x8A7E_7E04, // s_andn2_b32 exec_lo, s4, exec_lo
+            0x7E02_0283, // v_mov_b32 v1, 3
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001,
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&complement_guarded), None);
     }
 
     #[test]
