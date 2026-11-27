@@ -12142,6 +12142,11 @@ impl<'a> Lower<'a> {
     }
 
     fn loop_value_safe(&self, v: Value, l: &DivergentLoop, wave_wide: bool) -> bool {
+        let mut inv_memo = Map::default();
+        let mut inv_visiting = Set::default();
+        if self.loop_invariant_mask(v, l, &mut inv_memo, &mut inv_visiting) {
+            return true;
+        }
         if wave_wide {
             return false;
         }
@@ -12181,6 +12186,90 @@ impl<'a> Lower<'a> {
             })
     }
 
+    fn loop_invariant_mask(
+        &self,
+        v: Value,
+        l: &DivergentLoop,
+        memo: &mut Map<Value, bool>,
+        visiting: &mut Set<Value>,
+    ) -> bool {
+        if let Some(&ok) = memo.get(&v) {
+            return ok;
+        }
+        if !visiting.insert(v) {
+            return false;
+        }
+        let ok = if let Some(&orig) = self.x.st.restored.get(&v) {
+            self.loop_invariant_mask(orig, l, memo, visiting)
+        } else if let Some(&(pb, _)) = self.phi_at.get(&v) {
+            !l.in_loop[pb] && self.dominates(pb, l.header) && pb != l.header
+        } else if let Some(&db) = self.def_block.get(&v) {
+            if !l.in_loop[db] {
+                self.dominates(db, l.header)
+            } else if let Some(inst) = self.def_inst(v) {
+                if let Some(copies) = self.xor_copies(inst)
+                    && let Some(&(_, orig)) = copies.iter().find(|&&(w, _)| w == v)
+                {
+                    self.loop_invariant_mask(orig, l, memo, visiting)
+                } else {
+                    match &inst.fields {
+                        Fields::Sop { src, .. }
+                            if matches!(
+                                inst.name(),
+                                "s_mov_b32"
+                                    | "s_movk_i32"
+                                    | "s_mov_b64"
+                                    | "s_not_b32"
+                                    | "s_not_b64"
+                                    | "s_and_b32"
+                                    | "s_and_b64"
+                                    | "s_or_b32"
+                                    | "s_or_b64"
+                                    | "s_xor_b32"
+                                    | "s_xor_b64"
+                                    | "s_andn2_b32"
+                                    | "s_andn2_b64"
+                                    | "s_orn2_b32"
+                                    | "s_orn2_b64"
+                                    | "s_cselect_b32"
+                                    | "s_cselect_b64"
+                            ) && inst.read(Reg::S(EXEC)).is_none()
+                                && inst.read(Reg::S(EXEC + 1)).is_none() =>
+                        {
+                            let half = inst.writes.iter().position(|w| w.1 == v).unwrap_or(0) as u8;
+                            let scc_ok = inst.read(Reg::Scc).is_none_or(|scc| {
+                                self.def_block
+                                    .get(&scc)
+                                    .is_some_and(|&sb| !l.in_loop[sb] && self.dominates(sb, l.header))
+                            });
+                            scc_ok
+                                && src.iter().all(|op| match *op {
+                                    Operand::Scalar { code: NULL, .. }
+                                    | Operand::Const(_)
+                                    | Operand::Literal(_) => true,
+                                    Operand::Scalar { code, .. } => {
+                                        code != EXEC
+                                            && (!self.x.native.wave64 || code != EXEC + 1)
+                                            && inst
+                                                .read(Reg::S(code + half))
+                                                .is_some_and(|u| self.loop_invariant_mask(u, l, memo, visiting))
+                                    }
+                                    _ => false,
+                                })
+                        }
+                        _ => false,
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        visiting.remove(&v);
+        memo.insert(v, ok);
+        ok
+    }
     /// Walks `v` inside `l` through bit-preserving updates back to a loop-header
     /// phi (`target`, or discovering it when `target` is `None`).
     #[allow(clippy::too_many_arguments)]
@@ -12204,16 +12293,65 @@ impl<'a> Lower<'a> {
             return None;
         }
         let res = (|| {
-            // Only the header's phi: a join inside the loop is not followed.
-            if let Some(&(pb, _)) = self.phi_at.get(&v) {
-                return (pb == l.header && target.is_none()).then_some(v);
+            if let Some(&(pb, pi)) = self.phi_at.get(&v) {
+                if !l.in_loop[pb] {
+                    return None;
+                }
+                if pb == l.header {
+                    return target.is_none().then_some(v);
+                }
+                let phi = &self.x.p.blocks[pb].phis[pi];
+                let mut found = target;
+                for (n, &q) in self.x.p.blocks[pb].preds.iter().enumerate() {
+                    if self.block[q].is_none() || self.never_taken(q, pb) {
+                        continue;
+                    }
+                    let t = self.trace_preserved_phi(
+                        phi.args[n],
+                        found,
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    if found.is_some_and(|prev| prev != t) {
+                        return None;
+                    }
+                    found = Some(t);
+                }
+                return found;
+            }
+            if let Some(&orig) = self.x.st.restored.get(&v) {
+                return self.trace_preserved_phi(
+                    orig,
+                    target,
+                    l,
+                    memo,
+                    visiting,
+                    zero_memo,
+                    zero_visiting,
+                );
             }
             let db = *self.def_block.get(&v)?;
             if !l.in_loop[db] {
                 return None;
             }
             let inst = self.def_inst(v)?;
-            let Fields::Sop { src, .. } = &inst.fields else {
+            if let Some(copies) = self.xor_copies(inst)
+                && let Some(&(_, orig)) = copies.iter().find(|&&(w, _)| w == v)
+            {
+                return self.trace_preserved_phi(
+                    orig,
+                    target,
+                    l,
+                    memo,
+                    visiting,
+                    zero_memo,
+                    zero_visiting,
+                );
+            }
+            let Fields::Sop { dst, src, .. } = &inst.fields else {
                 return None;
             };
             let half = inst.writes.iter().position(|w| w.1 == v)? as u8;
@@ -12231,7 +12369,49 @@ impl<'a> Lower<'a> {
                     zero_memo,
                     zero_visiting,
                 ),
-                "s_or_b32" | "s_or_b64" => {
+                "s_cselect_b32" | "s_cselect_b64" => {
+                    let a = self.trace_preserved_phi(
+                        read_half(src.first())?,
+                        target,
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    let c = self.trace_preserved_phi(
+                        read_half(src.get(1))?,
+                        Some(a),
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    (a == c).then_some(a)
+                }
+                "s_cmov_b32" | "s_cmov_b64" => {
+                    let a = self.trace_preserved_phi(
+                        read_half(src.first())?,
+                        target,
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    let old = self.trace_preserved_phi(
+                        read_half(dst.as_ref())?,
+                        Some(a),
+                        l,
+                        memo,
+                        visiting,
+                        zero_memo,
+                        zero_visiting,
+                    )?;
+                    (a == old).then_some(a)
+                }
+                "s_or_b32" | "s_or_b64" | "s_xor_b32" | "s_xor_b64" => {
                     if self.is_zero_when_exited_op(
                         src.get(1),
                         inst,
@@ -12253,6 +12433,70 @@ impl<'a> Lower<'a> {
                         return Some(t);
                     }
                     if self.is_zero_when_exited_op(
+                        src.first(),
+                        inst,
+                        half,
+                        l,
+                        zero_memo,
+                        zero_visiting,
+                    ) && let Some(u) = read_half(src.get(1))
+                        && let Some(t) = self.trace_preserved_phi(
+                            u,
+                            target,
+                            l,
+                            memo,
+                            visiting,
+                            zero_memo,
+                            zero_visiting,
+                        )
+                    {
+                        return Some(t);
+                    }
+                    None
+                }
+                "s_andn2_b32" | "s_andn2_b64" => {
+                    if self.is_zero_when_exited_op(
+                        src.get(1),
+                        inst,
+                        half,
+                        l,
+                        zero_memo,
+                        zero_visiting,
+                    ) {
+                        return self.trace_preserved_phi(
+                            read_half(src.first())?,
+                            target,
+                            l,
+                            memo,
+                            visiting,
+                            zero_memo,
+                            zero_visiting,
+                        );
+                    }
+                    None
+                }
+                "s_and_b32" | "s_and_b64" => {
+                    if self.is_one_when_exited_op(
+                        src.get(1),
+                        inst,
+                        half,
+                        l,
+                        zero_memo,
+                        zero_visiting,
+                    ) && let Some(u) = read_half(src.first())
+                        && let Some(t) = self.trace_preserved_phi(
+                            u,
+                            target,
+                            l,
+                            memo,
+                            visiting,
+                            zero_memo,
+                            zero_visiting,
+                        )
+                    {
+                        return Some(t);
+                    }
+                    if self.is_one_when_exited_op(
                         src.first(),
                         inst,
                         half,
@@ -12299,6 +12543,35 @@ impl<'a> Lower<'a> {
             Operand::Scalar { code, .. } => inst
                 .read(Reg::S(code + half))
                 .is_some_and(|u| self.zero_when_exited(u, inst, l, memo, visiting)),
+            _ => false,
+        }
+    }
+
+    fn is_one_when_exited_op(
+        &self,
+        op: Option<&Operand>,
+        inst: &Inst,
+        half: u8,
+        l: &DivergentLoop,
+        memo: &mut Map<Value, bool>,
+        visiting: &mut Set<Value>,
+    ) -> bool {
+        let Some(&op) = op else { return false };
+        match op {
+            Operand::Const(c) => crate::resource::inline(c) == Some(u32::MAX),
+            Operand::Literal(x) => x == u32::MAX,
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code + half)).is_some_and(|u| {
+                let Some(def) = self.def_inst(u) else {
+                    return false;
+                };
+                if matches!(def.name(), "s_not_b32" | "s_not_b64")
+                    && let Fields::Sop { src, .. } = &def.fields
+                {
+                    let h = def.writes.iter().position(|w| w.1 == u).unwrap_or(0) as u8;
+                    return self.is_zero_when_exited_op(src.first(), def, h, l, memo, visiting);
+                }
+                false
+            }),
             _ => false,
         }
     }
@@ -17880,6 +18153,247 @@ mod tests {
         );
     }
 
+    /// The forms of a loop's mask update that keep the bits of lanes that left (one rule each),
+    /// accepted, and a near form of each that does not, refused. Each program sets `s8 = 0`,
+    /// updates it in a loop lanes leave one pass apart (`v3` from `31 - v0`, plus 8 a pass, until
+    /// 32), and reads it per lane after the loop. Assembled with `llvm-mc -mcpu=gfx1030`.
+    #[test]
+    fn loop_masks_whose_updates_keep_the_bits_of_lanes_that_left_translate() {
+        let refusal = |words: &[u32]| match lowers(words, 1 << 15) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        // `s_cselect` of two values that both keep the header phi's bits of lanes that left.
+        let cselect_same_phi = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8809_7E08, // s_or_b32 s9, s8, exec_lo
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0x8508_0809, // s_cselect_b32 s8, s9, s8
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&cselect_same_phi), None, "cselect_same_phi");
+        // `s_cmov` of such a value over the phi itself.
+        let cmov_same_phi = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8809_7E08, // s_or_b32 s9, s8, exec_lo
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBE88_0509, // s_cmov_b32 s8, s9
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&cmov_same_phi), None, "cmov_same_phi");
+        // `s_and` with `~vcc` of a compare made in the pass: all ones for lanes that left.
+        let and_not_compare = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0xBE89_076A, // s_not_b32 s9, vcc_lo
+            0x8708_0908, // s_and_b32 s8, s8, s9
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&and_not_compare), None, "and_not_compare");
+        // `s_andn2` with that compare: 0 for lanes that left.
+        let andn2_compare = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0x8A08_6A08, // s_andn2_b32 s8, s8, vcc_lo
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&andn2_compare), None, "andn2_compare");
+        // `s_xor` with EXEC: 0 for lanes that left.
+        let xor_exec = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8908_7E08, // s_xor_b32 s8, s8, exec_lo
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&xor_exec), None, "xor_exec");
+        // A join inside the loop whose two arms each OR in EXEC or a compare.
+        let join_in_loop = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 other
+            0x8808_7E08, // s_or_b32 s8, s8, exec_lo
+            0xBF82_0002, // s_branch join
+            // other:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0x8808_6A08, // s_or_b32 s8, s8, vcc_lo
+            // join:
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFF7, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&join_in_loop), None, "join_in_loop");
+        // `s_cmov` of -1 sets the bits of lanes that left.
+        let neg_cmov_all = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBE88_05C1, // s_cmov_b32 s8, -1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_cmov_all), Some(super::LOOP_MASK_EXIT), "neg_cmov_all");
+        // `s_and` with the compare clears them.
+        let neg_and_compare = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0x8708_6A08, // s_and_b32 s8, s8, vcc_lo
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFB, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_and_compare), Some(super::LOOP_MASK_EXIT), "neg_and_compare");
+        // `s_andn2` with -1 clears them.
+        let neg_andn2_all = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8A08_C108, // s_andn2_b32 s8, s8, -1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_andn2_all), Some(super::LOOP_MASK_EXIT), "neg_andn2_all");
+        // `s_xor` with 1 flips lane 0's bit after it may have left.
+        let neg_xor_one = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x8908_8108, // s_xor_b32 s8, s8, 1
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFC, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_xor_one), Some(super::LOOP_MASK_EXIT), "neg_xor_one");
+        // One arm ORs in 1, set for lanes that left.
+        let neg_join_in_loop = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 other
+            0x8808_7E08, // s_or_b32 s8, s8, exec_lo
+            0xBF82_0001, // s_branch join
+            // other:
+            0x8808_8108, // s_or_b32 s8, s8, 1
+            // join:
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFF8, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_join_in_loop), Some(super::LOOP_MASK_EXIT), "neg_join_in_loop");
+        // An OR of the compare with 1 is not 0 for lanes that left.
+        let neg_or_compare_or = [
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE8A_037E, // s_mov_b32 s10, exec_lo
+            0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+            // loop:
+            0x7D88_0684, // v_cmp_gt_u32 vcc_lo, 4, v3
+            0x8809_816A, // s_or_b32 s9, vcc_lo, 1
+            0x8808_0908, // s_or_b32 s8, s8, s9
+            0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+            0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+            0xBF89_FFFA, // s_cbranch_execnz loop
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_eq!(refusal(&neg_or_compare_or), Some(super::LOOP_MASK_EXIT), "neg_or_compare_or");
+    }
+
     #[test]
     fn a_loop_carried_mask_changing_exited_lanes_is_refused_after_divergent_loop() {
         let refusal = |words: &[u32]| match lowers(words, 1 << 15) {
@@ -18166,5 +18680,63 @@ mod tests {
         let c = crate::dxbc::Container::parse(&empty).unwrap();
         crate::emit::emit_with(&c, &native, &p, &st, &io, &res, opts)
             .expect("lockstep fallback translates");
+
+        // Regression guard for `loop_invariant_mask` reading `Reg::S(code + half)` on 64-bit
+        // SOPs: `s6` stays loop-invariant while `s7` mutates, so `s_and_b64 s[12:13], s[6:7], s[8:9]`
+        // must inspect `s7` (not `s6`) for the high half and refuse (without the `s7` mutation it
+        // translates).
+        let high_half_mutated = [
+            0x7D88_00B0u32, // v_cmp_gt_u32 vcc, 48, v0
+            0xBE86_046A,    // s_mov_b64 s[6:7], vcc
+            0xBE88_03C1,    // s_mov_b32 s8, -1
+            0xBE89_03C1,    // s_mov_b32 s9, -1
+            0xBE8A_047E,    // s_mov_b64 s[10:11], exec
+            0x4C06_00BF,    // v_sub_nc_u32 v3, 63, v0
+            0x8B07_7F07,    // s_orn2_b32 s7, s7, exec_hi
+            0x878C_0806,    // s_and_b64 s[12:13], s[6:7], s[8:9]
+            0x4A06_0690,    // v_add_nc_u32 v3, 16, v3
+            0x7DA8_06C0,    // v_cmpx_gt_u32 64, v3
+            0xBF89_FFFB,    // s_cbranch_execnz loop
+            0xBEFE_040A,    // s_mov_b64 exec, s[10:11]
+            0xD501_0002, 0x0031_0280, // v_cndmask_b32 v2, 0, 1, s[12:13]
+            0x3402_0082,    // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        let run_hi = |code_words: &[u32]| {
+            let hi_code: Vec<u8> = code_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let hi_native = NativeProgram { code: hi_code, ..native.clone() };
+            let hi_p = ir::build(&hi_native.code, true, 32).unwrap();
+            let hi_st = structure::structure(&hi_p).unwrap();
+            let hi_res =
+                resource::track(&hi_p, &hi_native.layout, hi_native.stage, Some(&hi_st)).unwrap();
+            let hi_io = io::raise(&hi_p, &hi_native).unwrap();
+            lower(&Parts {
+                native: &hi_native,
+                p: &hi_p,
+                st: &hi_st,
+                io: &hi_io,
+                res: &hi_res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+                atomic_locks: false,
+                bias_as_gradients: false,
+                narrow_waves: false,
+                wave32_host: true,
+                zero_copy_memory: false,
+                rect_list: false,
+                copy_params: [0; 32],
+            })
+        };
+        let hi_err = run_hi(&high_half_mutated)
+            .err()
+            .expect("mutated high half of b64 op must be refused");
+        assert!(hi_err.to_string().contains(super::LOOP_MASK_EXIT), "{hi_err}");
+        let mut high_half_invariant = high_half_mutated;
+        high_half_invariant[6] = 0xBF80_0000; // s_nop 0 in place of s_orn2_b32 s7, s7, exec_hi
+        run_hi(&high_half_invariant).expect("invariant high half of b64 op must translate");
     }
 }

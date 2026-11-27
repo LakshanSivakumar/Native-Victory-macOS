@@ -646,13 +646,16 @@ A branch or operand that depends on a first-lane read can differ between the hos
 stays refused.
 
 In the per-lane fast path, a loop mask read after a divergent loop is refused ("a loop-carried
-lane mask read after a divergent loop") unless it is defined outside and dominates the loop, or,
-for a per-lane bit read, each pass only ORs into it `EXEC` or a compare made in that pass, both 0
-for lanes that have already exited (an in-loop `v_cmp` itself is refused because later passes
-write 0 into exited lanes' bits on the console while each host lane keeps its last compare), with
-`EXEC` never widened inside the loop (`exec_unwidened`: saved active subsets propagated via
-`s_mov`, `s_and`/`s_andn2` narrowings, `st.restored`, xor copies, and `st.active` loop joins).
-That keeps the shadow pass's and the G-buffer's accumulated masks. Otherwise a lane that
+lane mask read after a divergent loop") unless it is loop-invariant (defined outside and
+dominating the loop, or a loop-invariant scalar SOP chain whose inputs dominate the loop; an
+in-loop `v_cmp` itself is refused because later passes write 0 into exited lanes' bits on the
+console while each host lane keeps its last compare) or, for a per-lane bit read, every update
+inside the loop keeps the bits of lanes that have already exited, traced back to the loop
+header's phi: an OR, XOR or ANDN2 with a value 0 for those lanes (`EXEC`, a compare made in the
+pass), an AND with one that is all ones for them, `s_cselect` and `s_cmov` of two such values,
+joins inside the loop, xor copies and restored `EXEC`, with `EXEC` never widened inside the loop
+(`exec_unwidened`: saved active subsets propagated via `s_mov`, `s_and`/`s_andn2` narrowings,
+`st.restored`, xor copies, and `st.active` loop joins). Otherwise a lane that
 left on an earlier pass would read its exit-pass value rather than the wave's final mask; one-wave
 compute shaders fall back to `lockstep`.
 
