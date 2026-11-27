@@ -3159,3 +3159,114 @@ fn a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("lane-mask join") && err.contains("0x48"), "{err:?}");
 }
+
+/// Build a wave32 compute shader that constructs a buffer descriptor around an appended constant
+/// table via `s_getpc_b64`, performs a `buffer_load_*` (`op`: 8=ubyte, 9=sbyte, 10=ushort,
+/// 11=sshort, 12=dword, 13=dwordx2, 14=dwordx3, 15=dwordx4; `flags`: bit 12 = offen, bit 13 =
+/// idxen, bits 0..11 = immediate byte offset; `soffset`: scalar offset code, e.g. `0x80` for 0 or
+/// `1` for `s1`), and writes the first loaded dword to `s[2:3]`.
+fn code_table_buffer_words(
+    op: u32,
+    flags: u32,
+    soffset: u32,
+    stride: u32,
+    records: u32,
+    control: u32,
+    swizzle_bits: u32,
+) -> Vec<u32> {
+    let hi_bits = (stride << 16) | (swizzle_bits << 30);
+    let mut w = vec![
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xBE84_1F00, // s_getpc_b64 s[4:5] (returns byte offset 8)
+        0x8004_FF04,
+        0,           // s_add_u32 s4, s4, <table_offset> (patched below)
+        0x8205_8005, // s_addc_u32 s5, s5, 0
+        0x8805_FF05,
+        hi_bits,     // s_or_b32 s5, s5, hi_bits (stride / swizzle)
+        0xBE86_03FF,
+        records,     // s_mov_b32 s6, records
+        0xBE87_03FF,
+        control,     // s_mov_b32 s7, control
+        0x7E04_0200, // v_mov_b32 v2, s0 (index or voffset)
+        0x7E06_0201, // v_mov_b32 v3, s1 (voffset when idxen+offen)
+        0xE000_0000 | (op << 18) | flags,
+        (soffset << 24) | 0x0001_0402, // buffer_load_* v4.., v2[..], s[4:7], soffset
+        0xDC70_8000,
+        0x0002_0401, // global_store_dword v1, v4, s[2:3]
+        0xBF81_0000, // s_endpgm
+    ];
+    w[3] = (w.len() * 4 - 8) as u32;
+    w.extend([0x8433_2211, 0x8877_6695, 0xCCBB_AA99, 0xFFEE_DDCC]);
+    w
+}
+
+#[test]
+fn code_table_buffer_subword_and_indexed_loads_lower_across_oob_modes() {
+    // All subword (ubyte, sbyte, ushort, sshort) and dword (x1..x4) loads, both unindexed
+    // (offen) and indexed (idxen / idxen+offen), across all four RDNA2 OOB_SELECT modes.
+    for op in 8..=15 {
+        for bounds in 0..4u32 {
+            let control = 0x0101_6FAC | (bounds << 28);
+            // Unindexed offen (stride = 0, raw byte count = 16).
+            let raw = code_table_buffer_words(op, 0x1000, 0x80, 0, 16, control, 0);
+            if let Err(e) = emit_cs(&raw, false, 32, false) {
+                panic!("raw op={op} bounds={bounds}: {e}");
+            }
+            // Indexed idxen only (stride = 4, 4 records).
+            let idx = code_table_buffer_words(op, 0x2000, 0x80, 4, 4, control, 0);
+            if let Err(e) = emit_cs(&idx, false, 32, false) {
+                panic!("idxen op={op} bounds={bounds}: {e}");
+            }
+            // Indexed idxen + offen with non-zero scalar offset (s4) and immediate offset 2.
+            let both = code_table_buffer_words(op, 0x3002, 4, 8, 2, control, 0);
+            if let Err(e) = emit_cs(&both, false, 32, false) {
+                panic!("idxen+offen op={op} bounds={bounds}: {e}");
+            }
+        }
+    }
+    // Empty descriptor (`records = 0`), static-only immediate offset past/at end, and `idxen`
+    // with `stride = 0` all lower cleanly.
+    for (op, flags, stride, records, control) in [
+        (10, 0x1000, 0, 0, 0x3101_6FAC),  // ushort, records = 0
+        (12, 0x100C, 0, 16, 0x3101_6FAC), // dword, immediate = 12, records = 16 (last valid)
+        (12, 0x1010, 0, 16, 0x3101_6FAC), // dword, immediate = 16, records = 16 (statically OOB)
+        (15, 0x1000, 0, 12, 0x3101_6FAC), // dwordx4, records = 12 (4th dword statically OOB)
+        (11, 0x0003, 0, 16, 0x3101_6FAC), // sshort, static unaligned offset 3 straddling dwords
+        (12, 0x2000, 0, 4, 0x1101_6FAC),  // dword, idxen with stride = 0, OOB_SELECT = 1
+    ] {
+        let w = code_table_buffer_words(op, flags, 0x80, stride, records, control, 0);
+        if let Err(e) = emit_cs(&w, false, 32, false) {
+            panic!("edge case op={op} flags={flags:#x} records={records}: {e}");
+        }
+    }
+}
+
+#[test]
+fn code_table_buffer_rejects_swizzled_add_tid_non_buffer_and_stores() {
+    // Swizzled dword 1 (bit 30 set).
+    let swizzled = code_table_buffer_words(12, 0x1000, 0x80, 0, 16, 0x3101_6FAC, 1);
+    let err = emit_cs(&swizzled, false, 32, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("swizzling, ADD_TID or a non-buffer type"), "{err:?}");
+
+    // ADD_TID_ENABLE (bit 23) set in control word.
+    let add_tid = code_table_buffer_words(12, 0x1000, 0x80, 0, 16, 0x3181_6FAC, 0);
+    let err = emit_cs(&add_tid, false, 32, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("swizzling, ADD_TID or a non-buffer type"), "{err:?}");
+
+    // Non-buffer TYPE (bits 30-31 non-zero) in control word.
+    let non_buf = code_table_buffer_words(12, 0x1000, 0x80, 0, 16, 0x7101_6FAC, 0);
+    let err = emit_cs(&non_buf, false, 32, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("swizzling, ADD_TID or a non-buffer type"), "{err:?}");
+
+    // buffer_store_dword (op 0x1C) and buffer_load_format_x (op 0) stay refused.
+    for op in [0x1C, 0x00] {
+        let w = code_table_buffer_words(op, 0x1000, 0x80, 0, 16, 0x3101_6FAC, 0);
+        let err = emit_cs(&w, false, 32, false).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            err.contains(
+                "an access other than a load through a descriptor built around a table in the code"
+            ),
+            "op={op:#x}: {err:?}"
+        );
+    }
+}
