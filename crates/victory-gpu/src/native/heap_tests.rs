@@ -896,6 +896,70 @@ fn an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor() {
     drop(records);
 }
 
+/// [`CS_NULL_TEST`] with no image instruction: the descriptor is only read as data, so its words
+/// come from the heap's view addresses.
+const CS_NULL_TEST_DATA: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF40C_0405, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[10:11], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF00_8011, // s_cmp_eq_i32 s17, 0
+    0x8518_8180, // s_cselect_b32 s24, 0, 1
+    0x7E08_0218, // v_mov_b32 v4, s24
+    0xE070_0000, 0x8003_0400, // buffer_store_dword v4, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+/// The null test of [`an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor`] on a
+/// descriptor read only as data (the view-address table): a 5x8 view is no null descriptor, an
+/// entry never written is one.
+#[test]
+fn a_null_test_of_view_addresses_tells_a_view_from_an_empty_entry() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_NULL_TEST_DATA, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+    assert!(t.host.mirror(start).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "null test data") else { panic!("{:?}", t.shaders) };
+    let test = |t: &Title<Metal>| {
+        f.put(0x2_0000, &[super::addr_tests::CANARY]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        f.get(0x2_0000, 1)
+    };
+    assert_eq!(test(&t), [0], "an entry never written");
+    // A 5x8 RGBA8 texture placed at 0x12000 (its view's size fields come from these words).
+    let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 5, 8)).unwrap();
+    let mut resource = [0u32; 14];
+    (resource[0], resource[4], resource[6], resource[7], resource[9]) = (3, 5, 8, 1 | 1 << 16, 1);
+    t.host.register_texture(crate::native::textures::placed_key(0x12000, &resource), &tex);
+    let mut srv = [0u32; 16];
+    (srv[0], srv[1], srv[5], srv[10]) = (28, 4, 1, 0x12000);
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    assert_eq!(test(&t), [1], "a view");
+    drop(records);
+}
+
 /// The size query of the texture at table entry 1 (`image_get_resinfo`), width and height stored.
 const CS_SIZE: &[u32] = &[
     0xBE8A_0304, // s_mov_b32 s10, s4

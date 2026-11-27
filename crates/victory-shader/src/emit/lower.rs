@@ -7483,6 +7483,26 @@ impl<'a> Lower<'a> {
             let word = (a.offset / 4 + k) % 8;
             let written = inst.write(Reg::S(code + k as u8));
             let val = match known.get(word as usize) {
+                // Dword 1 only null-tested or read for its width bits: rebuilt below.
+                Some(_) if word == 1 && count == 8 && written.is_some_and(|v| self.width_bits_or_null_test(v)) => {
+                    let index = self.heap_index(site, k as u8, false)?;
+                    let c = self.cur;
+                    let four = self.s.m.i32(4);
+                    let at = self.s.m.bin(c, Bin::Shl, index, four);
+                    let d1 = self.s.m.i32(4);
+                    let d1 = self.s.m.bin(c, Bin::Add, at, d1);
+                    let d1 = self.raw_dword(views, d1);
+                    let d3 = self.s.m.i32(12);
+                    let d3 = self.s.m.bin(c, Bin::Add, at, d3);
+                    let d3 = self.raw_dword(views, d3);
+                    // As in `descriptor_data`: the table holds a view's dword 1 as width bits
+                    // only, and a view's dword 3 is never 0 (its swizzle) where a null entry's
+                    // four words are.
+                    let (zero, format) = (self.s.m.i32(0), self.s.m.i32(1 << 20));
+                    let null = self.s.m.cmp(c, pred::EQ, d3, zero);
+                    let view = self.s.m.bin(c, Bin::Or, d1, format);
+                    Val::I32(self.s.m.select(c, null, zero, view))
+                }
                 Some(&(held, why))
                     if written.is_some_and(|v| self.seen_bits(v, 4) & !held != 0) =>
                 {

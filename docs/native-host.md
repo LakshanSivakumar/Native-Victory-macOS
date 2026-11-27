@@ -2383,9 +2383,7 @@ passes the stale value on as scalar arithmetic does, and a result the path fixes
 holds nothing of it. Corpus: 651 programs gained (493 pixel, 158 vertex), 0 lost, 0 changed; of
 the world run's 14,508 pixel draws dropped for these two reasons, 12,156 were of pipelines whose
 every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Still refused, rightly
-for now: texture size queries in a waterfall loop that test dword 1 against 0 for a null view
-(the view-address table holds dword 1 as width bits only, so a texture of width 4k + 1 would
-read as null); buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+for now (null tests of dword 1 were fixed later, "Null tests of image dword 1"): buffer dwords 2-3 and image dwords 5-7, which no host table holds.
 
 **Null tests of image dword 1.** Before it sizes an image from its descriptor the console
 compiler tests dword 1 against 0 (`s_cmp_eq_i32 d1, 0; s_cselect_b32 size, 0, size`): a null
@@ -2397,9 +2395,14 @@ code tests the dword against 0 and otherwise reads only its width bits (`s_bfe_u
 `s_lshr_b32` from bit 30) or passes it to an image instruction as the descriptor, and no join
 takes it (`Lower::width_bits_or_null_test`), dword 1 is now 0 for a view of size 0 and has
 format bit 20 set otherwise: exact for such code, which sees no other bit. Anything else that
-reads it keeps the old dword. The view-address table path (`view_addresses`, a size read with no
-use of the view) is unchanged. Test (`victory-gpu`, Metal):
-`heap_tests::an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor` (a 5x8 image
+reads it keeps the old dword. The view-address table path (`view_addresses`, a whole image
+loaded only to read its size fields) does the same from the table's four dwords: dword 1 is 0
+when the entry's dword 3 is 0 and has bit 20 set otherwise. The host writes dword 3 of every
+texture entry with the identity swizzle (`descriptor::image_words`, 0xFAC), and a null, never
+written or buffer entry as 0. Test (`victory-gpu`, Metal):
+`heap_tests::a_null_test_of_view_addresses_tells_a_view_from_an_empty_entry` (a 5x8 placed view
+read as null before; corpus: 0 outputs changed, no program reaches it today). Test (`victory-gpu`,
+Metal): `heap_tests::an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor` (a 5x8 image
 read as null before). Corpus (tmi-agent, 21,600): 0 newly translated, 0 regressed, 2,739 outputs
 changed (94 compute, 589 pixel, 2,056 vertex), each a program whose rebuilt dword 1 is tested
 against 0.
