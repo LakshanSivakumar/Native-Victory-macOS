@@ -17,7 +17,9 @@ use victory_backend::resources::{Format, HeapKind, ResourceBackend, TextureDesc,
 use victory_metal::mem::Alias;
 use victory_metal::metal::Metal;
 use victory_shader::emit::{HostShader, emit_with};
-use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
+use victory_shader::native::{
+    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+};
 use victory_shader::{Container, io, ir, resource, structure};
 
 /// Every lane: `dst[tid] = src[tid] + **(src + 0x1000)`; the same again at `dst + 1024` through a
@@ -166,11 +168,51 @@ pub(super) fn try_translate_wave(
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
+    try_translate_native(&native, options)
+}
+
+/// A 64-lane compute shader with root constants in `s0..s3` and a root view (`kind`, a root
+/// descriptor in root slot 1) in `s4:s5`, translated the way the host translates.
+fn translate_root_view(words: &[u32], kind: ResourceType) -> HostShader {
+    let mut native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo { rsrc2: 6 << 1, threads: [64, 1, 1] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    native.layout.push(RootParam { root: RootType::Descriptor, sgprs: 2, user_data: 4, slot: 1, ..native.layout[0] });
+    native.used.push(UsedResource {
+        kind,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 2,
+        user_data: 4,
+        slot: 1,
+    });
+    try_translate_native(&native, shaders::options()).expect("emit")
+}
+
+fn try_translate_native(
+    native: &NativeProgram,
+    options: victory_shader::emit::Options,
+) -> Result<HostShader, victory_shader::ShaderError> {
     let mut p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     p.thread_counts = options.thread_counts;
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     // A container of no parts: `DXBC`, a digest, version 1.0, its size, no parts.
     let mut empty = b"DXBC".to_vec();
     empty.extend([0; 16]);
@@ -178,7 +220,7 @@ pub(super) fn try_translate_wave(
     empty.extend(32u32.to_le_bytes());
     empty.extend(0u32.to_le_bytes());
     let c = Container::parse(&empty).expect("container");
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_with(&c, native, &p, &st, &io, &res, options)
 }
 
 pub(super) fn title() -> Option<Title<Metal>> {
@@ -891,6 +933,186 @@ fn a_vertex_fetch_straddling_title_pages_apart_in_the_pool_reads_each_dword_wher
         assert_eq!(p, [255, 128, 128, 255]);
     }
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// Title pages at `SPLIT` and the next, mapped at pool offsets 0x4_0000 and 0x8_0000 (apart, as
+/// the title maps them); an access of 4 dwords at `SPLIT + 0xFFF8` has 2 in each.
+const SPLIT: u64 = 0x7100_0000;
+const STRADDLE: u64 = SPLIT + 0xFFF8;
+const FOUR: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+
+fn split_pages(t: &Title<Metal>, f: &Fixture) {
+    t.host.memory().mapped(SPLIT as usize, 0x1_0000, &f.info, 0x4_0000);
+    t.host.memory().mapped(SPLIT as usize + 0x1_0000, 0x1_0000, &f.info, 0x8_0000);
+}
+
+/// `cs` run once, `s[0:1]` = `VA_A`, `s[2:3]` = `STRADDLE` and, with a root view, that view at
+/// `STRADDLE`.
+fn run_straddling(t: &mut Title<Metal>, cs: &HostShader, view: bool) {
+    let Pipe::Compute(pso) = t.compute_pipe(cs, "straddle") else {
+        panic!("not made: {:?}", t.shaders)
+    };
+    let [a, b] = halves(VA_A);
+    let [c, d] = halves(STRADDLE);
+    let mut l = NativeList::default();
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[a, b, c, d]);
+    if view {
+        l.set_compute_root_view(1, STRADDLE);
+    }
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
+/// A load of `FOUR` straddling the pages, stored by every lane at `VA_A + 16 * lane`.
+fn check_straddling_load(cs: &HostShader, view: bool) {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    split_pages(&t, &f);
+    f.put(0x4_FFF8, &FOUR[..2]);
+    f.put(0x8_0000, &FOUR[2..]);
+    run_straddling(&mut t, cs, view);
+    let want: Vec<u32> = FOUR.map(f32::to_bits).repeat(64);
+    // Before, the last two read the pool after the first page: the canary.
+    assert_eq!(f.get(0x2_0000, 256), want);
+}
+
+/// A store of `FOUR` straddling the pages: 2 dwords at the end of the first, 2 at the start of
+/// the next, and nothing in the pool after the first page (another title page, or none).
+fn check_straddling_store(cs: &HostShader, view: bool) {
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    split_pages(&t, &f);
+    run_straddling(&mut t, cs, view);
+    let [a, b, c, d] = FOUR.map(f32::to_bits);
+    assert_eq!(f.get(0x4_FFF0, 4), [CANARY, CANARY, a, b]);
+    assert_eq!(f.get(0x8_0000, 3), [c, d, CANARY]);
+    assert_eq!(f.get(0x5_0000, 2), [CANARY; 2], "written past the first page in the pool");
+}
+
+/// `global_load_dwordx4` straddling two title pages apart in the pool.
+#[test]
+fn a_global_load_straddling_title_pages_apart_in_the_pool_reads_each_dword_where_the_title_has_it() {
+    const LOAD: &[u32] = &[
+        0x3402_0084, // v_lshlrev_b32 v1, 4, v0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xDC38_8000, 0x0202_0006, // global_load_dwordx4 v[2:5], v6, s[2:3]
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xDC78_8000, 0x0000_0201, // global_store_dwordx4 v1, v[2:5], s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    check_straddling_load(&shader(LOAD, 4), false);
+}
+
+/// `global_store_dwordx4` straddling two title pages apart in the pool.
+#[test]
+fn a_global_store_straddling_title_pages_apart_in_the_pool_writes_each_dword_where_the_title_has_it() {
+    const STORE: &[u32] = &[
+        0x7E04_02F2, // v_mov_b32 v2, 1.0
+        0x7E06_02F4, // v_mov_b32 v3, 2.0
+        0x7E08_02FF, 0x4040_0000, // v_mov_b32 v4, 3.0
+        0x7E0A_02F6, // v_mov_b32 v5, 4.0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xDC78_8000, 0x0002_0206, // global_store_dwordx4 v6, v[2:5], s[2:3]
+        0xBF81_0000, // s_endpgm
+    ];
+    check_straddling_store(&shader(STORE, 4), false);
+}
+
+/// `s_load_dwordx4` straddling two title pages apart in the pool.
+#[test]
+fn a_scalar_load_straddling_title_pages_apart_in_the_pool_reads_each_dword_where_the_title_has_it() {
+    const LOAD: &[u32] = &[
+        0x3402_0084, // v_lshlrev_b32 v1, 4, v0
+        0xF408_0101, 0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E04_0204, // v_mov_b32 v2, s4
+        0x7E06_0205, // v_mov_b32 v3, s5
+        0x7E08_0206, // v_mov_b32 v4, s6
+        0x7E0A_0207, // v_mov_b32 v5, s7
+        0xDC78_8000, 0x0000_0201, // global_store_dwordx4 v1, v[2:5], s[0:1]
+        0xBF81_0000, // s_endpgm
+    ];
+    check_straddling_load(&shader(LOAD, 4), false);
+}
+
+/// The descriptor `s[8:11]` around the root view in `s[4:5]`: no record limit, raw.
+macro_rules! root_descriptor {
+    () => {
+        [
+            0xBE88_0304, // s_mov_b32 s8, s4
+            0xBE89_0305, // s_mov_b32 s9, s5
+            0xBE8A_03C1, // s_mov_b32 s10, -1
+            0xBE8B_03FF, 0x0001_4FAC, // s_mov_b32 s11, 0x14fac
+        ]
+    };
+}
+
+/// `s_buffer_load_dwordx4` through a root view, straddling two title pages apart in the pool.
+#[test]
+fn a_scalar_buffer_load_straddling_title_pages_apart_in_the_pool_reads_each_dword_where_the_title_has_it() {
+    let load = [
+        &[0x3402_0084][..], // v_lshlrev_b32 v1, 4, v0
+        &root_descriptor!(),
+        &[
+            0xF428_0304, 0xFA00_0000, // s_buffer_load_dwordx4 s[12:15], s[8:11], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E04_020C, // v_mov_b32 v2, s12
+            0x7E06_020D, // v_mov_b32 v3, s13
+            0x7E08_020E, // v_mov_b32 v4, s14
+            0x7E0A_020F, // v_mov_b32 v5, s15
+            0xDC78_8000, 0x0000_0201, // global_store_dwordx4 v1, v[2:5], s[0:1]
+            0xBF81_0000, // s_endpgm
+        ],
+    ]
+    .concat();
+    check_straddling_load(&translate_root_view(&load, ResourceType::Srv), true);
+}
+
+/// `tbuffer_load_format_xyzw` (32_32_32_32_FLOAT) through a root view, straddling two title
+/// pages apart in the pool.
+#[test]
+fn a_typed_format_load_straddling_title_pages_apart_in_the_pool_reads_each_dword_where_the_title_has_it() {
+    let load = [
+        &[
+            0x3402_0084, // v_lshlrev_b32 v1, 4, v0
+            0x7E0C_0280, // v_mov_b32 v6, 0
+        ][..],
+        &root_descriptor!(),
+        &[
+            0xEA6B_1000, 0x8002_0206, // tbuffer_load_format_xyzw v[2:5], v6, s[8:11], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xDC78_8000, 0x0000_0201, // global_store_dwordx4 v1, v[2:5], s[0:1]
+            0xBF81_0000, // s_endpgm
+        ],
+    ]
+    .concat();
+    check_straddling_load(&translate_root_view(&load, ResourceType::Srv), true);
+}
+
+/// `buffer_store_dwordx4` through a root UAV, straddling two title pages apart in the pool.
+#[test]
+fn a_buffer_store_straddling_title_pages_apart_in_the_pool_writes_each_dword_where_the_title_has_it() {
+    let store = [
+        &[
+            0x7E04_02F2, // v_mov_b32 v2, 1.0
+            0x7E06_02F4, // v_mov_b32 v3, 2.0
+            0x7E08_02FF, 0x4040_0000, // v_mov_b32 v4, 3.0
+            0x7E0A_02F6, // v_mov_b32 v5, 4.0
+            0x7E0C_0280, // v_mov_b32 v6, 0
+        ][..],
+        &root_descriptor!(),
+        &[
+            0xE078_1000, 0x8002_0206, // buffer_store_dwordx4 v[2:5], v6, s[8:11], 0 offen
+            // global_store_dword v6, v2, s[0:1]: a program using title memory reads its root
+            // views through the page table (compute programs that do not keep host views).
+            0xDC70_8000, 0x0000_0206,
+            0xBF81_0000, // s_endpgm
+        ],
+    ]
+    .concat();
+    check_straddling_store(&translate_root_view(&store, ResourceType::Uav), true);
 }
 
 /// The table follows the title's maps: the same dispatch, the same title addresses, after the title

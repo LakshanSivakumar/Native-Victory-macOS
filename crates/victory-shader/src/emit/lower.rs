@@ -605,6 +605,18 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
 /// reach that block, so the ballot misses none.
+/// The page after an access's first, for the dwords of the access that lie on it
+/// ([`Lower::memory_tail`]).
+#[derive(Clone, Copy)]
+struct Tail {
+    /// The access's title address, low dword.
+    lo: V,
+    /// The next page's view.
+    h: V,
+    /// The byte of that view the access's first dword would be at.
+    base: V,
+}
+
 /// A page table lookup ([`Lower::memory`]).
 struct MemoryEntry {
     handle: V,
@@ -1374,8 +1386,10 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let bytes = sub.map_or(4 * n, |(width, _)| width / 8);
+        let mut tail = None;
         let (h, off) = if a.param == MEMORY {
             let (lo, hi) = self.global_address(inst)?;
+            tail = self.memory_tail(lo, hi, bytes, false);
             let (h, off) = self.memory(lo, hi, bytes, false, guard);
             (Some(h), off)
         } else {
@@ -1392,6 +1406,7 @@ impl<'a> Lower<'a> {
                     bits: 0,
                     words: [0, 0],
                 };
+                tail = self.raw_view_tail(&src, off, bytes, false);
                 let (h, off) = self.raw_view((b, i), &src, off, bytes, (11, 0), false, guard)?;
                 (Some(h), off)
             }
@@ -1421,7 +1436,8 @@ impl<'a> Lower<'a> {
                 None => {
                     let four = self.s.m.i32(4 * k);
                     let at = self.s.m.bin(c, Bin::Add, off, four);
-                    dword(self, at)?
+                    let x = dword(self, at)?;
+                    self.tail_pick(tail, k, x)
                 }
                 Some((width, signed)) => {
                     // shortcut: the field is taken not to cross a dword.
@@ -1567,6 +1583,16 @@ impl<'a> Lower<'a> {
             (_, Some(r)) => r,
             _ => unreachable!(),
         };
+        let tail = match memory {
+            Some((lo, hi)) if ops.is_none() => self.memory_tail(lo, hi, 4 * u32::from(n), true),
+            _ => None,
+        };
+        if let Some(t) = tail {
+            self.tail_store(t, h, off, &vals);
+            self.mark_view_write(h, off, 4 * u32::from(n), None);
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         if name.starts_with("global_store_") {
             let mut args = vec![h, off, iu];
             args.extend(&vals);
@@ -6625,6 +6651,7 @@ impl<'a> Lower<'a> {
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
+            let tail = self.raw_view_tail(src, addr, 4 * count, false);
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
             let c = self.cur;
             for k in 0..count {
@@ -6642,6 +6669,7 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = self.tail_pick(tail, k, x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6973,11 +7001,13 @@ impl<'a> Lower<'a> {
         for (x, negative) in extra {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
+        let tail = self.memory_tail(lo, hi, 4 * count, false);
         let (h, off) = self.memory(lo, hi, 4 * count, false, None);
         for k in 0..count {
             let four = self.s.m.i32(4 * k);
             let at = self.s.m.bin(self.cur, Bin::Add, off, four);
             let x = self.raw_dword(h, at);
+            let x = self.tail_pick(tail, k, x);
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -7306,11 +7336,14 @@ impl<'a> Lower<'a> {
     /// [`super::shader::MEMORY_SPACE`]; the root UAV `u0` there takes a bit
     /// per page written and per page or 256 MiB region missed. May end in a
     /// new block: callers take [`Lower::cur`] afresh.
-    // shortcut: one lookup per access, so its bytes are taken to lie in one
-    // host copy of title memory (any access within a 64 KiB page does).
-    // Raw buffer loads of root views take the next page's own entry for their
-    // later dwords (`title_load_tail`); global, scalar, typed-format and BVH
-    // loads and all stores do not yet: give them the same if one is seen to cross.
+    // One lookup per access, so its bytes lie in one host copy of title
+    // memory. Accesses of more than one dword that may cross a 64 KiB page
+    // look up the page of their last dword too and use it for the dwords on
+    // it: raw buffer loads of root views (`title_load_tail`), global, scalar,
+    // scalar buffer and typed-format loads (`tail_pick`), global and raw
+    // buffer stores (`tail_store`). The rest cannot cross: single dwords and
+    // the bytes and halves inside one, atomics (aligned to their size), and
+    // BVH nodes (64-byte aligned, read 64 and 48 bytes at a time).
     pub(crate) fn memory(
         &mut self,
         lo: V,
@@ -7710,7 +7743,7 @@ impl<'a> Lower<'a> {
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
     // bytes or more as dword-aligned.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    fn format_load(&mut self, h: V, off: V, tail: Option<Tail>, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
@@ -7741,7 +7774,8 @@ impl<'a> Lower<'a> {
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
-            load(self, off, total / 32)
+            let ws = load(self, off, total / 32);
+            (0..total / 32).map(|k| self.tail_pick(tail, k, ws[k as usize])).collect()
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
@@ -13678,6 +13712,7 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
+            let mut tail = None;
             // Where the write starts in the view, and how many bytes it may
             // cover (for its marks).
             let (byte, bytes);
@@ -13691,7 +13726,7 @@ impl<'a> Lower<'a> {
                 let element = index.unwrap_or(self.s.m.i32(0));
                 args.push(h);
                 args.extend([element, iu]);
-                for x in vals {
+                for &x in &vals {
                     args.push(self.as_float(x));
                 }
                 // A store of fewer channels (`_x`, `_xy`, `_xyz`) still
@@ -13727,6 +13762,7 @@ impl<'a> Lower<'a> {
                     }
                     None => {
                         let n = 4 * count;
+                        tail = self.raw_view_tail(src, off, n, true);
                         let (h, off) =
                             self.raw_view(site, src, off, n, (11 | u, 0), true, guard)?;
                         args.extend([h, off, iu]);
@@ -13743,7 +13779,10 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
-            self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            match tail {
+                Some(t) => self.tail_store(t, args[0], byte, &vals),
+                None => _ = self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args),
+            }
             self.mark_view_write(args[0], byte, bytes, None);
             self.end_guarded(at, &[]);
             return Ok(());
@@ -13752,11 +13791,13 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
+            let bytes = buffer_format(f).map_or(4, |(bits, _)| bits.iter().sum::<u32>() / 8);
+            let tail = self.raw_view_tail(src, off, bytes, false);
             let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let mut xs = self.format_load(h, off, f, count)?;
+            let mut xs = self.format_load(h, off, tail, f, count)?;
             if d16 {
                 xs = self.d16_channels(f, xs)?;
             }
@@ -13972,6 +14013,78 @@ impl<'a> Lower<'a> {
                 self.s.m.select(self.cur, on_next, theirs[k as usize], mine[k as usize])
             })
             .collect()
+    }
+
+    /// The next 64 KiB title page of an access of `bytes` bytes at title address `(hi:lo)`
+    /// (`hi` bits 32-47), looked up at its last dword, for accesses of more than one dword: see
+    /// [`Self::title_load_tail`]. Every lane looks it up; a lane whose access stays in one page
+    /// gets that page again and uses none of it.
+    fn memory_tail(&mut self, lo: V, hi: V, bytes: u32, write: bool) -> Option<Tail> {
+        if bytes <= 4 {
+            return None;
+        }
+        let last = self.s.m.i32(bytes - 4);
+        let (lo2, hi2) = self.add64(lo, hi, last, false);
+        let mask = self.s.m.i32(0xFFFF);
+        let hi2 = self.s.m.bin(self.cur, Bin::And, hi2, mask);
+        let e = self.memory_entry(lo2, hi2, write);
+        let base = self.s.m.bin(self.cur, Bin::Sub, e.offset, last);
+        Some(Tail { lo, h: e.handle, base })
+    }
+
+    /// [`Self::memory_tail`] of a root view access that [`Self::raw_view`] makes (`off` past the
+    /// root address); `None` for views that are not title memory.
+    fn raw_view_tail(&mut self, src: &Source, off: V, bytes: u32, write: bool) -> Option<Tail> {
+        let (lo, hi) = self.root_address(src)?;
+        let (lo, hi) = self.add64(lo, hi, off, false);
+        let mask = self.s.m.i32(0xFFFF);
+        let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
+        self.memory_tail(lo, hi, bytes, write)
+    }
+
+    /// Whether dword `k` of an access at title address low dword `lo` lies on the page after its
+    /// first dword's (its address differs from the first's in bits 16 and up).
+    fn on_next_page(&mut self, lo: V, k: u32) -> V {
+        let c = self.cur;
+        let (step, k16, zero) = (self.s.m.i32(4 * k), self.s.m.i32(16), self.s.m.i32(0));
+        let a = self.s.m.bin(c, Bin::Add, lo, step);
+        let x = self.s.m.bin(c, Bin::Xor, lo, a);
+        let x = self.s.m.bin(c, Bin::LShr, x, k16);
+        self.s.m.cmp(c, pred::NE, x, zero)
+    }
+
+    /// Dword `k` of an access, `x` as read through its first page's view: read through `t`'s
+    /// page instead where it lies on that one.
+    fn tail_pick(&mut self, t: Option<Tail>, k: u32, x: V) -> V {
+        let Some(t) = t else { return x };
+        let four = self.s.m.i32(4 * k);
+        let at = self.s.m.bin(self.cur, Bin::Add, t.base, four);
+        let y = self.raw_dword(t.h, at);
+        let next = self.on_next_page(t.lo, k);
+        self.s.m.select(self.cur, next, y, x)
+    }
+
+    /// Stores `vals` (dwords) at byte `off` of view `h`, the access's first page, with those
+    /// on `t`'s page stored there instead: one dword at a time, each written through one view
+    /// and sent out of bounds of the other (dropped by its bounds check).
+    fn tail_store(&mut self, t: Tail, h: V, off: V, vals: &[V]) {
+        let (iu, void) = (self.s.m.undef(self.s.t.i32), self.s.t.void);
+        let outside = self.s.m.i32(u32::MAX - 15);
+        for (k, &x) in vals.iter().enumerate() {
+            let k = k as u32;
+            let next = self.on_next_page(t.lo, k);
+            let c = self.cur;
+            let four = self.s.m.i32(4 * k);
+            let here = self.s.m.bin(c, Bin::Add, off, four);
+            let there = self.s.m.bin(c, Bin::Add, t.base, four);
+            let here = self.s.m.select(c, next, outside, here);
+            let there = self.s.m.select(c, next, there, outside);
+            for (view, at) in [(h, here), (t.h, there)] {
+                let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+                let args = [view, at, iu, x, iu, iu, iu, mask, align];
+                self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            }
+        }
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {

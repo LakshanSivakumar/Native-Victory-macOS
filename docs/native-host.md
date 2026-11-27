@@ -3251,8 +3251,23 @@ view (`Lower::title_load_tail`). Test, on the GPU:
 `addr_tests::a_vertex_fetch_straddling_title_pages_apart_in_the_pool_reads_each_dword_where_the_title_has_it`
 (a triangle whose second vertex's x ends one page and y starts the next, mapped apart in the pool:
 the target stayed empty before, covered now; with the pages next to each other in the pool it passed
-either way). Global, scalar, typed-format and BVH loads and stores keep one lookup (marked shortcut
-in `Lower::memory`).
+either way).
+
+The same holds for every other access of more than one dword that can cross a page, and is fixed
+the same way: global loads (`global_load_dwordx2..4`), scalar loads from memory (`s_load_dwordx2..16`)
+and through root views (`s_buffer_load_*`), typed-format loads (`tbuffer_load_format_*` of 8 bytes or
+more), and stores (`global_store_dwordx2..4`, `buffer_store_dwordx2..4` through a root UAV). A loaded
+dword on the next page is read through that page's own view (`Lower::tail_pick`). A store writes
+each dword once: through the first page's view or the next page's, the other one sent out of bounds
+(dropped by its bounds check), so nothing lands in the pool after the first page, which is another
+title page or none (`Lower::tail_store`). Accesses that cannot cross keep one lookup: single dwords
+and the bytes and halves in one, atomics (aligned to their size, 4 or 8 bytes), and BVH nodes (node
+addresses are multiples of 64; a node is read as 64 bytes and the box tail as 48 from the next
+64-byte boundary). Tests, on the GPU, each with the two pages apart in the pool and failing before:
+`addr_tests::a_{global_load,global_store,scalar_load,scalar_buffer_load,typed_format_load,buffer_store}_straddling_title_pages_apart_in_the_pool_*`.
+A compute program that uses no title memory itself keeps host root views (`root_memory`), which run
+on linearly in the pool past their first page: a store through one crossing a page writes into the
+pool after it. No case is known; not changed.
 Whether this was the bunk bed's shards is not proven: two headless runs with the change (28 November,
 pass trace at the 9th world present, one with `VICTORY_DEBUG_PS=id`) showed no shards in their
 G-buffer, and no "with a gap" view, but each run's camera showed another scene (a character close
