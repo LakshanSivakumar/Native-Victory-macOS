@@ -372,20 +372,19 @@ fn probe_hash(at: usize, size: usize, whole: bool, scratch: &mut Vec<u8>) -> bla
     hasher.finalize()
 }
 
-/// Whether the `PROBE_SAMPLE` bytes in the middle of the `size` bytes at `at` are not all zero:
-/// a blank texture's probe, one read (a few hundred blank textures are probed every submission).
+/// Whether any of the bytes a sampled probe reads from the `size` bytes at `at` are non-zero:
+/// a blank texture's probe. The Windows a hot probe samples are spread over the texture, so a
+/// movie's first frame is seen even when the middle of its plane is black (letterboxing); reading
+/// only the middle left the first frames showing blank planes for a scanner round.
 ///
-/// shortcut: a first write that misses the middle (a glyph in a blank atlas) waits for the
-/// scanner; textures written whole (streaming, a movie's planes) are seen at once.
+/// shortcut: a first write that misses every sampled window (a glyph in a blank atlas) still waits
+/// for the scanner; once a blank texture is marked written, the hot probe's whole reads catch it.
 fn probe_nonzero(at: usize, size: usize, scratch: &mut Vec<u8>) -> bool {
-    let off = (size / 2) & !4095;
-    let n = PROBE_SAMPLE.min(size - off);
-    if scratch.len() < n {
-        scratch.resize(n, 0);
-    }
-    scratch[..n].fill(0);
-    let _ = super::safe_read((at + off) as *const u8, &mut scratch[..n]);
-    scratch[..n].iter().any(|&b| b != 0)
+    let mut written = false;
+    probe_read(at, size, false, scratch, |b| {
+        written |= b.iter().any(|&v| v != 0);
+    });
+    written
 }
 
 /// Hands `seen` the bytes a probe of `size` bytes at `at` reads: all of them if `whole`, else

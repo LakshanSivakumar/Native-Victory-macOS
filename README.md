@@ -81,7 +81,7 @@ The setup script checks Rosetta, the Xcode command line tools, rustup and the Me
 tools/macos/run-native.sh /path/to/your/game/folder
 ```
 
-Point it at the folder that holds `game_scarlett_master.exe`. A window opens; after a few seconds of black while it loads, you should see the boot movie and then the menus, and the full log is saved under `runs/`. The script also presses Enter for you every two seconds until 80 s to get past the start screen. Click the window and the keyboard drives the game's gamepad:
+Point it at the folder that holds `game_scarlett_master.exe`. A window opens; after about 20 seconds of black while it loads (down from about 49), you should see the boot movie and then the menus, and the full log is saved under `runs/`. The script also presses Enter for you every two seconds until 80 s to get past the start screen. Click the window and the keyboard drives the game's gamepad:
 
 | Keys | Pad |
 | --- | --- |

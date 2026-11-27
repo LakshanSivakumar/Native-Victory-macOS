@@ -68,6 +68,12 @@ pub(crate) struct Shader {
     /// so only tests keep it.
     #[cfg(any(windows, test, target_os = "macos"))]
     container: Mutex<Vec<u8>>,
+    /// A guessed shader's stage and raw GFX10 pieces, inferred on first translation rather than
+    /// at the title's pipeline creation. Empty for a container the title or our host put together.
+    #[cfg(target_os = "macos")]
+    pieces: Mutex<Option<(victory_shader::HwStage, Vec<u8>, Vec<u8>)>>,
+    #[cfg(target_os = "macos")]
+    built: OnceLock<()>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Its translation for the native host (container let go once made).
@@ -93,6 +99,28 @@ impl std::fmt::Debug for Shader {
 
 /// Every container seen, by full content hash.
 static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+
+/// A guessed graphics stage, shared by the code and metadata it came from. The title makes tens
+/// of thousands of pipelines from the same few shader binaries. Inference is deferred to the
+/// first translation (on a prewarm worker), so nothing here decodes a program on the title's
+/// pipeline-creation path.
+///
+/// shortcut: the key is the bytes, not the title's pointer, so a freed and reused blob cannot
+/// return another shader's program.
+#[cfg(target_os = "macos")]
+type Guessed = Mutex<Option<HashMap<([u8; 32], [u8; 32], &'static str), Arc<Shader>>>>;
+
+#[cfg(target_os = "macos")]
+static GUESSED: Guessed = Mutex::new(None);
+
+/// Counts calls to `emit::graphics::container`, so a test can see that inference is not repeated.
+#[cfg(all(test, target_os = "macos"))]
+static INFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(test, target_os = "macos"))]
+fn inferred_count() -> u64 {
+    INFERRED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
@@ -162,6 +190,10 @@ impl Shader {
             size: bytes.len(),
             #[cfg(any(windows, test, target_os = "macos"))]
             container: Mutex::new(bytes.to_vec()),
+            #[cfg(target_os = "macos")]
+            pieces: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            built: OnceLock::new(),
             #[cfg(windows)]
             translated: OnceLock::new(),
             #[cfg(target_os = "macos")]
@@ -175,9 +207,55 @@ impl Shader {
         }
     }
 
+    /// A guessed graphics stage, kept as the code and metadata the title gave. Building its
+    /// container decodes the whole program and builds its IR (~4 ms); doing that at the title's
+    /// pipeline creations cost 69 CPU-seconds in the first 15 s of boot. Here it happens
+    /// when the shader is first translated, on a prewarm worker rather than a title thread.
+    #[cfg(target_os = "macos")]
+    fn new_guessed(stage: victory_shader::HwStage, name: &'static str, code: &[u8], meta: &[u8]) -> Shader {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(code);
+        hasher.update(meta);
+        let full = hasher.finalize();
+        Shader {
+            stage: name,
+            hash: full.to_hex()[..16].to_owned(),
+            size: code.len() + meta.len(),
+            container: Mutex::new(Vec::new()),
+            pieces: Mutex::new(Some((stage, code.to_vec(), meta.to_vec()))),
+            built: OnceLock::new(),
+            native: OnceLock::new(),
+            rect: OnceLock::new(),
+            threads: OnceLock::new(),
+            // A host-built container has no address in title memory to read again.
+            at: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Build the container of a guessed stage the first time a translation needs it. `get_or_init`
+    /// makes a thread that beats the prewarm pool do the work itself, as with `native()`.
+    #[cfg(target_os = "macos")]
+    fn ensure_container(&self) {
+        let _ = self.built.get_or_init(|| {
+            let pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some((stage, code, meta)) = pieces else { return };
+            #[cfg(test)]
+            INFERRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match victory_shader::emit::graphics::container(stage, &code, &meta) {
+                Ok(container) => {
+                    *self.container.lock().unwrap_or_else(|e| e.into_inner()) = container;
+                }
+                Err(e) => {
+                    tracing::warn!(stage = self.stage, error = %e, "a guessed graphics piece is no program");
+                }
+            }
+        });
+    }
+
     /// The translation for the native host, made on first use; the reason if there is none.
     #[cfg(target_os = "macos")]
     pub(crate) fn native(&self) -> Result<&Arc<victory_shader::emit::HostShader>, &str> {
+        self.ensure_container();
         self.native
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
@@ -202,12 +280,14 @@ impl Shader {
 impl Shader {
     /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
     pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        self.ensure_container();
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
         crate::native::shaders::translate_extra(&container, rect, extra, copy).map(Arc::new)
     }
 
     /// The translation for rectangle-list draws, made on first use.
     pub(crate) fn native_rect(&self) -> Result<&Arc<victory_shader::emit::HostShader>, &str> {
+        self.ensure_container();
         self.rect
             .get_or_init(|| {
                 let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
@@ -714,12 +794,21 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
                 .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
         }
     };
-    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container(stage, code, meta) {
-        Ok(c) => Ok(shader(name, &c)),
-        Err(e) => {
-            tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
-            Err("a graphics piece whose shader could not be inferred")
+    let make = |stage, name, code, meta| {
+        let key = (
+            *blake3::hash(code).as_bytes(),
+            *blake3::hash(meta).as_bytes(),
+            name,
+        );
+        let mut guessed = GUESSED.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guessed.get_or_insert_with(HashMap::new);
+        if let Some(s) = map.get(&key) {
+            return Ok(s.clone());
         }
+        let s = Arc::new(Shader::new_guessed(stage, name, code, meta));
+        prewarm(&s);
+        map.insert(key, s.clone());
+        Ok(s)
     };
     // The vertex shader is pair 4/5, or pair 6/7 when that is empty (observed; the pairs vary).
     let (code, meta) = match (piece(4), piece(5)) {
@@ -1285,6 +1374,11 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    /// The guessed-shader cache and its inference counter are process-wide; keep the two tests
+    /// that use them from counting each other's work.
+    #[cfg(target_os = "macos")]
+    static GUESS: Mutex<()> = Mutex::new(());
+
     /// A registered shader is translated without anyone calling `native()`.
     #[cfg(target_os = "macos")]
     #[test]
@@ -1300,6 +1394,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn guessed_graphics_skips_vertexless_slots_and_lowers_depth_only() {
+        let _guess = GUESS.lock().unwrap_or_else(|e| e.into_inner());
         let code = |words: &[u32]| -> Vec<u8> {
             words.iter().flat_map(|w| w.to_le_bytes()).collect()
         };
@@ -1333,6 +1428,44 @@ mod tests {
         let depth_only = read(&pairs).unwrap();
         assert_eq!(depth_only.len(), 1);
         assert_eq!(depth_only[0].native().unwrap().stage, victory_shader::HwStage::Vs);
+    }
+
+    /// The title makes thousands of pipeline states from the same shader binaries. Inferring a
+    /// program decodes its whole GFX10 code and builds its IR; without the cache the boot spent
+    /// 69 CPU-seconds redoing that for the same few thousand programs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_guessed_graphics_shader_is_inferred_only_once() {
+        let _guess = GUESS.lock().unwrap_or_else(|e| e.into_inner());
+        let code = |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        // An s_nop makes these binaries distinct from the other tests' programs, so the
+        // process-wide cache cannot have inferred them already.
+        let pixel = code(&[0x7E00_02F2, 0xF800_180F, 0, 0xBF80_0000, 0xBF81_0000]);
+        let vertex = code(&[0x7E00_02F2, 0xF800_08CF, 0, 0xBF80_0000, 0xBF81_0000]);
+        let meta = [0u8; 0x10];
+        let piece = |bytes: &[u8]| [bytes.as_ptr() as usize, bytes.len()];
+        let mut pairs = [[0; 2]; 8];
+        pairs[2] = piece(&pixel);
+        pairs[3] = piece(&meta);
+        pairs[4] = piece(&vertex);
+        pairs[5] = piece(&meta);
+        let read = || {
+            // SAFETY: pairs covers the slot's eight entries, and the slices above back them.
+            unsafe { graphics_containers(pairs.as_ptr().cast()) }
+        };
+        let before = inferred_count();
+        let first = read().unwrap();
+        let second = read().unwrap();
+        assert!(first.iter().zip(&second).all(|(a, b)| Arc::ptr_eq(a, b)));
+        // Prewarm may get there first; `native()` waits for whichever translation wins.
+        for s in first.iter().chain(&second) {
+            s.native().unwrap();
+        }
+        assert_eq!(
+            inferred_count() - before,
+            2,
+            "one inference per distinct binary, not one per pipeline creation"
+        );
     }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {

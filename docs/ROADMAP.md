@@ -60,6 +60,7 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 ## Solved recently
 
 - **26–27 November:**
+  - The 48 s black screen at boot (27 November, Series X windowed): guessed graphics stages were inferred at every pipeline creation. `VICTORY_PROFILE=5` measured 69 CPU-seconds in `d3d12!0x1c8` in the first 15 s; a stage is now keyed by its code and metadata and inferred on first translation on a prewarm worker. That call dropped to 3.3 CPU-seconds and the first real frame moved from 48.7 s to about 20.3 s. Details and the test are in `native-host.md`, "Guessed graphics pipelines".
   - The Metal GPU timeout at about 53 s ([#2](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/2)): waits stay on the CPU until the GPU work is observed done.
   - Failed command buffers now still signal their fences ([#80](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/80)).
   - The black window on M1/M2 ([#26](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/26), #91).

@@ -142,6 +142,28 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
     });
 }
 
+/// A first write outside the middle of a blank plane is seen at the next submission: the movie's
+/// first frame can be black in the middle (letterboxing), which a middle-only probe missed and
+/// left showing blank planes until the scanner's round.
+#[test]
+fn a_blank_texture_written_first_outside_the_middle_is_probed_at_the_next_submission() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(pool) = pool(9125, (256 << 10) / page_size() + 1) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
+    let key = res as usize;
+    with_title(|t| {
+        assert!(t.realize(key));
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(key), 1, "the blank first upload");
+    });
+    // Page 8 is read by a sampled probe, but not by one that reads only the middle.
+    pool.write(8 * 4096 + 100, &[1u8; 16]);
+    with_title(|t| {
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(key), 2, "the first write is seen at the next submission");
+    });
+}
+
 /// A texture uploaded blank stays hot however long it stays blank: the boot movie's planes are
 /// made about 40 s (thousands of submissions) before the movie decodes into them, and once cold
 /// their first frames waited seconds for the scanner (green).
