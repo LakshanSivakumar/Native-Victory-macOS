@@ -4724,11 +4724,11 @@ impl<'a> Lower<'a> {
 
     /// Writes VGPR `reg` (or the SGPR of a lane read), under `guard`.
     fn write(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
-        let (x, kept, low16) = match (Self::sdwa_dst(inst), reg) {
-            (Some((sel, unused)), Reg::V(_)) => self.place_bits(inst, reg, x, sel, unused, guard.is_none()),
-            _ => (x, None, None),
+        let x = match (Self::sdwa_dst(inst), reg) {
+            (Some((sel, unused)), Reg::V(_)) => self.place_bits(inst, reg, x, sel, unused),
+            _ => x,
         };
-        self.write_placed_with(inst, reg, x, guard, kept, low16);
+        self.write_placed(inst, reg, x, guard);
     }
 
     /// [`Self::write`] of a dword already placed (SDWA applied).
@@ -4778,15 +4778,7 @@ impl<'a> Lower<'a> {
     }
 
     /// The low byte or word of `x` placed at `sel` in VGPR `reg`.
-    fn place_bits(
-        &mut self,
-        inst: &Inst,
-        reg: Reg,
-        x: V,
-        sel: u8,
-        unused: u8,
-        unguarded: bool,
-    ) -> (V, Option<KeptOld>, Option<V>) {
+    fn place_bits(&mut self, inst: &Inst, reg: Reg, x: V, sel: u8, unused: u8) -> V {
         let c = self.cur;
         let (width, at) = if sel < 4 {
             (8u32, 8 * u32::from(sel))
@@ -4798,18 +4790,19 @@ impl<'a> Lower<'a> {
         let right = self.s.m.i32(32 - width - at);
         if unused == 1 {
             // Bits below the field shift in as zeros.
-            return (self.s.m.bin(c, Bin::AShr, t, right), None, None);
+            return self.s.m.bin(c, Bin::AShr, t, right);
         }
         let field = self.s.m.bin(c, Bin::LShr, t, right);
         if unused != 2 {
-            return (field, None, None);
+            return field;
         }
-        let (old, kept) = self.kept_old_of(inst, inst.read(reg));
+        let old = match inst.read(reg).map(|o| self.i32_of(o)) {
+            Some(Ok(o)) => o,
+            _ => self.s.m.i32(0),
+        };
         let keep = self.s.m.i32(!((((1u64 << width) - 1) as u32) << at));
         let old = self.s.m.bin(c, Bin::And, old, keep);
-        let r = self.s.m.bin(c, Bin::Or, old, field);
-        let low16 = (unguarded && sel == 4 && kept.is_some()).then_some(r);
-        (r, kept, low16)
+        self.s.m.bin(c, Bin::Or, old, field)
     }
 
     fn write_f(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
@@ -9515,8 +9508,7 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 let h = self.narrow16(r);
-                let high = name == "v_fma_mixhi_f16";
-                let (keep, h) = if high {
+                let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
                 } else {
@@ -10053,10 +10045,9 @@ impl<'a> Lower<'a> {
             }
         }
         let c = self.cur;
-        let (old, kept) = if keep {
-            self.kept_old_of(inst, inst.read(Reg::V(reg)))
-        } else {
-            (self.s.m.i32(0), None)
+        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+            Some(Ok(o)) if keep => o,
+            _ => self.s.m.i32(0),
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
         let x = self.s.m.bin(c, Bin::And, x, low);
@@ -10069,8 +10060,7 @@ impl<'a> Lower<'a> {
             let o = self.s.m.bin(c, Bin::And, old, keep);
             self.s.m.bin(c, Bin::Or, o, x)
         };
-        let low16 = (!high && keep && guard.is_none() && kept.is_some()).then_some(r);
-        self.write_placed_with(inst, Reg::V(reg), r, guard, kept, low16);
+        self.write_placed(inst, Reg::V(reg), r, guard);
         Ok(())
     }
 
