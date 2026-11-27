@@ -231,7 +231,18 @@ pub struct Title<B: PresentBackend> {
     /// Title textures no view has named yet.
     pub(super) pending: HashMap<usize, super::textures::TextureInfo>,
     /// Textures placed in title memory (no resource object), by address: their key and pool.
-    pub(super) placed: HashMap<u64, (usize, usize)>,
+    pub(super) placed: std::collections::BTreeMap<u64, (usize, usize)>,
+    /// The largest placed texture's size: how far before an address a placed texture over it can
+    /// start ([`Self::texture_placed`]).
+    pub(super) placed_reach: u64,
+    /// Title textures whose host texture is another's, laid out identically over the same memory
+    /// ([`Self::realize`]): that other key (in `textures`), and their own description.
+    pub(super) copies_of: HashMap<usize, (usize, super::textures::TextureInfo)>,
+    /// Keys in `textures` by the title memory they start at.
+    pub(super) at_memory: HashMap<usize, Vec<usize>>,
+    /// Placed copies another placement covered, given up once nothing uses them
+    /// ([`Self::give_up_covered`]).
+    pub(super) covered: std::collections::HashSet<usize>,
     /// Resource objects whose host texture a placed view names too: its address and key.
     pub(super) shared: HashMap<usize, (u64, usize)>,
     queues: HashMap<usize, Rc<B::Queue>>,
@@ -271,8 +282,12 @@ impl<B: PresentBackend> Title<B> {
             probe_buf: Vec::new(),
             surface: None,
             pending: HashMap::new(),
-            placed: HashMap::new(),
+            placed: Default::default(),
             shared: HashMap::new(),
+            placed_reach: 0,
+            copies_of: HashMap::new(),
+            at_memory: HashMap::new(),
+            covered: Default::default(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),

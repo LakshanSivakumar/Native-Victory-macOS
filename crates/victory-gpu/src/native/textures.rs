@@ -842,7 +842,7 @@ impl<B: PresentBackend> Title<B> {
     /// Makes the host texture of title texture `key` if it has none yet and registers it for
     /// views. `false` when there is none (not a title texture, or one the host cannot represent).
     pub fn realize(&mut self, key: usize) -> bool {
-        if self.textures.contains_key(&key) {
+        if self.textures.contains_key(&key) || self.copies_of.contains_key(&key) {
             return true;
         }
         let Some(info) = self.pending.remove(&key) else {
@@ -858,6 +858,16 @@ impl<B: PresentBackend> Title<B> {
             }
             return false;
         };
+        if self.host.is_evicted(key) {
+            BUDGET_TRACE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(owner) = self.identical_copy(&info) {
+            let tex = self.textures[&owner].texture.clone();
+            self.host.register_texture(key, &tex);
+            self.copies_of.insert(key, (owner, info));
+            SHARED_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
         let tex = match self.host.texture(&desc) {
             Ok(t) => t,
             Err(e) => {
@@ -865,9 +875,7 @@ impl<B: PresentBackend> Title<B> {
                 return false;
             }
         };
-        if self.host.is_evicted(key) {
-            BUDGET_TRACE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.at_memory.entry(info.memory as usize).or_default().push(key);
         self.host.register_texture(key, &tex);
         self.budget.live += info.size as u64;
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -918,14 +926,44 @@ impl<B: PresentBackend> Title<B> {
         true
     }
 
+    /// A live copy that title texture `info` would duplicate: one over the same memory with the
+    /// same layout, dimensions and host format, filled from that memory the same way (B4G4R4A4 is
+    /// converted on upload), not a render target or depth (the GPU's, not memory's) and not
+    /// GPU-written. Views of either then sample the same texels from one texture.
+    fn identical_copy(&self, info: &TextureInfo) -> Option<usize> {
+        let desc = info.desc()?;
+        if info.render_target() || desc.format.is_depth() {
+            return None;
+        }
+        self.at_memory.get(&(info.memory as usize))?.iter().copied().find(|k| {
+            let o = &self.textures[k].info;
+            !self.textures[k].gpu_written
+                && !o.render_target()
+                && o.size == info.size
+                && o.layout == info.layout
+                && o.dimension == info.dimension
+                && (o.width, o.height, o.depth_or_layers) == (info.width, info.height, info.depth_or_layers)
+                && o.flags & UNORDERED_ACCESS == info.flags & UNORDERED_ACCESS
+                && (o.format == 115) == (info.format == 115)
+                && o.desc().is_some_and(|d| d.format == desc.format)
+        })
+    }
+
+    /// The key whose copy title texture `key` uses: its own, or the identical copy it shares.
+    fn owner_of(&self, key: usize) -> usize {
+        self.copies_of.get(&key).map_or(key, |&(owner, _)| owner)
+    }
+
     /// The format of the host texture of title texture `key`.
     pub fn format_of(&self, key: usize) -> Option<Format> {
+        let key = self.owner_of(key);
         self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
     }
 
     /// The host texture of title texture `key`.
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
+        let key = self.owner_of(key);
         let serial = self.budget.serial;
         self.textures.get_mut(&key).map(|t| {
             t.used = serial;
@@ -942,6 +980,7 @@ impl<B: PresentBackend> Title<B> {
     ) -> Option<(Rc<B::Texture>, Format)> {
         let key = record.resource as usize;
         self.realize(key);
+        let key = self.owner_of(key);
         let t = self.textures.get_mut(&key)?;
         let desc = t.info.desc()?;
         let (mip, slice) = record.native_rtv_subresource(
@@ -988,6 +1027,7 @@ impl<B: PresentBackend> Title<B> {
     /// shortcut: what the title writes into its memory afterwards is not seen; when a title is
     /// found to refill a GPU-written texture from the CPU, upload a change again.
     pub fn gpu_written(&mut self, key: usize) {
+        let key = self.owner_of(key);
         // A placed view sharing an object's texture ([`Self::alias_placed`]) writes the object's.
         let key = self.shared.iter().find(|(_, (_, placed))| *placed == key).map_or(key, |(&object, _)| object);
         if let Some(t) = self.textures.get_mut(&key) {
@@ -998,12 +1038,40 @@ impl<B: PresentBackend> Title<B> {
 
     /// How many times title texture `key`'s memory was detiled into its host texture.
     pub fn uploads_of(&self, key: usize) -> u64 {
-        self.textures.get(&key).map_or(0, |t| t.uploads)
+        self.textures.get(&self.owner_of(key)).map_or(0, |t| t.uploads)
     }
 
     pub fn texture_released(&mut self, key: usize) {
+        self.copies_of.remove(&key);
+        self.covered.remove(&key);
         if let Some(t) = self.textures.remove(&key) {
             self.budget.live -= t.info.size as u64;
+            let at = t.info.memory as usize;
+            if let Some(keys) = self.at_memory.get_mut(&at) {
+                keys.retain(|&k| k != key);
+                if keys.is_empty() {
+                    self.at_memory.remove(&at);
+                }
+            }
+            // The copy stays with those that shared it: the first takes it over (their entries
+            // show it, so it is neither made nor uploaded again), the others share its.
+            let mut sharing: Vec<usize> = self.copies_of.iter().filter(|(_, (o, _))| *o == key).map(|(&k, _)| k).collect();
+            sharing.sort_unstable();
+            if let Some((&first, rest)) = sharing.split_first() {
+                let (_, info) = self.copies_of.remove(&first).expect("listed");
+                for k in rest {
+                    self.copies_of.get_mut(k).expect("listed").0 = first;
+                }
+                if self.unloaded.contains(&key) {
+                    self.unloaded.insert(first);
+                }
+                self.budget.live += info.size as u64;
+                self.at_memory.entry(at).or_default().push(first);
+                watch(|w| w.entries.insert(first, (at, info.size, false, t.serial)));
+                let mut t = t;
+                t.info = info;
+                self.textures.insert(first, t);
+            }
         }
         // A placed view that shares this texture ([`Self::alias_placed`]) goes with it.
         if let Some((address, placed)) = self.shared.remove(&key)
@@ -1023,7 +1091,12 @@ impl<B: PresentBackend> Title<B> {
     /// release for it, so the texture another description placed at that address before goes
     /// now (guess: the title is done with it once it places another there), and every texture
     /// placed in a pool goes when the pool is released ([`Self::sync_dirty`]).
-    pub fn texture_placed(&mut self, address: u64, key: usize, pool: usize) {
+    pub fn texture_placed(&mut self, address: u64, key: usize, pool: usize, size: usize) {
+        // A view of a copy given up before comes back at its own address: not a new placement.
+        if self.placed.get(&address).is_none_or(|&(k, _)| k != key) {
+            self.give_up_overlapped(address, key, size as u64);
+        }
+        self.placed_reach = self.placed_reach.max(size as u64);
         if let Some((old, _)) = self.placed.insert(address, (key, pool))
             && old != key
         {
@@ -1038,6 +1111,55 @@ impl<B: PresentBackend> Title<B> {
             }
             self.host.forget_resource(old);
             self.texture_released(old);
+        }
+    }
+
+    /// Placed copies over `[address, address + size)` that start elsewhere, which placed texture
+    /// `key` now covers, are marked covered: given up once nothing uses them
+    /// ([`Self::give_up_covered`]). Guess: the title is done with a placed view once it places
+    /// another over its memory (it does so when it streams something else in). Never marked:
+    /// copies that hold what title memory does not (render targets, depth, GPU-written, ever
+    /// viewed for unordered access).
+    fn give_up_overlapped(&mut self, address: u64, key: usize, size: u64) {
+        let end = address.saturating_add(size);
+        let over: Vec<usize> = self
+            .placed
+            .range(address.saturating_sub(self.placed_reach)..end)
+            .filter(|&(&a, &(k, _))| a != address && k != key)
+            .map(|(_, &(k, _))| k)
+            .filter(|k| {
+                self.textures.get(k).is_some_and(|t| {
+                    let o = t.info.memory as u64;
+                    o < end
+                        && o + t.info.size as u64 > address
+                        && self.holds_only_memory(*k, t)
+                })
+            })
+            .collect();
+        self.covered.extend(over);
+    }
+
+    /// At each sync: covered copies ([`Self::give_up_overlapped`]) that nothing uses any more are
+    /// given up as the budget gives one up ([`Self::evictable`]: no heap entry shows one, so no
+    /// work in flight reads it through an entry, and no list holds one), and none a submission in
+    /// flight names. One still shown waits until the title writes another record over that entry.
+    /// One named again later is made again from title memory.
+    fn give_up_covered(&mut self) {
+        let keys: Vec<usize> = self.covered.iter().copied().collect();
+        for k in keys {
+            let Some(t) = self.textures.get(&k) else {
+                self.covered.remove(&k);
+                continue;
+            };
+            if self.budget.named.contains_key(&k) || !self.evictable(k, t) {
+                continue;
+            }
+            let info = t.info.clone();
+            OVERLAP_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            OVERLAP_TRACE[1].fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
+            self.host.evict_texture(k);
+            self.texture_released(k);
+            self.pending.insert(k, info);
         }
     }
 
@@ -1144,6 +1266,7 @@ impl<B: PresentBackend> Title<B> {
             self.realize(key);
         }
         self.keep_to_budget();
+        self.give_up_covered();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
@@ -1540,6 +1663,10 @@ pub(super) fn distinct_bytes(mut ranges: Vec<(usize, usize)>) -> u64 {
 
 /// For the trace: textures given up under the budget, their bytes, and evicted ones made again.
 static BUDGET_TRACE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// For the trace: placed copies given up as another placement covered them, and their bytes.
+static OVERLAP_TRACE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// For the trace: title textures that took an identical live copy's texture instead of their own.
+static SHARED_TRACE: [std::sync::atomic::AtomicU64; 1] = [const { std::sync::atomic::AtomicU64::new(0) }; 1];
 
 impl<B: PresentBackend> Title<B> {
     /// Sets the texture budget in bytes (0: none).
@@ -1552,11 +1679,16 @@ impl<B: PresentBackend> Title<B> {
     /// access), that no heap entry shows and no recorded or submitted work holds (the host's two
     /// references are all there are: `Title::textures` and the host's resources).
     fn evictable(&self, key: usize, t: &Tracked<B>) -> bool {
+        self.holds_only_memory(key, t) && Rc::strong_count(&t.texture) <= 2 && !self.host.texture_in_use(key)
+    }
+
+    /// Whether copy `t` (title texture `key`) holds only what title memory does: a sampled texture
+    /// (not a render target or depth), not GPU-written, never viewed for unordered access.
+    fn holds_only_memory(&self, key: usize, t: &Tracked<B>) -> bool {
         !t.info.render_target()
             && !t.gpu_written
             && t.info.desc().is_some_and(|d| !d.format.is_depth())
-            && Rc::strong_count(&t.texture) <= 2
-            && !self.host.texture_in_use(key)
+            && !self.host.ever_unordered(key)
     }
 
     /// For the trace: bytes of title memory under the copies, each byte once, and bytes of copies
@@ -1672,10 +1804,11 @@ impl<B: PresentBackend> Title<B> {
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
             let (distinct, outside) = self.memory_under_copies();
             tracing::info!(
-                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}; {} MiB of distinct title memory under the copies, {} MiB of copies outside the title's pools",
+                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}; {} MiB of distinct title memory under the copies, {} MiB of copies outside the title's pools; in the last second {} textures shared an identical copy ({} share one now), {} placed copies another placement covered were given up ({} MiB), {} covered still in use",
                 self.budget.live >> 20, self.budget.limit >> 20, shown >> 20, evictable >> 20,
                 take(&BUDGET_TRACE[0]), take(&BUDGET_TRACE[1]) >> 20, take(&BUDGET_TRACE[2]),
                 distinct >> 20, outside >> 20,
+                take(&SHARED_TRACE[0]), self.copies_of.len(), take(&OVERLAP_TRACE[0]), take(&OVERLAP_TRACE[1]) >> 20, self.covered.len(),
             );
         }
     }

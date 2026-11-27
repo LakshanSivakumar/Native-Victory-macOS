@@ -908,7 +908,7 @@ pub(crate) fn mirror(handle: u64) {
                     && let Some(info) = crate::resource::placed_info(address, &res)
                     && let Some((pool, _)) = t.host.memory().resolve(address, 1)
                 {
-                    t.texture_placed(address, key, pool.id);
+                    t.texture_placed(address, key, pool.id, info.size);
                     if !t.alias_placed(address, key, &info) {
                         t.texture_created(key, info);
                         t.realize(key);

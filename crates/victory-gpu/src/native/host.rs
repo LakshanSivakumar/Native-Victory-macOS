@@ -703,6 +703,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         std::mem::take(&mut self.wanted.borrow_mut())
     }
 
+    /// Whether an entry ever showed texture `key` for unordered access.
+    pub(crate) fn ever_unordered(&self, key: usize) -> bool {
+        self.unordered.borrow().contains(&key)
+    }
+
     /// Whether a heap entry shows texture `key` (shaders index heaps themselves, so a texture an
     /// entry shows counts as used), or ever showed it for unordered access.
     pub(crate) fn texture_in_use(&self, key: usize) -> bool {

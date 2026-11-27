@@ -965,7 +965,10 @@ and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallback
 * **Trace.** With `VICTORY_TRACE_TEXTURE_SYNC=1`, once a second: `host texture copies: <MiB>,
   budget <MiB>; <MiB> shown by heap entries, named by the submission's tables or viewed for
   unordered access, <MiB> could be given up; given up in the last second <n> (<MiB>), made again <n>;
-  <MiB> of distinct title memory under the copies, <MiB> of copies outside the title's pools`. If
+  <MiB> of distinct title memory under the copies, <MiB> of copies outside the title's pools; in
+  the last second <n> textures shared an identical copy (<n> share one now), <n> placed copies
+  another placement covered were given up (<MiB>), <n> covered still in use` ("One copy per
+  range" below). If
   the copies are mostly shown by heap entries, the budget frees little and the levers are the ones
   #79 names (one copy instead of two, fewer top mips).
 * **What the count counts, and why it can pass the title's memory.** One copy per title texture,
@@ -1001,6 +1004,52 @@ and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallback
   `textures_over_one_memory_each_hold_a_copy_of_their_own`, `distinct_bytes_counts_overlaps_once`,
   `a_copy_outside_the_titles_pools_is_logged_so`,
   and `a_textures_counted_size_is_never_more_than_its_footprint` (in `resource.rs`).
+
+#### One copy per range of title memory (#356)
+
+The copies held the same title memory several times over: during a world load on a 24 GB M4 Pro
+(Series S, budget off), 8.5 GB of copies over 1.7 GB of distinct title memory, about 11 bytes of
+copies per new byte in the last 12 s, until macOS ran out of memory (#301). Two changes:
+
+* **Identical copies share one texture** (`Title::realize`, `identical_copy`). A title texture
+  laid out exactly as a live copy that starts at the same memory (same size, layout, dimensions,
+  unordered-access flag and host format; neither or both B4G4R4A4, which is converted on upload;
+  not a render target, depth or GPU-written) registers that copy's texture under its own key
+  (`Title::copies_of`) instead of making one. Both would have been detiled from the same bytes into
+  the same format, so a draw samples the same texels either way. It is not counted again. A GPU
+  write through either key makes the shared copy the GPU's (`gpu_written` goes to the owner), as
+  the R9G9B9E5 view of an R32_UINT object already did; before, the other key's own copy went on
+  being filled from title memory. When the owner's title texture goes, the first key that shared
+  it takes the copy over (`texture_released`): its entries already show that texture, so nothing
+  is cleared, made or uploaded again, and the others share the new owner's. An owner that others
+  share is never given up by the budget (the extra references make `evictable` false). Sharing
+  goes by title address: a copy left over memory the title freed and mapped again would be shared
+  too. The title releases its objects before their memory, and placed copies go with their pool;
+  the tests, whose pools reuse addresses under one host, release what earlier tests left there
+  (`texture_tests::pool`).
+* **A placed copy goes when another placement covers it at another start, once nothing uses it**
+  (`Title::give_up_overlapped` marks it from `texture_placed`; `give_up_covered` gives it up at a
+  sync). Before, it went only when a description was placed at its exact address, or with its
+  pool, so memory the title streamed something else into kept the old copies. Guess: the title is
+  done with a placed view once it places another over its memory; for resource objects D3D12
+  makes an older alias's contents undefined once another is used, but for views of raw memory
+  the console's rule is not known. A covered copy is given up only under the budget's own rule
+  (`evictable`: no heap entry shows it, no recorded or submitted list holds it) and when no
+  submission in flight names it. Giving up a copy an entry shows would clear that entry (and drop
+  the Metal reference it holds) under work the GPU may still be running; so one still shown waits
+  until the title writes another record over the entry. A view or table that names a copy given
+  up gets it made again (one late upload; the draw in the same submission reads it through
+  `keep_named`), and a view written again at the copy's own address is not a new placement, so
+  two placements in use do not keep covering each other. Never marked: copies that hold what
+  title memory does not (render targets, depth, GPU-written, ever viewed for unordered access).
+  Placements are the only trigger: an object created over placed copies does not cover them. The
+  trace's "covered still in use" counts those waiting on an entry.
+* What it cannot share: copies at other starts (separately placed mips or slices of one chain)
+  and copies of one memory in other layouts or formats still hold it once each; the trace's
+  distinct figure shows what is left.
+* Tests (`texture_tests`): `an_identical_texture_over_the_same_memory_shares_its_copy`,
+  `a_texture_sharing_a_released_copy_takes_it_over`,
+  `a_placed_copy_another_placement_covers_is_given_up_once_unused`.
 
 #### Texture views over 2D arrays
 
