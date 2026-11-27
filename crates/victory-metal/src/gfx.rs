@@ -21,7 +21,7 @@ use std::ptr::NonNull;
 type Res = Retained<ProtocolObject<dyn MTLResource>>;
 type TextureObject = Retained<ProtocolObject<dyn MTLTexture>>;
 type HeapRef = (Res, Option<TextureObject>);
-type TextureViewKey = (usize, usize, usize, usize, usize, usize);
+type TextureViewKey = (usize, usize, usize, usize, usize, usize, [u8; 4]);
 
 const BUFFER_VIEWS: usize = 8192;
 const TEXTURE_VIEWS: usize = 64;
@@ -1259,7 +1259,15 @@ impl ResourceBackend for Metal {
                 v.mips, v.slices
             ));
         };
-        let key = (format.0, ty.0, levels.location, levels.length, layers.location, layers.length);
+        // D3D12 component mappings: a component, then zero and one. shortcut: depth textures keep
+        // their reads unswizzled (the plane a mapping names is not modelled), if a title maps one.
+        let channel = |c: u8| match c {
+            0..=3 => MTLTextureSwizzle(MTLTextureSwizzle::Red.0 + c),
+            4 => MTLTextureSwizzle::Zero,
+            _ => MTLTextureSwizzle::One,
+        };
+        let swizzle = if is_depth(source) { ViewDesc::IDENTITY } else { v.swizzle };
+        let key = (format.0, ty.0, levels.location, levels.length, layers.location, layers.length, swizzle);
         let mut views = t.views.borrow_mut();
         let tex = if let Some(tex) = views.get(&key) {
             frame_time::count(Metric::ViewCached, 1);
@@ -1267,8 +1275,18 @@ impl ResourceBackend for Metal {
         } else {
             // SAFETY: the ranges are inside the texture.
             let tex = unsafe {
-                t.tex
-                    .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
+                if swizzle == ViewDesc::IDENTITY {
+                    t.tex.newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
+                } else {
+                    let [red, green, blue, alpha] = swizzle.map(channel);
+                    t.tex.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                        format,
+                        ty,
+                        levels,
+                        layers,
+                        MTLTextureSwizzleChannels { red, green, blue, alpha },
+                    )
+                }
             }
             .ok_or("newTextureView refused (format not view-compatible)")?;
             frame_time::count(Metric::ViewMade, 1);
@@ -4120,6 +4138,7 @@ mod render_target_tests {
             format: Format::Rgba8Unorm,
             mips: (1, 1),
             slices: (1, 1),
+            swizzle: ViewDesc::IDENTITY,
         }).expect("narrowed render target");
         assert_eq!((target.tex.width(), target.tex.height()), (4, 4));
 
@@ -4698,7 +4717,7 @@ mod heap_set_tests {
             dim: TexDim::D2Array, depth_or_layers: 4, mips: 4,
             ..TextureDesc::d2(Format::Rgba8Unorm, 32, 32)
         }).unwrap();
-        let all = ViewDesc { format: Format::Rgba8Unorm, mips: (1, usize::MAX), slices: (1, usize::MAX) };
+        let all = ViewDesc { format: Format::Rgba8Unorm, mips: (1, usize::MAX), slices: (1, usize::MAX), swizzle: ViewDesc::IDENTITY };
         let fitted = ViewDesc { mips: (1, 3), slices: (1, 3), ..all };
         let first = m.create_texture_view(&texture, &all).unwrap();
         let second = m.create_texture_view(&texture, &fitted).unwrap();
@@ -5245,7 +5264,7 @@ mod heap_usage_tests {
         m.write_texture(&heap, 2, &b, 0.0);
         m.write_texture(&heap, 3, &c, 0.0);
         // A view of `c` is `c`'s memory: one allocation, its latest use theirs.
-        let view = m.create_texture_view(&c, &ViewDesc { format: Format::Rgba8Unorm, mips: (0, 1), slices: (0, 1) }).unwrap();
+        let view = m.create_texture_view(&c, &ViewDesc { format: Format::Rgba8Unorm, mips: (0, 1), slices: (0, 1), swizzle: ViewDesc::IDENTITY }).unwrap();
         m.write_texture(&heap, 4, &view, 0.0);
         // `a` is named by entries last used at frames 10 and 50, `b` at 20, `c` never, its view at 5.
         let mut all = m.heap_allocations(&heap, &[10, 50, 20, 0, 5, 0, 0, 0]).unwrap();

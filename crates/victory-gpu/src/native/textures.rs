@@ -1334,6 +1334,7 @@ impl<B: PresentBackend> Title<B> {
                 format,
                 mips: if base { (0, usize::MAX) } else { (mip, 1) },
                 slices: if base { (0, usize::MAX) } else { (slice, 1) },
+                swizzle: ViewDesc::IDENTITY,
             };
             if let Some((_, texture)) = t.target_views.iter().find(|(cached, _)| *cached == view) {
                 return Some((texture.clone(), format));

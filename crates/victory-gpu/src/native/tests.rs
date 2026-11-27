@@ -91,6 +91,7 @@ fn volume_view_mips_and_full_depth_reach_the_backend() {
                 format: Format::Rgb10a2Unorm,
                 mips: (1, 1),
                 slices: (0, usize::MAX),
+                swizzle: ViewDesc::IDENTITY,
             });
         }
     }
@@ -135,6 +136,7 @@ fn array_texture_ranges_reach_the_backend_for_object_and_placed_views() {
                     format: Format::Rgba8Unorm,
                     mips: (1, if unordered { 1 } else { 3 }),
                     slices: (2, if unordered { 1 } else { 4 }),
+                    swizzle: ViewDesc::IDENTITY,
                 })
             );
         }

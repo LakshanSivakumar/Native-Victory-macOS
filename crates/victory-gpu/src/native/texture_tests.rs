@@ -1001,7 +1001,7 @@ fn check_present_planes(
         t.sync_textures();
         // Clear through plain views, just as the title stores display values in sRGB textures.
         let view = |tex: &_| Rc::new(t.host.backend.create_texture_view(tex, &ViewDesc {
-            format: Format::Rgba8Unorm, mips: (0, 1), slices: (0, 1),
+            format: Format::Rgba8Unorm, mips: (0, 1), slices: (0, 1), swizzle: ViewDesc::IDENTITY,
         }).unwrap());
         let (bottom_view, top_view) = (view(&bottom), view(&top));
         let mut list = NativeList::default();

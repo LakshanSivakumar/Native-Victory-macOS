@@ -1096,6 +1096,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     };
     into_destination(request, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
+            .inspect(|()| dump_bcpack(bc, &source, out))
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
         None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
@@ -1122,6 +1123,26 @@ fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
 
 /// The BCPack format's constant tables, parsed once for the process. If
 /// they do not parse every BCPack request fails: one warning, then debug.
+/// `VICTORY_DUMP_BCPACK=<dir>` (diagnostics, off by default): the first 400 BCPack chunks of
+/// BC1, BC3, BC4 and BC5 as `<n>.bc<k>` (packed, after zlib) and `<n>.out` (this decoder's
+/// output), the layout `bcpack::reference_chunks` reads. Game data: keep `<dir>` outside the
+/// repository.
+fn dump_bcpack(bc: u8, packed: &[u8], out: &[u8]) {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_DUMP_BCPACK").map(Into::into)) else {
+        return;
+    };
+    if !matches!(bc, 1 | 3 | 4 | 5) {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 400 {
+        let _ = std::fs::write(dir.join(format!("{n}.bc{bc}")), packed);
+        let _ = std::fs::write(dir.join(format!("{n}.out")), out);
+    }
+}
+
 fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     static TABLES: OnceLock<Result<Tables, String>> = OnceLock::new();
     static WARNED: AtomicBool = AtomicBool::new(false);

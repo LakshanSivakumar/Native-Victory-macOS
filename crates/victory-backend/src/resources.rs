@@ -176,6 +176,13 @@ pub struct ViewDesc {
     pub mips: (usize, usize),
     /// First slice, count.
     pub slices: (usize, usize),
+    /// Where each of red, green, blue, alpha reads from: 0-3 a component, 4 zero, 5 one (D3D12's
+    /// `D3D12_SHADER_COMPONENT_MAPPING` values); [`ViewDesc::IDENTITY`] for none.
+    pub swizzle: [u8; 4],
+}
+
+impl ViewDesc {
+    pub const IDENTITY: [u8; 4] = [0, 1, 2, 3];
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

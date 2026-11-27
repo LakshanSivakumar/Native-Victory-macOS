@@ -9,7 +9,7 @@
 
 use crate::descriptor::View;
 use std::collections::HashMap;
-use victory_backend::resources::{Address, BorderColor, Filter, Format, SamplerDesc};
+use victory_backend::resources::{Address, BorderColor, Filter, Format, SamplerDesc, ViewDesc};
 
 /// A registered resource: title address and size for buffers, the native texture for images.
 pub(super) enum Res<T> {
@@ -31,13 +31,15 @@ pub enum Decoded {
     /// ranges and an optional format override. A count of `u32::MAX` includes every remaining mip
     /// or slice; the backend clips it to the texture. With no mip, slice, or format override, bind
     /// the original texture, including every mip and slice. `min_lod`: the view's minimum LOD
-    /// clamp in its own mips ([`min_lod`]; 0 for none).
+    /// clamp in its own mips ([`min_lod`]; 0 for none). `swizzle`: its component mapping
+    /// ([`swizzle`]).
     Image {
         resource: usize,
         mips: Option<(u32, u32)>,
         slices: Option<(u32, u32)>,
         format: Option<Format>,
         min_lod: f32,
+        swizzle: [u8; 4],
     },
     Sampler {
         desc: SamplerDesc,
@@ -200,6 +202,16 @@ pub(super) fn min_lod(d: &[u32; 10], first: u32) -> f32 {
     if clamp.is_finite() { clamp.max(0.0) } else { 0.0 }
 }
 
+/// A shader-resource view's `Shader4ComponentMapping` (description word 2) as the components
+/// red, green, blue and alpha read ([`ViewDesc::swizzle`]): three bits each, then the bit D3D12
+/// sets on every valid mapping. A word without that bit (a zeroed record) reads as the identity.
+pub(super) fn swizzle(mapping: u32) -> [u8; 4] {
+    if mapping & 1 << 12 == 0 {
+        return ViewDesc::IDENTITY;
+    }
+    std::array::from_fn(|i| (mapping >> (3 * i) & 7).min(5) as u8)
+}
+
 /// The view-stride table's dword `HEAP_VIEWS + i` for `view` at index `i`: a texture shader
 /// view's minimum LOD clamp in 256ths of a mip (`VIEW_MIN_LOD_STEPS`), for samples at an
 /// explicit level, which Metal does not clamp; 0 for anything else.
@@ -240,6 +252,7 @@ fn texture_view(resource: usize, unordered: bool, d: &[u32; 10]) -> Option<Decod
         slices,
         format,
         min_lod: if unordered { 0.0 } else { min_lod(d, mips.0) },
+        swizzle: if unordered { ViewDesc::IDENTITY } else { swizzle(d[2]) },
     })
 }
 
@@ -301,6 +314,7 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
                 slices: None,
                 format: None,
                 min_lod: 0.0,
+                swizzle: ViewDesc::IDENTITY,
             }),
             Res::Texture(_) => None,
         },
@@ -317,6 +331,7 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
             format: format(d[0]),
             // The whole texture is bound: its mips are the resource's.
             min_lod: if matches!(view, View::Shader(..)) { min_lod(d, 0) } else { 0.0 },
+            swizzle: if matches!(view, View::Shader(..)) { swizzle(d[2]) } else { ViewDesc::IDENTITY },
         }),
         View::ConsoleSampler(w) => Some(sampler(&crate::sampler::console_fields(w))),
         // shortcut: the plain D3D12 sampler description (13 words) is not decoded; titles on this
@@ -596,6 +611,27 @@ mod tests {
         }
     }
 
+    /// A shader-resource view's component mapping reaches the host view, for object and placed
+    /// views alike: the default and a zeroed word are the identity; forced 0 and 1 are kept.
+    #[test]
+    fn a_texture_views_component_mapping_is_its_swizzle() {
+        let mut resource = [0; 14];
+        resource[0] = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        // Red reads alpha, green 1, blue red, alpha 0.
+        let mapped = 3 | 5 << 3 | 4 << 9 | 1 << 12; // blue: 0 (red) at bits 6-8
+        for (mapping, want) in [(0x1688, ViewDesc::IDENTITY), (0, ViewDesc::IDENTITY), (mapped, [3, 5, 0, 4])] {
+            let mut placed = [0; 16];
+            (placed[0], placed[1], placed[2], placed[5]) = (28, TEXTURE_2D, mapping, 1);
+            let srv: [u32; 10] = placed[..10].try_into().unwrap();
+            for view in [View::Shader(7, Some(srv)), View::Placed(false, resource, placed)] {
+                let Some(Decoded::Image { swizzle, .. }) = decode(&view, &Resources::new()) else {
+                    panic!("expected a texture view");
+                };
+                assert_eq!(swizzle, want, "{mapping:#x}");
+            }
+        }
+    }
+
     /// A view's `ResourceMinLODClamp` reaches the host entry, in the view's mips: the title keeps
     /// samples off finer mips it has not streamed in yet (a clamp of 3 over a view from mip 1 is
     /// 2 in the view's mips; one at or below the first mip clamps nothing). Unordered views have
@@ -637,7 +673,7 @@ mod tests {
         let resources = Resources::from([(7, Res::Texture(())), (8, Res::Buffer(0x1000, 256))]);
         assert_eq!(
             decode(&View::Shader(7, None), &resources),
-            Some(Decoded::Image { resource: 7, mips: None, slices: None, format: None, min_lod: 0.0 })
+            Some(Decoded::Image { resource: 7, mips: None, slices: None, format: None, min_lod: 0.0, swizzle: ViewDesc::IDENTITY })
         );
         assert_eq!(
             decode(&View::Shader(8, None), &resources),

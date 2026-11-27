@@ -362,7 +362,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     texture
                 } else {
                     let own = info_format(resource)?;
-                    Rc::new(self.backend.create_texture_view(&texture, &ViewDesc { format: own, mips: (mip, 1), slices: (0, usize::MAX) }).ok()?)
+                    Rc::new(self.backend.create_texture_view(&texture, &ViewDesc { format: own, mips: (mip, 1), slices: (0, usize::MAX), swizzle: ViewDesc::IDENTITY }).ok()?)
                 };
                 Some((ClearTarget::Texture(target), format!("texture of format {format} level {mip}"), size))
             }
@@ -1568,6 +1568,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 slices,
                 format,
                 min_lod,
+                swizzle,
             } => {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
                     if self.is_covered(resource) {
@@ -1600,10 +1601,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 if matches!(view, crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..)) {
                     self.unordered.borrow_mut().insert(resource);
                 }
+                // A view with a component mapping but no mip range is the whole texture, mapped.
+                let mips = mips.or((swizzle != ViewDesc::IDENTITY).then_some((0, u32::MAX)));
                 match (mips, format) {
                     _ if plane.is_some() => {
                         let (texture, format) = plane.as_ref().expect("a plane");
-                        let v = self.backend.create_texture_view(texture, &ViewDesc { format: *format, mips: (0, 1), slices: (0, 1) })?;
+                        let v = self.backend.create_texture_view(texture, &ViewDesc { format: *format, mips: (0, 1), slices: (0, 1), swizzle: ViewDesc::IDENTITY })?;
                         self.backend.write_texture(&heap.heap, index, &v, 0.0);
                     }
                     (Some((first, count)), Some(format)) if count > 0 => {
@@ -1617,6 +1620,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 slices: slices.map_or((0, usize::MAX), |(first, count)| {
                                     (first as usize, count as usize)
                                 }),
+                                swizzle,
                             },
                         )?;
                         self.backend.write_texture(&heap.heap, index, &v, min_lod);
@@ -2471,7 +2475,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             None => format!("{r:#x}:buf"),
         };
         // A shader-resource view's minimum LOD clamp (in the resource's mips), and its component
-        // mapping when not the default (the host does not apply one).
+        // mapping when not the default.
         let clamp = |v: &[u32; 10]| {
             let map = if v[2] == 0x1688 { String::new() } else { format!(":map{:#x}", v[2]) };
             match super::descriptors::min_lod(v, 0) {
