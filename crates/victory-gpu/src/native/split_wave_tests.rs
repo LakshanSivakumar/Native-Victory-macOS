@@ -2038,3 +2038,89 @@ fn integer_pairs_pack_to_16_bits_with_saturation() {
         (0..32i32).map(|i| s((i << 12) - 0x10000) | s(0x10002 - i) << 16).collect();
     assert_eq!(got, want, "signed");
 }
+
+// Groups of several console waves whose waves branch differently (#376). Lockstep (above) takes
+// only a group of one console wave; these are refused on the fast path and have no retry yet.
+
+/// `v_cmp_gt_u32 vcc, 100, v0; s_and_saveexec_b64 s[4:5], vcc`: in a group of 128, console wave 0
+/// stays whole and wave 1 keeps its lanes 0..35 (threads 64..99).
+const THREADS_BELOW_100: [u32; 3] = [0x7D88_00FF, 100, 0xBE84_246A];
+
+/// [`run_io`] of a wave64 group of `threads`, `dwords` read back from `dst`.
+fn run_group(words: &[u32], threads: u32, dwords: usize) -> Vec<u32> {
+    let Some(mut t) = title() else { return Vec::new() };
+    let f = Fixture::new(&t);
+    let cs = translate_io(words, 5, 0, threads, shaders::options());
+    let [c, d] = halves(VA_A + 0x4_0000);
+    dispatch(&mut t, &cs, &[0, 0, c, d, 0], false);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    f.get(DST, dwords)
+}
+
+/// Each wave of a group of two reads its own lane 35 behind `s_cbranch_execz`, with a different
+/// EXEC in each wave: wave 0 whole, wave 1 only its lanes 0..35.
+fn lane_read_with_a_different_exec_per_wave() -> Vec<u32> {
+    let mut w = vec![
+        V_LSHLREV_V1_2_V0,
+        0x4A06_00FF,
+        0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+    ];
+    w.extend(THREADS_BELOW_100);
+    w.extend([
+        skip_execz(5),
+        0xD760_0006,
+        0x0001_4703, // v_readlane_b32 s6, v3, 35
+        0x7E04_0206, // v_mov_b32 v2, s6
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+        S_ENDPGM,
+    ]);
+    w
+}
+
+/// Only wave 0 of a group of two enters the block (lanes 0..39) and counts its lanes above 5 there
+/// with a ballot read as a number (34); wave 1 skips it whole.
+fn ballot_in_a_block_one_wave_skips() -> Vec<u32> {
+    let mut w = LANES_BELOW_40.to_vec();
+    w.extend([
+        skip_execz(6),
+        0x7D82_0085, // v_cmp_lt_u32 vcc, 5, v0
+        0xBE86_106A, // s_bcnt1_i32_b64 s6, vcc
+        V_LSHLREV_V1_2_V0,
+        0x7E04_0206, // v_mov_b32 v2, s6
+    ]);
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn several_waves_branching_differently_are_refused_today() {
+    let why = refusal(&lane_read_with_a_different_exec_per_wave()).expect("refused");
+    assert!(why.contains("between host waves"), "{why}");
+}
+
+#[test]
+#[ignore = "#376: lockstep for groups of several console waves is not written yet"]
+fn a_lane_read_in_a_group_of_two_waves_reads_each_waves_own_lane() {
+    let got = run_group(&lane_read_with_a_different_exec_per_wave(), 128, 128);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..64], [1035; 64], "wave 0: its lane 35");
+    assert_eq!(got[64..100], [1099; 36], "wave 1: its lane 35 (thread 99)");
+    assert_eq!(got[100..], [CANARY; 28]);
+}
+
+/// A guard, not a gap: the fast path already takes a ballot whose block only skipping lanes leave
+/// (`exchange_site`), so this must keep its output when lockstep takes groups of several waves.
+#[test]
+fn a_ballot_in_a_block_one_wave_of_the_group_skips_counts_only_its_wave() {
+    let got = run_group(&ballot_in_a_block_one_wave_skips(), 128, 128);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [34; 40]);
+    assert_eq!(got[40..], [CANARY; 88]);
+}
