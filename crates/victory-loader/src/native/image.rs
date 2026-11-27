@@ -47,6 +47,19 @@ pub struct NativeImage {
     info: ImageInfo,
 }
 
+/// Owns the allocation until setup succeeds and the image takes it over.
+struct PendingMapping {
+    base: *mut u8,
+    len: usize,
+}
+
+impl Drop for PendingMapping {
+    fn drop(&mut self) {
+        // SAFETY: this allocation is still private to the mapping operation.
+        unsafe { mem::release(self.base, self.len) }.ok();
+    }
+}
+
 // SAFETY: the base is just an address; the image has no interior state.
 unsafe impl Send for NativeImage {}
 // SAFETY: as above.
@@ -71,6 +84,7 @@ impl NativeImage {
                 unsafe { mem::alloc(None, len, Protect::READ_WRITE) }
             })
             .with_context(|| format!("mapping {len:#x} bytes of image at {at:#x}"))?;
+        let pending = PendingMapping { base: region, len };
         let image = NativeImage {
             base: region as usize,
             len,
@@ -84,12 +98,13 @@ impl NativeImage {
                 layout::read_u32(bytes, at + 4).unwrap_or(0),
             )
         });
-        seh::unwind::add_image(image.base, image.len, pdata);
         tracing::info!(
             base = format_args!("{:#x}", image.base),
             preferred = format_args!("{preferred:#x}"),
             "native image mapped"
         );
+        seh::unwind::add_image(image.base, image.len, pdata);
+        std::mem::forget(pending); // The caller now controls the mapping's lifetime via unmap.
         Ok(image)
     }
 
@@ -296,5 +311,45 @@ impl NativeImage {
         seh::unwind::remove_image(self.base);
         // SAFETY: forwarded from the caller.
         unsafe { mem::release(self.base as *mut u8, self.len) }.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relocation_failure_releases_the_mapping() {
+        // A headers-only PE32+ with preferred base zero and no relocations.
+        let mut bytes = [0u8; 0x200];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        bytes[0x40..0x44].copy_from_slice(b"PE\0\0");
+        bytes[0x44..0x46].copy_from_slice(&victory_pe::MACHINE_AMD64.to_le_bytes());
+        bytes[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        let opt = layout::optional_header_offset(&bytes).unwrap();
+        bytes[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[opt + 56..opt + 60].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+
+        let len = mem::page_size();
+        // Use a high address so ordinary allocations in parallel tests leave the probe alone.
+        // SAFETY: this test owns the reservation and releases it before the load.
+        let at = unsafe { mem::reserve_in(0x5000_0000_0000, 0x5fff_ffff_ffff, len, len) }.unwrap();
+        // SAFETY: the full reservation is unused.
+        unsafe { mem::release(at, len) }.unwrap();
+
+        let err = NativeImage::map(&bytes, Some(at as usize)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "image is not at its preferred base and has no relocations"
+        );
+        // SAFETY: at is page aligned and reserve fails if anything is still mapped there.
+        let retry = unsafe { mem::reserve(Some(at as usize), len) }
+            .expect("the failed image load should have released its mapping");
+        assert_eq!(retry, at);
+        // SAFETY: the full reservation belongs to this test and is unused.
+        unsafe { mem::release(retry, len) }.unwrap();
     }
 }
