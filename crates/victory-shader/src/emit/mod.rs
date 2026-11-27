@@ -486,6 +486,13 @@ pub struct Options {
     /// it stores nothing and a count of EXEC leaves it out.
     /// Guess: that is what the console's lanes past the count do (`docs/native-host.md`).
     pub thread_counts: bool,
+    /// Per `SV_Target` index, the component type to declare the render target's output as
+    /// (`5` u32, `4` i32; 0: the signature's own). A pipeline whose render target format is an
+    /// integer one needs its output typed so: the converter checks the output type against the
+    /// color attachment ("output of type float4 is not compatible with a ...Uint color
+    /// attachment"), while the console's exports are raw dwords either way. Eight slots, as
+    /// D3D12's RTVs.
+    pub target_comps: [u8; 8],
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -668,6 +675,7 @@ fn emit_fast(
         zero_copy_memory: options.zero_copy_memory,
         rect_list: options.rect_list,
         copy_params: options.copy_params,
+        target_comps: options.target_comps,
     };
     let guessed = graphics::is_guessed(c);
     let l = match lower::lower_graphics(&parts(st, res), guessed) {

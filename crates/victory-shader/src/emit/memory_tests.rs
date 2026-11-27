@@ -194,7 +194,7 @@ fn program() -> HostShader {
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
         view_marks: false,
     })
     .expect("lower");
@@ -432,7 +432,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
         view_marks: false,
     })
     .expect("lower");
@@ -583,7 +583,7 @@ fn writes_through_views_mark_their_pages() {
         wave32_host: false,
         zero_copy_memory: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
         view_marks: true,
     })
     .expect("lower");
@@ -709,7 +709,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             wave32_host: false,
             zero_copy_memory: false,
             rect_list: false,
-            copy_params: [0; 32],
+            copy_params: [0; 32], target_comps: [0; 8],
         })
         .expect("lower")
     };

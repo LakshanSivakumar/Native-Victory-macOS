@@ -313,6 +313,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         extra_params: 0,
         // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
         thread_counts: false,
+        // The D3D12 host's pipelines declare their own target types.
+        target_comps: [0; 8],
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());

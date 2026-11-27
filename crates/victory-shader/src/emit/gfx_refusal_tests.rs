@@ -260,7 +260,7 @@ pub(super) fn computed_subword_test_shader(op: u32, bounds: u32) -> super::HostS
         inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0,
         atomic_locks: false, bias_as_gradients: false, narrow_waves: false,
         wave32_host: false, zero_copy_memory: true, view_marks: false,
-        rect_list: false, copy_params: [0; 32],
+        rect_list: false, copy_params: [0; 32], target_comps: [0; 8],
     }).unwrap();
     super::HostShader {
         stage: HwStage::Cs, dxil: l.dxil, splits: l.splits, table_entries: l.table_entries,
@@ -314,6 +314,21 @@ fn lower_ps(
     inputs: Vec<SigElement>,
     wave32_host: bool,
 ) -> Result<Lowered, ShaderError> {
+    lower_ps_comps(words, wave64, layout, ps_inputs, input_addr, db_shader_control, inputs, wave32_host, [0; 8])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_ps_comps(
+    words: &[u32],
+    wave64: bool,
+    layout: Vec<RootParam>,
+    ps_inputs: Vec<PsInput>,
+    input_addr: u32,
+    db_shader_control: u32,
+    inputs: Vec<SigElement>,
+    wave32_host: bool,
+    target_comps: [u8; 8],
+) -> Result<Lowered, ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Ps,
         wave64,
@@ -349,7 +364,7 @@ fn lower_ps(
         zero_copy_memory: false,
         view_marks: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps,
     })
 }
 
@@ -392,7 +407,7 @@ fn lower_vs(
         zero_copy_memory: false,
         view_marks: false,
         rect_list,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
     })
 }
 
@@ -1848,7 +1863,7 @@ fn store_cs(dwords: u8, setup: &[u32], store: [u32; 2]) -> Result<Lowered, Shade
         zero_copy_memory: false,
         view_marks: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
     })
 }
 
@@ -2264,7 +2279,7 @@ fn computed_descriptor_cs(computed: bool) -> Result<Lowered, ShaderError> {
         zero_copy_memory: computed,
         view_marks: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
     })
 }
 
@@ -2356,7 +2371,7 @@ fn indexed_srv_cs(stride: u32) -> Result<Lowered, ShaderError> {
         zero_copy_memory: false,
         view_marks: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
     })
 }
 
@@ -2963,4 +2978,31 @@ fn a_wave64_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     }
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("data whose high dword is not known"), "{err:?}");
+}
+
+/// A render target of an integer format (R32Uint): the converter checks the pixel output's type
+/// against the color attachment ("output of type float4 is not compatible with a ...Uint color
+/// attachment"), so the `SV_Target` must be declared u32 and stored as `storeOutput.i32` — the
+/// console's exports are raw dwords either way (`Options::target_comps`).
+#[test]
+fn an_integer_render_target_types_its_output_u32() {
+    let words = [
+        0x7E02_02FF, 0x3F80_0000, // v_mov_b32 v1, 1.0
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let target_comp = |l: &Lowered| {
+        let c = Container::parse(&l.dxil).unwrap();
+        let osg = super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        osg.iter().find(|e| e.kind == 16).unwrap().comp
+    };
+    // Without the option the target stays float.
+    let l = lower_ps_comps(&words, false, vec![], vec![], 0, 0, vec![], false, [0; 8]).expect("lowers");
+    assert_eq!(target_comp(&l), 9);
+    // R32Uint: declared u32, stored as an i32.
+    let l = lower_ps_comps(&words, false, vec![], vec![], 0, 0, vec![], false, [5, 0, 0, 0, 0, 0, 0, 0])
+        .expect("lowers");
+    assert_eq!(target_comp(&l), 5);
+    let names: Vec<&str> = l.output_stores.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.iter().any(|n| n.ends_with("storeOutput.i32")), "{names:?}");
 }

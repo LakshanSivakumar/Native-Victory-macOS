@@ -62,6 +62,12 @@ pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u
     translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
 }
 
+/// A pixel shader's container translated for pipelines whose color targets are of integer
+/// formats, typing the `SV_Target` outputs as `comps` say (`Options::target_comps`).
+pub fn translate_targets(container: &[u8], comps: [u8; 8]) -> Result<HostShader, String> {
+    translate_cached(container, Options { target_comps: comps, ..options() })
+}
+
 /// Whether [`translate_extra`]'s translation is in the disk cache already.
 pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
     let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };

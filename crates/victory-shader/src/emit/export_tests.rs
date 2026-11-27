@@ -62,7 +62,7 @@ fn lowered(
         zero_copy_memory: false,
         view_marks: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
     })
 }
 

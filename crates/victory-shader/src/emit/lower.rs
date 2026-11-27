@@ -154,6 +154,8 @@ pub(crate) struct Parts<'a> {
     pub rect_list: bool,
     /// See [`Options::copy_params`](super::Options).
     pub copy_params: [u8; 32],
+    /// See [`Options::target_comps`](super::Options).
+    pub target_comps: [u8; 8],
 }
 
 enum Stop {
@@ -897,6 +899,16 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // `Options::target_comps`: a render target of an integer format declares its output
+        // with that component type, and the stores to it then emit as `storeOutput.i32` (the
+        // console's exports are raw dwords either way).
+        for e in s.outputs.iter_mut().filter(|e| e.kind == 16) {
+            if let Some(&c) = x.target_comps.get(e.index as usize)
+                && c != 0
+            {
+                e.comp = c;
+            }
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -14823,7 +14835,7 @@ mod tests {
             wave32_host: false,
             zero_copy_memory: false,
             rect_list: false,
-            copy_params: [0; 32],
+            copy_params: [0; 32], target_comps: [0; 8],
             view_marks: false,
         })
         .map(|_| ())
@@ -14881,7 +14893,7 @@ mod tests {
             wave32_host: false,
             zero_copy_memory: false,
             rect_list: false,
-            copy_params: [0; 32],
+            copy_params: [0; 32], target_comps: [0; 8],
             view_marks: false,
         })
     }
@@ -15108,7 +15120,7 @@ mod tests {
             wave32_host: false,
             zero_copy_memory: false,
             rect_list: false,
-            copy_params: [0; 32],
+            copy_params: [0; 32], target_comps: [0; 8],
             view_marks: false,
         })
         .unwrap();
@@ -16095,7 +16107,7 @@ mod tests {
             wave32_host,
             zero_copy_memory: false,
             rect_list: false,
-            copy_params: [0; 32],
+            copy_params: [0; 32], target_comps: [0; 8],
             view_marks: false,
         })
         .expect("lower")
@@ -16334,7 +16346,7 @@ mod tests {
                 wave32_host: true,
                 zero_copy_memory: false,
                 rect_list: false,
-                copy_params: [0; 32],
+                copy_params: [0; 32], target_comps: [0; 8],
             })
             .unwrap()
         };

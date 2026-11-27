@@ -255,6 +255,29 @@ impl Shader {
             .clone()
     }
 
+    /// The translation for pipelines whose color targets are of integer formats, with the
+    /// `SV_Target` outputs typed as `comps` say (`Options::target_comps`). Not held on the
+    /// shader: the disk cache makes a repeat cheap. Falls back to the title memory copy when
+    /// the container was let go, as [`Self::native_threads_shader`] does.
+    pub(crate) fn native_targets_shader(&self, comps: [u8; 8]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        {
+            let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+            if !container.is_empty() {
+                return crate::native::shaders::translate_targets(&container, comps).map(Arc::new);
+            }
+        }
+        self.native()?;
+        let mut container = vec![0; self.size];
+        let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
+        if at == 0 || !crate::queue::read_bytes(at, &mut container) {
+            return Err("its container is no longer in title memory".into());
+        }
+        if blake3::hash(&container).to_hex()[..16] != *self.hash {
+            return Err("its container changed since the pipeline was made".into());
+        }
+        crate::native::shaders::translate_targets(&container, comps).map(Arc::new)
+    }
+
     /// Whether [`Self::translate_extra`] would find its translation on disk.
     pub(crate) fn extra_cached(&self, rect: bool, extra: u32, copy: [u8; 32]) -> bool {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());

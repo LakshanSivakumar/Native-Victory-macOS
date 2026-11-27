@@ -1157,7 +1157,28 @@ fn make_host_pipe(
             None => Pipe::Refused,
         },
         Some(g) => match find("vertex") {
-            Some(vs) => t.render_pipe(vs, find("pixel"), &g, &name),
+            Some(vs) => {
+                // A color target of an integer format needs the pixel shader's outputs typed
+                // for it, or the converter refuses the pipeline ("output of type float4 is
+                // not compatible with a ...Uint color attachment"). On any failure the plain
+                // translation is used, which is refused at conversion as before.
+                let comps = g.target_comps();
+                let ps = if comps.iter().any(|&c| c != 0) {
+                    match stages.iter().find(|s| s.0 == "pixel").map(|s| &s.1) {
+                        Some(shader) => match shader.native_targets_shader(comps) {
+                            Ok(h) => Some(h),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "the target-typed pixel translation was not made");
+                                find("pixel").cloned()
+                            }
+                        },
+                        None => find("pixel").cloned(),
+                    }
+                } else {
+                    find("pixel").cloned()
+                };
+                t.render_pipe(vs, ps.as_deref(), &g, &name)
+            }
             None => {
                 t.refused_translation(&name, "a graphics pipeline without a vertex shader".into());
                 Pipe::Refused

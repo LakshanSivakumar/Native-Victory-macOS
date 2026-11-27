@@ -412,6 +412,23 @@ impl Graphics {
             .collect()
     }
 
+    /// The DXIL component types for the color targets when a pixel shader's outputs must be
+    /// retyped for them (`Options::target_comps`): 5 (u32) for an integer format, 0 else. The
+    /// converter checks an output's type against its color attachment, so a pipeline rendering
+    /// to an R32Uint target refuses a float4 output; the console's exports are raw dwords either
+    /// way.
+    pub fn target_comps(&self) -> [u8; 8] {
+        let mut comps = [0; 8];
+        if let Ok(color) = self.color_formats() {
+            for (i, f) in color.iter().enumerate().take(8) {
+                if f.is_integer() {
+                    comps[i] = 5;
+                }
+            }
+        }
+        comps
+    }
+
     /// The depth format; `Ok(None)` for no depth target, `Err` if the host does not know it.
     pub fn depth_format(&self) -> Result<Option<Format>, u32> {
         if let Some((_, depth)) = &self.bound {

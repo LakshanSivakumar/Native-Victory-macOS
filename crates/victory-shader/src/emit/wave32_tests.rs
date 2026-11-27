@@ -136,7 +136,7 @@ fn lowered(
         wave32_host,
         zero_copy_memory: false,
         rect_list: false,
-        copy_params: [0; 32],
+        copy_params: [0; 32], target_comps: [0; 8],
         view_marks: false,
     })?;
     // VICTORY_DUMP_DXIL=<dir>: keep the containers, to run Apple's converter on.

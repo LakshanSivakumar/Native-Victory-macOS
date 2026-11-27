@@ -993,6 +993,20 @@ four minutes, 21 world frames each) had no failed command buffer. That is fewer 
 set-mode runs reached before stalling (31 and 54), so it does not show that per-encoder naming
 survives pressure better.
 
+#### Integer render target formats retype the pixel outputs
+
+The converter checks a pixel output's type against its color attachment: a pipeline rendering to
+an R32Uint target refuses a float4 output ("output of type float4 is not compatible with a
+MTLPixelFormatR32Uint color attachment"), and its draws drop. The console's exports are raw
+dwords either way, so this is our typing choice: `Options::target_comps` (per `SV_Target`
+index, 5 u32 / 4 i32) retypes the signature elements in `Lower::new` (`emit/lower.rs`), and the
+stores to them then emit as `storeOutput.i32`. A described pipeline whose color formats are
+integer ones gets its pixel shader translated with those comps (`Shader::native_targets_shader`,
+`glue::make_host_pipe`; the disk cache keys on the options as on any other variant), falling
+back to the plain translation — refused at conversion as before — when the container cannot be
+read back. Seen as 179 refused pipelines of one run (tester report #313; 179 and 135 in #280
+and #265). Test: `gfx_refusal_tests::an_integer_render_target_types_its_output_u32`.
+
 #### A pass refused mid-encoding ends its encoder
 
 `submit_passes` refuses a pass it cannot encode and still encodes the passes after it. A refusal after the pass's encoder was opened (a counted record whose gate fails, an indexed indirect draw without an index buffer) now ends that encoder first; it used to leave it open, and Metal aborted the process (`A command encoder is already encoding to this command buffer`) when the next pass opened its own.
