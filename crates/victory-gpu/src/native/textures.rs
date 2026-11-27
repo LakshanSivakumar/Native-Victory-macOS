@@ -1480,6 +1480,13 @@ pub struct Budget {
     named: HashMap<usize, u32>,
 }
 
+impl Budget {
+    /// Whether the trace logs at this submission's check (once a second).
+    fn trace_due(&self) -> bool {
+        env_set!("VICTORY_TRACE_TEXTURE_SYNC") && self.logged.is_none_or(|t| t.elapsed().as_secs() >= 1)
+    }
+}
+
 /// Submissions between checks while over budget with too little to give up.
 pub(super) const RECHECK: u64 = 64;
 
@@ -1488,14 +1495,16 @@ pub(super) const RECHECK: u64 = 64;
 /// frame.
 pub const MIN_TEXTURE_BUDGET: u64 = 1536 << 20;
 
-/// Bytes of host texture copies to allow: `VICTORY_METAL_TEXTURE_BUDGET_MB` when set (0: no
-/// budget), else what Metal's recommended working set leaves after the title's memory, at least
-/// [`MIN_TEXTURE_BUDGET`].
-pub fn texture_budget(working_set: u64, title_memory: u64, var: Option<&str>) -> u64 {
-    match var.and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(mb) => mb << 20,
-        None => working_set.saturating_sub(title_memory).max(MIN_TEXTURE_BUDGET),
-    }
+/// Bytes of host texture copies to allow: `VICTORY_METAL_TEXTURE_BUDGET_MB` MiB. Off (0) unless
+/// that is set to a number, until there are runs on more machines.
+pub fn texture_budget(var: Option<&str>) -> u64 {
+    var.and_then(|v| v.trim().parse::<u64>().ok()).map_or(0, |mb| mb << 20)
+}
+
+/// The budget to try on this Mac, logged at startup: what Metal's recommended working set leaves
+/// after the title's memory, at least [`MIN_TEXTURE_BUDGET`].
+pub fn suggested_texture_budget(working_set: u64, title_memory: u64) -> u64 {
+    working_set.saturating_sub(title_memory).max(MIN_TEXTURE_BUDGET)
 }
 
 /// Which of `candidates` (key, bytes, last use) to give up to free `over` bytes: the least recently
@@ -1576,14 +1585,14 @@ impl<B: PresentBackend> Title<B> {
     /// [`Self::let_named_go`], once the submission is with its queue, so another submission's sync
     /// in between cannot give them up. Nothing is read under the budget with nothing given up
     /// (`glue::submit` runs one submission at a time, so none goes over budget in between), unless
-    /// the trace is on.
+    /// the trace logs at this submission, so its figures match a run with the budget on.
     #[must_use = "the names stay kept until handed to `let_named_go`"]
     pub(super) fn keep_named<'a>(&mut self, lists: impl Iterator<Item = &'a NativeList<B>>) -> HashSet<usize>
     where
         B: 'a,
     {
         let over = self.budget.limit > 0 && self.budget.live > self.budget.limit;
-        if !over && !self.host.any_evicted() && !env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
+        if !over && !self.host.any_evicted() && !self.budget.trace_due() {
             return HashSet::new();
         }
         // shortcut: a record changed after this read (before held work is encoded) still gets the
@@ -1623,8 +1632,7 @@ impl<B: PresentBackend> Title<B> {
     pub(super) fn keep_to_budget(&mut self) {
         self.budget.serial += 1;
         let serial = self.budget.serial;
-        let trace = env_set!("VICTORY_TRACE_TEXTURE_SYNC")
-            && self.budget.logged.is_none_or(|t| t.elapsed().as_secs() >= 1);
+        let trace = self.budget.trace_due();
         let over = self.budget.live.saturating_sub(self.budget.limit);
         let check = self.budget.limit > 0 && over > 0 && serial >= self.budget.next_check;
         if !check && !trace {

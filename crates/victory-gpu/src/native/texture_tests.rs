@@ -1610,19 +1610,20 @@ fn the_least_recently_used_textures_go_first_until_the_excess_is_freed() {
     assert_eq!(choose_evictions(c, 10_000), vec![2, 3, 4, 1]);
 }
 
-/// The budget is what Metal's working set leaves after the title's memory, with a floor, unless
-/// `VICTORY_METAL_TEXTURE_BUDGET_MB` says otherwise.
+/// The budget is off unless `VICTORY_METAL_TEXTURE_BUDGET_MB` sets it; the figure suggested for a
+/// Mac is what Metal's working set leaves after the title's memory, with a floor.
 #[test]
-fn the_texture_budget_is_the_working_set_the_title_leaves() {
-    use crate::native::textures::{MIN_TEXTURE_BUDGET, texture_budget};
+fn the_texture_budget_is_off_unless_set() {
+    use crate::native::textures::{MIN_TEXTURE_BUDGET, suggested_texture_budget, texture_budget};
     const MIB: u64 = 1 << 20;
+    assert_eq!(texture_budget(None), 0, "off by default");
+    assert_eq!(texture_budget(Some("2048")), 2048 * MIB);
+    assert_eq!(texture_budget(Some("0")), 0, "0: no budget");
+    assert_eq!(texture_budget(Some("lots")), 0, "not a number: no budget");
     // An M4 with 16 GB, Series S (#8).
-    assert_eq!(texture_budget(12124 * MIB, 7776 * MIB, None), 4348 * MIB);
+    assert_eq!(suggested_texture_budget(12124 * MIB, 7776 * MIB), 4348 * MIB);
     // Series X on the same Mac: the title alone is past the working set.
-    assert_eq!(texture_budget(12124 * MIB, 13824 * MIB, None), MIN_TEXTURE_BUDGET);
-    assert_eq!(texture_budget(12124 * MIB, 7776 * MIB, Some("2048")), 2048 * MIB);
-    assert_eq!(texture_budget(12124 * MIB, 7776 * MIB, Some("0")), 0, "0: no budget");
-    assert_eq!(texture_budget(12124 * MIB, 7776 * MIB, Some("lots")), 4348 * MIB);
+    assert_eq!(suggested_texture_budget(12124 * MIB, 13824 * MIB), MIN_TEXTURE_BUDGET);
 }
 
 /// A title host of its own over a pool of its own, and a 16x16 RGBA8 texture of `flags` at `at`
