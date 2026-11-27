@@ -460,6 +460,8 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
         return;
     }
     *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+    // Which frame the dumps are of, and whether `VICTORY_SKIP_DRAWS` dropped its draws.
+    tracing::info!(present = PRESENTS.load(Ordering::Relaxed), skip_draws = skipping().is_some(), secs = now, "targets dumped of this frame");
     with_title(|t| {
         for (n, key) in stats.keys().enumerate() {
             let Some(info) = crate::resource::texture_info(*key as This) else { continue };
@@ -1282,6 +1284,15 @@ fn pass_config(v: &str) -> (String, u64, i64) {
 fn skip_draws_takes_full_hashes_only() {
     assert_eq!(skip_hashes(" 99EFD78FE89B1349,abc,0f8f96e17fabe141x,0f8f96e17fabe141 "), ["99efd78fe89b1349", "0f8f96e17fabe141"]);
     assert!(skip_hashes("").is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn root_mapped_finds_where_the_mapping_ends() {
+    assert_eq!(root_mapped(|_| false, 1 << 24), 0);
+    assert_eq!(root_mapped(|_| true, 1 << 24), 1 << 24);
+    let got = root_mapped(|len| len <= 300_000, 1 << 24);
+    assert!((300_000 - 4096..=300_000).contains(&got), "{got}");
 }
 
 #[cfg(test)]
@@ -2990,14 +3001,67 @@ static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// an even number of presents, so that one run's consecutive frames show the scene with and
 /// without them.
 fn skipped_draw(pipeline: usize) -> bool {
+    skipping().is_some_and(|hashes| {
+        stage_hashes(pipeline).iter().any(|s| s.split(' ').nth(1).is_some_and(|h| hashes.iter().any(|x| x == h)))
+    })
+}
+
+/// `VICTORY_TRACE_ROOT_MEMORY=<hash>,...` (diagnostics): for the first 400 draws whose pipeline
+/// has one of those shaders, each root view's title address and how much title memory after it
+/// the host's pools map: the bytes in one pool from the address (`mapped`, up to 16 MiB), and the
+/// 64 KiB pages of the 16 MiB from the address's page that no pool maps (`unmapped`, with the first
+/// eight as page offsets). A program that reads title memory through the page table reads 0 there.
+fn trace_root_memory(t: &MetalTitle, l: &MetalList) {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let hashes = HASHES.get_or_init(|| skip_hashes(&std::env::var("VICTORY_TRACE_ROOT_MEMORY").unwrap_or_default()));
+    if hashes.is_empty() {
+        return;
+    }
+    let names = stage_hashes(l.pipeline);
+    if !names.iter().any(|s| s.split(' ').nth(1).is_some_and(|h| hashes.iter().any(|x| x == h))) {
+        return;
+    }
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 400 {
+        return;
+    }
+    const SPAN: u64 = 16 << 20;
+    let memory = t.host.memory();
+    for (slot, address) in l.list.graphics_root_views() {
+        let mapped = root_mapped(|len| memory.resolve(address, len).is_some(), SPAN);
+        let page = address & !0xFFFF;
+        let unmapped: Vec<u64> = (0..SPAN >> 16).map(|k| page + (k << 16)).filter(|&p| memory.resolve(p, 1).is_none()).collect();
+        let first: Vec<String> = unmapped.iter().take(8).map(|p| format!("+{:#x}", p - page)).collect();
+        tracing::info!(draw = n, present = PRESENTS.load(Ordering::Relaxed), shaders = ?names, slot, address = format!("{address:#x}"), mapped, unmapped = unmapped.len(), first = ?first, "root view memory");
+    }
+}
+
+/// The largest length up to `most` (to 4 KiB) for which `covered(len)` holds, `covered` holding
+/// for every length below one it holds for; 0 when it does not hold for 1 byte.
+fn root_mapped(covered: impl Fn(u64) -> bool, most: u64) -> u64 {
+    if !covered(1) {
+        return 0;
+    }
+    if covered(most) {
+        return most;
+    }
+    let (mut lo, mut hi) = (1, most);
+    while hi - lo > 4096 {
+        let mid = lo + (hi - lo) / 2;
+        if covered(mid) { lo = mid } else { hi = mid }
+    }
+    lo
+}
+
+/// The hashes `VICTORY_SKIP_DRAWS` names when this frame's draws of them are dropped.
+fn skipping() -> Option<&'static [String]> {
     static SKIP: OnceLock<(Vec<String>, bool)> = OnceLock::new();
     let (hashes, alternate) = SKIP.get_or_init(|| {
         let v = std::env::var("VICTORY_SKIP_DRAWS").unwrap_or_default();
         (skip_hashes(&v), env_set!("VICTORY_SKIP_DRAWS_ALTERNATE"))
     });
-    !hashes.is_empty()
-        && (!alternate || PRESENTS.load(Ordering::Relaxed) % 2 == 0)
-        && stage_hashes(pipeline).iter().any(|s| s.split(' ').nth(1).is_some_and(|h| hashes.iter().any(|x| x == h)))
+    (!hashes.is_empty() && (!alternate || PRESENTS.load(Ordering::Relaxed) % 2 == 0)).then_some(&hashes[..])
 }
 
 /// The 16-digit hex hashes of a comma list, lower case; anything else is left out.
@@ -3014,6 +3078,7 @@ fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<b
         dropped("a draw VICTORY_SKIP_DRAWS names");
         return None;
     }
+    trace_root_memory(t, l);
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
         trace_drop(l);

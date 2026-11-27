@@ -1057,6 +1057,16 @@ impl<B: GraphicsBackend> NativeList<B> {
         );
     }
 
+    /// The graphics root views set (slot, title address), for diagnostics.
+    pub fn graphics_root_views(&self) -> Vec<(usize, u64)> {
+        let views = self.state.graphics_root.iter().enumerate();
+        views.filter_map(|(slot, r)| match r {
+            Some(Root::View(address)) => Some((slot, *address)),
+            _ => None,
+        })
+        .collect()
+    }
+
     pub fn set_graphics_root_view(&mut self, slot: usize, address: u64) {
         set(&mut self.state.graphics_root, slot, Root::View(address));
     }
