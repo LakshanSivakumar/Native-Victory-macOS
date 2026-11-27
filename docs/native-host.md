@@ -1353,6 +1353,10 @@ packed chunk). A wrong order would swap transparent and colour1 texels in BC1 cu
 BC1, BC3, BC4 and BC5 chunks a run unpacks, packed (`<n>.bc<k>`) and as decoded (`<n>.out`):
 game data, outside the repository. A check outside the repository compares in-block smoothness
 of those modes' blocks under each order, calibrated on the plain modes.
+Result (tex2 run, 400 chunks): the plain modes calibrate it (BC1 four-colour: the decoder's order
+smoother in 563,156 blocks, the mode-aware one in 159,977; BC4-family eight-value: 514,950 to
+321,607), and the special modes back the decoder's single order (BC1 three-colour: 13,020 to 93
+of 68,039 blocks; six-value: 11,476 to 14 of 23,572; the rest tie). The order stays as it is.
 
 #### A view's minimum LOD clamp
 
