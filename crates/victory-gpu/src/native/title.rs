@@ -210,6 +210,8 @@ pub struct Title<B: PresentBackend> {
     pub(super) textures: super::textures::Textures<B>,
     /// The byte budget of host texture copies ([`Self::keep_to_budget`]).
     pub(super) budget: super::textures::Budget,
+    /// `VICTORY_TRACE_TEXTURE_OVERLAP`: how the copies overlap.
+    pub(super) overlap: super::overlap::Overlap,
     /// GPU-written textures waiting to be copied back into title memory.
     pub(super) back: super::textures::Back<B>,
     /// Sampled textures realized but not yet uploaded once.
@@ -272,6 +274,7 @@ impl<B: PresentBackend> Title<B> {
             libraries: Default::default(),
             textures: Default::default(),
             budget: Default::default(),
+            overlap: Default::default(),
             back: Default::default(),
             unloaded: std::collections::HashSet::new(),
             sync_serial: 0,

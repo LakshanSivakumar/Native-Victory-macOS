@@ -1558,6 +1558,9 @@ impl<B: PresentBackend> Title<B> {
         self.keep_to_budget();
         self.give_up_covered();
         let pools = self.host.memory();
+        if super::overlap::on() {
+            self.trace_overlap();
+        }
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
@@ -1626,6 +1629,7 @@ impl<B: PresentBackend> Title<B> {
         let started = std::time::Instant::now();
         let mut cost = SyncCost { batches: 1, prepare: prepared.took, ..Default::default() };
         let mut read = Vec::new();
+        let mut uploaded = Vec::new();
         for r in prepared.ready {
             cost.textures += 1;
             cost.bytes += r.bytes as u64;
@@ -1694,6 +1698,9 @@ impl<B: PresentBackend> Title<B> {
                     if !t.info.render_target() && t.info.flags & UNORDERED_ACCESS == 0 {
                         t.uploaded_mips = if r.blank { 0 } else { t.uploaded_mips | detiled_mips };
                     }
+                    if super::overlap::on() {
+                        uploaded.push(key);
+                    }
                 }
                 Err(e) => {
                     stats.undetilable += 1;
@@ -1731,6 +1738,9 @@ impl<B: PresentBackend> Title<B> {
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             cost.upload = started.elapsed();
             cost.log();
+        }
+        for key in uploaded {
+            self.note_upload(key);
         }
     }
 }
@@ -2041,6 +2051,44 @@ impl<B: PresentBackend> Title<B> {
             && !t.gpu_written
             && t.info.desc().is_some_and(|d| !d.format.is_depth())
             && !self.host.ever_unordered(key)
+    }
+
+    /// Where copy `t` starts for the traces: its pool offset (by the pool's primary address), else
+    /// its title address.
+    fn copy_start(&self, t: &Tracked<B>) -> usize {
+        self.host.memory().resolve(t.info.memory as u64, 1).map_or(t.info.memory as usize, |(_, at)| at as usize)
+    }
+
+    /// `VICTORY_TRACE_TEXTURE_OVERLAP`: copy `key` was uploaded and owns its range now.
+    pub(super) fn note_upload(&mut self, key: usize) {
+        use super::overlap::Was;
+        let Some(t) = self.textures.get(&key) else { return };
+        let start = self.copy_start(t);
+        for (from, bytes) in self.overlap.take(start, start + t.info.size, key) {
+            let was = match self.textures.get(&from) {
+                None => Was::Gone,
+                Some(o) if self.copy_start(o) == start && o.info.layout == t.info.layout => Was::Identical,
+                Some(_) => Was::Different,
+            };
+            self.overlap.count(was, bytes);
+        }
+    }
+
+    /// `VICTORY_TRACE_TEXTURE_OVERLAP`: once a second, how the copies overlap now and how often
+    /// ranges changed owner since the last line.
+    fn trace_overlap(&mut self) {
+        if self.overlap.logged.is_some_and(|t| t.elapsed().as_secs() < 1) {
+            return;
+        }
+        self.overlap.logged = Some(std::time::Instant::now());
+        let copies: Vec<(usize, usize, &victory_formats::texture::Layout)> =
+            self.textures.values().map(|t| (self.copy_start(t), t.info.size, &t.info.layout)).collect();
+        let (identical, different) = super::overlap::excess(&copies);
+        let [same, other, gone] = self.overlap.take_counts();
+        tracing::info!(
+            "host texture copies overlap: {} copies, {} MiB held again by identical layouts at one start, {} MiB by different layouts; ranges that changed owner in the last second: {} ({} MiB) from an identical layout, {} ({} MiB) from a different one, {} ({} MiB) from a copy no longer there",
+            copies.len(), identical >> 20, different >> 20, same.0, same.1 >> 20, other.0, other.1 >> 20, gone.0, gone.1 >> 20,
+        );
     }
 
     /// For the trace: bytes of title memory under the copies, each byte once, and bytes of copies

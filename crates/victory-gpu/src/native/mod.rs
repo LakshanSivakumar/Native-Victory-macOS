@@ -39,6 +39,7 @@ pub(crate) mod glue;
 pub mod host;
 pub mod list;
 pub mod memory;
+pub mod overlap;
 pub mod shaders;
 pub mod state;
 pub mod textures;
