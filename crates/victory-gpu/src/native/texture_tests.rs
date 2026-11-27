@@ -1079,6 +1079,60 @@ fn described_rectangle_list_draw_uses_supplied_triangles() {
     assert_eq!(recorded, (Topology::Triangles, 6, 1, 3, 0));
 }
 
+/// `DispatchMeshX` with an argument address, called through the list's method table: it records a
+/// mesh draw whose group counts are the record at that address, read on the GPU. A record of one
+/// group colours the target; a record of zero groups draws nothing.
+#[test]
+fn an_indirect_dispatch_mesh_x_draws_the_groups_its_record_holds() {
+    use super::mesh_tests::{RED, TRIANGLE, translate};
+    use victory_backend::backend::ComputeBackend;
+    use victory_shader::native::HwStage;
+    let Some(pool) = pool(9205, 4) else { return };
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let state = crate::native::state::Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let pso = match with_title(|t| t.render_pipe(&ms, Some(&ps), &state, "mesh")).unwrap() {
+        crate::native::title::Pipe::Render(pso, _) => pso,
+        _ => panic!("no mesh pipeline"),
+    };
+    let pipe_key = 0xDEAD_BEE8usize;
+    glue::install_test_render_pipeline(pipe_key, pso);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let records = 0x8000;
+    pool.write(records, &[1u32, 1, 1, 0, 0, 0]);
+    for (i, want) in [(0usize, [255u8, 128, 128, 255]), (1, [0; 4])] {
+        let rt = crate::resource::test_texture_at(pool.va(0x2000 * i), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
+        crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
+        let list = crate::list::test_list(false, std::ptr::null());
+        glue::set_pipeline(list, pipe_key as This);
+        slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(list, 1, &handle, 0, std::ptr::null());
+        let record = pool.va(records + 12 * i);
+        // DispatchMeshX(x, flags, indirect arguments, payload): x is unused with an address.
+        slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, 0x310)(list, 7, 0, record, 0);
+        let recorded = with_list(list, |_, l| match l.list.cmds.last() {
+            Some(crate::native::list::Cmd::Draw { call: DrawCall::Mesh { .. }, indirect, .. }) => *indirect,
+            _ => None,
+        })
+        .flatten();
+        assert_eq!(recorded, Some(record), "record {i}: an indirect mesh draw of the record");
+        assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
+        let queue = crate::queue::test_queue(false);
+        let mut fence = std::ptr::null();
+        assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), 0);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        assert_eq!(slot::<extern "system" fn(This, This, u64) -> i32>(queue, 0x70)(queue, fence, 1), 0);
+        with_title(|t| {
+            let fence = t.fence(fence as usize, 0).expect("native fence");
+            assert!(t.host.backend.wait(&fence, 1, 2000), "the mesh draw did not finish");
+            let texture = t.texture_of(rt as usize).expect("realized target");
+            let mut data = vec![0u8; 16 * 16 * 4];
+            t.host.backend.read_texture(&texture, 0, 0, &mut data, 16 * 4, 0);
+            assert!(data.as_chunks::<4>().0.iter().all(|p| *p == want), "record {i}: {:?}", &data[..8]);
+        })
+        .unwrap();
+    }
+}
+
 /// `CopyResource` between textures and `CopyTextureRegion` (subresource-to-subresource and
 /// footprint-to/from-subresource) execute on Metal without dropping to `dropped_op`.
 #[test]

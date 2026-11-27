@@ -1749,9 +1749,10 @@ mod state {
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With `indirect`, the group counts
+    /// are the record at that GPU (title) address, run as a one-record `ExecuteIndirect`.
+    /// Guess (`docs/native-host.md`): the record is `D3D12_DISPATCH_MESH_ARGUMENTS` and `x` is
+    /// then unused; flags and payload are ignored.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1761,8 +1762,15 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            const MESH: u32 = 10;
+            let mut ran = false;
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH, 12, 1), indirect, None);
+            });
+            if !ran {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1797,8 +1805,9 @@ mod state {
         unsafe { std::slice::from_raw_parts(items, count as usize) }
     }
 
-    pub(super) use super::draw as dispatch_mesh;
-    pub(super) use super::draw as dispatch_mesh_x;
+    // shortcut: direct mesh dispatches are dropped (counted, warned once); route them to
+    // `MetalList::dispatch_mesh` when a mesh pipeline needs them.
+    pub(super) use super::dropped_mesh as dispatch_mesh;
     pub(super) use super::ignored_state as clear_unordered_float;
     pub(super) use super::ignored_state as clear_unordered_uint;
 
@@ -1876,6 +1885,15 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         glue::dispatch(this, x, y, z);
+    }
+    /// `DispatchMeshX`: with `indirect`, a Metal indirect mesh draw of the record at that title
+    /// address (same guess as the D3D12 host's `dispatch_mesh_x`); otherwise dropped.
+    pub(super) extern "system" fn dispatch_mesh_x(this: This, x: u32, flags: u64, indirect: u64, payload: u64) {
+        if indirect != 0 && glue::execute_indirect(this, crate::signature::Command::DispatchMesh, 12, 1, indirect, None) {
+            super::count_draw();
+            return;
+        }
+        super::dropped_mesh_x(this, x, flags, indirect, payload);
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         glue::set_heaps(this, items(heaps, count));

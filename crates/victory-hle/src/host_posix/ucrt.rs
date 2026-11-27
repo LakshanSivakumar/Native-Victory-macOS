@@ -208,7 +208,13 @@ pub(super) use {exports, exports64};
 /// Visual C++ runtimes (`vcruntime140`, `msvcp140`): the title ships those,
 /// with the C++ runtime and `__CxxFrameHandler`, and they are loaded from its folder.
 pub(super) fn serves(dll: &str) -> bool {
-    dll == "ucrtbase.dll" || dll.starts_with("api-ms-win-crt-")
+    dll == "ucrtbase.dll"
+        || dll.starts_with("api-ms-win-crt-")
+        // `vcruntime140.dll`'s memory and string functions are the ucrt's
+        // (its `memset` and `memcpy` came back as no-op stubs in a failed
+        // load, #104); a title's own DLL of that name still wins.
+        || (dll.starts_with("vcruntime140")
+            && victory_loader::native::dll::find(dll).is_none())
 }
 
 pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
@@ -278,6 +284,22 @@ mod tests {
     /// With `VICTORY_UCRT_IMPORTS` naming a `--list-imports` dry-run output,
     /// every UCRT import in it must resolve (the HLE registry's own `exit`
     /// and `abort` are served there first, not here).
+    /// `vcruntime140.dll`'s memory functions came back as no-op stubs in a
+    /// failed load (#104): no title DLL of that name is loaded in a test,
+    /// so the host serves the ucrt's implementations.
+    #[test]
+    fn vcruntime140s_memory_and_string_imports_are_served() {
+        assert!(serves("vcruntime140.dll"));
+        assert!(serves("vcruntime140_1.dll"));
+        assert!(lookup("vcruntime140.dll", "memset").is_some());
+        assert!(lookup("vcruntime140.dll", "memcpy").is_some());
+        assert!(lookup("vcruntime140.dll", "memmove").is_some());
+        assert!(lookup("vcruntime140.dll", "memcmp").is_some());
+        assert!(lookup("vcruntime140.dll", "strlen").is_some());
+        assert!(!serves("msvcp140.dll"));
+        assert!(!serves("kernel32.dll"));
+    }
+
     #[test]
     fn every_ucrt_import_of_a_dry_run_is_served() {
         let Some(list) = std::env::var_os("VICTORY_UCRT_IMPORTS") else {

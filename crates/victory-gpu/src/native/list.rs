@@ -36,7 +36,16 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// With `VICTORY_TRACE_HEAP_SET`: the frame (+1; 0: never) each entry was last inside a table a
     /// draw or dispatch bound (diagnostics).
     pub used: std::cell::RefCell<Vec<u32>>,
+    /// Buffer views over title memory no pool run holds, by entry: their range and the signature
+    /// of the title's mappings under it when the entry was written ([`super::memory::PoolTable::
+    /// signature`]): `Some` for a wrap of the title's own pages, `None` for the null view a gap
+    /// left. The host mirrors such an entry again when that changes (`NativeHost::follow_title_pages`).
+    pub title_views: std::cell::RefCell<std::collections::HashMap<usize, TitleView>>,
 }
+
+/// A heap buffer view over title memory: its address, length and the signature of the mappings
+/// under it when written (see [`NativeHeap::title_views`]).
+pub type TitleView = (u64, u64, Option<u64>);
 
 /// The title texture each heap entry shows (`of`), and each texture's entries (`entries`; those
 /// may be stale: an entry counts only while `of` still names the texture).

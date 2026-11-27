@@ -100,6 +100,9 @@ unsafe extern "C" {
 const FORMAT_LINEAR_PCM: u32 = 0x6C70_636D;
 const FLAGS_FLOAT_PACKED: u32 = 1 | 8;
 const BUFFERS: usize = 3;
+/// How many times `AudioQueueStart` is tried, and how long between tries.
+const RETRIES: usize = 3;
+const START_RETRY_MS: u64 = 250;
 
 /// What the queue's callback reaches: boxed, so its address is stable.
 struct Shared {
@@ -217,9 +220,25 @@ impl CoreAudio {
                 return Err(fail(queue, "AudioQueueEnqueueBuffer", status));
             }
         }
-        // SAFETY: the queue just made.
-        let status = unsafe { AudioQueueStart(queue, std::ptr::null()) };
-        if status != 0 {
+        // `AudioQueueStart` can fail with a transient device problem: a
+        // mid-run engine re-creation (a cutscene, #140) got OSStatus 'what'
+        // (0x77686174) while the device was changing, and the output fell
+        // back to silence for the rest of the run. Retried, it starts.
+        let mut status = 0;
+        let mut started = false;
+        for attempt in 0..RETRIES {
+            // SAFETY: the queue just made.
+            status = unsafe { AudioQueueStart(queue, std::ptr::null()) };
+            if status == 0 {
+                started = true;
+                break;
+            }
+            tracing::warn!(attempt, status, "AudioQueueStart failed; retrying");
+            if attempt + 1 < RETRIES {
+                std::thread::sleep(Duration::from_millis(START_RETRY_MS));
+            }
+        }
+        if !started {
             return Err(fail(queue, "AudioQueueStart", status));
         }
         // SAFETY: the state stays alive until the queue is disposed.

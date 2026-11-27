@@ -108,6 +108,11 @@ pub trait ComputeBackend {
     fn create_fence(&self, initial: u64) -> Result<Self::Fence, String>;
     /// Wrap `ptr..ptr+len` (page-aligned) without copying; it stays mapped while the buffer lives.
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Self::Buffer, String>;
+    /// The bytes of GPU memory the device holds for this process now, where the backend knows
+    /// (Metal's `currentAllocatedSize`), for memory measurements.
+    fn allocated_bytes(&self) -> u64 {
+        0
+    }
     /// A zeroed buffer of the host's own (`len` bytes) and where the CPU writes it. It lives
     /// while the caller or work submitted with it holds it: memory the GPU reads after the
     /// caller let go (a page table that was replaced) must not be the caller's to free.

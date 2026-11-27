@@ -132,6 +132,210 @@ impl Pool {
     }
 }
 
+unsafe extern "C" {
+    fn mach_task_self() -> u32;
+    fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
+    fn mach_vm_deallocate(task: u32, addr: u64, size: u64) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn mach_vm_remap(
+        target: u32,
+        addr: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: i32,
+        src_task: u32,
+        src_addr: u64,
+        copy: i32,
+        cur: *mut i32,
+        max: *mut i32,
+        inherit: u32,
+    ) -> i32;
+}
+
+/// Title pages made of pool pages in any order, mapped for real at a title address of this
+/// process (as the title maps its physical pages), and registered with the host's pool table.
+struct TitlePages {
+    va: u64,
+    len: usize,
+    /// Pages of `page` bytes unmapped since, by index: no longer ours to deallocate.
+    gone: std::cell::RefCell<Vec<(usize, usize)>>,
+}
+
+impl TitlePages {
+    /// One title page of `page` bytes per pool offset in `from`, in that order.
+    fn new(h: &Host, pool: &Alias, info: &PoolInfo, from: &[usize], page: usize) -> TitlePages {
+        let len = from.len() * page;
+        let mut va = 0u64;
+        // SAFETY: Mach VM calls on our own task; each remap overwrites a page of our reservation
+        // with a view of a page of the pool's own mapping.
+        unsafe {
+            let t = mach_task_self();
+            assert_eq!(mach_vm_allocate(t, &mut va, len as u64, 1), 0);
+            for (k, &off) in from.iter().enumerate() {
+                let (mut at, mut cur, mut max) = (va + (k * page) as u64, 0, 0);
+                // VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, shared (not copied).
+                let r = mach_vm_remap(t, &mut at, page as u64, 0, 0x4000, t, pool.primary as u64 + off as u64, 0, &mut cur, &mut max, 0);
+                assert_eq!(r, 0, "mach_vm_remap");
+                h.memory().mapped(at as usize, page, info, off);
+            }
+        }
+        TitlePages { va, len, gone: Default::default() }
+    }
+
+    /// The title maps title page `k` (of `page` bytes) from pool offset `off` instead.
+    fn remap(&self, h: &Host, info: &PoolInfo, pool: &Alias, k: usize, off: usize, page: usize) {
+        let (mut at, mut cur, mut max) = (self.va + (k * page) as u64, 0, 0);
+        // SAFETY: Mach VM calls on our own task over a page of the reservation, as in `new`.
+        let r = unsafe { mach_vm_remap(mach_task_self(), &mut at, page as u64, 0, 0x4000, mach_task_self(), pool.primary as u64 + off as u64, 0, &mut cur, &mut max, 0) };
+        assert_eq!(r, 0, "mach_vm_remap");
+        h.memory().mapped(at as usize, page, info, off);
+    }
+
+    /// The title unmaps title page `k` (of `page` bytes).
+    fn unmap(&self, h: &Host, k: usize, page: usize) {
+        let at = self.va + (k * page) as u64;
+        // SAFETY: a page of the reservation, which is not used again (`gone`).
+        assert_eq!(unsafe { mach_vm_deallocate(mach_task_self(), at, page as u64) }, 0);
+        h.memory().unmapped(at as usize, page);
+        self.gone.borrow_mut().push((k * page, page));
+    }
+
+    fn write<T: Copy>(&self, at: usize, v: &[T]) {
+        // SAFETY: inside the mapping; the GPU is idle while the test writes.
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), (self.va as *mut u8).add(at).cast(), v.len()) };
+    }
+
+    fn read<T: Copy>(&self, at: usize, n: usize) -> Vec<T> {
+        // SAFETY: inside the mapping; read after the fence wait.
+        unsafe { std::slice::from_raw_parts((self.va as *const u8).add(at).cast::<T>(), n).to_vec() }
+    }
+}
+
+impl Drop for TitlePages {
+    fn drop(&mut self) {
+        // The pages given back may hold someone else's mapping by now (the GPU driver's
+        // notification queue was seen there): deallocate only the rest.
+        let mut gone = self.gone.borrow().clone();
+        gone.sort_unstable();
+        let mut at = 0;
+        for (from, len) in gone.into_iter().chain([(self.len, 0)]) {
+            if from > at {
+                // SAFETY: part of the range `new` allocated, still ours.
+                unsafe { mach_vm_deallocate(mach_task_self(), self.va + at as u64, (from - at) as u64) };
+            }
+            at = at.max(from + len);
+        }
+    }
+}
+
+/// A buffer view over two title pages the title mapped from pool pages in descending order (the
+/// G-buffer culling programs' 174 MB instance buffer, #258): not one linear run of the pool, so
+/// it was the null view and the shader read zeros. It now wraps the title's own mapping.
+#[test]
+fn a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping() {
+    let Some(h) = host() else { return };
+    let page = page_size().max(16384);
+    let pool = Alias::new(4 * page).unwrap();
+    let info = PoolInfo { id: 1, base: pool.primary as usize, len: pool.len, memory_entry: None };
+    h.memory().pool_created(&info);
+    // Title pages 0 and 1 are pool pages 2 and 1; title page 2, pool page 3, takes the output.
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, page, 3 * page], page);
+    let (src, dst) = (page - 128, 2 * page);
+    title.write(src, &(0..64u32).collect::<Vec<_>>());
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        d[1] = 1; // buffer view
+        d[6] = 64; // elements
+        d[8] = 1; // raw (SRV flags word)
+        d[10] = (title.va + at as u64) as u32;
+        d[11] = ((title.va + at as u64) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // buffer
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start);
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 32);
+    assert!(h.mirror(start).unwrap(), "the source view was not mirrored");
+    assert!(h.mirror(start + 32).unwrap());
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[3, 1]);
+    l.set_compute_root_table(1, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    run(&h, &[&l]);
+    assert_eq!(title.read::<u32>(dst, 64), (0..64).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    drop(slots);
+}
+
+/// A wrap keeps the physical pages it was made over: once the title maps other pool pages at
+/// those title addresses, or unmaps them, the GPU still reads the old pages through it (no fault,
+/// no zeros; seen on an M5 Pro, macOS 27). The host mirrors such a heap entry again before the
+/// next work it submits (`NativeHost::follow_title_pages`), so the view reads the new page, and
+/// then zeros (the null view) once part of its range is unmapped.
+#[test]
+fn a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it() {
+    let Some(h) = host() else { return };
+    let page = page_size().max(16384);
+    let pool = Alias::new(5 * page).unwrap();
+    let info = PoolInfo { id: 1, base: pool.primary as usize, len: pool.len, memory_entry: None };
+    h.memory().pool_created(&info);
+    // Title pages 0 and 1 are pool pages 2 and 1 (the source, across them); title page 2, pool
+    // page 3, takes the output.
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, page, 3 * page], page);
+    let (src, dst) = (page - 128, 2 * page);
+    title.write(src, &(0..64u32).collect::<Vec<_>>());
+    // Pool page 4 holds other words where title page 1's are.
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::copy_nonoverlapping((100..132u32).collect::<Vec<_>>().as_ptr(), pool.primary.add(4 * page).cast(), 32) };
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        d[1] = 1; // buffer view
+        d[6] = 64; // elements
+        d[8] = 1; // raw (SRV flags word)
+        d[10] = (title.va + at as u64) as u32;
+        d[11] = ((title.va + at as u64) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // buffer
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start);
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 32);
+    assert!(h.mirror(start).unwrap());
+    assert!(h.mirror(start + 32).unwrap());
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    // dst[i] = src[i] * 3 + 1 through the heap's views; dst starts at a canary.
+    let pass = || {
+        title.write(dst, &[0xCAFE_CAFEu32; 64]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[3, 1]);
+        l.set_compute_root_table(1, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        run(&h, &[&l]);
+        title.read::<u32>(dst, 64)
+    };
+    let expect = |page1: &dyn Fn(u32) -> u32| (0..64u32).map(|i| if i < 32 { i * 3 + 1 } else { page1(i) * 3 + 1 }).collect::<Vec<_>>();
+    assert_eq!(pass(), expect(&|i| i));
+    title.remap(&h, &info, &pool, 1, 4 * page, page);
+    assert_eq!(pass(), expect(&|i| i + 68), "the view still read the old pool page");
+    title.unmap(&h, 1, page);
+    assert_eq!(pass(), vec![1; 64], "a view with an unmapped page is the null view");
+    drop(slots);
+}
+
 fn run(h: &Host, lists: &[&NativeList<Metal>]) {
     let q = h.backend.create_queue().unwrap();
     let f = h.backend.create_fence(0).unwrap();

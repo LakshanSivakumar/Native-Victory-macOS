@@ -39,14 +39,14 @@ pub(super) const TRIANGLE: &[u32] = &[
 ];
 
 /// Writes (1.0, 0.5, 0.5, 1.0) to mrt0.
-const RED: &[u32] = &[
+pub(super) const RED: &[u32] = &[
     0x7E00_02F2, // v_mov_b32 v0, 1.0
     0x7E02_02F0, // v_mov_b32 v1, 0.5
     0xF800_180F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
     0xBF81_0000, // s_endpgm
 ];
 
-fn translate(stage: HwStage, words: &[u32]) -> HostShader {
+pub(super) fn translate(stage: HwStage, words: &[u32]) -> HostShader {
     let mut meta = [0; 0x10];
     meta[12] = 0x40;
     translate_with(stage, words, &meta)

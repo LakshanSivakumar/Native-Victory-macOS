@@ -411,6 +411,10 @@ impl ComputeBackend for Metal {
         Ok(Fence(e))
     }
 
+    fn allocated_bytes(&self) -> u64 {
+        self.dev.currentAllocatedSize() as u64
+    }
+
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Buffer, String> {
         let p = NonNull::new(ptr.cast()).ok_or("null title memory")?;
         // SAFETY: the caller keeps `ptr..ptr+len` mapped while the buffer and its work live.

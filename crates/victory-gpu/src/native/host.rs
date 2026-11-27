@@ -9,22 +9,30 @@ use super::addr::{self, Mapping, Pages, Pairs};
 use super::descriptors::{Decoded, Res, decode};
 use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
 use super::memory::PoolTable;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::backend::{Dispatch, Heaps, RootArgs};
 use victory_backend::resources::*;
 
+/// Buffers over ranges of the title's own addresses, by `(start, end)`: the signature of the
+/// mappings they were made over, when they were last used, and the buffer.
+type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, Rc<Buf>)>>;
+
 pub struct NativeHost<B: GraphicsBackend> {
     pub backend: B,
     memory: Arc<PoolTable>,
     /// A buffer over each pool, made the first time the GPU needs it.
     buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
+    /// Buffers over the title's own addresses, by page-aligned range ([`Self::title_alias`]).
+    aliases: TitleAliases<B::Buffer>,
     /// The pool table's mappings as [`Self::mapping_list`] last read them, and their generation.
     maps: RefCell<Option<(u64, Rc<[Mapping]>)>>,
     /// Pools released whose buffers went, not yet taken by [`Self::released_pools`].
     released: RefCell<Vec<usize>>,
+    /// The pool-table generation [`Self::follow_title_pages`] last looked at.
+    followed: Cell<u64>,
     resources: RefCell<HashMap<usize, Res<Rc<B::Texture>>>>,
     /// Counts changes to [`Self::resources`], so unrealized table entries retry once registered.
     resources_epoch: std::cell::Cell<u64>,
@@ -139,7 +147,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
             backend,
             memory,
             buffers: RefCell::default(),
+            aliases: RefCell::default(),
             released: RefCell::default(),
+            followed: Cell::new(0),
             maps: RefCell::default(),
             resources: RefCell::default(),
             resources_epoch: std::cell::Cell::new(0),
@@ -203,6 +213,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if gone.is_empty() {
             return;
         }
+        // A wrap over pages of a released pool no longer matches the mappings there: later
+        // mirrors make new ones. The others stay, so a heap entry mirrored again reuses its wrap
+        // (dropping them all made a new 174 MB wrap at each release, while the old ones stayed
+        // alive in the heap entries and in-flight work: Metal's count rose by gigabytes).
+        self.aliases.borrow_mut().retain(|&(base, end), (sig, _, _)| self.memory.signature(base, end - base) == Some(*sig));
         let mut buffers = self.buffers.borrow_mut();
         let mut c = self.contract.borrow_mut();
         for &id in &gone {
@@ -216,6 +231,161 @@ impl<B: GraphicsBackend> NativeHost<B> {
     pub(crate) fn released_pools(&self) -> Vec<usize> {
         self.forget_released();
         std::mem::take(&mut self.released.borrow_mut())
+    }
+
+    /// A buffer over the title's own addresses `[addr, addr + len)`, for a buffer view whose range
+    /// is not one linear run of a pool but which the title maps without a gap: title memory is
+    /// mapped at its own addresses in this process, so the view wraps those (whole 16 KiB host
+    /// pages, the alignment the no-copy wrap needs, also under Rosetta's 4 KiB pages; the title's
+    /// own pages are 64 KiB). The G-buffer's culling programs read
+    /// their instances through a heap view of 174 MB whose pages the title mapped from scattered
+    /// pool pages (#258); the null view gave them zeros. A wrap is reused while the mappings under
+    /// it are the same ([`PoolTable::signature`]), made again when they change; every wrap a heap
+    /// entry shows is kept and 64 others at most, and those over a released pool's pages are
+    /// dropped. A range with a gap stays the null view. A wrap keeps
+    /// the physical pages it was made over, so the heap entries that show one are mirrored again
+    /// when the title's mappings under them change ([`Self::follow_title_pages`]).
+    // shortcut: a range partly unmapped is the null view as a whole (zeros), where a reserved
+    // resource reads zeros only at its unmapped tiles (D3D12 tier 2); give such a range a wrap of
+    // its own with zero pages in the holes if a title reads a view it maps sparsely.
+    fn title_alias(&self, addr: u64, len: u64) -> Option<(Rc<B::Buffer>, *const u8, u64)> {
+        // Wraps kept for reuse: the heap entries that show one keep it alive themselves.
+        const KEPT: usize = 64;
+        static USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (base, end) = Self::alias_range(addr, len)?;
+        let Some(sig) = self.memory.signature(base, end - base) else {
+            // A real gap: the title maps nothing at part of the view. It stays the null view.
+            static GAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if GAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+                tracing::info!(addr = format!("{addr:#x}"), len, "a buffer view over title memory with a gap stays the null view");
+            }
+            return None;
+        };
+        let now = USE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut aliases = self.aliases.borrow_mut();
+        if let Some((s, used, b)) = aliases.get_mut(&(base, end))
+            && *s == sig
+        {
+            *used = now;
+            return Some((b.clone(), addr as *const u8, sig));
+        }
+        // What a large wrap costs (#267 review): the process footprint and Metal's own count.
+        #[cfg(target_os = "macos")]
+        let footprint = victory_platform::mem::footprint;
+        #[cfg(not(target_os = "macos"))]
+        let footprint = || 0usize;
+        let measure = || (footprint(), self.backend.allocated_bytes());
+        let before = (len >= 16 << 20).then(measure);
+        let buf = Rc::new(self.backend.wrap_title_memory(base as *mut u8, (end - base) as usize).ok()?);
+        if let Some(before) = before {
+            static BIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if BIG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+                let after = measure();
+                tracing::info!(addr = format!("{addr:#x}"), len, signature = format!("{sig:#x}"), footprint_before = before.0, footprint_after = after.0, metal_before = before.1, metal_after = after.1, "a large buffer view wraps the title's own pages");
+            }
+        }
+        if aliases.len() >= KEPT {
+            // Only a wrap no heap entry shows goes: one that is shown would be made again, and the
+            // entry's copy would stay alive beside it.
+            let shown: std::collections::HashSet<(u64, u64, u64)> = self
+                .heaps
+                .borrow()
+                .iter()
+                .flat_map(|h| {
+                    h.title_views
+                        .borrow()
+                        .values()
+                        .filter_map(|&(a, l, s)| Some((Self::alias_range(a, l)?, s?)))
+                        .map(|((b, e), s)| (b, e, s))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            if let Some(&oldest) = aliases
+                .iter()
+                .filter(|&(&(b, e), &(s, _, _))| !shown.contains(&(b, e, s)))
+                .min_by_key(|(_, (_, used, _))| *used)
+                .map(|(k, _)| k)
+            {
+                aliases.remove(&oldest);
+            }
+        }
+        aliases.insert((base, end), (sig, now, buf.clone()));
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(addr = format!("{addr:#x}"), len, "a buffer view not linear in its pool reads the title's own mapping (first time)");
+        });
+        Some((buf, addr as *const u8, sig))
+    }
+
+    /// The whole 16 KiB host pages a wrap of `[addr, addr + len)` covers (the alignment the
+    /// no-copy wrap needs, also under Rosetta's 4 KiB pages), as `(start, end)`.
+    fn alias_range(addr: u64, len: u64) -> Option<(u64, u64)> {
+        const PAGE: u64 = 1 << 14;
+        if addr == 0 || len == 0 {
+            return None;
+        }
+        let end = addr.checked_add(len)?.checked_add(PAGE - 1)? & !(PAGE - 1);
+        Some((addr & !(PAGE - 1), end))
+    }
+
+    /// The signature of the title's mappings under a wrap of `[addr, addr + len)`; `None` where
+    /// part of it is not mapped.
+    fn alias_signature(&self, addr: u64, len: u64) -> Option<u64> {
+        let (base, end) = Self::alias_range(addr, len)?;
+        self.memory.signature(base, end - base)
+    }
+
+    /// Mirrors again, once per pool-table change and before the work that reads them, the heap
+    /// buffer views over title memory no pool run holds whose pages changed since they were
+    /// written: a wrap whose mappings the title changed or removed, and a null view whose gap the
+    /// title has mapped since. A shader can load such an entry from the heap itself (the
+    /// G-buffer culling programs' 174 MB view, #258), so no bound table brings it back to
+    /// [`Self::remirror_tables`], and the title writes the entry once, early, while it keeps
+    /// mapping pages into the range. Costs one comparison while the pool table is unchanged.
+    fn follow_title_pages(&self) {
+        let generation = self.memory.generation();
+        if self.followed.replace(generation) == generation {
+            return;
+        }
+        let heaps: Vec<Rc<NativeHeap<B>>> = self.heaps.borrow().clone();
+        // The 1st, 10th, 100th... look: the large views followed and their signatures now.
+        static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let looks = LOOKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if matches!(looks, 1 | 10 | 100 | 1_000 | 10_000 | 100_000 | 1_000_000) {
+            let large: Vec<String> = heaps
+                .iter()
+                .flat_map(|h| h.title_views.borrow().iter().filter(|v| v.1.1 >= 16 << 20).map(|(i, &(a, l, _))| format!("{i}: {a:#x}+{l:#x} {:?}", self.alias_signature(a, l).map(|s| format!("{s:#x}")))).collect::<Vec<_>>())
+                .collect();
+            tracing::info!(looks, generation, ?large, "following the title's pages under heap buffer views");
+        }
+        for heap in heaps {
+            let moved: Vec<_> = heap
+                .title_views
+                .borrow()
+                .iter()
+                .filter_map(|(&index, &(addr, len, was))| {
+                    let now = self.alias_signature(addr, len);
+                    (now != was).then_some((index, addr, len, was, now))
+                })
+                .collect();
+            for (index, addr, len, was, now) in moved {
+                let handle = heap.start + index as u64 * Self::step(heap.kind);
+                let result = self.mirror(handle);
+                if let Ok(false) = result {
+                    // No longer a view the host can write (the title put another record there):
+                    // nothing to follow until it is one again.
+                    heap.title_views.borrow_mut().remove(&index);
+                }
+                // Large views apart, so the few that matter are not lost among small ones.
+                static LARGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                static SMALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let logged = if len >= 16 << 20 { &LARGE } else { &SMALL };
+                if logged.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+                    let sig = |s: Option<u64>| s.map(|s| format!("{s:#x}"));
+                    tracing::info!(index, addr = format!("{addr:#x}"), len, was = ?sig(was), now = ?sig(now), ?result, "a heap buffer view's title pages changed: mirrored again");
+                }
+            }
+        }
     }
 
     /// The buffer over pool `id`, made the first time the GPU needs it.
@@ -305,6 +475,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             table: Default::default(),
             mirrored: Default::default(),
             pending_mirror: Default::default(),
+            title_views: Default::default(),
             images: Default::default(),
             used: Default::default(),
         });
@@ -447,14 +618,36 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let Some(decoded) = decode(&view, &resources) else {
             return Ok(false);
         };
+        if !matches!(decoded, Decoded::Buffer { .. }) {
+            heap.title_views.borrow_mut().remove(&index);
+        }
         match decoded {
             Decoded::Buffer { addr, size } => {
                 // Read before resolving: a pool mapped by a title thread after a failed resolve
                 // must bump past these, so the entry is retried.
                 let (pool_gen, res_gen) = (self.memory.generation(), self.resources_epoch.get());
-                let (buf, ptr) = match self.resolve(addr, u64::from(size)) {
-                    Ok(found) => found,
+                let alias = || self.title_alias(addr, u64::from(size)).map(|(b, p, sig)| (b, p, Some(sig)));
+                let found = self.resolve(addr, u64::from(size)).map(|(b, p)| (b, p, None));
+                let (buf, ptr) = match found.map_or_else(|e| alias().ok_or(e), Ok) {
+                    Ok((buf, ptr, wrapped)) => {
+                        let mut views = heap.title_views.borrow_mut();
+                        match wrapped {
+                            Some(sig) => {
+                                views.insert(index, (addr, u64::from(size), Some(sig)));
+                            }
+                            None => {
+                                views.remove(&index);
+                            }
+                        }
+                        (buf, ptr)
+                    }
                     Err(e) => {
+                        // Tried again once the pages under it change: a gap the title maps
+                        // later, say ([`Self::follow_title_pages`]).
+                        if addr != 0 && size != 0 {
+                            let sig = self.alias_signature(addr, u64::from(size));
+                            heap.title_views.borrow_mut().insert(index, (addr, u64::from(size), sig));
+                        }
                         let null = self.null_view()?;
                         self.backend.write_buffer(
                             &heap.heap,
@@ -825,6 +1018,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             table: Default::default(),
             mirrored: Default::default(),
             pending_mirror: Default::default(),
+            title_views: Default::default(),
             images: Default::default(),
             used: Default::default(),
         });
@@ -1319,6 +1513,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
         let _counted = super::descriptor_trace::Submission;
+        self.follow_title_pages();
         // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
         // waits for one of those then holds everything behind it for good. (A title shader's
