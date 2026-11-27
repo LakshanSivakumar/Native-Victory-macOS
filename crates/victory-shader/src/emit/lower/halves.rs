@@ -45,17 +45,101 @@
 //! ([`split_wave_barriers`](super::split_wave_barriers)), or is refused.
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Rmw, Term, V, pred};
 use crate::emit::shader::flags;
 use crate::emit::wave::Op;
 
 impl Lower<'_> {
-    /// A group barrier with a shared-memory fence in DXIL block `at`.
-    fn xchg_barrier(&mut self, at: usize) {
+    /// A group barrier with a shared-memory fence in DXIL block `at`, or with `pair_sync` the
+    /// barrier of this console wave's two host waves ([`Self::pair_barrier`]). Returns the DXIL
+    /// block the code goes on in.
+    fn xchg_barrier(&mut self, at: usize) -> Result<usize, Why> {
+        if self.pair_sync {
+            return self.pair_barrier(at);
+        }
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        Ok(at)
+    }
+
+    /// The pair counters start at 0: every thread writes its console wave's, then one group
+    /// barrier (in the entry block, which every thread runs once).
+    pub(super) fn clear_pairs(&mut self) {
+        let e = self.s.entry;
+        let f = self.console_flat();
+        let six = self.s.m.i32(6);
+        let w = self.s.m.bin(e, Bin::LShr, f, six);
+        let g = self.s.pairs();
+        let slot = self.s.m.element(e, g, w);
+        let z = self.s.m.i32(0);
+        self.s.m.store(e, slot, z);
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// A barrier of the two host waves of this thread's console wave alone, in lockstep of several
+    /// console waves a group (`pair_sync`): Metal has no barrier scoped to two SIMD groups, and a
+    /// group barrier would wait for console waves that took another way.
+    ///
+    /// Each console wave has a counter in group-shared memory (`pairs`), 0 at entry. Every thread
+    /// of the wave adds 1 and waits until the counter reaches the next multiple of the wave's
+    /// thread count `n`: the `k`th barrier's adds give `[k n, (k + 1) n)`, and no thread adds for
+    /// barrier `k + 1` before all `n` have added for `k` (it waits for them first). Lockstep keeps
+    /// every thread of a console wave on one program counter, so both host waves reach each such
+    /// barrier, in the same order. Shared-memory fences on either side order the exchange's
+    /// stores and loads.
+    ///
+    /// Guess: SIMD groups of one threadgroup make progress while another spins (Apple GPUs run
+    /// them as separate threads of one core). The wait is bounded (2^20 polls) so a host that does
+    /// not would give wrong values, not hang the GPU. Must be emitted in the current block (it
+    /// splits it).
+    pub(super) fn pair_barrier(&mut self, at: usize) -> Result<usize, Why> {
+        if at != self.cur {
+            return Err("an exchange between host waves in an earlier block, in lockstep of \
+                        several console waves a group");
+        }
+        let i32t = self.s.t.i32;
+        let void = self.s.t.void;
+        let fence = self.s.m.i32(8);
+        self.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        let f = self.console_flat();
+        let (six, one, z) = (self.s.m.i32(6), self.s.m.i32(1), self.s.m.i32(0));
+        let w = self.s.m.bin(at, Bin::LShr, f, six);
+        let g = self.s.pairs();
+        let slot = self.s.m.element(at, g, w);
+        let old = self.s.m.atomic(at, Rmw::Add, slot, one);
+        // The wave's threads: 64, or what the group's last console wave has.
+        let lanes: u32 = self.s.threads.map_or(64, |t| t.iter().product());
+        let k64 = self.s.m.i32(64);
+        let n = if lanes.is_multiple_of(64) {
+            k64
+        } else {
+            let last = self.s.m.i32(lanes / 64);
+            let rest = self.s.m.i32(lanes % 64);
+            let is_last = self.s.m.cmp(at, pred::EQ, w, last);
+            self.s.m.select(at, is_last, rest, k64)
+        };
+        let q = self.s.m.bin(at, Bin::UDiv, old, n);
+        let q = self.s.m.bin(at, Bin::Add, q, one);
+        let target = self.s.m.bin(at, Bin::Mul, q, n);
+        let (spin, done) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(at, Term::Br(spin));
+        let tries = self.s.m.phi(spin, i32t);
+        let now = self.s.m.atomic(spin, Rmw::Or, slot, z);
+        let gap = self.s.m.bin(spin, Bin::Sub, now, target);
+        let there = self.s.m.cmp(spin, pred::SGE, gap, z);
+        let more = self.s.m.bin(spin, Bin::Add, tries, one);
+        self.s.m.set_phi(tries, vec![(z, at), (more, spin)]);
+        let limit = self.s.m.i32(1 << 20);
+        let out = self.s.m.cmp(spin, pred::IUGE, more, limit);
+        let leave = self.s.m.bin(spin, Bin::Or, there, out);
+        self.s.m.terminate(spin, Term::CondBr(leave, done, spin));
+        self.s.op(done, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        self.cur = done;
+        Ok(done)
     }
 
     /// Whether every thread of the group (both halves of a console wave)
@@ -115,13 +199,13 @@ impl Lower<'_> {
         let mine = self.s.m.bin(at, Bin::LShr, f, five);
         let slot = self.xchg_slot(at, mine);
         self.s.m.store(at, slot, x);
-        self.xchg_barrier(at);
+        let at = self.xchg_barrier(at)?;
         let pair = self.s.m.bin(at, Bin::LShr, f, six);
         let lo_at = self.s.m.bin(at, Bin::Shl, pair, one);
         let hi_at = self.s.m.bin(at, Bin::Add, lo_at, one);
         let (lo_p, hi_p) = (self.xchg_slot(at, lo_at), self.xchg_slot(at, hi_at));
         let (lo, hi) = (self.s.m.load(at, lo_p), self.s.m.load(at, hi_p));
-        self.xchg_barrier(at);
+        let at = self.xchg_barrier(at)?;
         // A missing upper half has no lanes on.
         let hi = match self.xchg_written(at, hi_at, 5) {
             Some(there) => {
@@ -193,14 +277,14 @@ impl Lower<'_> {
         let f = self.console_flat();
         let slot = self.xchg_slot(c, f);
         self.s.m.store(c, slot, x);
-        self.xchg_barrier(c);
+        let c = self.xchg_barrier(c)?;
         let (k63, not63) = (self.s.m.i32(63), self.s.m.i32(!63));
         let wave = self.s.m.bin(c, Bin::And, f, not63);
         let lane = self.s.m.bin(c, Bin::And, lane, k63);
         let src = self.s.m.bin(c, Bin::Or, wave, lane);
         let p = self.xchg_slot(c, src);
         let r = self.s.m.load(c, p);
-        self.xchg_barrier(c);
+        let c = self.xchg_barrier(c)?;
         // Guess: a lane the group lacks reads as 0 (the console reads whatever its VGPR holds).
         Ok(match self.xchg_written(c, src, 0) {
             Some(there) => self.s.m.select(c, there, r, z),
@@ -249,13 +333,13 @@ impl Lower<'_> {
         let half = self.s.m.bin(c, Bin::LShr, f, five);
         let slot = self.xchg_slot(c, half);
         self.s.m.store(c, slot, bits);
-        self.xchg_barrier(c);
+        let c = self.xchg_barrier(c)?;
         let pair = self.s.m.bin(c, Bin::LShr, f, six);
         let lo_at = self.s.m.bin(c, Bin::Shl, pair, one);
         let hi_at = self.s.m.bin(c, Bin::Add, lo_at, one);
         let (lo_p, hi_p) = (self.xchg_slot(c, lo_at), self.xchg_slot(c, hi_at));
         let (lo, hi) = (self.s.m.load(c, lo_p), self.s.m.load(c, hi_p));
-        self.xchg_barrier(c);
+        let c = self.xchg_barrier(c)?;
         let (lo, hi) = if float {
             (self.as_float(lo), self.as_float(hi))
         } else {

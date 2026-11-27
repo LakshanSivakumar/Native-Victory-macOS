@@ -2046,15 +2046,21 @@ fn integer_pairs_pack_to_16_bits_with_saturation() {
 /// stays whole and wave 1 keeps its lanes 0..35 (threads 64..99).
 const THREADS_BELOW_100: [u32; 3] = [0x7D88_00FF, 100, 0xBE84_246A];
 
-/// [`run_io`] of a wave64 group of `threads`, `dwords` read back from `dst`.
-fn run_group(words: &[u32], threads: u32, dwords: usize) -> Vec<u32> {
+/// [`run_io`] of a wave64 group of `threads` with `lds` units of LDS, translated with lockstep for
+/// groups of several console waves, `dwords` read back from `dst`.
+fn run_group(words: &[u32], lds: u32, threads: u32, dwords: usize) -> Vec<u32> {
     let Some(mut t) = title() else { return Vec::new() };
     let f = Fixture::new(&t);
-    let cs = translate_io(words, 5, 0, threads, shaders::options());
+    let cs = translate_io(words, 5, lds << 15, threads, several_waves());
     let [c, d] = halves(VA_A + 0x4_0000);
     dispatch(&mut t, &cs, &[0, 0, c, d, 0], false);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
     f.get(DST, dwords)
+}
+
+/// The native host's options with lockstep for groups of several console waves.
+fn several_waves() -> victory_shader::emit::Options {
+    victory_shader::emit::Options { lockstep_waves: true, ..shaders::options() }
 }
 
 /// Each wave of a group of two reads its own lane 35 behind `s_cbranch_execz`, with a different
@@ -2102,9 +2108,8 @@ fn several_waves_branching_differently_are_refused_today() {
 }
 
 #[test]
-#[ignore = "#376: lockstep for groups of several console waves is not written yet"]
 fn a_lane_read_in_a_group_of_two_waves_reads_each_waves_own_lane() {
-    let got = run_group(&lane_read_with_a_different_exec_per_wave(), 128, 128);
+    let got = run_group(&lane_read_with_a_different_exec_per_wave(), 0, 128, 128);
     if got.is_empty() {
         return;
     }
@@ -2117,10 +2122,177 @@ fn a_lane_read_in_a_group_of_two_waves_reads_each_waves_own_lane() {
 /// (`exchange_site`), so this must keep its output when lockstep takes groups of several waves.
 #[test]
 fn a_ballot_in_a_block_one_wave_of_the_group_skips_counts_only_its_wave() {
-    let got = run_group(&ballot_in_a_block_one_wave_skips(), 128, 128);
+    let got = run_group(&ballot_in_a_block_one_wave_skips(), 0, 128, 128);
     if got.is_empty() {
         return;
     }
     assert_eq!(got[..40], [34; 40]);
     assert_eq!(got[40..], [CANARY; 88]);
+}
+
+/// [`lane_read_with_a_different_exec_per_wave`] in a group of four waves: threads below 200, so
+/// waves 0 to 2 whole and wave 3 only its lanes 0..7. Each reads its own lane 35, which in wave 3
+/// is off (a lane read ignores EXEC).
+fn lane_read_in_four_waves() -> Vec<u32> {
+    let mut w = lane_read_with_a_different_exec_per_wave();
+    w.splice(3..5, [0x7D88_00FF, 200]); // v_cmp_gt_u32 vcc, 200, v0
+    w
+}
+
+#[test]
+fn a_lane_read_in_a_group_of_four_waves_reads_each_waves_own_lane() {
+    assert!(refusal_of(&lane_read_in_four_waves(), 256).is_some(), "refused on the fast path");
+    let got = run_group(&lane_read_in_four_waves(), 0, 256, 256);
+    if got.is_empty() {
+        return;
+    }
+    for wave in 0..3 {
+        let at = wave * 64;
+        assert_eq!(got[at..at + 64], [1035 + at as u32; 64], "wave {wave}");
+    }
+    assert_eq!(got[192..200], [1227; 8], "wave 3: its lane 35 (thread 227, off)");
+    assert_eq!(got[200..], [CANARY; 56]);
+}
+
+/// What the fast path refuses `words` for in a wave64 group of `threads`.
+fn refusal_of(words: &[u32], threads: u32) -> Option<String> {
+    try_translate_wave(words, 5, 0, threads, true, shaders::options()).err().map(|e| e.to_string())
+}
+
+#[test]
+fn a_per_lane_loop_sharing_lds_in_each_wave_of_a_group_runs_each_waves_trips() {
+    // The single-wave loop above (lane i adds what lane `i ^ 32` last wrote to LDS) in a group of
+    // two waves whose trip counts differ: `(i & 1) + (i >> 6)`, so wave 0 loops at most once and
+    // wave 1 twice. Each wave runs its own trips; neither waits for the other.
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x3A06_02FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v1: lane i ^ 32's slot
+        0x2C0C_0086, // v_lshrrev_b32 v6, 6, v0
+        0x3608_0081, // v_and_b32 v4, 1, v0
+        0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
+        0x7E0A_0300, // v_mov_b32 v5, v0
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0x7D8A_0880, // loop: v_cmp_ne_u32 vcc, 0, v4
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        skip_execz(8),
+        DS_READ_V2_AT_V3[0],
+        DS_READ_V2_AT_V3[1],
+        S_WAITCNT_LGKM,
+        0x4A0A_0505, // v_add_nc_u32 v5, v5, v2
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0x4A08_08C1, // v_add_nc_u32 v4, -1, v4
+        0xBF82_FFF5, // s_branch loop
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xDC70_8000,
+        0x0002_0501, // global_store_dword v1, v5, s[2:3]
+        S_ENDPGM,
+    ];
+    assert!(refusal_of(&w, 128).is_some(), "refused on the fast path");
+    let got = run_group(&w, 1, 128, 128);
+    if got.is_empty() {
+        return;
+    }
+    let trips = |i: usize| (i & 1) + (i >> 6);
+    let (mut acc, mut lds): (Vec<u32>, Vec<u32>) = ((0..128).collect(), (0..128).collect());
+    for trip in 0..2 {
+        let on: Vec<usize> = (0..128).filter(|&i| trips(i) > trip).collect();
+        let read: Vec<u32> = on.iter().map(|&i| lds[i ^ 32]).collect();
+        for (&i, r) in on.iter().zip(read) {
+            acc[i] += r;
+            lds[i] = acc[i];
+        }
+    }
+    assert_eq!(got, acc);
+}
+
+#[test]
+fn a_whole_wave_prefix_sum_behind_a_branch_each_wave_takes_differently() {
+    // The single-wave prefix sum above, in a group of two waves, behind threads below 100: wave 0
+    // sums all its lanes, wave 1 its lanes 0..35 (threads 64..99; the others give 0).
+    let mut w = vec![
+        V_LSHLREV_V1_2_V0,
+        0x7D88_00FF,
+        100, // v_cmp_gt_u32 vcc, 100, v0
+        LANES_BELOW_40[1],
+        skip_execz(23),
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0003,
+        0x0022_0080, // v_cndmask_b32_e64 v3, 0, v0, s[8:9]
+    ];
+    for shr in [0xFF09_1103, 0xFF09_1203, 0xFF09_1403, 0xFF09_1803] {
+        w.extend([0x4A06_06FA, shr]); // v_add_nc_u32_dpp v3, v3, v3 row_shr:1, 2, 4, 8
+    }
+    w.extend([
+        0xD778_0002,
+        0x0305_8303, // v_permlanex16_b32 v2, v3, -1, -1
+        0x4A06_06FA,
+        0xAF00_E402, // v_add_nc_u32_dpp v3, v2, v3 row_mask:0xa
+        0xD760_000A,
+        0x0201_3F03, // v_readlane_b32 s10, v3, 31
+        0x7E04_020A, // v_mov_b32 v2, s10
+        0x4A06_06FA,
+        0xCF00_E402, // v_add_nc_u32_dpp v3, v2, v3 row_mask:0xc
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+        S_ENDPGM,
+    ]);
+    let got = run_group(&w, 0, 128, 128);
+    if got.is_empty() {
+        return;
+    }
+    let want0: Vec<u32> = (0..64).map(|l| l * (l + 1) / 2).collect();
+    let want1: Vec<u32> = (0..36).map(|l| (l + 1) * 64 + l * (l + 1) / 2).collect();
+    assert_eq!(got[..64], want0);
+    assert_eq!(got[64..100], want1);
+    assert_eq!(got[100..], [CANARY; 28]);
+}
+
+#[test]
+fn a_title_barrier_in_a_loop_the_waves_of_a_group_run_differently_is_refused() {
+    // The per-wave loop above with an `s_barrier` in its body: wave 0 reaches it once at most,
+    // wave 1 twice, so a group barrier there would wait for a wave that left the loop. The fast
+    // path refuses the lane read in the loop, and lockstep must not take it either.
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x3A06_02FF,
+        0x0000_0080, // v_xor_b32 v3, 0x80, v1
+        0x2C0C_0086, // v_lshrrev_b32 v6, 6, v0
+        0x3608_0081, // v_and_b32 v4, 1, v0
+        0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
+        0x7E0A_0300, // v_mov_b32 v5, v0
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0x7D8A_0880, // loop: v_cmp_ne_u32 vcc, 0, v4
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        skip_execz(11),
+        0xBF8A_0000, // s_barrier
+        0xD760_0006,
+        0x0001_4703, // v_readlane_b32 s6, v3, 35: an exchange in the loop
+        DS_READ_V2_AT_V3[0],
+        DS_READ_V2_AT_V3[1],
+        S_WAITCNT_LGKM,
+        0x4A0A_0505, // v_add_nc_u32 v5, v5, v2
+        0xD834_0000,
+        0x0000_0501, // ds_write_b32 v1, v5
+        0x4A08_08C1, // v_add_nc_u32 v4, -1, v4
+        0xBF82_FFF2, // s_branch loop
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0xDC70_8000,
+        0x0002_0501, // global_store_dword v1, v5, s[2:3]
+        S_ENDPGM,
+    ];
+    let fast = try_translate_wave(&w, 5, 1 << 15, 128, true, shaders::options()).err();
+    assert!(fast.is_some(), "refused on the fast path");
+    let why = try_translate_wave(&w, 5, 1 << 15, 128, true, several_waves())
+        .err()
+        .map(|e| e.to_string())
+        .expect("refused");
+    assert!(why.contains("unevenly"), "{why}");
 }

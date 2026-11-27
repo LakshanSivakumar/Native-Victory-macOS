@@ -19,8 +19,12 @@
 //! `v_readfirstlane_b32` (the first lane of the wide EXEC). LDS gets a group barrier after each
 //! write, outside its guard.
 //!
-//! Only programs whose group is one console wave (64 lanes or fewer) run this way: in a group of
-//! several waves, one wave's branches are not the others'.
+//! In a group of several console waves (#376) each wave follows its own program counter: one
+//! wave's branches are not the others', so a group barrier would wait for waves that took another
+//! way. There the exchanges and LDS barriers of a console wave wait for its own two host waves
+//! alone (`Lower::pair_barrier`), and the title's own `s_barrier` keeps the group's barrier: the
+//! console's waits for every wave that has not ended, so the title brings them there together
+//! (only in a block outside any loop that every thread reaches once; elsewhere refused).
 
 use super::{HostShader, Options, emit_fast};
 use crate::dxbc::Container;
@@ -35,18 +39,23 @@ use crate::resource::Resources;
 /// A branch the lockstep structuriser could not make uniform.
 pub(crate) const NOT_UNIFORM: &str = "a branch not uniform across a console wave run in lockstep";
 
-/// Whether a refused program may run in lockstep: wave64 compute on a 32-lane host whose group is
-/// one console wave.
+/// Whether a refused program may run in lockstep: wave64 compute on a 32-lane host. A group of
+/// several console waves takes it only with [`Options::lockstep_waves`] for now (#376).
 pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -> bool {
     let StageIo::Cs(cs) = &native.io else { return false };
     options.wave32_host
         && native.stage == HwStage::Cs
         && native.wave64
         && !st.lockstep
-        && cs.threads.iter().product::<u32>() <= 64
+        && (cs.threads.iter().product::<u32>() <= 64 || options.lockstep_waves)
         // VICTORY_NO_LOCKSTEP=1: refuse as the fast path does (for comparisons).
         && std::env::var_os("VICTORY_NO_LOCKSTEP").is_none()
 }
+
+/// A title barrier in a block a group of several console waves may reach unevenly: each wave
+/// follows its own program counter, so only a barrier every thread reaches once is safe.
+pub(crate) const UNEVEN_BARRIER: &str =
+    "an s_barrier the console waves of a lockstep group may reach unevenly";
 
 /// The lockstep translation of `p` (see the module).
 pub(super) fn retry(
@@ -59,6 +68,17 @@ pub(super) fn retry(
 ) -> Result<HostShader, ShaderError> {
     let q = branches(p);
     let st = structure::lockstep(&q)?;
+    if let StageIo::Cs(cs) = &native.io
+        && cs.threads.iter().product::<u32>() > 64
+    {
+        let once = super::lower::once_blocks(&q);
+        if let Some(offset) = (0..q.blocks.len()).find_map(|b| {
+            let at = q.blocks[b].insts.iter().find(|i| i.name() == "s_barrier")?;
+            (!once[b]).then_some(at.machine.offset)
+        }) {
+            return Err(ShaderError::Unsupported { offset, what: UNEVEN_BARRIER });
+        }
+    }
     if let Some(offset) = divergent(&q, &st) {
         return Err(ShaderError::Unsupported { offset, what: NOT_UNIFORM });
     }

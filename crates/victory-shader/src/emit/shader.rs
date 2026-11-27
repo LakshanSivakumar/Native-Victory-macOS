@@ -168,6 +168,10 @@ pub(crate) struct Shader {
     /// Group-shared dwords for exchanges between host waves (`xchg`).
     pub xchg_dwords: u32,
     xchg: Option<V>,
+    /// Group-shared counters, one per console wave, of the barriers between a console wave's two
+    /// host waves (`pair_barrier`; lockstep of several console waves a group).
+    pub pair_dwords: u32,
+    pairs: Option<V>,
     main: V,
     pub entry: usize,
 }
@@ -234,6 +238,8 @@ impl Shader {
             lds: None,
             xchg_dwords: 0,
             xchg: None,
+            pair_dwords: 0,
+            pairs: None,
             main,
             entry,
         }
@@ -260,6 +266,17 @@ impl Shader {
         let arr = self.m.array(self.xchg_dwords, self.t.i32);
         let g = self.m.global("xchg", arr, 3);
         self.xchg = Some(g);
+        g
+    }
+
+    /// The group-shared counters of [`Self::pair_dwords`].
+    pub fn pairs(&mut self) -> V {
+        if let Some(g) = self.pairs {
+            return g;
+        }
+        let arr = self.m.array(self.pair_dwords, self.t.i32);
+        let g = self.m.global("pairs", arr, 3);
+        self.pairs = Some(g);
         g
     }
 

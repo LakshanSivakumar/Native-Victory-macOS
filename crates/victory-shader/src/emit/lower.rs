@@ -378,6 +378,10 @@ struct Lower<'a> {
     /// cross-lane operations: lanes are `flat & 63`, and what reaches across
     /// the halves goes through group-shared memory (`lower/halves.rs`).
     halves: bool,
+    /// Lockstep in a group of several console waves (`lockstep.rs`): each wave follows its own
+    /// program counter, so what the two host waves of one console wave exchange waits for those
+    /// two alone ([`Lower::pair_barrier`]), never for the group.
+    pair_sync: bool,
     /// With `halves`, blocks where both halves of a console wave arrive
     /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
@@ -971,6 +975,7 @@ impl<'a> Lower<'a> {
             || (x.zero_copy_memory && x.native.stage != HwStage::Cs);
         let mut console_lanes = console;
         let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
+        let mut pair_sync = false;
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -1023,7 +1028,14 @@ impl<'a> Lower<'a> {
             // passes between its lanes without a barrier.
             let mut synced = false;
             host32 = x.wave32_host && x.native.wave64;
-            if (x.narrow_waves || host32) && one_wave && lanes > 32 && s.lds_dwords > 0 {
+            // Lockstep of several console waves a group: every console wave is in lockstep on its
+            // own, and its LDS barriers and exchanges are its two host waves' alone.
+            pair_sync = host32 && x.st.lockstep && !one_wave;
+            if (x.narrow_waves || host32)
+                && (one_wave || pair_sync)
+                && lanes > 32
+                && s.lds_dwords > 0
+            {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
                 // program then runs as before.
@@ -1058,6 +1070,9 @@ impl<'a> Lower<'a> {
                         *o |= at_barrier;
                     }
                     s.xchg_dwords = lanes.next_multiple_of(64);
+                    if pair_sync {
+                        s.pair_dwords = lanes.div_ceil(64);
+                    }
                 }
             } else if console_lanes || one_wave && s.lds_dwords > 0 && !fits {
                 s.wave_size = Some(wave);
@@ -1172,6 +1187,7 @@ impl<'a> Lower<'a> {
             barycentrics: false,
             host32,
             halves,
+            pair_sync,
             once,
             console_flat: None,
             refuse,
@@ -1940,6 +1956,16 @@ impl<'a> Lower<'a> {
             self.rpo[b] = n;
         }
         self.cur = self.s.entry;
+        if self.pair_sync {
+            self.clear_pairs();
+            // EXEC and other masks on entry: their numbers from the entry block (see below).
+            let inputs: Vec<Value> = self.x.p.inputs.iter().map(|r| r.1).collect();
+            for v in inputs {
+                if self.x.st.masks.contains_key(&v) {
+                    let _ = self.mask_dword(v);
+                }
+            }
+        }
         self.find_sections();
         if let Some(vid_val) = self.rect_vertex_id() {
             self.run_rect_by_id(&order, vid_val)?;
@@ -2109,9 +2135,12 @@ impl<'a> Lower<'a> {
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
                 if self.split_barriers.contains(&(b, i)) {
-                    self.group_barrier();
+                    self.split_barrier().map_err(|w| unsupported(p.blocks[b].insts[i].machine.offset, w))?;
                 }
                 self.inst(b, i)?;
+                if self.pair_sync {
+                    self.ballot_masks_written(b, i);
+                }
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -2123,7 +2152,8 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
-                self.group_barrier();
+                let offset = p.blocks[b].insts.last().map_or(0, |i| i.machine.offset);
+                self.split_barrier().map_err(|w| unsupported(offset, w))?;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -5465,6 +5495,32 @@ impl<'a> Lower<'a> {
     /// Thread-group sync with a shared-memory fence, and a UAV fence when
     /// the program writes UAVs (the waits before an s_barrier make those
     /// writes visible on the console).
+    /// With [`Self::pair_sync`], the numbers of the lane masks instruction `i` of block `b` writes,
+    /// taken now, at an instruction boundary: a ballot's exchange splits the DXIL block
+    /// ([`Self::pair_barrier`]), which is only sound where no caller holds the block it was in.
+    /// Lockstep reads almost every mask as a number (each branch compares one with 0). A mask that
+    /// cannot be made a number here is left to its first read, as before.
+    fn ballot_masks_written(&mut self, b: usize, i: usize) {
+        let written: Vec<Value> = self.x.p.blocks[b].insts[i].writes.iter().map(|w| w.1).collect();
+        for w in written {
+            if self.x.st.masks.contains_key(&w) {
+                let _ = self.mask_dword(w);
+            }
+        }
+    }
+
+    /// A barrier that orders LDS one console wave shares within itself ([`Self::split_barriers`]):
+    /// the group's, or with [`Self::pair_sync`] its two host waves' alone.
+    fn split_barrier(&mut self) -> Result<(), Why> {
+        if self.pair_sync {
+            let at = self.cur;
+            self.pair_barrier(at)?;
+            return Ok(());
+        }
+        self.group_barrier();
+        Ok(())
+    }
+
     fn group_barrier(&mut self) {
         let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
         let mode = self.s.m.i32(mode);

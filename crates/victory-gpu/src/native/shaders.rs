@@ -25,6 +25,9 @@ pub fn options() -> Options {
     Options {
         wave32_host: true,
         zero_copy_memory: true,
+        // VICTORY_LOCKSTEP_WAVES=1: lockstep also for compute groups of several console waves
+        // (#376; off by default). Part of the options, so of the shader cache key.
+        lockstep_waves: std::env::var("VICTORY_LOCKSTEP_WAVES").is_ok_and(|v| v.trim() == "1"),
         ..Options::default()
     }
 }

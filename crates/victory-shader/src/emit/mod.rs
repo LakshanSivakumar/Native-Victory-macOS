@@ -466,6 +466,10 @@ pub struct Options {
     /// memory (module notes, "Wave64 on a 32-lane host"). Implies
     /// [`Self::narrow_waves`]. Off for D3D12.
     pub wave32_host: bool,
+    /// Lockstep (`lockstep.rs`) also for compute groups of several console waves, each wave on its
+    /// own program counter, its exchanges waiting for its two host waves alone (#376). Off by
+    /// default; the native host sets it from `VICTORY_LOCKSTEP_WAVES=1`.
+    pub lockstep_waves: bool,
     /// The host's title memory is the memory the GPU reads and writes (the native Metal
     /// host: one buffer per pool, no copies): accesses at computed addresses still go through
     /// the page table of "Title memory" to find the host view, but mark nothing, so the
