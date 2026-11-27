@@ -2344,3 +2344,21 @@ fn a_whole_wave_prefix_sum_behind_a_branch_on_a_mask_anded_with_exec_in_four_wav
     assert_eq!(got[64..128], prefix(64, 36), "wave 1");
     assert_eq!(got[128..], [CANARY; 128], "waves 2 and 3 skip");
 }
+
+#[test]
+fn a_lane_read_in_a_group_of_96_whose_last_wave_is_one_host_wave() {
+    // A group of 96: console wave 1 has threads 64..95 only, one host wave, so its pair barriers
+    // count 32 threads. Threads below 80: wave 0 whole, wave 1 its lanes 0..15. Each reads its own
+    // lane 35; wave 1 has no lane 35 (thread 99 is not in the group), which reads 0 (the guess
+    // `wide_read_lane` makes for lanes the group lacks).
+    let mut w = lane_read_with_a_different_exec_per_wave();
+    w.splice(3..5, [0x7D88_00FF, 80]); // v_cmp_gt_u32 vcc, 80, v0
+    assert!(refusal_of(&w, 96).is_some(), "refused on the fast path");
+    let got = run_group(&w, 0, 96, 96);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..64], [1035; 64], "wave 0");
+    assert_eq!(got[64..80], [0; 16], "wave 1: a lane the group lacks");
+    assert_eq!(got[80..], [CANARY; 16]);
+}
