@@ -32,6 +32,7 @@ pub mod native;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
+pub mod resolution;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]

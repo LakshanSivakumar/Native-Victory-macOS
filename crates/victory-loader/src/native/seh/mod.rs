@@ -33,6 +33,9 @@
 pub mod context;
 pub mod unwind;
 
+#[cfg(any(target_arch = "x86_64", test))]
+mod step_over;
+
 #[cfg(target_arch = "x86_64")]
 mod dispatch;
 #[cfg(target_arch = "x86_64")]

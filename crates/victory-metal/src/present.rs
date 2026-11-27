@@ -7,11 +7,13 @@
 //! and presents it after the work already submitted to the queue.
 
 use crate::metal::{Metal, Queue};
+use crate::frame_time::{Metric, Timer};
 use crate::gfx::Texture;
-use crate::resources::PresentBackend;
+use crate::resources::{PresentBackend};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::msg_send;
+use objc2_core_graphics::{CGColorSpace, kCGColorSpaceITUR_2100_PQ};
 use objc2_foundation::NSSize as CGSize;
 use objc2_foundation::NSString;
 use objc2_metal::*;
@@ -64,14 +66,37 @@ unsafe impl Send for Drawable {}
 
 impl AcquisitionLayer {
     fn next(&self) -> Option<Drawable> {
+        let _drawable = Timer::new(Metric::Drawable);
         self.0.nextDrawable().map(Drawable)
     }
 }
 
+/// R10G10B10A2 carries display-encoded PQ when HDR reporting is enabled.
+fn hdr_source(enabled: bool, format: MTLPixelFormat) -> bool {
+    enabled && format == MTLPixelFormat::RGB10A2Unorm
+}
+
+fn reporting_hdr() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_REPORT_HDR").as_deref() == Ok("1"))
+}
+
+/// Apple's direct PQ presentation path: preserve encoded values in a 10-bit
+/// drawable and let Core Animation interpret their BT.2020 primaries and PQ transfer.
+fn enable_hdr(layer: &CAMetalLayer) -> Result<(), String> {
+    // SAFETY: Core Graphics' immutable system color-space name (macOS 10.15+).
+    let colorspace = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceITUR_2100_PQ }))
+        .ok_or("PQ/BT.2020 color space unavailable")?;
+    layer.setPixelFormat(MTLPixelFormat::BGR10A2Unorm);
+    layer.setColorspace(Some(&colorspace));
+    layer.setWantsExtendedDynamicRangeContent(true);
+    Ok(())
+}
+
 /// A `CAMetalLayer` presented to.
 pub struct Surface {
-    acquisition: std::sync::mpsc::Sender<()>,
-    drawables: std::sync::mpsc::Receiver<Option<Drawable>>,
+    acquisition: std::sync::mpsc::Sender<bool>,
+    drawables: std::sync::mpsc::Receiver<Result<(bool, Option<Drawable>), String>>,
     acquiring: std::cell::Cell<bool>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     /// The copy pipeline for each drawable format seen, and whether it blends.
@@ -169,8 +194,14 @@ impl Surface {
 
     /// The pixels of the last presented drawable (width, height, BGRA rows), read back from its
     /// texture: complete once the GPU has drawn the frame (a fence signalled after the present).
+    /// HDR drawables return None; this diagnostic has no HDR-to-SDR tone mapper.
     pub fn read_last(&self) -> Option<(usize, usize, Vec<u8>)> {
         let t = self.last.borrow().clone()?;
+        // This diagnostic promises SDR BGRA8. HDR needs a tone-mapped readback,
+        // not packed 10-bit words misreported as 8-bit pixels.
+        if t.pixelFormat() != MTLPixelFormat::BGRA8Unorm {
+            return None;
+        }
         let (w, h) = (t.width(), t.height());
         let mut out = vec![0u8; w * h * 4];
         let region = MTLRegion {
@@ -284,8 +315,27 @@ impl PresentBackend for Metal {
         let (results, drawables) = std::sync::mpsc::sync_channel(1);
         let layer = AcquisitionLayer(layer);
         std::thread::Builder::new().name("victory drawables".into()).spawn(move || {
-            while requests.recv().is_ok() {
-                let drawable = objc2::rc::autoreleasepool(|_| layer.next());
+            let sdr_format = layer.0.pixelFormat();
+            let sdr_colorspace = layer.0.colorspace();
+            let sdr_extended = layer.0.wantsExtendedDynamicRangeContent();
+            let mut hdr = false;
+            while let Ok(wanted) = requests.recv() {
+                let drawable = objc2::rc::autoreleasepool(|_| {
+                    // Serialized with nextDrawable: no drawable is acquired with
+                    // a half-updated format/color space, including SDR/HDR transitions.
+                    if wanted != hdr {
+                        if wanted {
+                            enable_hdr(&layer.0)?;
+                        } else {
+                            layer.0.setPixelFormat(sdr_format);
+                            layer.0.setColorspace(sdr_colorspace.as_deref());
+                            layer.0.setWantsExtendedDynamicRangeContent(sdr_extended);
+                        }
+                        hdr = wanted;
+                        tracing::info!(hdr, "Metal presentation color mode changed");
+                    }
+                    Ok((hdr, layer.next()))
+                });
                 if results.send(drawable).is_err() {
                     break;
                 }
@@ -333,12 +383,19 @@ impl PresentBackend for Metal {
             }
             return Ok(true);
         }
+        let hdr = hdr_source(reporting_hdr(), first.view_without_srgb(self).pixelFormat());
         if !surface.acquiring.replace(true) {
-            surface.acquisition.send(()).map_err(|_| "drawable worker stopped")?;
+            surface.acquisition.send(hdr).map_err(|_| "drawable worker stopped")?;
         }
         let drawable = match surface.drawables.try_recv() {
-            Ok(drawable) => {
+            Ok(result) => {
                 surface.acquiring.set(false);
+                let (acquired_hdr, drawable) = result?;
+                if acquired_hdr != hdr {
+                    // The source changed while acquisition was pending. Drop the stale
+                    // drawable; the next poll requests the source's current color mode.
+                    return Ok(false);
+                }
                 drawable.ok_or("no drawable")?.0
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(false),
@@ -422,6 +479,25 @@ mod tests {
     use super::*;
     use crate::backend::ComputeBackend;
     use crate::resources::{Format, ResourceBackend, TextureDesc};
+
+    #[test]
+    fn hdr_requires_opt_in_and_a_ten_bit_source() {
+        assert!(hdr_source(true, MTLPixelFormat::RGB10A2Unorm));
+        assert!(!hdr_source(false, MTLPixelFormat::RGB10A2Unorm));
+        assert!(!hdr_source(true, MTLPixelFormat::BGRA8Unorm));
+        assert!(!hdr_source(true, MTLPixelFormat::RGBA16Float));
+        let layer = CAMetalLayer::new();
+        enable_hdr(&layer).unwrap();
+        assert_eq!(layer.pixelFormat(), MTLPixelFormat::BGR10A2Unorm);
+        assert!(layer.wantsExtendedDynamicRangeContent());
+        let colorspace = layer.colorspace().unwrap();
+        // SAFETY: Core Graphics' immutable system color-space name.
+        let expected = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceITUR_2100_PQ })).unwrap();
+        assert_eq!(
+            CGColorSpace::name(Some(&colorspace)),
+            CGColorSpace::name(Some(&expected))
+        );
+    }
 
     #[test]
     fn zero_planes_through_ycbcr_count_as_green() {

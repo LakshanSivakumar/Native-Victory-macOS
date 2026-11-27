@@ -43,6 +43,7 @@ pub mod shaders;
 pub mod state;
 pub mod textures;
 pub mod title;
+pub(crate) mod twin;
 
 #[cfg(target_os = "macos")]
 pub type Host = host::NativeHost<victory_metal::metal::Metal>;
@@ -81,7 +82,11 @@ pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {
         };
         r == 0 && got == out.len() as u64
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        crate::host::read_into(at, out)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (at, out);
         false

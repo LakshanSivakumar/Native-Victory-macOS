@@ -473,6 +473,8 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: Map<(usize, usize), Bool>,
+    /// EXEC at each instruction, before restricting it to the lanes reaching the block.
+    pub execs: Vec<Vec<Option<Bool>>>,
     /// Made by [`lockstep`]: the lowering runs the console wave's one PC in every lane.
     pub lockstep: bool,
 }
@@ -489,7 +491,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true, false)
+    structure_as(program, true, false, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -497,7 +499,13 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false, false)
+    structure_as(program, false, false, false)
+}
+
+/// Every lane follows the console's wave-wide branches; EXEC guards vector work.
+/// A join cannot assume that arriving lanes have their EXEC bit set.
+pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, false, true, false)
 }
 
 /// The form a console wave run in lockstep takes (`emit/lockstep.rs`): every branch tests a
@@ -505,17 +513,21 @@ pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
 /// whole mask first, [`crate::emit`]'s `lockstep_branches`), so every lane reaches every block
 /// and each vector instruction keeps EXEC as its guard.
 pub fn lockstep(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true, true)
+    structure_as(program, true, false, true)
 }
 
-fn structure_as(program: &Program, helpers: bool, lockstep: bool) -> Result<Structured, ShaderError> {
+fn structure_as(program: &Program, helpers: bool, console: bool, lockstep: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.console = console;
     l.lockstep = lockstep;
     if !helpers {
         l.kills.clear();
     }
     loop {
         let (execs, kill_lanes) = l.masks_in_order();
+        while let Some(key) = l.console_pending.pop() {
+            l.mask(key);
+        }
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -563,6 +575,8 @@ enum SplitPair {
 
 struct Lanes<'a> {
     p: &'a Program,
+    console: bool,
+    console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -649,6 +663,8 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            console: false,
+            console_pending: Vec::new(),
             order,
             index,
             incoming,
@@ -1039,6 +1055,7 @@ impl<'a> Lanes<'a> {
             active: self.active,
             restored: self.restored,
             discards: kill_lanes,
+            execs: execs.to_vec(),
             bools: self.b,
             exits,
             guards,
@@ -1621,7 +1638,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.console && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -1639,6 +1656,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.console {
+            self.console_pending.extend(args);
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))

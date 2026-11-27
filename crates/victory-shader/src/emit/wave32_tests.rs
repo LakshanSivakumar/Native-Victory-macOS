@@ -137,6 +137,7 @@ fn lowered(
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         view_marks: false,
     })?;
     // VICTORY_DUMP_DXIL=<dir>: keep the containers, to run Apple's converter on.
@@ -177,6 +178,11 @@ fn a_lane_read_across_the_halves_goes_through_group_shared_memory() {
     assert_eq!(l.wave_size, Some(32));
     assert!(l.exchanges);
     assert_eq!(l.barriers, 2);
+    // BPERMUTE is local to each half even when address bit 7 is set.
+    let l = host32(BPERMUTE, 64);
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.barriers, 0);
+    assert!(!l.exchanges);
 }
 
 #[test]
@@ -220,13 +226,14 @@ fn a_group_of_32_lanes_or_fewer_needs_no_exchange() {
 
 #[test]
 fn exchanges_wait_for_every_thread_to_arrive() {
-    // In the lanes below 10: the second host wave never gets there. The
-    // value is left unknown (the program is refused where something uses
-    // it), and no barrier is emitted.
-    for words in [DIVERGENT_READLANE, DIVERGENT_BALLOT] {
-        let l = host32(words, 64);
-        assert_eq!((l.barriers, l.exchanges), (0, false), "{words:x?}");
-    }
+    // Both halves now run the console branch, so a named lane access can
+    // exchange even if only the lower half has active vector lanes.
+    let l = host32(DIVERGENT_READLANE, 64);
+    assert!(l.console_flow && l.exchanges);
+    assert_eq!(l.barriers, 4);
+    // This unused numeric ballot has no effects and still disappears.
+    let l = host32(DIVERGENT_BALLOT, 64);
+    assert_eq!((l.barriers, l.exchanges), (0, false));
     // Behind a scalar branch every lane takes the same way, both halves.
     assert_eq!(host32(UNIFORM_BRANCH_READLANE, 64).barriers, 4);
     // Not in a group of several waves: the scalar may differ between them.
@@ -234,7 +241,7 @@ fn exchanges_wait_for_every_thread_to_arrive() {
 }
 
 #[test]
-fn lds_a_wave_shares_unsynced_in_divergent_code_is_refused() {
+fn lds_a_wave_shares_in_divergent_code_takes_console_flow() {
     // Write and read both under the branch: no barrier can go there.
     const WRITE_READ_DIVERGENT: &[u32] = &[
         0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
@@ -248,8 +255,10 @@ fn lds_a_wave_shares_unsynced_in_divergent_code_is_refused() {
         0xBEFE_0400, // s_mov_b64 exec, s[0:1]
         S_ENDPGM,
     ];
-    let r = lowered(WRITE_READ_DIVERGENT, 64, true, true);
-    assert!(matches!(r, Err(crate::ShaderError::Unsupported { .. })));
+    let l = lowered(WRITE_READ_DIVERGENT, 64, true, true).unwrap();
+    assert!(l.console_flow && l.exchanges);
+    assert!(l.barriers >= 4);
+    assert_eq!(l.wave_size, Some(32));
     // Where a barrier fits it is added, and no 64-lane wave is asked for.
     const WRITE_THEN_READ: &[u32] = &[
         0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0

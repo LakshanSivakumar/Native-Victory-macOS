@@ -126,6 +126,7 @@ impl<'a> Scene<'a> {
             state: DrawState::default(),
             root: self.root(z),
             fragment_root: None,
+            object_root: None,
             heaps: Heaps {
                 resource: Some(&self.res),
                 sampler: Some(&self.smp),
@@ -629,6 +630,7 @@ fn a_target_drawn_in_one_pass_is_sampled_by_the_next() {
                 .address(m.heap_address(&s.res, 1))
                 .address(m.heap_address(&s.smp, 0)),
             fragment_root: None,
+            object_root: None,
             heaps: Heaps {
                 resource: Some(&s.res),
                 sampler: Some(&s.smp),
@@ -746,6 +748,7 @@ fn heap_sampled(m: &Metal, ps: &str, index: usize, sampler: [u32; 10]) -> [u8; 4
         state: DrawState::default(),
         root: s.root(0.5),
         fragment_root: Some(RootArgs::default().constants(&[index as u32, 0, 0, 0])),
+        object_root: None,
         heaps: Heaps {
             resource: Some(&heap),
             sampler: Some(&s.smp),

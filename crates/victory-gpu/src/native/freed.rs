@@ -1,8 +1,8 @@
 //! Title memory the title's allocator returned, watched while
 //! `VICTORY_TRACE_FREED` is on: `XMemAllocDefault` notes every range it
 //! hands out, `XMemFreeDefault` the ones it takes back (the header holds
-//! the size), and `Host::resolve` — the way every host and GPU use of
-//! title memory begins — checks the range it is about to map and names
+//! the size), and `Host::resolve` - the way every host and GPU use of
+//! title memory begins - checks the range it is about to map and names
 //! any overlap with freed memory (#339: a host copy or a GPU write into
 //! a range the title has freed is one candidate for the corrupted pool
 //! links).

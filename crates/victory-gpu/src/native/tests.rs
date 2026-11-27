@@ -34,8 +34,12 @@ mod stale_tests;
 mod state_tests;
 #[path = "texture_tests.rs"]
 mod texture_tests;
+#[path = "tile_wave_tests.rs"]
+mod tile_wave_tests;
 #[path = "title_tests.rs"]
 mod title_tests;
+#[path = "volume_tests.rs"]
+mod volume_tests;
 
 fn host() -> Option<Host> {
     if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
@@ -45,6 +49,52 @@ fn host() -> Option<Host> {
         return None;
     }
     Some(Host::new(Metal::new().unwrap()))
+}
+
+#[test]
+fn volume_view_mips_and_full_depth_reach_the_backend() {
+    use crate::descriptor::{View, record};
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    host.heap(HeapKind::Resource, handle, 1).unwrap();
+    let texture = Rc::new(TextureDesc {
+        dim: TexDim::D3,
+        depth_or_layers: 24,
+        mips: 2,
+        unordered_access: true,
+        ..TextureDesc::d2(Format::Rgb10a2Unorm, 24, 16)
+    });
+    let key = Rc::as_ptr(&texture) as usize;
+    let mut resource = [0; 14];
+    resource[0] = 4;
+    let address = 0x12000;
+    host.register_texture(key, &texture);
+    host.register_texture(super::textures::placed_key(address, &resource), &texture);
+    for unordered in [false, true] {
+        let mut d = [0; 10];
+        d[..2].copy_from_slice(&[24, 8]);
+        let object = if unordered {
+            d[2..5].copy_from_slice(&[1, 0, 12]);
+            View::Unordered(key, 0, Some(d))
+        } else {
+            d[4..6].copy_from_slice(&[1, 1]);
+            View::Shader(key, Some(d))
+        };
+        let mut placed = [0; 16];
+        placed[..10].copy_from_slice(&d);
+        placed[10] = address as u32;
+        for view in [object, View::Placed(unordered, resource, placed)] {
+            record(handle, view);
+            assert!(host.mirror(handle).unwrap());
+            assert_eq!(*host.backend.views.borrow().last().unwrap(), ViewDesc {
+                format: Format::Rgb10a2Unorm,
+                mips: (1, 1),
+                slices: (0, usize::MAX),
+            });
+        }
+    }
+    crate::descriptor::forget(key);
 }
 
 #[test]
@@ -389,7 +439,8 @@ fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
     walks();
     run(&h, &[]);
     assert_eq!(walks(), 1);
-    // Remapped under them: still one walk, and the copy the program reads follows.
+    // Remapped under them: one comparison walk, then each remirrored direct wrap validates
+    // its mappings afresh (three more walks). No generation-wide cache hides those checks.
     let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
     title.remap(&h, &info, &pool, 1, 4 * page, page);
     title.write(dst, &[0xCAFE_CAFEu32; 64]);
@@ -401,7 +452,7 @@ fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
     l.dispatch(1, 1, 1).unwrap();
     walks();
     run(&h, &[&l]);
-    assert_eq!(walks(), 1);
+    assert_eq!(walks(), 4);
     let expect: Vec<u32> = (0..64u32).map(|i| if i < 32 { i * 3 + 1 } else { (i + 68) * 3 + 1 }).collect();
     assert_eq!(title.read::<u32>(dst, 64), expect);
     drop(slots);
@@ -1550,6 +1601,56 @@ fn a_released_pool_leaves_the_residency_set() {
     dispatch(&second);
     assert_eq!(h.backend.residency_counts().added, 2);
     assert_eq!(second.read::<u32>(4096, 64), (0..64).map(|i| i * 2).collect::<Vec<_>>());
+}
+
+/// The native list snapshots graphics roots, ignores stale vertex/index state, resolves the
+/// 12-byte mesh record through an aliased pool, and reads a prior GPU copy at execution time.
+#[test]
+fn an_indirect_mesh_reads_a_record_written_earlier_on_the_gpu() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 1);
+    let ms = fixture("tri_ms");
+    let ps = fixture("mesh_ps");
+    let pso = h
+        .render_pipeline(&RenderPipelineDesc {
+            mesh: Some(MeshPipelineDesc {
+                mesh: &ms,
+                layout: None,
+                amplification: None,
+                amplification_layout: None,
+            }),
+            ps: Some(&ps),
+            color: &[Format::Rgba8Unorm],
+            // The full-screen fixture is CCW; default CW front faces would back-cull it.
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut td = TextureDesc::d2(Format::Rgba8Unorm, 16, 16);
+    td.render_target = true;
+    let color = Rc::new(h.backend.create_texture(&td).unwrap());
+    pool.write(64, &[0u32; 3]);
+    pool.write(128, &[1u32; 3]);
+    let mut l = NativeList::default();
+    l.copy_buffer_region(pool.va(64), pool.va(128), 12);
+    l.set_graphics_pipeline(&pso, Topology::Triangles);
+    l.set_graphics_root_constants(0, &[0f32, 1., 0., 1.].map(f32::to_bits));
+    l.set_render_targets(&[color.clone()], None);
+    l.clear_render_target(&color, [0.; 4]);
+    l.set_vertex_buffer(0, 0xDEAD_0000);
+    l.set_index_buffer(0xDEAD_0000, true);
+    l.dispatch_mesh_indirect(pool.va(64), None).unwrap();
+    // Recording must own the old graphics arguments.
+    l.set_graphics_root_constants(0, &[1f32, 0., 0., 1.].map(f32::to_bits));
+    run(&h, &[&l]);
+    assert_eq!(h.unmapped(), 0);
+    let mut pixels = vec![0u8; 16 * 16 * 4];
+    h.backend.read_texture(&color, 0, 0, &mut pixels, 64, 0);
+    assert!(
+        pixels.chunks_exact(4).all(|p| p == [0, 255, 0, 255]),
+        "center {:?}",
+        &pixels[544..548]
+    );
 }
 
 #[test]

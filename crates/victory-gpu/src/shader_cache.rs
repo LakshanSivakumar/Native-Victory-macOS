@@ -310,6 +310,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         extra_params: 0,
         // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
         thread_counts: false,

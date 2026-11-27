@@ -7,22 +7,23 @@
 //! thread's console lane is its group index modulo 64 (`console_flat`, which
 //! also makes the host lane the console's). What stays inside 32 lanes is
 //! the host's own: DPP rows and quads, `ds_swizzle` (its masks keep bit 5),
-//! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers and
-//! `v_readfirstlane` (read per half: the console reads the first lane EXEC
-//! leaves on, and the translation has always read the first lane that runs,
-//! so a value that is not the same in both halves is where it differs).
+//! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, and lane-bit tests of numeric masks.
+//! In the per-lane fast path `v_readfirstlane` reads per half, so a value that
+//! differs between halves is where it differs from a console-wide first lane.
 //!
-//! What reaches across the two halves goes through group-shared memory (the
-//! `xchg` array, one dword per thread) between two group barriers: a ballot
-//! of a mask read as data, `v_readlane_b32` and the reductions and prefixes
-//! of whole-wave sections. A ballot is each
-//! half's 32 bits, joined; a lane read is a load at the source lane's slot;
-//! a reduction is each half's result, combined; a prefix combines the lower
-//! half's total with each upper lane's prefix. Lanes the group lacks (a group
-//! whose lanes are not a multiple of 64) write no slot: their ballot bits are
-//! 0, a missing upper half adds nothing to a reduction, and a lane read of
-//! one gives 0.
+//! What reaches across halves uses group-shared memory between barriers:
+//! masks read as data, named lane reads, and whole-wave reductions. In a
+//! group of one console wave, console flow makes every thread follow the
+//! wave-wide branch while EXEC guards vector effects. This permits exchanges
+//! inside divergent console loops without placing a host barrier in divergent
+//! host control flow. Multi-wave groups retain the uniform-site restriction.
+//! First-lane reads in console flow and lockstep read the first set lane of
+//! the complete EXEC mask. RDNA2 `ds_bpermute_b32` stays within its own half.
 //!
+//! The `xchg` array holds one dword per thread between two group barriers.
+//! A ballot joins each half's 32 bits; a lane read loads the source lane's slot;
+//! a reduction combines the half results; a prefix combines the lower half's
+//! total with each upper lane's prefix.
 //! Group barriers need every thread of the group. Such an operation is
 //! therefore lowered only in a block each thread runs exactly once
 //! ([`once_blocks`](super::once_blocks)), or, in a group that is one console
@@ -40,9 +41,14 @@
 //! shared-memory round trip per such operation, 4 bytes per thread of
 //! group-shared memory in all, and `WaveSize(32)` in place of 64.
 //!
-//! LDS that lanes of one console wave share without a barrier (the console
-//! runs the wave in lockstep) gets the group barriers `narrow_waves` adds
-//! ([`split_wave_barriers`](super::split_wave_barriers)), or is refused.
+//! Lanes the group lacks (a group whose lanes are not a multiple of 64)
+//! write no exchange slot: their ballot bits are 0, a missing upper half
+//! adds nothing to a reduction, and a lane read of one gives 0. An SCC
+//! computed from a `v_readfirstlane` is not uniform outside console flow:
+//! each half reads its own first lane.
+//!
+//! LDS shared by one console wave gets barriers between accesses in console
+//! flow. The existing narrow-wave barrier analysis is retained elsewhere.
 
 use super::{Lower, Why};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
@@ -61,8 +67,8 @@ impl Lower<'_> {
     /// Whether every thread of the group (both halves of a console wave)
     /// reaches IR block `ir` together.
     fn exchange_site(&self, ir: usize) -> Result<(), Why> {
-        // In lockstep every thread reaches every block together (`lockstep.rs`).
-        if self.once[ir] || self.x.st.lockstep {
+        // Both wave-wide forms bring every thread to each exchange.
+        if self.console_cf || self.once[ir] || self.x.st.lockstep {
             return Ok(());
         }
         Err(super::DIVERGENT_EXCHANGE)
@@ -186,6 +192,8 @@ impl Lower<'_> {
         let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
         let (z, k32, k63) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(63));
         let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let none_hi = self.s.m.cmp(c, pred::EQ, hi, z);
+        let fhi = self.s.m.select(c, none_hi, z, fhi);
         let low = self.s.m.cmp(c, pred::NE, lo, z);
         let r = self.s.m.select(c, low, flo, fhi);
         Ok(self.s.m.bin(c, Bin::And, r, k63))

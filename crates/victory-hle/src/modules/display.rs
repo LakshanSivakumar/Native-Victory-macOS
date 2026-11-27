@@ -57,13 +57,51 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
-    tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
-    2
+/// Native HDR is opt-in: the presenter tags 10-bit output as PQ/BT.2020.
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
+    let enabled = std::env::var("VICTORY_REPORT_HDR").as_deref() == Ok("1");
+    tracing::info!(preference, enabled, "HDR mode (VICTORY_REPORT_HDR)");
+    // SAFETY: the title passes a writable XDisplayHdrModeInfo or null.
+    unsafe { report_hdr(enabled, info) }
+}
+
+/// # Safety
+/// `info` is null or writable for three f32 values (XDisplayHdrModeInfo).
+unsafe fn report_hdr(enabled: bool, info: *mut c_void) -> u32 {
+    if !enabled {
+        return 2;
+    }
+    if !info.is_null() {
+        // SAFETY: the caller's writable XDisplayHdrModeInfo, possibly unaligned.
+        unsafe {
+            info.cast::<[f32; 3]>()
+                .write_unaligned([0.0, 1600.0, 1000.0])
+        };
+    }
+    1
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+
+    #[test]
+    fn hdr_report_preserves_sdr_and_writes_unaligned_info() {
+        let mut data = [0u8; 13];
+        // SAFETY: twelve writable bytes, deliberately unaligned, and null is allowed.
+        unsafe {
+            let info = data.as_mut_ptr().add(1).cast();
+            assert_eq!(report_hdr(false, info), 2);
+            assert_eq!(data, [0; 13]);
+            assert_eq!(report_hdr(true, info), 1);
+            assert_eq!(
+                info.cast::<[f32; 3]>().read_unaligned(),
+                [0.0, 1600.0, 1000.0]
+            );
+            assert_eq!(report_hdr(true, std::ptr::null_mut()), 1);
+            assert_eq!(report_hdr(false, std::ptr::null_mut()), 2);
+        }
+    }
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app

@@ -32,7 +32,7 @@ pub struct Metal {
     /// by their DXIL and layout.
     compiling: Compiling<Result<ComputeState, String>>,
     /// As `compiling`, the render and mesh pipelines (`create_render_pipeline_within`).
-    pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<MTLSize>), String>>,
+    pub(crate) compiling_render: Compiling<Result<(crate::gfx::RenderState, Option<crate::gfx::MeshDispatch>), String>>,
     /// `VICTORY_TRACE_GPU_FAILS`: label command buffers and encoders, report failures with them.
     pub(crate) trace_fails: bool,
     /// The most passes of a submission in one command buffer (`VICTORY_PASSES_PER_BUFFER`;
@@ -121,6 +121,12 @@ pub(crate) fn residency_timed<R>(
 /// Counters of residency work.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ResidencyCounts {
+    /// Descriptor entries actually written (identical entries do not count).
+    pub entry_writes: u64,
+    /// Heap-set `addAllocation` calls, including the heap buffer at creation.
+    pub set_adds: u64,
+    /// Heap-set `removeAllocation` calls (excludes Drop's `removeAllAllocations`).
+    pub set_removes: u64,
     /// `useResource` calls on title buffers (compute, render and blit encoders).
     pub use_resource: u64,
     /// Resources named to encoders for descriptor heaps without sets.
@@ -183,13 +189,23 @@ pub struct Pipeline(
 pub struct Buffer {
     pub(crate) buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub(crate) base: *const u8,
+    /// Long-lived title pools can join the queue residency set. Host tables
+    /// stay encoder-named so each command buffer retains their allocation.
+    pub(crate) pool: bool,
     /// The residency set it is in (so that dropping it leaves the set).
     pub(crate) resident: std::cell::RefCell<Option<Retained<ProtocolObject<dyn MTLResidencySet>>>>,
+    /// Texture-buffer views by offset, fitted width, pixel format and writable usage. Metal's
+    /// views retain `buf`, but `buf` does not retain them; the Rust owner is not a retain cycle.
+    pub(crate) views: std::cell::RefCell<std::collections::HashMap<
+        (usize, usize, usize, bool), Retained<ProtocolObject<dyn MTLTexture>>,
+    >>,
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        self.views.get_mut().clear();
         if let Some(set) = self.resident.get_mut().take() {
+            let Some(_changes) = crate::gfx::RESIDENCY.changes() else { return };
             set.removeAllocation(ProtocolObject::from_ref(&*self.buf));
             residency_timed("pool_commit", Some(&set), || set.commit());
         }
@@ -516,8 +532,45 @@ impl ComputeBackend for Metal {
         Ok(Buffer {
             buf,
             base: ptr,
+            pool: true,
             resident: Default::default(),
+            views: Default::default(),
         })
+    }
+
+    fn wrap_title_span(&self, len: usize, pieces: &[(usize, *mut u8, usize)]) -> Result<(Buffer, *mut u8), String> {
+        let (ptr, len) = crate::mem::Stitch::new(len, pieces)?.into_raw();
+        let p = NonNull::new(ptr.cast()).ok_or("null stitched memory")?;
+        // The range is unmapped when Metal lets go of the buffer (work in flight keeps it).
+        let range = (ptr as usize, len);
+        let free = block2::RcBlock::new(move |_: NonNull<std::ffi::c_void>, _: usize| {
+            // SAFETY: the stitch made above, which only this buffer used.
+            unsafe { crate::mem::Stitch::free(range.0 as *mut u8, range.1) };
+        });
+        // SAFETY: `ptr..ptr+len` is mapped until the deallocator runs.
+        let buf = unsafe {
+            self.dev.newBufferWithBytesNoCopy_length_options_deallocator(
+                p,
+                len,
+                MTLResourceOptions::StorageModeShared,
+                Some(&free),
+            )
+        };
+        let Some(buf) = buf else {
+            // SAFETY: no buffer was made over the range.
+            unsafe { crate::mem::Stitch::free(ptr, len) };
+            return Err("newBufferWithBytesNoCopy refused a stitched range".into());
+        };
+        Ok((
+            Buffer {
+                buf,
+                base: ptr,
+                pool: true,
+                resident: Default::default(),
+                views: Default::default(),
+            },
+            ptr,
+        ))
     }
 
     fn host_buffer(&self, len: usize) -> Result<(Buffer, *mut u8), String> {
@@ -529,7 +582,9 @@ impl ComputeBackend for Metal {
         let buffer = Buffer {
             buf,
             base,
+            pool: false,
             resident: Default::default(),
+            views: Default::default(),
         };
         Ok((buffer, base))
     }
@@ -553,8 +608,11 @@ impl ComputeBackend for Metal {
                 }
             }
         };
+        let Some(_changes) = crate::gfx::RESIDENCY.changes() else {
+            return Err("GPU residency has stopped".into());
+        };
         let mut joined = false;
-        for b in buffers.iter().filter(|b| !b.is_resident()) {
+        for b in buffers.iter().filter(|b| b.pool && !b.is_resident()) {
             set.addAllocation(ProtocolObject::from_ref(&*b.buf));
             *b.resident.borrow_mut() = Some(set.clone());
             self.count(|c| c.added += 1);

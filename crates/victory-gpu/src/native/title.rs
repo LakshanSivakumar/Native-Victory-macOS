@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::resources::{Format, GraphicsBackend, PresentBackend};
+#[cfg(target_os = "macos")]
+use victory_metal::frame_time::{Metric, Timer};
 
 /// A wait for a memory value (`Wait32BitValueX`, `Wait64BitValueX`): the value at `address`
 /// (`bytes` 4 or 8, masked) compared with `reference` by a D3D12 comparison function.
@@ -143,11 +145,18 @@ pub struct Stats {
     pub undetilable: u64,
 }
 
+/// Why a mesh dispatch could not be recorded. Retained in the pipeline cache so every
+/// attempted dispatch is counted, while shader diagnostics are emitted only once.
+#[derive(Clone, Copy, Debug)]
+pub enum MeshRefusal { OverLimit, ConversionFailed, NoPipeline }
+
 /// What a title pipeline object became on the host.
 pub enum Pipe<B: GraphicsBackend> {
     Compute(Rc<ComputePso<B>>),
     /// With the argument layout of its translated shaders (none: the title's root as it is).
+    /// A mesh pipeline is one too (its backend pipeline has a mesh thread-group size).
     Render(Rc<B::RenderPipeline>, Option<Rc<Binding>>),
+    MeshRefused(MeshRefusal),
     /// A guessed graphics pipeline (`VICTORY_GUESS_GRAPHICS`): made, per target formats and
     /// vertex strides, at its draws.
     Guess(Rc<Guessed<B>>),
@@ -163,6 +172,7 @@ impl<B: GraphicsBackend> Clone for Pipe<B> {
         match self {
             Pipe::Compute(p) => Pipe::Compute(p.clone()),
             Pipe::Render(p, b) => Pipe::Render(p.clone(), b.clone()),
+            Pipe::MeshRefused(r) => Pipe::MeshRefused(*r),
             Pipe::Guess(g) => Pipe::Guess(g.clone()),
             #[cfg(target_os = "macos")]
             Pipe::Skipped => Pipe::Skipped,
@@ -191,16 +201,23 @@ enum QueuedAction<B: PresentBackend> {
     Present(Rc<B::Queue>, Rc<B::Surface>, Vec<Rc<B::Texture>>),
 }
 
+type FlowSnap<T> = (u32, String, Rc<T>, u32, [usize; 3]);
+
 pub struct Title<B: PresentBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
     pub pipelines: HashMap<usize, Pipe<B>>,
+    /// Rectangle-output variants, separate from ordinary and guessed-strip pipelines.
+    pub rect_pipes: HashMap<(usize, TargetFormats), Pipe<B>>,
     /// Host pipelines of the console's pipelines (whose state names no target formats) by title
     /// pipeline object and the targets of the draw ([`super::console_state`]).
     pub console_pipes: HashMap<(usize, TargetFormats), Pipe<B>>,
     /// Host pipelines of compute pipelines dispatched with thread counts (`DispatchX`), whose
     /// shader is translated for that, by title pipeline object.
     pub thread_pipes: HashMap<usize, Pipe<B>>,
+    /// `VICTORY_TRACE_FLOW_SNAP`: copies of a colour target made on the GPU in the middle of a
+    /// captured frame (sequence number, what the copy follows, the copy, format, [width, height, depth]).
+    pub flow_snaps: Vec<FlowSnap<B::Texture>>,
     /// What the shader path did, and refused.
     pub shaders: super::shaders::ShaderStats,
     /// How long a new pipeline may hold the frame while Metal compiles it (`glue::compile_wait`);
@@ -240,9 +257,12 @@ pub struct Title<B: PresentBackend> {
     pub(super) copies_of: HashMap<usize, (usize, super::textures::TextureInfo)>,
     /// Keys in `textures` by the title memory they start at.
     pub(super) at_memory: HashMap<usize, Vec<usize>>,
-    /// Placed copies another placement covered, given up once nothing uses them
+    /// Placed copies another placement covered, mapped to the displacing key; given up once safe
     /// ([`Self::give_up_covered`]).
-    pub(super) covered: std::collections::HashSet<usize>,
+    pub(super) covered: HashMap<usize, usize>,
+    /// Clear stale entries for covered copies, unless VICTORY_COVERED_CLEAR=0.
+    pub(super) covered_clear: bool,
+    pub(super) covered_history: super::textures::CoveredHistory,
     /// Resource objects whose host texture a placed view names too: its address and key.
     pub(super) shared: HashMap<usize, (u64, usize)>,
     queues: HashMap<usize, Rc<B::Queue>>,
@@ -265,8 +285,10 @@ impl<B: PresentBackend> Title<B> {
         Title {
             host,
             pipelines: HashMap::new(),
+            rect_pipes: HashMap::new(),
             console_pipes: HashMap::new(),
             thread_pipes: HashMap::new(),
+            flow_snaps: Vec::new(),
             shaders: Default::default(),
             compile_wait: std::time::Duration::MAX,
             libraries: Default::default(),
@@ -288,6 +310,8 @@ impl<B: PresentBackend> Title<B> {
             copies_of: HashMap::new(),
             at_memory: HashMap::new(),
             covered: Default::default(),
+            covered_clear: std::env::var("VICTORY_COVERED_CLEAR").as_deref() != Ok("0"),
+            covered_history: Default::default(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),
@@ -388,32 +412,19 @@ impl<B: PresentBackend> Title<B> {
         self.pump();
     }
 
-    /// `ID3D12CommandQueue::Signal`: behind work the queue still holds, else on the GPU at once
-    /// (after the work already submitted to its queue).
+    /// `ID3D12CommandQueue::Signal`: retain the action at its queue's head
+    /// until submission succeeds, including when no earlier work is held.
     pub fn signal_queue(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
         let r = self.requested.entry(fence).or_insert((0, std::time::Instant::now()));
         if value > r.0 {
             *r = (value, std::time::Instant::now());
         }
-        if self.held.holds_work(queue) {
-            let n = self.next_action;
-            self.next_action += 1;
-            let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else { return };
-            self.actions.insert(n, QueuedAction::Signal(q, f, value));
-            self.held.push(queue, Item::Signal(n, 0));
-        } else {
-            self.signal_gpu(queue, fence, initial, value);
-        }
+        let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else { return };
+        let n = self.next_action;
+        self.next_action += 1;
+        self.actions.insert(n, QueuedAction::Signal(q, f, value));
+        self.held.push(queue, Item::Signal(n, 0));
         self.pump();
-    }
-
-    fn signal_gpu(&mut self, queue: usize, fence: usize, initial: u64, value: u64) {
-        let (Ok(q), Ok(f)) = (self.queue(queue), self.fence(fence, initial)) else {
-            return;
-        };
-        if let Err(e) = self.host.execute(&q, &[], &[], &[(&*f, value)]) {
-            tracing::warn!(error = %e, "a fence signal was not queued");
-        }
     }
 
     /// Queue waits remain on the CPU until completion, including committed producers.
@@ -430,6 +441,8 @@ impl<B: PresentBackend> Title<B> {
 
     /// Runs the heads of held queues that may run, until none can.
     pub fn pump(&mut self) {
+        #[cfg(target_os = "macos")]
+        let _pump = Timer::counted(Metric::Pump, Metric::Pumps);
         if self.held.is_empty() {
             return;
         }
@@ -468,7 +481,8 @@ impl<B: PresentBackend> Title<B> {
             match actions.get(&n) {
                 Some(QueuedAction::Signal(q, f, value)) => {
                     if let Err(e) = host.execute(q, &[], &[], &[(&**f, *value)]) {
-                        tracing::warn!(error = %e, "a held fence signal was not queued");
+                        tracing::warn!(error = %e, "a held fence signal was not queued; retaining it for retry");
+                        return false;
                     }
                 }
                 Some(QueuedAction::Present(queue, surface, planes)) => {
@@ -511,7 +525,7 @@ impl<B: PresentBackend> Title<B> {
                 let f = self.fences.get(k)?;
                 let done = self.host.backend.completed(f);
                 (done < want && since.elapsed() >= limit)
-                    .then(|| format!("fence {k:#x}: signal of {want} queued {:.1?} ago, GPU at {done}", since.elapsed()))
+                    .then(|| format!("fence {k:#x}: signal of {want} requested {:.1?} ago, GPU at {done}", since.elapsed()))
             })
             .collect();
         let memory = self.host.memory();

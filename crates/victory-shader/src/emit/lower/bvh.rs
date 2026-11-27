@@ -100,6 +100,27 @@ impl Lower<'_> {
             l.i32_of(v)
         };
         let node = word(self, 0)?;
+        if self.x.bvh_no_hit {
+            let Operand::Vector { reg: out, .. } = *data else {
+                return Err("a BVH intersection result");
+            };
+            let guard = self.guard(b, i)?;
+            // Empty scene, in the instruction's encoding: triangle miss (+inf, 1, 0, 0),
+            // or four INVALID children for a box/instance/procedural node. Do not even
+            // form a node address, much less read an unbuilt node through it.
+            let c = self.cur;
+            let seven = self.s.m.i32(7);
+            let ty = self.s.m.bin(c, Bin::And, node, seven);
+            let four = self.s.m.i32(4);
+            let is_tri = self.s.m.cmp(c, pred::IULT, ty, four);
+            let none = self.s.m.i32(INVALID);
+            for (k, m) in [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0].into_iter().enumerate() {
+                let miss = self.s.m.i32(m);
+                let value = self.s.m.select(c, is_tri, miss, none);
+                self.write(inst, Reg::V(out + k as u8), value, guard);
+            }
+            return Ok(());
+        }
         let node_hi = if wide { Some(word(self, 1)?) } else { None };
         let first = 1 + usize::from(wide);
         let mut f = [self.s.m.f32(0); 10];

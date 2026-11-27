@@ -659,6 +659,112 @@ fn a_mask_selected_by_scc_joined_with_data_nanded_with_exec_is_each_lanes_bit() 
     assert_eq!(got[40..], [1; 24]);
 }
 
+/// A whole-wave sum of 16-bit floats (`WaveActiveSum` of `min16float`: `v_add_f16` steps, which
+/// keep the high half of their destination), the words of a title's deformation kernel: lanes
+/// 0..39 of each console wave stay and hold 1.0 in the low half and the thread's number plus one
+/// in the high half; the rest leave for the end. The sum is 40.0 (32 lanes of the lower host
+/// wave and 8 of the upper), and the high half is lane 0's.
+fn half_sum() -> Vec<u32> {
+    let mut w = vec![
+        0x360A_00BF, // v_and_b32 v5, 63, v0
+        0x7D88_0AA8, // v_cmp_gt_u32 vcc, 40, v5
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(28),
+        0x4A0E_0081, // v_add_nc_u32 v7, 1, v0
+        0x340E_0E90, // v_lshlrev_b32 v7, 16, v7
+        0x380E_0EFF, 0x0000_3C00, // v_or_b32 v7, 0x3c00, v7
+        0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+        0xD501_0001, 0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+        0x6402_02E9, 0xDE54_C101, // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        0x6402_02E9, 0x9360_1201, // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        0x6402_02E9, 0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+        0x6402_02FA, 0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+        0xD778_0002, 0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+        0x6402_0302, // v_add_f16 v1, v2, v1
+        0xD760_0007, 0x0001_4101, // v_readlane_b32 s7, v1, 32
+        0x6402_0207, // v_add_f16 v1, s7, v1
+        0xD760_0007, 0x0001_0101, // v_readlane_b32 s7, v1, 0
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0x7E04_0207, // v_mov_b32 v2, s7
+        V_LSHLREV_V1_2_V0,
+    ];
+    w.extend(GLOBAL_STORE_V2_AT_V1);
+    w.push(S_ENDPGM);
+    w
+}
+
+/// 40.0 as a 16-bit float.
+const F16_40: u32 = 0x5100;
+
+#[test]
+fn a_whole_wave_sum_of_16_bit_floats_adds_both_halves() {
+    let got = run_io(&half_sum(), 0, 64, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [1 << 16 | F16_40; 40]);
+    assert_eq!(got[40..], [CANARY; 24]);
+}
+
+/// The same in a group of two console waves (four host waves), where the lanes that left are
+/// kept on to the end so that both halves of each wave reach the exchange: each wave sums its own
+/// lanes and keeps its own lane 0's high half (threads 0 and 64).
+#[test]
+fn a_whole_wave_sum_of_16_bit_floats_in_each_wave_of_a_group() {
+    let got = run_io(&half_sum(), 0, 128, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [1 << 16 | F16_40; 40]);
+    assert_eq!(got[40..64], [CANARY; 24]);
+    assert_eq!(got[64..104], [65 << 16 | F16_40; 40]);
+    assert_eq!(got[104..], [CANARY; 24]);
+}
+
+/// One lane clears a word of LDS, every lane ORs a bit into it atomically, and that lane reads
+/// the word back: the title's tiled lighting gathers a tile's material mask this way (its
+/// `tiled_lighting` compute shaders), with no barrier, since the console runs the wave in
+/// lockstep. Lane `i` gives bit `2 * (i / 4)`, so the word is every even bit, from both halves,
+/// and an odd bit is something no lane put there. (This program stores by address and has LDS,
+/// so it runs upstream's lowering; `tile_wave_tests` has the same gather under the console flow.)
+#[test]
+fn a_word_of_lds_one_lane_clears_gathers_every_lanes_bits() {
+    let w = [
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xD834_0000, // ds_write_b32 v4, v4
+        0x0000_0404,
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        0x2C0A_0082, // v_lshrrev_b32 v5, 2, v0
+        0x340A_0A81, // v_lshlrev_b32 v5, 1, v5
+        0x7E0C_0281, // v_mov_b32 v6, 1
+        0x340A_0D05, // v_lshlrev_b32 v5, v5, v6
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xD828_0000, // ds_or_b32 v4, v5
+        0x0000_0504,
+        S_WAITCNT_LGKM,
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        skip_execz(7),
+        0x7E06_0280, // v_mov_b32 v3, 0
+        DS_READ_V2_AT_V3[0],
+        DS_READ_V2_AT_V3[1],
+        S_WAITCNT_LGKM,
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    for round in 0..4 {
+        let got = run(&w, 1, 0);
+        if got.is_empty() {
+            return;
+        }
+        assert_eq!(got[0], 0x5555_5555, "round {round}: {:#010x}", got[0]);
+        assert_eq!(got[1..], [CANARY; 63]);
+    }
+}
+
 #[test]
 fn a_mask_join_read_by_two_ands_with_execs_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
     // `s[8:9]` holds the lanes below 50, then loaded data for lanes 0..39 (a join of data and a

@@ -13,6 +13,9 @@ pub(crate) extern "system" fn create_variant(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    if !crate::pipeline::console_pipelines() {
+        return crate::object::E_NOTIMPL;
+    }
     if records.is_null() || count as usize > MAX_RECORDS {
         return E_INVALIDARG;
     }

@@ -215,10 +215,16 @@
 mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
+#[cfg(test)]
+mod bvh_no_hit_tests;
 mod container;
+#[cfg(test)]
+pub(crate) use container::{SigElement as TestSigElement, signature as test_signature};
 #[cfg(test)]
 mod container_tests;
 pub mod graphics;
+mod mesh;
+pub use mesh::{METAL_MESH_OUTPUT_BYTES, metal_mesh_bytes};
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -228,6 +234,8 @@ pub mod host;
 mod lockstep;
 mod lower;
 mod rect;
+#[cfg(test)]
+mod rect_tests;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(test)]
 mod export_tests;
@@ -256,6 +264,8 @@ mod waterfall_tests;
 mod wave;
 #[cfg(test)]
 mod wave32_tests;
+#[cfg(test)]
+mod console_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -306,6 +316,8 @@ pub const TRANSLATION_SWITCHES: &[&str] = &[
     "VICTORY_DEBUG_VS_POS",
     "VICTORY_DEBUG_VS_TRI",
     "VICTORY_NO_LOCKSTEP",
+    "VICTORY_NO_CONSOLE_FLOW",
+    "VICTORY_EXPORT_INTERLEAVED",
 ];
 
 /// The [`TRANSLATION_SWITCHES`] that are set, as `NAME=value` lines in the
@@ -440,6 +452,9 @@ pub struct UserData {
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
+    /// Return misses from BVH node tests without reading node memory. Hosts that suppress
+    /// the builder must enable this too; ordinary translation keeps full intersection tests.
+    pub bvh_no_hit: bool,
     /// Writes through buffer views mark the pages they write (module notes,
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
@@ -477,6 +492,10 @@ pub struct Options {
     /// vertex ids `3 * instance + 0..2`, and the strip vertex id 0 to 3 picks a corner, the fourth
     /// being the sum of two corners less the right-angle one (`SV_Position.xy` or the first
     /// two-channel float fetch).
+    /// For a described vertex shader, instead evaluates the whole program at the three console
+    /// vertex IDs and completes its outputs. Draw six host vertices per rectangle as a triangle
+    /// list, doubling the first vertex. The instance ID is unchanged; stage-in attributes are
+    /// refused (shader-pulled attributes are evaluated with each console ID).
     pub rect_list: bool,
     /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
     /// n, undefined values) because its pixel shader reads them.
@@ -505,6 +524,51 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_kept(container, options, None, None)
+}
+
+/// Translate a mesh/pixel pair together, dropping arbitrary outputs the emitted pixel
+/// shader never reads (including depth-only pairs). The host measures the linked DXIL.
+pub fn translate_linked(mesh: &[u8], pixel: Option<&[u8]>, options: Options)
+    -> Result<(HostShader, Option<HostShader>), ShaderError>
+{
+    let ps = pixel.map(|p| translate_kept(p, options, None, Some(HwStage::Ps))).transpose()?;
+    if ps.as_ref().is_some_and(|p| p.stage != HwStage::Ps) {
+        return Err(ShaderError::Malformed("mesh consumer is not a pixel shader"));
+    }
+    let reads = match &ps {
+        Some(ps) => pixel_input_reads(&ps.dxil)?,
+        None => lower::KeptOutputs::new(),
+    };
+    let ms = translate_kept(mesh, options, Some(&reads), Some(HwStage::Ms))?;
+    if ms.stage != HwStage::Ms { return Err(ShaderError::Malformed("mesh producer is not a mesh shader")); }
+    let ps = pixel.map(|p| translate_kept(p, options, Some(&reads), Some(HwStage::Ps))).transpose()?;
+    Ok((ms, ps))
+}
+
+/// The arbitrary (non system value) input channels an emitted pixel shader reads, by
+/// `(UPPERCASE_NAME, semantic index)`: the emitted signature's read masks, not the console's
+/// declared masks.
+fn pixel_input_reads(dxil: &[u8]) -> Result<lower::KeptOutputs, ShaderError> {
+    let mut reads = lower::KeptOutputs::new();
+    let c = Container::parse(dxil)?;
+    let Some(part) = c.part(FourCC::ISG1) else { return Ok(reads) };
+    let count = crate::dxbc::u32_at(part.data, 0)? as usize;
+    let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+    for i in 0..count {
+        let at = base + i * 32;
+        if crate::dxbc::u32_at(part.data, at + 12)? != 0 { continue; }
+        let name_at = crate::dxbc::u32_at(part.data, at + 4)? as usize;
+        let name = part.data.get(name_at..).and_then(|s| s.split(|&b| b == 0).next())
+            .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        let index = crate::dxbc::u32_at(part.data, at + 8)?;
+        let mask = *part.data.get(at + 25).ok_or(ShaderError::Malformed("signature truncated"))?;
+        *reads.entry((String::from_utf8_lossy(name).to_ascii_uppercase(), index)).or_insert(0) |= mask;
+    }
+    Ok(reads)
+}
+
+fn translate_kept(container: &[u8], options: Options, keep: Option<&lower::KeptOutputs>, stage: Option<HwStage>) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -513,10 +577,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
+            stage.map_or(matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms), |want| p.stage == want)
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
@@ -538,7 +599,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     )?;
     let io = io::raise_graphics(&p, &native, guessed)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_kept(&c, &native, &p, &st, &io, &res, options, keep)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -564,7 +625,15 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
-    match emit_fast(c, native, p, st, io, res, options) {
+    emit_kept(c, native, p, st, io, res, options, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_kept(
+    c: &Container, native: &NativeProgram, p: &ir::Program, st: &structure::Structured,
+    io: &io::Io, res: &resource::Resources, options: Options, keep: Option<&lower::KeptOutputs>,
+) -> Result<HostShader, ShaderError> {
+    match emit_fast(c, native, p, st, io, res, options, keep) {
         Err(ShaderError::Unsupported { .. }) if lockstep::fits(native, st, &options) => {
             lockstep::retry(c, native, p, io, res, options)
         }
@@ -572,15 +641,11 @@ pub fn emit_with(
     }
 }
 
-/// [`emit_with`] without the lockstep fallback.
+/// [`emit_with`] without the lockstep fallback, preserving linked signatures.
+#[allow(clippy::too_many_arguments)]
 fn emit_fast(
-    c: &Container,
-    native: &NativeProgram,
-    p: &ir::Program,
-    st: &structure::Structured,
-    io: &io::Io,
-    res: &resource::Resources,
-    options: Options,
+    c: &Container, native: &NativeProgram, p: &ir::Program, st: &structure::Structured,
+    io: &io::Io, res: &resource::Resources, options: Options, keep: Option<&lower::KeptOutputs>,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -684,9 +749,10 @@ fn emit_fast(
         zero_copy_memory: options.zero_copy_memory,
         rect_list: options.rect_list,
         copy_params: options.copy_params,
+        bvh_no_hit: options.bvh_no_hit,
     };
     let guessed = graphics::is_guessed(c);
-    let l = match lower::lower_graphics(&parts(st, res), guessed) {
+    let l = match lower::lower_graphics_pruned(&parts(st, res), guessed, keep) {
         // A console wave the host splits needs both halves at each group
         // barrier, and lanes that left early for the end never arrive.
         // Kept on to the end with EXEC off (`ir::keep_lanes_to_end`), they do.
@@ -698,7 +764,7 @@ fn emit_fast(
             let Some(q) = ir::keep_lanes_to_end(p) else {
                 return Err(e);
             };
-            return emit_fast(c, native, &q, &structure::structure(&q)?, io, res, options);
+            return emit_fast(c, native, &q, &structure::structure(&q)?, io, res, options, keep);
         }
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
@@ -708,7 +774,7 @@ fn emit_fast(
             let res = resource::track_graphics(
                 p, &native.layout, native.stage, Some(&st), guessed && options.zero_copy_memory,
             )?;
-            lower::lower_graphics(&parts(&st, &res), guessed)?
+            lower::lower_graphics_pruned(&parts(&st, &res), guessed, keep)?
         }
         l => l?,
     };
@@ -878,6 +944,7 @@ mod tests {
         // test programs.
         const NOT_TRANSLATION: &[&str] = &[
             "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_TRACE_CONSOLE_FLOW",
             "VICTORY_WARP",
             "VICTORY_PC_DXC",
             "VICTORY_DXIL",
@@ -1784,6 +1851,18 @@ mod tests {
         isg1: &[u8],
         osg1: &[u8],
     ) -> Result<HostShader, ShaderError> {
+        emit_pixel_kept(words, inputs, input_addr, isg1, osg1, None)
+    }
+
+    /// [`emit_pixel`] linked to a producer: only the inputs in `keep` stay in the signature.
+    fn emit_pixel_kept(
+        words: &[u32],
+        inputs: Vec<crate::native::PsInput>,
+        input_addr: u32,
+        isg1: &[u8],
+        osg1: &[u8],
+        keep: Option<&lower::KeptOutputs>,
+    ) -> Result<HostShader, ShaderError> {
         let native = super::NativeProgram {
             stage: super::HwStage::Ps,
             wave64: false,
@@ -1804,7 +1883,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native)?;
-        let out = emit(&c, &native, &p, &st, &io, &res)?;
+        let out = emit_kept(&c, &native, &p, &st, &io, &res, Options::default(), keep)?;
         // dxil.dll, where there is one, checks the module.
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -1854,6 +1933,43 @@ mod tests {
             pack2: false,
             row2: 0,
         }
+    }
+
+    /// Two 16-bit values per dword, linked: parameter 0 packs TEXCOORD0 (dwords 0-1) and
+    /// TEXCOORD1 (dwords 2-3), and the program reads only dword 2's low half (TEXCOORD1.x). A
+    /// link prunes TEXCOORD0 and narrows TEXCOORD1 to x; the half is still found by the declared
+    /// signature's packing. Before, the pruned signature was packed again, parameter 0 was gone
+    /// and the pair was refused ("a packed input half no element holds").
+    #[test]
+    fn a_packed_half_is_found_in_the_declared_layout_after_a_link_prunes_inputs() {
+        let words = [
+            0xD742_0002, 0x0202_0080, // v_interp_p1ll_f16 v2, v0, attr0.z
+            0xD75A_0003, 0x040A_0280, // v_interp_p2_f16 v3, v1, attr0.z, v2
+            0x7E08_1703, // v_cvt_f32_f16 v4, v3
+            0xF800_180F,
+            0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+            0xBF81_0000,
+        ];
+        let inputs = || {
+            vec![crate::native::PsInput { mask: 0b1111, pack2: true, row2: 1, ..texcoord(true) }]
+        };
+        let isg1 = rows(&[("TEXCOORD", 0, true), ("TEXCOORD", 0, true)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let reads = |host: &HostShader| -> lower::KeptOutputs {
+            let mut reads = pixel_input_reads(&host.dxil).unwrap();
+            reads.retain(|_, mask| *mask != 0);
+            reads
+        };
+        let full = emit_pixel(&words, inputs(), 1 << 1, &isg1, &osg1).unwrap();
+        let keep = reads(&full);
+        assert_eq!(keep, [(("TEXCOORD".to_string(), 1), 1)].into_iter().collect());
+        let linked = emit_pixel_kept(&words, inputs(), 1 << 1, &isg1, &osg1, Some(&keep)).unwrap();
+        // The linked program reads the same element, now alone in its signature.
+        assert_eq!(reads(&linked), keep);
+        let c = Container::parse(&linked.dxil).unwrap();
+        let sig = signature(c.part(FourCC::ISG1).unwrap().data).unwrap();
+        let arbitrary: Vec<_> = sig.iter().filter(|e| e.kind == 0).map(|e| (e.index, e.col, e.cols)).collect();
+        assert_eq!(arbitrary, [(1, 0, 1)]);
     }
 
     /// A 16-bit read of an input no stage data marks 16-bit is refused saying which: an f16

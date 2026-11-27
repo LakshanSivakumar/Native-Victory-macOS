@@ -1805,13 +1805,42 @@ mod state {
         unsafe { std::slice::from_raw_parts(items, count as usize) }
     }
 
-    /// `DispatchMesh(x, y, z)`: the bound mesh pipeline runs those groups (#353).
-    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
-        super::count_draw();
-        glue::dispatch_mesh(this, x, y, z);
+    pub(super) use super::native_mesh as dispatch_mesh;
+    pub(super) use super::native_mesh_x as dispatch_mesh_x;
+
+    /// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource, values, rectangle
+    /// count, rectangles)`: the view the title made at the CPU handle, cleared to the values.
+    /// shortcut: the whole view, whatever the rectangles.
+    pub(super) extern "system" fn clear_unordered_uint(
+        this: This,
+        _gpu: u64,
+        cpu: u64,
+        _resource: This,
+        values: *const [u32; 4],
+        _count: u32,
+        _rects: *const u8,
+    ) {
+        // SAFETY: the title passes four values (null is tolerated).
+        if let Some(&values) = unsafe { values.as_ref() } {
+            crate::native::glue::clear_unordered(this, cpu, values, false);
+        }
     }
-    pub(super) use super::ignored_state as clear_unordered_float;
-    pub(super) use super::ignored_state as clear_unordered_uint;
+
+    /// `ClearUnorderedAccessViewFloat`, the same with four floats.
+    pub(super) extern "system" fn clear_unordered_float(
+        this: This,
+        _gpu: u64,
+        cpu: u64,
+        _resource: This,
+        values: *const [u32; 4],
+        _count: u32,
+        _rects: *const u8,
+    ) {
+        // SAFETY: as above.
+        if let Some(&values) = unsafe { values.as_ref() } {
+            crate::native::glue::clear_unordered(this, cpu, values, true);
+        }
+    }
 
     /// `(count, handles, one range, depth)`: with one range, the handles follow the first at the
     /// render target view size (128 bytes).
@@ -1888,20 +1917,6 @@ mod state {
         super::count_dispatch();
         glue::dispatch(this, x, y, z);
     }
-    /// `DispatchMeshX`: with `indirect`, a Metal indirect mesh draw of the record at that title
-    /// address; without, `x` groups of the bound mesh pipeline (#353). Both are the D3D12 host's
-    /// guess in `dispatch_mesh_x` (`docs/native-host.md`): flags and payload are ignored.
-    pub(super) extern "system" fn dispatch_mesh_x(this: This, x: u32, flags: u64, indirect: u64, payload: u64) {
-        if indirect == 0 {
-            dispatch_mesh(this, x, 1, 1);
-            return;
-        }
-        if glue::execute_indirect(this, crate::signature::Command::DispatchMesh, 12, 1, indirect, None) {
-            super::count_draw();
-            return;
-        }
-        super::dropped_mesh_x(this, x, flags, indirect, payload);
-    }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         glue::set_heaps(this, items(heaps, count));
     }
@@ -1977,24 +1992,10 @@ fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Draws of the kinds the host does not run yet (indirect, mesh), and
-/// dispatches, counted per frame for the log.
-/// shortcut: dropped until their shaders translate (decision 0007).
-#[cfg(not(windows))]
+/// Draws counted on hosts without a graphics backend.
+#[cfg(not(any(windows, target_os = "macos")))]
 extern "system" fn draw(_: This) {
     count_draw();
-}
-
-/// Commands the native host drops, by kind: mesh dispatches, indirect mesh dispatches, indirect
-/// executions, texture copies and resolves.
-#[cfg(target_os = "macos")]
-pub(crate) static DROPPED_KINDS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
-
-/// The totals of [`DROPPED_KINDS`].
-#[cfg(target_os = "macos")]
-pub(crate) fn dropped_kinds() -> (u64, u64, u64, u64, u64) {
-    let n = |i: usize| DROPPED_KINDS[i].load(std::sync::atomic::Ordering::Relaxed);
-    (n(0), n(1), n(2), n(3), n(4))
 }
 
 /// Indirect executions dropped so far.
@@ -2004,18 +2005,22 @@ pub(crate) fn indirect_dropped() -> u64 {
 }
 
 #[cfg(target_os = "macos")]
-fn drop_kind(kind: usize) {
-    DROPPED_KINDS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let what = ["a mesh dispatch", "an indirect mesh dispatch", "an indirect execution", "a texture copy or resolve", "a dropped command of kind 4"][kind.min(4)];
-    crate::native::glue::warn_once(what);
-    crate::native::glue::trace_reason(what);
+extern "system" fn native_mesh(this: This, x: u32, y: u32, z: u32) {
+    count_draw();
+    crate::native::glue::dispatch_mesh(this, [x, y, z], None);
 }
 
-/// An indirect mesh dispatch the host could not run.
 #[cfg(target_os = "macos")]
-extern "system" fn dropped_mesh_x(this: This, _x: u32, _flags: u64, _indirect: u64, _payload: u64) {
-    drop_kind(1);
-    draw(this);
+extern "system" fn native_mesh_x(this: This, x: u32, flags: u64, indirect: u64, payload: u64) {
+    count_draw();
+    // The console payload ABI is not a D3D amplification shader. Never discard a payload
+    // silently or reinterpret unknown flags as ordinary group counts.
+    if payload != 0 || flags != 0 {
+        crate::native::glue::warn_once("mesh dispatch flags or an external payload not represented on Metal");
+        crate::native::glue::refuse_mesh(crate::native::title::MeshRefusal::NoPipeline, indirect != 0);
+        return;
+    }
+    crate::native::glue::dispatch_mesh(this, [x, 1, 1], (indirect != 0).then_some(indirect));
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
@@ -2518,7 +2523,10 @@ mod tests {
                 table.f[0x1b0 / 8],
                 state::clear_unordered_float as *const ()
             );
-            assert_eq!(table.f[0x1b8 / 8], ignored_state as *const ());
+            // The empty ignored_state may have separate addresses in different codegen
+            // units. Compare stored entries: DiscardResource uses the ignored root-signature
+            // handler, rather than a fresh function-pointer coercion in this test's unit.
+            assert_eq!(table.f[0x1b8 / 8], table.f[0x108 / 8]);
         }
     }
 

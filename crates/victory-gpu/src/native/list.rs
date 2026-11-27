@@ -135,12 +135,26 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// entry, see `NativeHost::view_addresses`), made the first time a shader reads them and kept
     /// current by every mirrored write after that.
     pub addresses: std::cell::RefCell<Option<Rc<super::addr::Pages<B>>>>,
-    /// The title record (tag, view index, generation) each entry was last mirrored from.
-    pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, [u8; 12]>>,
+    /// Successful mirrors, including the mappings/resource identities they resolved against.
+    pub mirrored: std::cell::RefCell<std::collections::HashMap<usize, super::host::MirrorStamp>>,
     /// Entries whose last mirror attempt could not complete yet, keyed by `(record, pool_gen, res_gen)`
     /// so unchanged entries are retried only once the pool table or registered resources change.
     pub pending_mirror: std::cell::RefCell<std::collections::HashMap<usize, PendingMirror>>,
     pub images: std::cell::RefCell<Shown>,
+    /// The entries that show a buffer view through a span buffer (`NativeHost::span`): which
+    /// span, and which of its buffers. Written again when the title maps the range differently.
+    pub spanned: std::cell::RefCell<std::collections::HashMap<usize, super::host::SpanRef>>,
+    /// The entries given the null view because their buffer view's memory was not mapped: tried
+    /// again when the pool table changes.
+    pub unmapped: std::cell::RefCell<std::collections::BTreeSet<usize>>,
+    /// The entries that show a plane of a depth texture's writable twin (an unordered access
+    /// view of the depth texture, `NativeHost::twin_plane`), with the depth texture's key.
+    pub twin_uavs: std::cell::RefCell<std::collections::BTreeMap<usize, usize>>,
+    /// Colour reads that follow an existing twin, without marking it written.
+    pub twin_srvs: std::cell::RefCell<std::collections::BTreeMap<usize, usize>>,
+    /// The entries that show a depth texture itself (a shader resource view), with its key:
+    /// what a use reads once the texture has a twin.
+    pub depth_srvs: std::cell::RefCell<std::collections::BTreeMap<usize, usize>>,
     /// With `VICTORY_TRACE_HEAP_SET`: the frame (+1; 0: never) each entry was last inside a table a
     /// draw or dispatch bound (diagnostics).
     pub used: std::cell::RefCell<Vec<u32>>,
@@ -1408,8 +1422,9 @@ impl<B: GraphicsBackend> NativeList<B> {
             root: self.state.graphics_root.clone(),
             heaps: self.state.heaps.clone(),
             targets: self.state.targets.clone(),
-            vertex: self.state.vertex.iter().map(|(&slot, &addr)| (slot, addr)).collect(),
-            index: self.state.index,
+            // A mesh dispatch reads no vertex or index buffers: stale ones are not resolved.
+            vertex: if matches!(call, DrawCall::Mesh { .. }) { Vec::new() } else { self.state.vertex.iter().map(|(&slot, &addr)| (slot, addr)).collect() },
+            index: if matches!(call, DrawCall::Mesh { .. }) { None } else { self.state.index },
             state: self.state.draw,
             call,
             indirect,

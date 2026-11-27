@@ -10,8 +10,8 @@
 //! missing fourth corner, and each strip instance past the first would see
 //! `SV_VertexID` = `0..3` again.
 //!
-//! Such a program runs its body three times in one invocation — for console
-//! vertex ids `3 * instance + 0`, `3 * instance + 1` and `3 * instance + 2` —
+//! Such a program runs its body three times in one invocation - for console
+//! vertex ids `3 * instance + 0`, `3 * instance + 1` and `3 * instance + 2` -
 //! finds the right-angle corner opposite the longest `SV_Position.xy` side,
 //! extrapolates the fourth corner `p + q - r` across every float output, and
 //! selects `(p, r, fourth, q)` by the strip vertex id `0..3`.

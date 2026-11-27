@@ -180,6 +180,20 @@ pub struct NativeProgram {
 }
 
 impl NativeProgram {
+    /// Root parameters spilled past the hardware user SGPRs into a table starting at
+    /// user-data index 16. This is the arrangement used by this title's BVH builder
+    /// (the 7900XTX fork's `spill::is_spilled` detector), not a general RT-stage tag.
+    pub fn is_spilled(&self) -> bool {
+        let StageIo::Cs(cs) = &self.io else { return false };
+        if self.stage != HwStage::Cs || cs.user_sgprs() < 2 {
+            return false;
+        }
+        self.layout.iter()
+            .filter(|e| e.sgprs > 0 && e.user_data >= cs.user_sgprs())
+            .map(|e| e.user_data)
+            .min() == Some(16)
+    }
+
     /// The code with each render target's export patched for its full
     /// 32-bit format, so exports carry the shader's values unconverted (as
     /// the console does at pipeline creation for that format).
@@ -1241,6 +1255,96 @@ pub(crate) mod tests {
         );
     }
 
+    /// Synthetic FSSM register images, linked through exactly the native host's translator.
+    #[test]
+    fn mesh_stage_registers_and_pixel_pair_link_before_output_measurement() {
+        use crate::dxbc::{self, FourCC};
+        use crate::emit::{self, TestSigElement as SigElement, test_signature as signature};
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>();
+        let ms_code = words(&[
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0xF800_020F,
+            0, // exp param0 v0, v0, v0, v0
+            0xF800_021F,
+            0, // exp param1 v0, v0, v0, v0
+            0xF800_0941,
+            0, // exp prim v0, off, off, off done
+            0xF800_08CF,
+            0, // exp pos0 v0, v0, v0, v0 done
+            0xBF81_0000,
+        ]);
+        let mut ms_blob = fssm(&[(HwStage::Ms, &ms_code)]);
+        let ms_at = stage_data_at(&ms_blob, HwStage::Ms);
+        ms_blob[ms_at + VS_OUTPUTS..][..12].copy_from_slice(&[6, 0, 0, 0, 0, 0, 6, 1, 1, 0, 0, 0]);
+        ms_blob[ms_at + VS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        ms_blob[ms_at + MS_INFO..][..8].copy_from_slice(&[128, 0, 128, 0, 64, 0, 0, 2]);
+        let ps_code = words(&[
+            0xC808_0000,
+            0xC809_0001,
+            0xF800_180F,
+            0x0202_0202,
+            0xBF81_0000,
+        ]);
+        let mut ps_blob = fssm(&[(HwStage::Ps, &ps_code)]);
+        let ps_at = stage_data_at(&ps_blob, HwStage::Ps);
+        ps_blob[ps_at + PS_INPUTS..][..8].copy_from_slice(&[6, 0, 1, 0, 0, 0, 0, 0]);
+        ps_blob[ps_at + PS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        ps_blob[ps_at + PS_INPUT_ADDR..][..4].copy_from_slice(&2u32.to_le_bytes());
+        let element = |name: &str, index, kind, row, cols| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            row: Some(row),
+            col: 0,
+            cols,
+            comp: 9,
+            interp: 0,
+            usage: 15,
+            half: false,
+        };
+        let ms = dxbc::build(&[
+            (FourCC::DXIL, &part(&[(KIND_NATIVE, &xbch(&ms_blob))])),
+            (
+                FourCC::OSG1,
+                &signature(
+                    &[
+                        element("TEXCOORD", 0, 0, 0, 4),
+                        element("TEXCOORD", 1, 0, 1, 4),
+                        element("SV_Position", 0, 3, 2, 4),
+                    ],
+                    false,
+                ),
+            ),
+        ]);
+        let ps = dxbc::build(&[
+            (FourCC::DXIL, &part(&[(KIND_NATIVE, &xbch(&ps_blob))])),
+            (
+                FourCC::ISG1,
+                &signature(&[element("TEXCOORD", 0, 0, 0, 4)], true),
+            ),
+            (
+                FourCC::OSG1,
+                &signature(&[element("SV_Target", 0, 16, 0, 4)], false),
+            ),
+        ]);
+        let options = emit::Options {
+            wave32_host: true,
+            zero_copy_memory: true,
+            ..Default::default()
+        };
+        let full = emit::translate_with(&ms, options).unwrap();
+        let (linked, pixel) = emit::translate_linked(&ms, Some(&ps), options).unwrap();
+        assert_eq!(linked.stage, HwStage::Ms);
+        assert_eq!(pixel.unwrap().stage, HwStage::Ps);
+        assert!(
+            emit::metal_mesh_bytes(&linked.dxil).unwrap() < emit::metal_mesh_bytes(&full.dxil).unwrap()
+        );
+        let (depth_only, pixel) = emit::translate_linked(&ms, None, options).unwrap();
+        assert!(pixel.is_none());
+        assert_eq!(emit::metal_mesh_bytes(&depth_only.dxil), Some(128 * 16));
+        assert!(emit::translate_linked(&ps, Some(&ms), options).is_err());
+    }
+
     #[test]
     fn mesh_stage_io_ignores_unused_vs_input_count() {
         let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
@@ -1249,6 +1353,43 @@ pub(crate) mod tests {
         blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
         let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
         assert!(matches!(p.io, StageIo::Ms(_)));
+    }
+
+    #[test]
+    fn spilled_user_data_detects_only_the_builder_layout() {
+        let mut p = NativeProgram {
+            stage: HwStage::Cs, wave64: false, vgprs: 1,
+            layout: vec![RootParam {
+                root: RootType::Constants, table_offset_dwords: 0, sgprs: 2,
+                base_register: 0, user_data: 16, slot: 0,
+            }],
+            used: vec![], io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [1; 3] }),
+            code: vec![],
+        };
+        assert!(p.is_spilled());
+        for registers in [0, 1, 17, 31] {
+            p.io = StageIo::Cs(ComputeIo { rsrc2: registers << 1, threads: [1; 3] });
+            assert!(!p.is_spilled(), "registers={registers}");
+        }
+        for registers in [2, 5, 16] {
+            p.io = StageIo::Cs(ComputeIo { rsrc2: registers << 1, threads: [1; 3] });
+            assert!(p.is_spilled());
+        }
+        for first in [0, 15, 17, 20] {
+            p.layout[0].user_data = first;
+            assert!(!p.is_spilled(), "first={first}");
+        }
+        p.layout[0].user_data = 16;
+        p.layout[0].sgprs = 0;
+        assert!(!p.is_spilled());
+        p.layout[0].sgprs = 2;
+        p.stage = HwStage::Ms;
+        assert!(!p.is_spilled());
+        p.stage = HwStage::Cs;
+        p.io = StageIo::Vs { inputs: vec![], outputs: vec![] };
+        assert!(!p.is_spilled());
+        p.layout.clear();
+        assert!(!p.is_spilled());
     }
 
     #[test]

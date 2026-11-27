@@ -1,13 +1,8 @@
-//! The console's rectangle lists on the host. A rectangle comes as three
-//! corners in any order (the blits put the right angle at `v1`, the tiled
-//! lighting at `v0`), and the hardware adds the fourth opposite the right
-//! angle `vc`, at `va + vb - vc`, for the position and every attribute. The
-//! host has no such primitive; a geometry shader made for the vertex shader
-//! that feeds it takes each triangle `(v0, v1, v2)`, finds the right angle
-//! opposite its longest side, and emits the triangle with its completion
-//! `(va, vb, v3)` (`va` before `vc`, `vb` after it), both turning the same
-//! way. Integer outputs (which can only be flat) keep `va`'s value at the
-//! fourth corner.
+//! Rectangle lists on the host. Described vertex programs replay three console IDs and
+//! complete their outputs at `p1 + p2 - p0`. The geometry path retains its corner inference:
+//! find the right angle `vc` opposite the longest side and complete it at `va + vb - vc`.
+//! Both paths emit two triangles with matching winding. Integer outputs (which can only
+//! be flat) keep `va`'s value at the fourth corner.
 
 use super::bitcode::{Attr, Bin, Term, V, pred};
 use super::shader::Shader;
@@ -66,57 +61,8 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         }
         corners.push(values);
     }
-    // The right angle, as [`right_angle`] picks it from the position.
-    let position = elements
-        .iter()
-        .position(|e| e.kind == 3 && e.cols >= 2 && e.comp == 9)
-        .ok_or(ShaderError::Malformed("a rectangle list without a position"))?;
-    let side = |s: &mut Shader, i: usize, j: usize| {
-        let mut sum = None;
-        for (&p, &q) in corners[i][position].iter().zip(&corners[j][position]).take(2) {
-            let d = s.m.bin(b, Bin::Sub, p, q);
-            let sq = s.m.bin(b, Bin::Mul, d, d);
-            sum = Some(match sum {
-                Some(x) => s.m.bin(b, Bin::Add, x, sq),
-                None => sq,
-            });
-        }
-        sum.expect("two columns")
-    };
-    let (d12, d20, d01) = (side(&mut s, 1, 2), side(&mut s, 2, 0), side(&mut s, 0, 1));
-    let longest = |s: &mut Shader, d: V, others: [V; 2]| {
-        let [x, y] = others.map(|o| s.m.cmp(b, pred::OGT, d, o));
-        s.m.bin(b, Bin::And, x, y)
-    };
-    let (at0, at2) = (longest(&mut s, d12, [d20, d01]), longest(&mut s, d01, [d12, d20]));
-    // `x0` if the right angle is at v0, `x2` if at v2, else `x1`.
-    let pick = |s: &mut Shader, [x0, x1, x2]: [V; 3]| {
-        let x = s.m.select(b, at2, x2, x1);
-        s.m.select(b, at0, x0, x)
-    };
-    // The completing triangle (va, vb, v3), element by element.
-    let mut second: [Vec<Vec<V>>; 3] = Default::default();
-    for (id, e) in elements.iter().enumerate() {
-        let mut cols: [Vec<V>; 3] = Default::default();
-        let [c0, c1, c2] = [0, 1, 2].map(|k| &corners[k][id]);
-        for ((&v0, &v1), &v2) in c0.iter().zip(c1).zip(c2) {
-            let va = pick(&mut s, [v2, v0, v1]);
-            let vb = pick(&mut s, [v1, v2, v0]);
-            let v3 = if e.comp == 9 {
-                let vc = pick(&mut s, [v0, v1, v2]);
-                let sum = s.m.bin(b, Bin::Add, va, vb);
-                s.m.bin(b, Bin::Sub, sum, vc)
-            } else {
-                va
-            };
-            for (k, v) in [va, vb, v3].into_iter().enumerate() {
-                cols[k].push(v);
-            }
-        }
-        for (k, c) in cols.into_iter().enumerate() {
-            second[k].push(c);
-        }
-    }
+    let (at0, at2) = right_angle_flags(&mut s, b, &elements, &corners)?;
+    let second = complement(&mut s, b, &elements, &corners, at0, at2);
     corners.extend(second);
     for triangle in [[0, 1, 2], [3, 4, 5]] {
         for k in triangle {
@@ -138,6 +84,144 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     s.outputs = elements;
     s.m.terminate(b, Term::Ret);
     Ok(s.finish())
+}
+
+/// Geometry-stage rectangles may put the right angle at any supplied corner.
+fn right_angle_flags(
+    s: &mut Shader,
+    b: usize,
+    elements: &[super::container::SigElement],
+    corners: &[Vec<Vec<V>>],
+) -> Result<(V, V), ShaderError> {
+    // The right angle, as [`right_angle`] picks it from the position.
+    let position = elements
+        .iter()
+        .position(|e| e.kind == 3 && e.cols >= 2 && e.comp == 9)
+        .ok_or(ShaderError::Malformed("a rectangle list without a position"))?;
+    let side = |s: &mut Shader, i: usize, j: usize| {
+        let mut sum = None;
+        for (&p, &q) in corners[i][position].iter().zip(&corners[j][position]).take(2) {
+            let d = s.m.bin(b, Bin::Sub, p, q);
+            let sq = s.m.bin(b, Bin::Mul, d, d);
+            sum = Some(match sum {
+                Some(x) => s.m.bin(b, Bin::Add, x, sq),
+                None => sq,
+            });
+        }
+        sum.expect("two columns")
+    };
+    let (d12, d20, d01) = (side(s, 1, 2), side(s, 2, 0), side(s, 0, 1));
+    let longest = |s: &mut Shader, d: V, others: [V; 2]| {
+        let [x, y] = others.map(|o| s.m.cmp(b, pred::OGT, d, o));
+        s.m.bin(b, Bin::And, x, y)
+    };
+    let (at0, at2) = (longest(s, d12, [d20, d01]), longest(s, d01, [d12, d20]));
+    Ok((at0, at2))
+}
+
+/// Complete every output with the same pivot and preserve the original triangle's winding.
+fn complement(
+    s: &mut Shader,
+    b: usize,
+    elements: &[super::container::SigElement],
+    corners: &[Vec<Vec<V>>],
+    at0: V,
+    at2: V,
+) -> [Vec<Vec<V>>; 3] {
+    // `x0` if the right angle is at v0, `x2` if at v2, else `x1`.
+    let pick = |s: &mut Shader, [x0, x1, x2]: [V; 3]| {
+        let x = s.m.select(b, at2, x2, x1);
+        s.m.select(b, at0, x0, x)
+    };
+    // The completing triangle (va, vb, v3), element by element.
+    let mut second: [Vec<Vec<V>>; 3] = Default::default();
+    for (id, e) in elements.iter().enumerate() {
+        let mut cols: [Vec<V>; 3] = Default::default();
+        let [c0, c1, c2] = [0, 1, 2].map(|k| &corners[k][id]);
+        for ((&v0, &v1), &v2) in c0.iter().zip(c1).zip(c2) {
+            let va = pick(s, [v2, v0, v1]);
+            let vb = pick(s, [v1, v2, v0]);
+            let v3 = if e.comp == 9 {
+                let vc = pick(s, [v0, v1, v2]);
+                let sum = s.m.bin(b, Bin::Add, va, vb);
+                s.m.bin(b, Bin::Sub, sum, vc)
+            } else {
+                va
+            };
+            for (k, v) in [va, vb, v3].into_iter().enumerate() {
+                cols[k].push(v);
+            }
+        }
+        for (k, c) in cols.into_iter().enumerate() {
+            second[k].push(c);
+        }
+    }
+    second
+}
+
+/// A described vertex program evaluates the console body for IDs 3r, 3r+1 and 3r+2.
+/// Six host vertices select the original triangle followed by its completion. Instance IDs
+/// are never repurposed as rectangle numbers. This runs after lowering, leaving its export
+/// scheduling intact and collecting even exports inside branches before the final stores.
+pub(super) fn expand_vertex(s: &mut Shader) -> Result<(), ShaderError> {
+    if s.inputs.iter().any(|e| e.kind == 0 && e.usage != 0) {
+        return Err(ShaderError::Unsupported { offset: 0,
+            what: "rectangle output expansion of stage-in vertex attributes" });
+    }
+    let vertex = match s.inputs.iter().position(|e| e.kind == 1) {
+        Some(id) => id,
+        None => {
+            let row = s.inputs.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+            s.inputs.push(super::container::SigElement {
+                name: "SV_VertexID".into(), index: 0, kind: 1, comp: 5, interp: 0,
+                row: Some(row), col: 0, cols: 1, usage: 1, half: false,
+            });
+            s.inputs.len() - 1
+        }
+    };
+    s.inputs[vertex].usage = 1;
+    let elements = s.outputs.clone();
+    let (f32t, i32t) = (s.t.f32, s.t.i32);
+    let outputs: Vec<_> = elements.iter().enumerate().flat_map(|(id, e)| {
+        (0..e.cols).filter(|&col| e.usage >> col & 1 != 0)
+            .map(move |col| (id as u32, col, if e.comp == 9 { f32t } else { i32t }))
+    }).collect();
+    let i8t = s.m.int(8);
+    let ty = s.m.func_ty(s.t.i32, vec![s.t.i32, s.t.i32, s.t.i32, i8t, s.t.i32]);
+    s.m.ptr(ty);
+    let load = s.m.function("dx.op.loadInput.i32", ty, Some(Attr::ReadNone), false);
+    let (b, corner, values) = s.m.rectangle_values(vertex as u32, load, &outputs);
+    let mut corners = Vec::new();
+    for values in values {
+        let mut rows: Vec<Vec<_>> = elements.iter().map(|e| {
+            vec![s.m.undef(if e.comp == 9 { s.t.f32 } else { s.t.i32 }); e.cols as usize]
+        }).collect();
+        for (&(id, col, _), v) in outputs.iter().zip(values) { rows[id as usize][col as usize] = v; }
+        corners.push(rows);
+    }
+    // Described lists supply p0 as the parallelogram's pivot, including when a vertex
+    // transform makes its two edges non-orthogonal. Do not infer another pivot from lengths.
+    let (at0, at2) = (s.m.bool(true), s.m.bool(false));
+    let second = complement(s, b, &elements, &corners, at0, at2);
+    corners.extend(second);
+    let mut ready = Vec::new();
+    for &(id, col, _) in &outputs {
+        let mut v = corners[0][id as usize][col as usize];
+        for (k, values) in corners.iter().enumerate().take(6).skip(1) {
+            let n = s.m.i32(k as u32);
+            let is = s.m.cmp(b, pred::EQ, corner, n);
+            v = s.m.select(b, is, values[id as usize][col as usize], v);
+        }
+        ready.push((id, col, v));
+    }
+    // The converter requires all values before the consecutive component stores.
+    for (id, col, v) in ready {
+        let suffix = if elements[id as usize].comp == 9 { ".f32" } else { ".i32" };
+        let args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), v];
+        s.op(b, &format!("storeOutput{suffix}"), Attr::NoUnwind, s.t.void, 5, &args);
+    }
+    s.m.terminate(b, Term::Ret);
+    Ok(())
 }
 
 #[cfg(test)]

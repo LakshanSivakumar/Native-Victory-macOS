@@ -14,17 +14,35 @@
 
 use super::list::{Binding, ComputePso};
 use super::state::{self, Graphics};
-use super::title::{Pipe, Title};
+use super::title::{MeshRefusal, Pipe, Title};
 use std::collections::HashMap;
 use std::rc::Rc;
 use victory_backend::resources::*;
 use victory_shader::emit::{HostShader, Options};
+
+/// One policy for dispatch and translation, fixed for the process before prewarm workers run.
+/// Opting in restores the existing builder path; it does not make refused stages supported.
+pub(crate) fn builder_runs() -> bool {
+    static RUNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RUNS.get_or_init(|| {
+        let runs = builder_requested(std::env::var_os("VICTORY_BVH_BUILDER").as_deref());
+        if !runs {
+            tracing::info!("ray-tracing structure builder off (VICTORY_BVH_BUILDER=1 runs it)");
+        }
+        runs
+    })
+}
+
+fn builder_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
 
 /// The translation settings of the native host.
 pub fn options() -> Options {
     Options {
         wave32_host: true,
         zero_copy_memory: true,
+        bvh_no_hit: !builder_runs(),
         ..Options::default()
     }
 }
@@ -77,7 +95,7 @@ pub fn translate_threads(container: &[u8]) -> Result<HostShader, String> {
     translate_cached(container, Options { thread_counts: true, ..options() })
 }
 
-/// A guessed vertex shader's container translated to draw rectangle lists (`Options::rect_list`).
+/// A vertex shader's rectangle variant: guessed attribute strips or described output expansion.
 pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
     translate_cached(container, Options { rect_list: true, ..options() })
 }
@@ -163,6 +181,93 @@ pub fn threads_of(dxil: &[u8]) -> Option<[usize; 3]> {
     Some([n(0), n(1), n(2)]).filter(|t| t.iter().all(|&n| n > 0))
 }
 
+/// Metal's per-threadgroup mesh output limit. The Wine/D3DMetal measure
+/// includes alignment between signature elements; the packed component count
+/// alone misses e.g. a 34,816-byte layout that hangs the queue.
+const METAL_MESH_OUTPUT_BYTES: u32 = 32_768;
+
+/// Port of `pipeline/host.rs::metal_mesh_bytes` from the Wine build, using
+/// the container parser for bounds checks. Keep the larger of the aligned
+/// layout and packed component count, as the Wine pipeline guard does.
+pub(crate) fn metal_mesh_bytes(dxil: &[u8]) -> Option<u32> {
+    use victory_shader::{Container, FourCC};
+    let container = Container::parse(dxil).ok()?;
+    let u32_at = |b: &[u8], at: usize| {
+        Some(u32::from_le_bytes(
+            b.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let psv = container.part(FourCC::PSV0)?.data;
+    let info = psv.get(4..4usize.checked_add(u32_at(psv, 0)? as usize)?)?;
+    // Shader kind 13 is mesh.
+    if *info.get(24)? != 13 {
+        return None;
+    }
+    let maximum = |at: usize| {
+        Some(u32::from(u16::from_le_bytes(
+            info.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    let elements = |name| -> Option<Vec<(u32, u32, bool)>> {
+        let Some(part) = container.part(name) else {
+            return Some(Vec::new());
+        };
+        let data = part.data;
+        let count = u32_at(data, 0)? as usize;
+        let base = u32_at(data, 4)? as usize;
+        // Validate the declared records before allocating or iterating.
+        data.get(base..base.checked_add(count.checked_mul(32)?)?)?;
+        (0..count)
+            .map(|i| {
+                let at = base + 32 * i;
+                Some((
+                    u32_at(data, at + 12)?,
+                    data[at + 24].count_ones(),
+                    u32_at(data, at + 20)? != u32::MAX,
+                ))
+            })
+            .collect()
+    };
+    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
+        sizes.filter(|&size| size > 0).try_fold(0u32, |end, size| {
+            end.checked_next_multiple_of(size)?.checked_add(size)
+        })
+    };
+    let vertex = elements(FourCC::OSG1)?;
+    let primitive = elements(FourCC::PSG1)?;
+    let distances = vertex
+        .iter()
+        .filter(|e| matches!(e.0, 2 | 3))
+        .try_fold(0u32, |sum, e| sum.checked_add(e.1))?;
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4, distances as usize)
+            .chain([16])
+            .chain(vertex.iter().filter(|e| e.0 != 1).map(|e| 4 * e.1)),
+    )?;
+    let primitive_bytes = layout(&mut primitive.iter().map(|e| 4 * e.1))?;
+    let (vertices, primitives) = (maximum(12)?, maximum(14)?);
+    let aligned = vertices
+        .checked_mul(vertex_bytes)?
+        .checked_add(primitives.checked_mul(primitive_bytes)?)?;
+    let packed = |elements: &[(u32, u32, bool)]| {
+        elements
+            .iter()
+            .filter(|e| e.2)
+            .try_fold(0u32, |sum, e| sum.checked_add(4 * e.1))
+    };
+    let packed = vertices
+        .checked_mul(packed(&vertex)?)?
+        .checked_add(primitives.checked_mul(packed(&primitive)?)?)?;
+    Some(aligned.max(packed))
+}
+
+/// Default on for the native Metal host. The override only bypasses this
+/// size guard; it does not add the missing native mesh dispatch support.
+fn refuse_over_limit_mesh() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MESH_OVER_LIMIT").as_deref() != Ok("1"))
+}
+
 /// Counts of what the shader path did, and why it refused what it did.
 #[derive(Default, Debug, Clone)]
 pub struct ShaderStats {
@@ -175,12 +280,24 @@ pub struct ShaderStats {
     pub put_off: u64,
     /// Refusals, by reason, with how often.
     pub refused: Vec<(String, u64)>,
+    /// Mesh source shaders warned for output storage, independently of the bounded detail list.
+    mesh_limits: std::collections::HashSet<String>,
+    /// Pipeline variants refused for mesh output storage.
+    pub mesh_over_limit: u64,
 }
 
 impl ShaderStats {
     /// All refusals.
     pub fn refusals(&self) -> u64 {
-        self.refused.iter().map(|r| r.1).sum()
+        self.refused.iter().map(|r| r.1).sum::<u64>() + self.mesh_over_limit
+    }
+
+    fn mesh_limit(&mut self, shader: &str, bytes: u32) {
+        self.mesh_over_limit += 1;
+        if self.mesh_limits.insert(shader.to_owned()) {
+            tracing::warn!(shader, bytes, limit = victory_shader::emit::METAL_MESH_OUTPUT_BYTES,
+                "mesh outputs exceed Metal's limit; pipeline refused");
+        }
     }
 
     fn refuse(&mut self, what: &str, reason: String) {
@@ -264,7 +381,10 @@ impl<B: PresentBackend> Title<B> {
         }
     }
 
-    /// The render pipeline of a translated vertex shader, pixel shader and graphics state.
+    /// The render pipeline of a translated vertex/mesh producer, pixel shader and graphics state.
+    /// A mesh producer (`HwStage::Ms`: a described mesh stage of a stream pipeline, or a guessed
+    /// vertex program that exports primitives) makes a mesh pipeline, also [`Pipe::Render`].
+    /// For mesh pipelines `name` identifies the source mesh, independent of the pixel pairing.
     pub fn render_pipe(
         &mut self,
         vs: &HostShader,
@@ -272,9 +392,12 @@ impl<B: PresentBackend> Title<B> {
         graphics: &Graphics,
         name: &str,
     ) -> Pipe<B> {
-        if let Some(why) = refusal(vs, ps, graphics.is_guessed()) {
+        if self.refuse_mesh(vs, name) {
+            return Pipe::MeshRefused(MeshRefusal::OverLimit);
+        }
+        if let Some(why) = refusal(vs, ps, graphics.is_guessed() || vs.stage == victory_shader::HwStage::Ms) {
             self.shaders.refuse(name, why.into());
-            return Pipe::Refused;
+            return if vs.stage == victory_shader::HwStage::Ms { Pipe::MeshRefused(MeshRefusal::NoPipeline) } else { Pipe::Refused };
         }
         let mut h = blake3::Hasher::new();
         h.update(&vs.dxil);
@@ -311,39 +434,59 @@ impl<B: PresentBackend> Title<B> {
         g: &Graphics,
         name: &str,
     ) -> Pipe<B> {
-        let Some(reads) = state::vertex_inputs(&vs.dxil) else {
-            self.shaders.refuse(name, "no input signature".into());
-            return Pipe::Refused;
-        };
-        let Some((mut attributes, streams)) = g.vertex_layout(&reads) else {
-            self.shaders
-                .refuse(name, "the vertex shader reads an input the layout lacks".into());
-            return Pipe::Refused;
-        };
-        // A system value ahead of the attributes takes an attribute number: described as the
-        // attribute after it, which the converter's function ignores.
-        for at in state::system_gaps(&vs.dxil) {
-            if let Some(next) = attributes.get(at).copied() {
-                attributes.insert(at, next);
+        let mesh = vs.stage == victory_shader::HwStage::Ms;
+        let failed = || if mesh { Pipe::MeshRefused(MeshRefusal::ConversionFailed) } else { Pipe::Refused };
+        if mesh {
+            match victory_shader::emit::metal_mesh_bytes(&vs.dxil) {
+                Some(bytes) if bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES => {
+                    // A mesh can occur in many target-format variants. Warn once by source shader,
+                    // but keep the refusal reason in every cached pipeline for per-dispatch counts.
+                    self.shaders.mesh_limit(name, bytes);
+                    return Pipe::MeshRefused(MeshRefusal::OverLimit);
+                }
+                None => {
+                    self.shaders.refuse(name, "mesh output footprint is unknown".into());
+                    return failed();
+                }
+                _ => {}
             }
         }
+        let (attributes, streams) = if mesh { (Vec::new(), Vec::new()) } else {
+            let Some(reads) = state::vertex_inputs(&vs.dxil) else {
+                self.shaders.refuse(name, "no input signature".into());
+                return failed();
+            };
+            let Some((mut attributes, streams)) = g.vertex_layout(&reads) else {
+                self.shaders
+                    .refuse(name, "the vertex shader reads an input the layout lacks".into());
+                return failed();
+            };
+            // A system value ahead of the attributes takes an attribute number: described as the
+            // attribute after it, which the converter's function ignores.
+            for at in state::system_gaps(&vs.dxil) {
+                if let Some(next) = attributes.get(at).copied() {
+                    attributes.insert(at, next);
+                }
+            }
+            (attributes, streams)
+        };
         // Resolve colour and depth formats, reporting unknown formats as refusals.
         let (color, depth) = match (g.color_formats(), g.depth_format()) {
             (Ok(c), Ok(d)) => (c, d),
             (Err(dxgi), _) => {
                 self.shaders
                     .refuse(name, format!("unknown target format {}", dxgi));
-                return Pipe::Refused;
+                return failed();
             }
             (_, Err(dxgi)) => {
                 self.shaders
                     .refuse(name, format!("unknown depth format {}", dxgi));
-                return Pipe::Refused;
+                return failed();
             }
         };
         if g.samples > 1 {
             self.shaders.refuse(name, "multisampled targets".into());
-            return Pipe::Refused;
+            return failed();
         }
         let color_state = g.color_state();
         // A pixel shader with one output more than there are targets feeds target 0's second
@@ -365,9 +508,10 @@ impl<B: PresentBackend> Title<B> {
         let vs_layout = vs_binding.layout();
         let ps_layout = ps_full.as_ref().and_then(Binding::layout);
         let ps_binding = ps_full
-            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+            .filter(|b| b.memory || b.view_addresses || b.dwords > 0 || !b.views.is_empty());
         let desc = RenderPipelineDesc {
-            vs: &vs.dxil,
+            vs: if mesh { &[] } else { &vs.dxil },
+            mesh: mesh.then_some(MeshPipelineDesc { mesh: &vs.dxil, layout: vs_layout.as_ref(), amplification: None, amplification_layout: None }),
             ps: ps.map(|p| &p.dxil[..]),
             vs_layout: vs_layout.as_ref(),
             ps_layout: ps_layout.as_ref(),
@@ -396,9 +540,24 @@ impl<B: PresentBackend> Title<B> {
                 #[cfg(target_os = "macos")]
                 self.compile_failed(name, &e);
                 self.shaders.refuse(name, format!("conversion: {e}"));
-                Pipe::Refused
+                failed()
             }
         }
+    }
+
+    /// Refuse before converting any stages of an over-limit mesh pipeline.
+    pub(crate) fn refuse_mesh(&mut self, shader: &HostShader, name: &str) -> bool {
+        if shader.stage == victory_shader::HwStage::Ms
+            && refuse_over_limit_mesh()
+            && let Some(bytes) = metal_mesh_bytes(&shader.dxil)
+            && bytes > METAL_MESH_OUTPUT_BYTES
+        {
+            self.shaders.refuse(name, format!(
+                "mesh outputs {bytes} bytes exceed Metal's 32,768-byte limit (VICTORY_MESH_OVER_LIMIT=1 bypasses this guard)"
+            ));
+            return true;
+        }
+        false
     }
 
     /// A translation that failed, counted.
@@ -413,5 +572,102 @@ impl<B: PresentBackend> Title<B> {
     #[cfg(target_os = "macos")]
     pub(crate) fn compile_failed(&mut self, name: &str, error: &str) {
         super::glue::compile_failed(name, error);
+    }
+}
+
+#[cfg(test)]
+mod mesh_tests {
+    use super::*;
+
+    /// Synthetic DXBC metadata only; no game data or executable shader code.
+    fn mesh(vertices: u16, primitives: u16, outputs: &[(u32, u8)], prims: &[(u32, u8)]) -> Vec<u8> {
+        let signature = |elements: &[(u32, u8)]| {
+            let mut data = vec![0; 8 + elements.len() * 32];
+            data[..4].copy_from_slice(&(elements.len() as u32).to_le_bytes());
+            data[4..8].copy_from_slice(&8u32.to_le_bytes());
+            for (i, (kind, mask)) in elements.iter().enumerate() {
+                let at = 8 + i * 32;
+                data[at + 12..at + 16].copy_from_slice(&kind.to_le_bytes());
+                data[at + 20..at + 24].copy_from_slice(&(i as u32).to_le_bytes());
+                data[at + 24] = *mask;
+            }
+            data
+        };
+        let mut psv = vec![0; 52];
+        psv[..4].copy_from_slice(&48u32.to_le_bytes());
+        psv[16..18].copy_from_slice(&vertices.to_le_bytes());
+        psv[18..20].copy_from_slice(&primitives.to_le_bytes());
+        psv[28] = 13;
+        let mut dxil = vec![0; 44];
+        dxil[..4].copy_from_slice(b"DXBC");
+        dxil[28..32].copy_from_slice(&3u32.to_le_bytes());
+        for (i, (name, data)) in [
+            (*b"PSV0", psv),
+            (*b"OSG1", signature(outputs)),
+            (*b"PSG1", signature(prims)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = dxil.len() as u32;
+            dxil[32 + 4 * i..36 + 4 * i].copy_from_slice(&offset.to_le_bytes());
+            dxil.extend(name);
+            dxil.extend((data.len() as u32).to_le_bytes());
+            dxil.extend(data);
+        }
+        let size = dxil.len() as u32;
+        dxil[24..28].copy_from_slice(&size.to_le_bytes());
+        dxil
+    }
+
+    #[test]
+    fn mesh_limit_includes_alignment_and_declared_counts() {
+        let mut outputs = vec![(1, 15)]; // position
+        outputs.extend([(0, 15); 15]);
+        assert_eq!(
+            metal_mesh_bytes(&mesh(128, 0, &outputs, &[])),
+            Some(METAL_MESH_OUTPUT_BYTES)
+        );
+        assert_eq!(metal_mesh_bytes(&mesh(129, 0, &outputs, &[])), Some(33_024));
+        let mut aligned = vec![(1, 15)];
+        for _ in 0..8 {
+            aligned.extend([(0, 1), (0, 15)]);
+        }
+        // Packed components fit (22,528), aligned Metal output does not (34,816).
+        assert_eq!(metal_mesh_bytes(&mesh(128, 0, &aligned, &[])), Some(34_816));
+        assert_eq!(
+            metal_mesh_bytes(&mesh(128, 64, &[(1, 15)], &[(0, 15)])),
+            Some(3_072)
+        );
+        assert_eq!(metal_mesh_bytes(b"not DXBC"), None);
+        let mut not_mesh = mesh(128, 0, &outputs, &[]);
+        not_mesh[44 + 8 + 28] = 1; // PSV stage is vertex
+        assert_eq!(metal_mesh_bytes(&not_mesh), None);
+        let malformed = mesh(128, 0, &outputs, &[]);
+        assert_eq!(metal_mesh_bytes(&malformed[..malformed.len() - 1]), None);
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn builder_switch_requires_exact_opt_in() {
+        assert!(!builder_requested(None));
+        for value in ["", "0", "true", "yes", "01", "1 ", " 1", "2"] {
+            assert!(!builder_requested(Some(OsStr::new(value))), "{value:?}");
+        }
+        assert!(builder_requested(Some(OsStr::new("1"))));
+    }
+
+    // Run this in separate processes with the variable absent and set to 1. No process-wide
+    // environment mutation races the prewarm workers or other tests.
+    #[test]
+    fn builder_switch_and_traversal_options_agree() {
+        let runs = builder_requested(std::env::var_os("VICTORY_BVH_BUILDER").as_deref());
+        assert_eq!(builder_runs(), runs);
+        assert_eq!(options().bvh_no_hit, !runs);
     }
 }

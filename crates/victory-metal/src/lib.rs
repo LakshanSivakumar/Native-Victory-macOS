@@ -10,6 +10,8 @@ mod archive;
 pub use archive::is_compiler_crash;
 pub mod disk;
 #[cfg(target_os = "macos")]
+pub mod frame_time;
+#[cfg(target_os = "macos")]
 pub mod gfx;
 #[cfg(target_os = "macos")]
 pub mod mem;

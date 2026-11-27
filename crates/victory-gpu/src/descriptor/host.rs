@@ -948,7 +948,7 @@ fn view_stride(view: &View) -> u32 {
     element.max(1) as u32
 }
 
-/// The view-stride table's format-kind bits of a buffer view: a typed view
+/// The view-stride table's format-kind bits of an image or buffer view: a typed view
 /// (no structure stride, not raw) of an integer format gets
 /// `VIEW_INTEGER`, a signed one also `VIEW_SIGNED`; anything else none.
 /// Translated shaders pass 16-bit typed data of such views as bits, not as
@@ -958,14 +958,16 @@ fn view_kind(view: &View) -> u32 {
     let (unordered, words): (bool, &[u32; 10]) = match view {
         View::Shader(_, Some(desc)) => (false, desc),
         View::Unordered(_, _, Some(desc)) => (true, desc),
-        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+        View::Placed(unordered, _, desc) => match desc[..10].try_into() {
             Ok(words) => (*unordered, words),
             Err(_) => return 0,
         },
         _ => return 0,
     };
-    // Buffer views only (dimension 1); a structured or raw one is no typed view.
-    let (format, typed) = if unordered {
+    // Texture unions have no buffer stride or raw flag. Their format alone selects the kind.
+    let (format, typed) = if words[1] != 1 {
+        (crate::resource::pc_format(words[0]), true)
+    } else if unordered {
         let desc = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
@@ -976,7 +978,7 @@ fn view_kind(view: &View) -> u32 {
         let b = unsafe { desc.Anonymous.Buffer };
         (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0)
     };
-    match (words[1] == 1 && typed).then(|| integer_format(format)).flatten() {
+    match typed.then(|| integer_format(format)).flatten() {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
         Some(false) => VIEW_INTEGER,
         None => 0,

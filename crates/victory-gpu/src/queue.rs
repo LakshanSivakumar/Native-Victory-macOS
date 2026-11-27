@@ -666,11 +666,8 @@ fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     best
 }
 
-/// Shows the first resource of one plane in our window (the largest
-/// plane unless `VICTORY_PRESENT_PLANE` picks another).
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows each native picture plane in order, with later planes blended over earlier ones,
+/// unless `VICTORY_PRESENT_PLANE` selects a single plane. Windows keeps its own compositor.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -765,7 +762,7 @@ extern "system" fn present(
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
-    // On the native host: the first resource of the shown plane goes to the app's layer.
+    // The native display path scales the picture and UI planes into the app's layer.
     #[cfg(target_os = "macos")]
     {
         let found = plane_resources(planes, plane_parameters);

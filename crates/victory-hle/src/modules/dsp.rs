@@ -114,8 +114,8 @@ fn append_f32(path: &std::path::Path, floats: &[f32]) {
     let _ = file.write_all(&bytes);
 }
 
-/// Writes a convolution stream's own impulse response — the title's bytes,
-/// not the synthetic tail — to `<dir>/stream<n>_ir.f32`, to help settle
+/// Writes a convolution stream's own impulse response - the title's bytes,
+/// not the synthetic tail - to `<dir>/stream<n>_ir.f32`, to help settle
 /// the hardware's partitioned IR layout (see `trace_ir`). Off by default;
 /// reads are bounded by `ir_floats` and `DUMP_IR_MAX`.
 fn dump_ir(dir: &std::path::Path, n: u32, desc: &StreamDesc) {

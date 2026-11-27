@@ -13,6 +13,8 @@ mod run;
 mod shader;
 #[cfg(windows)]
 mod translate;
+#[cfg(not(windows))]
+mod translate_native;
 #[cfg(target_os = "macos")]
 mod warm;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -99,7 +101,7 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (default: every logical core).
+        /// Worker threads (native default: 4; Windows: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
@@ -249,8 +251,8 @@ fn main() -> Result<()> {
             }
             #[cfg(not(any(windows, target_os = "macos")))]
             {
-                let _ = (paths, jobs, pipelines);
-                anyhow::bail!("translate needs a Windows host for now")
+                anyhow::ensure!(!pipelines, "pipeline warm-up needs a Windows host");
+                translate_native::run(paths, false, jobs, true)
             }
         }
         Command::Translate {
@@ -265,12 +267,10 @@ fn main() -> Result<()> {
             {
                 translate::run(paths, validate, pipelines, list, jobs)
             }
-            // Translation checks shaders with the Windows DXC host, which
-            // other hosts do not have yet.
             #[cfg(not(windows))]
             {
-                let _ = (paths, validate, pipelines, list, jobs);
-                anyhow::bail!("translate needs a Windows host for now")
+                anyhow::ensure!(!validate && !pipelines, "DXIL validation and pipeline checks need a Windows host");
+                translate_native::run(paths, list, jobs, false)
             }
         }
         Command::Run {

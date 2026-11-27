@@ -351,6 +351,39 @@ mod tests {
         assert!(held.is_empty());
     }
 
+    /// A backend submission error must return false to Held. The producer
+    /// signal remains before its following work and cannot release a consumer.
+    #[test]
+    fn a_failed_signal_is_retried_in_order_without_replaying_work() {
+        let mut held = Held::new();
+        held.push(1, Item::Segment("producer", vec![]));
+        held.push(1, Item::Signal(10, 7));
+        held.push(1, Item::Segment("after signal", vec![]));
+        held.push(2, Item::FenceWait(10, 7));
+        held.push(2, Item::Segment("consumer", vec![]));
+        held.push(3, Item::Segment("independent", vec![]));
+        let log = RefCell::new(Vec::new());
+        let completed = std::cell::Cell::new(0);
+        let failing = std::cell::Cell::new(true);
+        let mut run = |_, pieces: Vec<&'static str>| log.borrow_mut().extend(pieces);
+        let mut signal = |fence, value| {
+            assert_eq!((fence, value), (10, 7));
+            if failing.get() { return false; }
+            log.borrow_mut().push("signal submitted");
+            completed.set(value);
+            true
+        };
+        let fence = |_| completed.get();
+        let mut world = World { read: &|_, _| None, fence: &fence, run: &mut run, signal: &mut signal };
+        held.pump(&mut world);
+        assert_eq!(*log.borrow(), ["producer", "independent"]);
+        assert!(held.holds_work(1) && held.holds_work(2));
+        failing.set(false);
+        held.pump(&mut world);
+        assert_eq!(*log.borrow(), ["producer", "independent", "signal submitted", "after signal", "consumer"]);
+        assert!(held.is_empty());
+    }
+
     #[test]
     fn comparisons_test_the_masked_value() {
         let read = |_, _| Some(0x1_0000_0005);

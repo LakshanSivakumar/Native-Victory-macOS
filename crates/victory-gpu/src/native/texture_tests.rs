@@ -64,7 +64,7 @@ fn tile(pool: &Pool, at: usize, layout: &victory_formats::texture::Layout) {
 
 fn read_mip(key: usize, mip: usize, w: usize, h: usize) -> Vec<u8> {
     with_title(|t| {
-        let tex = t.texture_of(key).expect("a host texture");
+        let tex = t.texture_of(key).or_else(|| t.host.texture_at(key)).expect("a host texture");
         let mut out = vec![0u8; w * h * 4];
         t.host.backend.read_texture(&tex, mip, 0, &mut out, w * 4, 0);
         out
@@ -598,6 +598,179 @@ fn a_placed_texture_goes_when_replaced_and_with_its_pool() {
     });
 }
 
+/// Synthetic placed SRVs use the resource's format and expose its full mip/layer range.
+fn placed_srv(address: u64, words: &[u32; 14], handle: u64) -> usize {
+    let layers = words[7] & 0xffff;
+    let mut view = [0u32; 16];
+    (view[0], view[1], view[5]) = (words[8], if layers > 1 { 5 } else { 4 }, u32::MAX);
+    view[7] = layers;
+    (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+    crate::descriptor::create_placed_srv(std::ptr::null(), words, &view, handle);
+    crate::native::textures::placed_key(address, words)
+}
+
+#[test]
+fn a_placed_view_at_a_gpu_written_textures_address_shows_that_texture() {
+    let Some(pool) = pool(9251, 4) else { return };
+    let object = crate::resource::test_texture_at(pool.va(0), (32, 16), 1, 42, Swizzle::LINEAR.0, 4);
+    let owner = object as usize;
+    let mut words = crate::resource::texture_desc(object).unwrap();
+    (words[8], words[12]) = (67, 0);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let texels: Vec<u8> = (0..32 * 16u32).flat_map(|i| (0x8100_0000 + i).to_le_bytes()).collect();
+    with_title(|t| {
+        assert!(t.realize(owner));
+        // A producer submission syncs the owner's initial contents before its GPU write.
+        t.sync_textures();
+        let texture = t.texture_of(owner).unwrap();
+        t.host.backend.upload_texture(&texture, 0, 0, &texels, 32 * 4, 0);
+        t.host.heap(HeapKind::Resource, handle, 4).unwrap();
+    }).unwrap();
+    let key = placed_srv(pool.va(0), &words, handle);
+    with_title(|t| {
+        assert!(std::rc::Rc::ptr_eq(&t.host.texture_at(key).unwrap(), &t.texture_of(owner).unwrap()));
+        assert_eq!(t.format_of(key), None, "the placed view has no texture copy of its own");
+        assert!(!t.textures.contains_key(&key) && !t.pending.contains_key(&key));
+        assert!(!t.texture_watched(key) && !t.unloaded.contains(&key));
+        assert!(t.jobs(vec![key]).is_empty());
+        assert!(t.host.heap_at(handle).unwrap().0.mirrored.borrow().contains_key(&0), "the cast view was mirrored");
+        let uploads = t.uploads_of(owner);
+        t.sync_textures();
+        t.sync_dirty();
+        assert_eq!(t.uploads_of(owner), uploads, "alias creation must not schedule another owner upload");
+        assert_eq!(t.uploads_of(key), 0);
+    }).unwrap();
+    assert_eq!(read_mip(key, 0, 32, 16), texels, "the zero title memory must not replace the GPU's words");
+    glue::resource_released(object);
+}
+
+#[test]
+fn releasing_a_gpu_written_texture_releases_its_placed_alias() {
+    let Some(pool) = pool(9253, 4) else { return };
+    let object = crate::resource::test_texture_at(pool.va(0), (32, 16), 1, 42, Swizzle::LINEAR.0, 4);
+    let mut words = crate::resource::texture_desc(object).unwrap();
+    (words[8], words[12]) = (67, 0);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    // The view must find and realize a pending object too.
+    let key = placed_srv(pool.va(0), &words, handle);
+    let old = with_title(|t| {
+        assert!(t.shared.values().any(|(_, placed)| *placed == key));
+        assert!(std::rc::Rc::ptr_eq(&t.host.texture_at(key).unwrap(), &t.texture_of(object as usize).unwrap()));
+        t.host.texture_at(key).unwrap()
+    }).unwrap();
+    glue::resource_released(object);
+    with_title(|t| {
+        assert!(!t.host.knows(key));
+        assert!(!t.shared.values().any(|(_, placed)| *placed == key) && !t.placed.contains_key(&pool.va(0)));
+        assert!(t.host.texture_at(key).is_none());
+    }).unwrap();
+    assert_eq!(placed_srv(pool.va(0), &words, handle), key);
+    with_title(|t| {
+        assert!(t.host.knows(key) && t.textures.contains_key(&key));
+        assert!(!t.shared.values().any(|(_, placed)| *placed == key));
+        assert!(t.unloaded.contains(&key));
+        assert!(!t.texture_watched(key), "sampled copies are watched after their initial upload");
+        t.sync_dirty();
+        assert!(!t.unloaded.contains(&key));
+        assert!(t.texture_watched(key));
+        assert_eq!(t.uploads_of(key), 1);
+        assert!(!std::rc::Rc::ptr_eq(&old, &t.host.texture_at(key).unwrap()));
+        t.host.forget_resource(key);
+        t.texture_released(key);
+    }).unwrap();
+}
+
+#[test]
+fn replacing_a_placed_alias_or_releasing_its_pool_keeps_its_owner() {
+    let Some(pool) = pool(9254, 4) else { return };
+    let object = crate::resource::test_texture_at(pool.va(0), (32, 16), 1, 42, Swizzle::LINEAR.0, 4);
+    let mut words = crate::resource::texture_desc(object).unwrap();
+    (words[8], words[12]) = (67, 0);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let key = placed_srv(pool.va(0), &words, handle);
+    words[4] = 16;
+    let replacement = placed_srv(pool.va(0), &words, handle);
+    with_title(|t| {
+        assert!(!t.host.knows(key));
+        assert!(t.host.knows(object as usize));
+        assert!(t.textures.contains_key(&replacement));
+    }).unwrap();
+    words[4] = 32;
+    assert_eq!(placed_srv(pool.va(0), &words, handle), key);
+    let info = PoolInfo { id: 9254, base: pool.mem.primary as usize, len: pool.mem.len, memory_entry: None };
+    glue::pool_observer().pool_released(&info);
+    with_title(|t| {
+        t.sync_dirty();
+        assert!(!t.host.knows(key));
+        assert!(!t.placed.contains_key(&pool.va(0)));
+        assert!(t.host.knows(object as usize));
+        assert!(t.texture_of(object as usize).is_some());
+    }).unwrap();
+    glue::resource_released(object);
+}
+
+#[test]
+fn incompatible_placed_views_keep_their_own_texture() {
+    let Some(pool) = pool(9256, 32) else { return };
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    // Each rejection is checked with both the object and the placement realized first.
+    for object_first in [true, false] {
+        for (case, own_format, flags, width, height, layers, view_format) in [
+            ("width", 42, 4, 16, 16, 1, 67),
+            ("height", 42, 4, 32, 8, 1, 67),
+            ("layers", 42, 4, 32, 16, 2, 67),
+            ("texel size", 42, 4, 32, 16, 1, 10),
+            ("depth", 40, 2, 32, 16, 1, 41),
+        ] {
+            let object = crate::resource::test_texture_at(pool.va(0), (32, 16), 1, own_format, Swizzle::LINEAR.0, flags);
+            let mut words = crate::resource::texture_desc(object).unwrap();
+            (words[4], words[6], words[7], words[8], words[12]) = (width, height, 1 << 16 | layers, view_format, 0);
+            if object_first {
+                with_title(|t| assert!(t.realize(object as usize), "{case}")).unwrap();
+            }
+            let key = placed_srv(pool.va(0), &words, handle);
+            with_title(|t| {
+                let own = t.texture_of(object as usize).unwrap();
+                let placed = t.host.texture_at(key).unwrap();
+                assert!(!std::rc::Rc::ptr_eq(&own, &placed), "{case}, object first: {object_first}");
+                assert!(t.textures.contains_key(&key) && !t.shared.values().any(|(_, placed)| *placed == key));
+                t.host.forget_resource(key);
+                t.texture_released(key);
+            }).unwrap();
+            glue::resource_released(object);
+        }
+    }
+}
+
+#[test]
+fn a_placed_alias_preserves_the_render_targets_cpu_write_tracking() {
+    let Some(pool) = pool(9257, 4) else { return };
+    let object = crate::resource::test_texture_at(pool.va(0), (32, 16), 1, 42, Swizzle::LINEAR.0, 1);
+    let info = crate::resource::texture_info(object).unwrap();
+    let mut words = crate::resource::texture_desc(object).unwrap();
+    (words[8], words[12]) = (67, 0);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let key = placed_srv(pool.va(0), &words, handle);
+    with_title(|t| {
+        assert!(t.texture_watched(object as usize) && !t.texture_watched(key));
+        tile(&pool, 0, &info.layout);
+        // Apply the owner's read just as the scanner does when it detects the CPU write.
+        let jobs = t.jobs(vec![object as usize, key]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].key, object as usize);
+        t.sync(jobs);
+        assert_eq!(t.uploads_of(key), 0);
+    }).unwrap();
+    let out = read_mip(key, 0, 32, 16);
+    assert_eq!(out[(5 * 32 + 9) * 4..][..4], texel(0, 9, 5));
+    glue::resource_released(object);
+}
+
 /// A render target the title clears through its view: the host texture is the target, never
 /// filled from memory.
 #[test]
@@ -733,13 +906,140 @@ fn an_undetilable_layout_is_counted_not_fatal() {
     assert_eq!(with_title(|t| t.stats.undetilable).unwrap(), before + 1, "once per content");
 }
 
-/// `PresentX`: the first resource of the largest plane is drawn over the app's layer (scaled,
+// These tests share the app's surface. Keep their drawable counters and readbacks isolated.
+static PRESENT_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `PresentX`: a single plane's first resource is drawn over the app's layer (scaled,
 /// whatever its channel order), after the queue's earlier work. Offscreen: the layer is not in a
 /// window; its last drawable is read back.
 #[test]
 fn present_draws_the_back_buffer_over_the_apps_layer() {
+    let _present = PRESENT_TEST.lock().unwrap_or_else(|e| e.into_inner());
     check_present_order(false);
     check_present_order(true);
+}
+
+/// Two independently sized planes, including a zero-alpha scene and straight-alpha UI,
+/// unlike sRGB formats, and the single-plane override. No process environment is changed.
+#[test]
+fn present_composites_two_planes_and_keeps_single_plane_overrides() {
+    let _present = PRESENT_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    for (case, (bottom_format, top_format, size)) in [
+        (28, 28, 8),
+        (29, 28, 24),
+        (28, 29, 24),
+    ].into_iter().enumerate() {
+        for (choice, single) in [None, Some(0), Some(1)].into_iter().enumerate() {
+            check_present_planes(9270 + case * 3 + choice, bottom_format, top_format, size, single);
+        }
+    }
+}
+
+fn check_present_planes(
+    id: usize,
+    bottom_format: u32,
+    top_format: u32,
+    size: usize,
+    single: Option<usize>,
+) {
+    use std::rc::Rc;
+    use victory_backend::backend::ComputeBackend;
+
+    let Some(pool) = pool(id, 16) else { return };
+    let bottom = crate::resource::test_texture_at(pool.va(0), (4, 4), 1, bottom_format, Swizzle::SW_64KB_S.0, 1);
+    let top = crate::resource::test_texture_at(pool.va(0x10000), (8, 8), 1, top_format, Swizzle::SW_64KB_S.0, 1);
+    let layer = glue::create_layer(size, size).expect("a layer");
+    glue::set_layer(layer.as_ptr()).expect("a surface");
+    let q = crate::queue::test_queue(false);
+    let fence = || {
+        let mut f = std::ptr::null();
+        crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f);
+        f
+    };
+    let (gate, done) = (fence(), fence());
+    glue::queue_wait(q, gate, 1);
+    let bottom_color = [160u8, 40, 80, 0];
+    let top_color = [32u8, 180, 64, 255];
+    let half = [32u8, 180, 64, 128];
+    let retained = with_title(|t| {
+        let bottom = t.texture_of(bottom as usize).unwrap();
+        let top = t.texture_of(top as usize).unwrap();
+        t.sync_textures();
+        // Clear through plain views, just as the title stores display values in sRGB textures.
+        let view = |tex: &_| Rc::new(t.host.backend.create_texture_view(tex, &ViewDesc {
+            format: Format::Rgba8Unorm, mips: (0, 1), slices: (0, 1),
+        }).unwrap());
+        let (bottom_view, top_view) = (view(&bottom), view(&top));
+        let mut list = NativeList::default();
+        list.clear_render_target(&bottom_view, bottom_color.map(|c| f32::from(c) / 255.0));
+        list.clear_render_target(&top_view, [0.0; 4]);
+        list.clear_render_target_rects(&top_view, top_color.map(|c| f32::from(c) / 255.0), &[
+            ClearRect { left: 4, top: 0, right: 8, bottom: 4 },
+        ]);
+        list.clear_render_target_rects(&top_view, half.map(|c| f32::from(c) / 255.0), &[
+            ClearRect { left: 6, top: 1, right: 7, bottom: 2 },
+        ]);
+        t.submit_synced(q as usize, vec![(list, vec![])]);
+        (Rc::downgrade(&bottom), Rc::downgrade(&top))
+    }).unwrap();
+    let before = glue::frames_presented();
+    let frames = if single.is_none() { 3 } else { 1 };
+    for _ in 0..frames {
+        let planes = match single { Some(0) => vec![bottom], Some(1) => vec![top], _ => vec![bottom, top] };
+        glue::present(q, &planes);
+    }
+    glue::queue_signal(q, done, 1);
+    assert_eq!(glue::frames_presented(), before, "present bypassed the wait and clears");
+    assert_eq!(slot::<extern "system" fn(This) -> u64>(done, 0x40)(done), 0);
+    // Only the queued work may keep these resources alive now. Both must survive the wait,
+    // all held presents, and asynchronous drawable acquisition, even after title release.
+    glue::resource_released(bottom);
+    glue::resource_released(top);
+    with_title(|t| {
+        if single != Some(1) { assert!(retained.0.upgrade().is_some()); }
+        if single != Some(0) { assert!(retained.1.upgrade().is_some()); }
+        let gate = t.fence(gate as usize, 0).unwrap();
+        t.host.backend.signal(&gate, 1);
+    });
+    let start = std::time::Instant::now();
+    while glue::frames_presented() < before + frames {
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "worker failed to drain composites");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> i32>(done, 0x48)(done, 1, std::ptr::null_mut()), 0);
+    let (w, h, bgra) = glue::last_frame().expect("a composite frame");
+    assert_eq!((w, h), (size, size));
+    let expected = |top: [f32; 4]| -> [u8; 4] {
+        let rgba = match single {
+            Some(0) => bottom_color,
+            Some(1) => top.map(|c| c.round() as u8),
+            _ => {
+                let a = top[3] / 255.0;
+                let factor = a;
+                [
+                    (f32::from(bottom_color[0]) * (1.0 - a) + top[0] * factor).round() as u8,
+                    (f32::from(bottom_color[1]) * (1.0 - a) + top[1] * factor).round() as u8,
+                    (f32::from(bottom_color[2]) * (1.0 - a) + top[2] * factor).round() as u8,
+                    (f32::from(bottom_color[3]) * (1.0 - a) + top[3]).round() as u8,
+                ]
+            }
+        };
+        [rgba[2], rgba[1], rgba[0], rgba[3]]
+    };
+    let check = |x: usize, y: usize, color: [f32; 4]| {
+        let pixel = &bgra[(y * w + x) * 4..][..4];
+        let want = expected(color);
+        assert!(pixel.iter().zip(want).all(|(&got, want)| got.abs_diff(want) <= 2),
+            "{bottom_format}/{top_format} single={single:?} at {x},{y}: {pixel:?}, want {want:?}");
+    };
+    let scale = size / 8;
+    check(scale, 7 * scale + scale / 2, [0.0; 4]);
+    check(5 * scale + scale / 2, 2 * scale + scale / 2, top_color.map(f32::from));
+    check(6 * scale + scale / 2, scale + scale / 2, half.map(f32::from));
+    if scale == 3 {
+        // One third of the UI colour/alpha at the quadrant's linearly filtered edge.
+        check(11, 4, top_color.map(|c| f32::from(c) / 3.0));
+    }
 }
 
 fn check_present_order(held: bool) {
@@ -1108,72 +1408,73 @@ fn a_render_target_view_selects_its_mip_and_slice() {
     }
 }
 
-/// A rectangle-list draw (`D3D_PRIMITIVE_TOPOLOGY_RECTLIST`, 17) on a described (non-guessed)
-/// pipeline must draw the supplied vertices as `Topology::Triangles` instead of issuing
-/// 4-vertex instanced strips designed for `Options::rect_list`.
+/// Described streams select an output-expansion variant for topology 17 and keep argument
+/// counts in console units until the Metal backend expands them. Topology changes cannot
+/// accidentally reuse the rectangle variant for an ordinary draw.
 #[test]
-fn described_rectangle_list_draw_uses_supplied_triangles() {
+fn described_rectangle_lists_select_the_expanded_pipeline_direct_and_indirect() {
+    use std::rc::Rc;
+    mod program { include!("../../../victory-shader/tests/programs/rect.rs"); }
     let Some(pool) = pool(9204, 4) else { return };
     let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
-    let pso = with_title(|t| {
-        let vs = super::fixture("tri_vs");
-        let ps = super::fixture("tri_ps");
-        t.host
-            .render_pipeline(&RenderPipelineDesc {
-                vs: &vs,
-                ps: Some(&ps),
-                vs_layout: None,
-                ps_layout: None,
-                attributes: &[
-                    VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
-                    VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
-                    VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
-                ],
-                streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
-                color: &[Format::Rgba8Unorm],
-                depth: None,
-                depth_test: None,
-                cull: Cull::None,
-                ..Default::default()
-            })
-            .unwrap()
-    })
-    .unwrap();
-    let pipe_key = 0xDEAD_BEE0usize;
-    glue::install_test_render_pipeline(pipe_key, pso);
-
+    let vs = program::vertex_container();
+    let ps = program::pixel_container();
+    let mut stream = vec![0u8; 24 * 2 + 40];
+    for (at, kind, bytes) in [(0, 1u32, &vs), (24, 2, &ps)] {
+        stream[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+        stream[at + 8..at + 16].copy_from_slice(&(bytes.as_ptr() as u64).to_le_bytes());
+        stream[at + 16..at + 24].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+    }
+    stream[48..52].copy_from_slice(&15u32.to_le_bytes()); // RT formats
+    stream[52..56].copy_from_slice(&28u32.to_le_bytes());
+    stream[84..88].copy_from_slice(&1u32.to_le_bytes()); // one RT
+    let pipeline = crate::pipeline::test_stream(&stream);
+    // Other tests may already have exhausted this frame's translation budget.
+    for (stage, shader) in crate::pipeline::native_stages(pipeline).unwrap().0 {
+        shader.native().unwrap();
+        if stage == "vertex" { shader.native_rect().unwrap(); }
+    }
     let list = crate::list::test_list(false, std::ptr::null());
-    glue::set_pipeline(list, pipe_key as This);
+    glue::set_pipeline(list, pipeline);
     let heap = crate::descriptor::test_heap(false, 4);
     let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
     crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
-    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
-        list,
-        1,
-        &handle,
-        0,
-        std::ptr::null(),
-    );
-    glue::topology(list, 17);
-    glue::draw(list, 6, 1, 3, 0);
-
-    let recorded = with_list(list, |_, l| match l.list.cmds.last() {
-        Some(crate::native::list::Cmd::Draw {
-            topology,
-            call:
-                DrawCall::Arrays {
-                    vertex_count,
-                    instance_count,
-                    first_vertex,
-                    first_instance,
-                },
-            ..
-        }) => Some((*topology, *vertex_count, *instance_count, *first_vertex, *first_instance)),
-        _ => None,
-    })
-    .flatten()
-    .expect("recorded draw");
-    assert_eq!(recorded, (Topology::Triangles, 6, 1, 3, 0));
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(list, 1, &handle, 0, std::ptr::null());
+    let mut pipelines = Vec::new();
+    for topology in [17, 4, 17] {
+        glue::topology(list, topology);
+        let before = with_list(list, |_, l| l.list.cmds.len()).unwrap();
+        let start = std::time::Instant::now();
+        loop {
+            glue::draw(list, 6, 2, 3, 1);
+            if with_list(list, |_, l| l.list.cmds.len() > before).unwrap() { break; }
+            assert!(start.elapsed() < std::time::Duration::from_secs(30), "render pipeline did not compile");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let want = if topology == 17 { Topology::Rectangles } else { Topology::Triangles };
+        with_list(list, |_, l| match l.list.cmds.last() {
+            Some(crate::native::list::Cmd::Draw { pso, topology, call: DrawCall::Arrays { vertex_count, instance_count, first_vertex, first_instance }, .. }) => {
+                assert_eq!((*topology, *vertex_count, *instance_count, *first_vertex, *first_instance), (want, 6, 2, 3, 1));
+                pipelines.push(pso.clone());
+            }
+            _ => panic!("no recorded direct draw"),
+        }).unwrap();
+        for count in [None, Some(pool.va(1040))] {
+            assert!(glue::execute_indirect(list, crate::signature::Command::Draw, 16, 1, pool.va(1024), count));
+            with_list(list, |_, l| match l.list.cmds.last() {
+                Some(crate::native::list::Cmd::Draw { pso, topology, indirect, count: recorded_count, .. }) => {
+                    assert_eq!(*topology, want);
+                    assert!(Rc::ptr_eq(pso, pipelines.last().unwrap()), "direct and indirect draws use the same variant");
+                    assert_eq!(*indirect, Some(pool.va(1024)));
+                    assert_eq!(*recorded_count, count.map(|c| (c, 0)));
+                }
+                _ => panic!("no recorded indirect draw"),
+            }).unwrap();
+        }
+    }
+    assert!(!Rc::ptr_eq(&pipelines[0], &pipelines[1]), "ordinary draws use a different vertex program");
+    assert!(Rc::ptr_eq(&pipelines[0], &pipelines[2]), "the rectangle variant is cached");
+    glue::pipeline_released(pipeline);
 }
 
 /// `DispatchMeshX` with an argument address, called through the list's method table: it records a
@@ -1262,13 +1563,13 @@ fn a_direct_dispatch_mesh_x_draws_its_groups() {
     let Some(pool) = pool(9217, 4) else { return };
     let red = [255u8, 128, 128, 255];
     for (i, (x, want)) in [(1u32, red), (0, [0; 4])].into_iter().enumerate() {
-        let before = crate::list::DROPPED_KINDS[0].load(std::sync::atomic::Ordering::Relaxed);
+        let before = glue::MESH_DROPPED[0].load(std::sync::atomic::Ordering::Relaxed);
         // DispatchMeshX(x, flags, indirect arguments, payload), no arguments.
         let got = mesh_dispatch_into(&pool, 0x2000 * i, 0xDEAD_BEF1, |list| {
             slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, 0x310)(list, x, 0, 0, 0)
         });
         assert!(got.iter().all(|p| *p == want), "x {x}: {:?}", &got[..2]);
-        assert_eq!(crate::list::DROPPED_KINDS[0].load(std::sync::atomic::Ordering::Relaxed), before, "x {x}: not dropped");
+        assert_eq!(glue::MESH_DROPPED[0].load(std::sync::atomic::Ordering::Relaxed), before, "x {x}: not dropped");
     }
 }
 
@@ -1407,7 +1708,7 @@ fn copy_resource_and_copy_texture_region_run_on_the_gpu() {
     )(list, &dst_fp, 0, 0, 0, &src_c, &box_c);
 
     assert_eq!(slot::<extern "system" fn(This) -> i32>(list, 0x48)(list), 0);
-    let before_drops = crate::list::DROPPED_KINDS[3].load(std::sync::atomic::Ordering::Relaxed);
+    let before_drops = crate::native::glue::TEXTURE_COPIES_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
     slot::<extern "system" fn(This, u32, *const This)>(q, 0x50)(q, 1, &list);
     slot::<extern "system" fn(This, This, u64) -> i32>(q, 0x70)(q, f, 1);
     assert_eq!(
@@ -1418,7 +1719,7 @@ fn copy_resource_and_copy_texture_region_run_on_the_gpu() {
         ),
         0
     );
-    let after_drops = crate::list::DROPPED_KINDS[3].load(std::sync::atomic::Ordering::Relaxed);
+    let after_drops = crate::native::glue::TEXTURE_COPIES_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(after_drops, before_drops, "texture copies must not be counted as dropped");
 
     let mut readback = vec![0u8; 3 * pitch + 16];
@@ -2174,6 +2475,7 @@ fn budget_texture(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, at: u
 fn over_budget_only_textures_nothing_uses_are_given_up_and_come_back() {
     let Some((mut t, pool)) = budget_title() else { return };
     let idle = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let idle_weak = std::rc::Rc::downgrade(&t.host.texture_at(idle).unwrap());
     let shown = budget_texture(&mut t, &pool, 0x4000, 0, 0x22);
     let held = budget_texture(&mut t, &pool, 0x8000, 0, 0x33);
     // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ALLOW_UNORDERED_ACCESS.
@@ -2203,6 +2505,7 @@ fn over_budget_only_textures_nothing_uses_are_given_up_and_come_back() {
     t.set_texture_budget(1);
     t.keep_to_budget();
     assert!(!t.host.knows(idle), "the one texture nothing uses is given up");
+    assert!(idle_weak.upgrade().is_none(), "the budget releases the host copy");
     for key in [shown, held, target, unordered] {
         assert!(t.host.knows(key), "{key:#x} is in use");
     }
@@ -2589,8 +2892,11 @@ fn show(t: &mut Title<victory_metal::metal::Metal>, views: &[u32], key: usize) {
 #[test]
 fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
     let Some((mut t, pool)) = budget_title() else { return };
+    t.covered_clear = false; // Preserve this regression's upstream wait semantics.
     let old = budget_placed(&mut t, &pool, 0, 32, 0x44);
     let shown = budget_placed(&mut t, &pool, 0x4000, 32, 0x33);
+    let old_weak = std::rc::Rc::downgrade(&t.host.texture_at(old).unwrap());
+    let shown_weak = std::rc::Rc::downgrade(&t.host.texture_at(shown).unwrap());
     let apart = budget_placed(&mut t, &pool, 0x8000, 16, 0x55);
     let written = budget_placed(&mut t, &pool, 0xA000, 32, 0x77);
     t.gpu_written(written);
@@ -2602,13 +2908,16 @@ fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
     assert!(t.host.knows(old), "not at the placement itself");
     let _ = t.sync_jobs();
     assert!(!t.host.knows(old) && t.host.is_evicted(old), "covered and unused: given up");
+    assert!(old_weak.upgrade().is_none());
     assert!(t.host.knows(shown), "an entry still shows it");
     assert!(t.host.knows(new) && t.host.knows(apart));
     assert!(t.host.knows(written), "the GPU's copy stays");
-    assert!(!t.covered.contains(&written), "and is not even marked");
+    assert!(!t.covered.contains_key(&written), "and is not even marked");
     show(&mut t, &views, apart);
     let _ = t.sync_jobs();
     assert!(!t.host.knows(shown), "given up once its entry shows another");
+    assert!(!t.host.texture_in_use(shown));
+    assert!(shown_weak.upgrade().is_none(), "the covered host copy is released");
     // The old view written again: back, and the new one stays.
     let res = crate::resource::test_texture_at(pool.va(0), (32, 32), 1, 28, Swizzle::LINEAR.0, 0);
     let words = crate::resource::texture_desc(res).unwrap();
