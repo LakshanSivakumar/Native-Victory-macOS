@@ -2928,3 +2928,17 @@ fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
     assert_eq!(draw_sampling(&mut t, &pool, old, 4), [0x44, 0, 0, 0x44]);
     drop(views);
 }
+
+/// `PASSTEX` describes a texture from the host's record only: once the title released the
+/// texture (its object may be freed), the trace says so instead of reading the object.
+#[test]
+fn the_pass_trace_does_not_read_a_released_texture_object() {
+    let Some(pool) = pool(9219, 4) else { return };
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let tex = crate::resource::test_texture_at(pool.va(0), (16, 8), 1, 28, Swizzle::LINEAR.0, 0);
+    crate::descriptor::create_srv(std::ptr::null(), tex, &[28u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0], start);
+    with_title(|t| assert!(glue::pass_info(t, tex as usize).is_some(), "known while alive"));
+    glue::resource_released(tex);
+    with_title(|t| assert!(glue::pass_info(t, tex as usize).is_none(), "nothing after release"));
+}
