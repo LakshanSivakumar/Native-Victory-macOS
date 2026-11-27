@@ -510,6 +510,28 @@ fn size(a: [usize; 3]) -> MTLSize {
     }
 }
 
+/// Typed buffer views' textures made and taken from the cache since the last
+/// [`take_typed_view_counts`].
+static TYPED_VIEWS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// (made, reused) typed buffer views' textures since the last call.
+pub fn take_typed_view_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TYPED_VIEWS[0].swap(0, Relaxed), TYPED_VIEWS[1].swap(0, Relaxed))
+}
+
+/// Entries the typed buffer views' cache keeps before it starts again (`VICTORY_TYPED_VIEW_CACHE`,
+/// 0 = no cache; default 1 << 17, about the typed views live in the world's heaps).
+fn typed_view_cache() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_TYPED_VIEW_CACHE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1 << 17)
+    })
+}
+
 impl Metal {
     fn heap_entry(
         &self,
@@ -951,25 +973,48 @@ impl ResourceBackend for Metal {
             self.write_buffer(heap, index, buffer, title, size);
             return false;
         }
-        let td = MTLTextureDescriptor::new();
-        td.setTextureType(MTLTextureType::TypeTextureBuffer);
-        td.setPixelFormat(pf);
-        // SAFETY: `width` is in `1..=(1 << 26)` and fits inside `buffer.buf`.
-        unsafe {
-            td.setWidth(width);
-        }
-        td.setStorageMode(MTLStorageMode::Shared);
-        let mut usage = MTLTextureUsage::ShaderRead;
-        if writable {
-            usage |= MTLTextureUsage::ShaderWrite;
-        }
-        td.setUsage(usage);
-        let Some(tex) = buffer
-            .buf
-            .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
-        else {
-            self.write_buffer(heap, index, buffer, title, size);
-            return false;
+        // The texture holds its buffer, so the buffer's address in the key is not reused while
+        // the entry is cached.
+        let key = (Retained::as_ptr(&buffer.buf) as *const u8 as usize, offset, width, pf.0, writable);
+        let cap = typed_view_cache();
+        let cached = if cap > 0 { self.typed_views.borrow().get(&key).cloned() } else { None };
+        let tex = match cached {
+            Some(tex) => {
+                TYPED_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tex
+            }
+            None => {
+                let td = MTLTextureDescriptor::new();
+                td.setTextureType(MTLTextureType::TypeTextureBuffer);
+                td.setPixelFormat(pf);
+                // SAFETY: `width` is in `1..=(1 << 26)` and fits inside `buffer.buf`.
+                unsafe {
+                    td.setWidth(width);
+                }
+                td.setStorageMode(MTLStorageMode::Shared);
+                let mut usage = MTLTextureUsage::ShaderRead;
+                if writable {
+                    usage |= MTLTextureUsage::ShaderWrite;
+                }
+                td.setUsage(usage);
+                let Some(tex) = buffer
+                    .buf
+                    .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
+                else {
+                    self.write_buffer(heap, index, buffer, title, size);
+                    return false;
+                };
+                TYPED_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if cap > 0 {
+                    let mut cache = self.typed_views.borrow_mut();
+                    // Bounded: the textures of buffers the host has let go are held only here.
+                    if cache.len() >= cap {
+                        cache.clear();
+                    }
+                    cache.insert(key, tex.clone());
+                }
+                tex
+            }
         };
         let gpu = self.gpu_address(buffer, title);
         let tex_id = resource_id(tex.gpuResourceID());
@@ -4211,5 +4256,99 @@ mod heap_usage_tests {
         m.residency_sets = false;
         let plain = m.create_heap(HeapKind::Resource, 1).unwrap();
         assert_eq!(m.heap_allocations(&plain, &[0]), None);
+    }
+}
+
+#[cfg(test)]
+mod typed_view_tests {
+    use super::*;
+    use crate::mem::{Region, page_size};
+
+    /// The entry's three words (address, texture ID, size).
+    fn words(heap: &Heap, index: usize) -> [u64; 3] {
+        // SAFETY: `index` is inside the heap buffer; the GPU is idle.
+        unsafe {
+            let p = heap.buf.contents().as_ptr().cast::<u64>().add(index * ENTRY / 8);
+            [p.read(), p.add(1).read(), p.add(2).read()]
+        }
+    }
+
+    /// A typed view written again (the title copies the same record into its heaps, and the host
+    /// mirrors it raw, then promotes it) names the texture already made for it: the same entry
+    /// words a fresh one would have, but one texture. Another offset, width, format or
+    /// writability is a texture of its own. With `VICTORY_TYPED_VIEW_CACHE=0` (or without the
+    /// cache) entries 0 and 1 name two textures and this fails.
+    #[test]
+    fn a_typed_view_written_again_reuses_its_texture_and_others_get_their_own() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(4 * page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let heap = m.create_heap(HeapKind::Resource, 8).unwrap();
+        // SAFETY: inside the region.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let _ = take_typed_view_counts();
+        assert!(m.write_typed_buffer(&heap, 0, &buf, at(0), 4096, Format::R32Uint, false));
+        assert!(m.write_typed_buffer(&heap, 1, &buf, at(0), 4096, Format::R32Uint, false));
+        // Index 0 written again with the same view.
+        assert!(m.write_typed_buffer(&heap, 0, &buf, at(0), 4096, Format::R32Uint, false));
+        assert_eq!(take_typed_view_counts(), (1, 2), "one texture made, taken twice from the cache");
+        assert_eq!(words(&heap, 0), words(&heap, 1));
+        assert_eq!(words(&heap, 0)[0], m.gpu_address(&buf, at(0)));
+        assert_eq!(words(&heap, 0)[2], 4096);
+        assert_eq!(heap.typed_views.get(), 2);
+
+        let align = m.dev.minimumTextureBufferAlignmentForPixelFormat(pixel_format(Format::R32Uint)).max(4);
+        assert!(m.write_typed_buffer(&heap, 2, &buf, at(align), 4096, Format::R32Uint, false));
+        assert!(m.write_typed_buffer(&heap, 3, &buf, at(0), 2048, Format::R32Uint, false));
+        assert!(m.write_typed_buffer(&heap, 4, &buf, at(0), 4096, Format::R32Float, false));
+        assert!(m.write_typed_buffer(&heap, 5, &buf, at(0), 4096, Format::R32Uint, true));
+        assert_eq!(take_typed_view_counts(), (4, 0));
+        let ids: std::collections::HashSet<u64> = (0..6).map(|i| words(&heap, i)[1]).collect();
+        assert_eq!(ids.len(), 5, "entries 0 and 1 share a texture, the others have their own");
+
+        // A raw view replaces the entry as before (it no longer holds a typed view); the cache
+        // keeps the texture, so promoting the entry again takes it.
+        m.write_buffer(&heap, 1, &buf, at(0), 4096);
+        assert_eq!(heap.typed_views.get(), 5);
+        assert!(m.write_typed_buffer(&heap, 1, &buf, at(0), 4096, Format::R32Uint, false));
+        assert_eq!(take_typed_view_counts(), (0, 1));
+        assert_eq!(words(&heap, 0), words(&heap, 1));
+        assert_eq!(heap.typed_views.get(), 6);
+    }
+
+    /// What a typed view costs made fresh and taken from the cache, after the raw views a
+    /// remirror writes in between. `cargo test -p victory-metal --release --lib typed_view_cost
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn typed_view_cost() {
+        let m = Metal::new().unwrap();
+        let n = 10_000;
+        let align = m.dev.minimumTextureBufferAlignmentForPixelFormat(pixel_format(Format::R32Uint)).max(4);
+        let region = Region::new((n * align + 4096).next_multiple_of(page_size()), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let heap = m.create_heap(HeapKind::Resource, n).unwrap();
+        // SAFETY: inside the region.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let _ = take_typed_view_counts();
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            m.write_typed_buffer(&heap, i, &buf, at(i * align), 4096, Format::R32Uint, false);
+        }
+        let fresh = t.elapsed();
+        for i in 0..n {
+            m.write_buffer(&heap, i, &buf, at(i * align), 4096);
+        }
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            m.write_typed_buffer(&heap, i, &buf, at(i * align), 4096, Format::R32Uint, false);
+        }
+        let again = t.elapsed();
+        let (made, reused) = take_typed_view_counts();
+        eprintln!(
+            "{n} typed views: first {:.2} us each, written again {:.2} us each ({made} made, {reused} from the cache)",
+            fresh.as_secs_f64() * 1e6 / n as f64,
+            again.as_secs_f64() * 1e6 / n as f64
+        );
     }
 }
