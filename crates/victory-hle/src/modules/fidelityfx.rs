@@ -231,13 +231,13 @@ pub fn use_host_dir(_dir: Option<&Path>) {
 }
 
 /// Whether the host's FidelityFX serves the title's: with the PC build on
-/// Windows; MetalFX carries macOS in M2 (for now it never serves there).
+/// Windows, or with MetalFX where `VICTORY_METALFX=1` (macOS).
 pub(crate) fn serving() -> bool {
     #[cfg(windows)]
     if HOST.get().is_some() {
         return true;
     }
-    false
+    metalfx_enabled()
 }
 
 #[cfg(windows)]
