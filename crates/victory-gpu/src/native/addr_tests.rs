@@ -826,6 +826,73 @@ fn a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool() {
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
+/// One access whose dwords straddle two title pages mapped apart in the pool: a vertex's x ends the
+/// first page and its y starts the next (a raw `offen` load, as the mesh programs read positions).
+#[test]
+fn a_vertex_fetch_straddling_title_pages_apart_in_the_pool_reads_each_dword_where_the_title_has_it() {
+    let vertex = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0x8805_FF01, 0x0008_0000, // s_or_b32 s5, s1, 0x80000 (stride 8)
+        0xBE86_03C1, // s_mov_b32 s6, -1
+        0xBE87_03FF, 0x0001_4FAC, // s_mov_b32 s7, 0x14fac
+        0x3400_0083, // v_lshlrev_b32 v0, 3, v0 (the vertex's byte offset)
+        0xE034_1000, 0x8001_0100, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 offen
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_02F2, // v_mov_b32 v4, 1.0
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF800_08CF, 0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+        0xBF81_0000, // s_endpgm
+    ];
+    let pixel = [
+        0x7E00_02F2, // v_mov_b32 v0, 1.0
+        0x7E02_02F0, // v_mov_b32 v1, 0.5
+        0xF800_180F, 0x0001_0100, // exp mrt0 v0, v1, v1, v0 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let translate = |stage, words: &[u32], meta: &[u8]| {
+        let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let c = victory_shader::emit::graphics::container(stage, &bytes, meta).unwrap();
+        shaders::translate(&c).unwrap()
+    };
+    let mut meta = [0; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x15] = 1; // A root SRV (kind 0, root descriptor) in slot 0, user data 0-1.
+    let vs = translate(HwStage::Vs, &vertex, &meta);
+    let ps = translate(HwStage::Ps, &pixel, &[0; 0x10]);
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    const VA_C: u64 = 0x7100_0000;
+    t.host.memory().mapped(VA_C as usize, 0x1_0000, &f.info, 0x4_0000);
+    t.host.memory().mapped(VA_C as usize + 0x1_0000, 0x1_0000, &f.info, 0x8_0000);
+    // Vertex 1's x is the first page's last dword and its y the next page's first. Read from the
+    // pool after the first page (the canary, -3.7e28), that y leaves the target almost empty.
+    f.put(0x4_FFF4, &[-1.0f32, -1.0, 3.0]);
+    f.put(0x8_0000, &[-1.0f32, -1.0, 3.0]);
+
+    let state = Graphics::guess_base()
+        .for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "straddling vertex") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+    desc.render_target = true;
+    let color = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&color), None);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.set_graphics_root_view(0, VA_C + 0xFFF4);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let mut pixels = [0; 8 * 8 * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+    for p in pixels.chunks(4) {
+        assert_eq!(p, [255, 128, 128, 255]);
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
+
 /// The table follows the title's maps: the same dispatch, the same title addresses, after the title
 /// mapped the pages somewhere else.
 #[test]

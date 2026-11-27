@@ -7308,6 +7308,9 @@ impl<'a> Lower<'a> {
     /// new block: callers take [`Lower::cur`] afresh.
     // shortcut: one lookup per access, so its bytes are taken to lie in one
     // host copy of title memory (any access within a 64 KiB page does).
+    // Raw buffer loads of root views take the next page's own entry for their
+    // later dwords (`title_load_tail`); global, scalar, typed-format and BVH
+    // loads and all stores do not yet: give them the same if one is seen to cross.
     pub(crate) fn memory(
         &mut self,
         lo: V,
@@ -13799,6 +13802,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let mut typed_h = None;
+        let mut split = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -13838,16 +13842,24 @@ impl<'a> Lower<'a> {
                 }
                 None => {
                     let bytes = 4 * count;
-                    let (h, off) =
+                    let first = self.root_address(src);
+                    let (h, at) =
                         self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
-                    self.s.op(
+                    let r = self.s.op(
                         self.cur,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, off, iu, mask, align],
-                    )
+                        &[h, at, iu, mask, align],
+                    );
+                    match first {
+                        Some((lo, hi)) if count > 1 && !d16 => {
+                            split = Some(self.title_load_tail(lo, hi, off, count, r, guard));
+                            r
+                        }
+                        _ => r,
+                    }
                 }
             }
         };
@@ -13894,11 +13906,72 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
+            let x = match &split {
+                Some(xs) => xs[k as usize],
+                None => self.s.m.extract(c, r, k),
+            };
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// A load of `count` dwords of title memory at `(hi:lo) + off` already made as `r` through
+    /// the page entry of its first byte: its channels, those on the next 64 KiB title page read
+    /// through that page's own entry. The title maps the next page anywhere in its pool, so the
+    /// first page's view goes on into other memory (a vertex whose x ends a page and y starts the
+    /// next read the wrong y: world meshes drawn as shards). The second lookup and load run only in
+    /// lanes whose access crosses a page.
+    fn title_load_tail(&mut self, lo: V, hi: V, off: V, count: u32, r: V, guard: Option<V>) -> Vec<V> {
+        let c = self.cur;
+        let (lo1, hi1) = self.add64(lo, hi, off, false);
+        let last = self.s.m.i32(4 * (count - 1));
+        let (lo2, hi2) = self.add64(lo1, hi1, last, false);
+        let (k16, zero) = (self.s.m.i32(16), self.s.m.i32(0));
+        // The page of a dword other than the first's: its address differs from the first's in bits
+        // 16 and up (a carry into the high dword changes bits 16-31 of the low one too).
+        let other = |l: &mut Self, at: V| {
+            let x = l.s.m.bin(l.cur, Bin::Xor, lo1, at);
+            let x = l.s.m.bin(l.cur, Bin::LShr, x, k16);
+            l.s.m.cmp(l.cur, pred::NE, x, zero)
+        };
+        let crosses = other(self, lo2);
+        let mine: Vec<V> = (0..count).map(|k| self.s.m.extract(c, r, k)).collect();
+        let lanes = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, crosses),
+            None => crosses,
+        };
+        let at = self.begin_guarded(Some(lanes));
+        let mask = self.s.m.i32(0xFFFF);
+        let hi2 = self.s.m.bin(self.cur, Bin::And, hi2, mask);
+        let (h2, o2) = self.memory(lo2, hi2, 4, false, guard);
+        // Dword 0 in the second page's view; the dwords before the page fall outside it (read as
+        // 0 by the bounds check) and are taken from the first load.
+        let base = self.s.m.bin(self.cur, Bin::Sub, o2, last);
+        let (iu, m, align) = (
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8((1u8 << count) - 1),
+            self.s.m.i32(4),
+        );
+        let r2 = self.s.op(
+            self.cur,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h2, base, iu, m, align],
+        );
+        let theirs: Vec<(V, V)> =
+            (0..count).map(|k| (self.s.m.extract(self.cur, r2, k), mine[k as usize])).collect();
+        let theirs = self.end_guarded(at, &theirs);
+        (0..count)
+            .map(|k| {
+                let step = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(self.cur, Bin::Add, lo1, step);
+                let on_next = other(self, a);
+                self.s.m.select(self.cur, on_next, theirs[k as usize], mine[k as usize])
+            })
+            .collect()
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {

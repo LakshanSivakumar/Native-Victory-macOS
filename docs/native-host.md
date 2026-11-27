@@ -3235,3 +3235,21 @@ There are **zero new refusals** and no changed outcomes or reasons outside those
 programs. The reported compute and both pixel partners now translate; both mesh partners
 already did. The retained original unmasked fixture was checked word-for-word against
 `4f35fa7c`. `git diff --check` passes; changes remain uncommitted.
+
+### Loads whose dwords cross a title page (fixed)
+
+A root view of a vertex or mesh program is title memory, one page-table lookup an access, at its
+first byte. The view that lookup names is the pool from that page on, but the title maps its next
+64 KiB page anywhere in the pool (vertex buffers in descending pool order). So a load whose later
+dwords lie on the next title page read them from the wrong memory. The mesh programs read each
+vertex's position as two dwords (`buffer_load_dwordx2 ... offen`, x in 24 bits of the first, y and z
+in the second) at a stride that need not divide 64 KiB, so about once a page a vertex took a garbage
+y and z, and every triangle sharing it became a long shard fanning from one point. Raw buffer loads
+of more than one dword through a root view now look up the page of their last dword too, in the
+lanes whose access crosses a page, and take each dword after the boundary from that page's own
+view (`Lower::title_load_tail`). Test, on the GPU:
+`addr_tests::a_vertex_fetch_straddling_title_pages_apart_in_the_pool_reads_each_dword_where_the_title_has_it`
+(a triangle whose second vertex's x ends one page and y starts the next, mapped apart in the pool:
+the target stayed empty before, covered now; with the pages next to each other in the pool it passed
+either way). Global, scalar, typed-format and BVH loads and stores keep one lookup (marked shortcut
+in `Lower::memory`).
