@@ -273,6 +273,37 @@ fn sample_bc1_and_create_every_bc_format() {
     }
 }
 
+/// The alpha (and the one- and two-channel values) of block formats with it, one 4x4 block each:
+/// BC1 in its three-colour mode (colour0 <= colour1) with every index 3 is transparent black;
+/// BC3's alpha block with every index 0 is alpha0; BC4 and BC5 read their endpoint 0 (index 0),
+/// with alpha 1 and absent channels 0.
+#[test]
+fn bc_formats_decode_their_alpha() {
+    let Some(m) = backend() else { return };
+    let cases: [(Format, Vec<u8>, [f32; 4]); 4] = [
+        (Format::Bc1, vec![0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], [0.0; 4]),
+        (
+            Format::Bc3,
+            [&[0x40u8, 0, 0, 0, 0, 0, 0, 0][..], &[0xff, 0xff, 0, 0, 0, 0, 0, 0]].concat(),
+            [1.0, 1.0, 1.0, 64.0 / 255.0],
+        ),
+        (Format::Bc4, vec![0x80, 0, 0, 0, 0, 0, 0, 0], [128.0 / 255.0, 0.0, 0.0, 1.0]),
+        (
+            Format::Bc5,
+            [&[0x40u8, 0, 0, 0, 0, 0, 0, 0][..], &[0xc0, 0, 0, 0, 0, 0, 0, 0]].concat(),
+            [64.0 / 255.0, 192.0 / 255.0, 0.0, 1.0],
+        ),
+    ];
+    for (f, block, want) in cases {
+        let t = m.create_texture(&d2(f, 4, 4)).unwrap();
+        m.upload_texture(&t, 0, 0, &block, f.row_bytes(4), 0);
+        let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [4, 4], z: 1, filter: Filter::Nearest };
+        for (i, c) in g.run(&t).iter().enumerate() {
+            assert!((0..4).all(|k| near(c[k], want[k])), "{f:?} texel {i}: {c:?} != {want:?}");
+        }
+    }
+}
+
 /// One BC6H block, mode 11 (mode bits `00011`: one region, 10-bit endpoints, not transformed),
 /// endpoint 0 = (0x100, 0x300, 0), every index 0, so every texel is endpoint 0. Decoded as
 /// Microsoft's "BC6H Format" page and the reference decoder (DirectXTex `BC6HBC7.cpp`,

@@ -2470,10 +2470,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
             Some(i) => format!("{r:#x}:f{}:{}x{}@{:#x}", i.format, i.width, i.height, i.memory as usize),
             None => format!("{r:#x}:buf"),
         };
-        // A shader-resource view's minimum LOD clamp (in the resource's mips), when it has one.
-        let clamp = |v: &[u32; 10]| match super::descriptors::min_lod(v, 0) {
-            0.0 => String::new(),
-            c => format!(":clamp{c}"),
+        // A shader-resource view's minimum LOD clamp (in the resource's mips), and its component
+        // mapping when not the default (the host does not apply one).
+        let clamp = |v: &[u32; 10]| {
+            let map = if v[2] == 0x1688 { String::new() } else { format!(":map{:#x}", v[2]) };
+            match super::descriptors::min_lod(v, 0) {
+                0.0 => map,
+                c => format!(":clamp{c}{map}"),
+            }
         };
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
