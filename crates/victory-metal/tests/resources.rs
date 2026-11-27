@@ -73,6 +73,11 @@ impl Grid<'_> {
     /// [`Self::run`], with the texture's entry cleared (`clear_entry`) before the dispatch when
     /// `cleared`.
     fn sample(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool) -> Vec<[f32; 4]> {
+        self.sample_clamped(tex, cleared, 0.0)
+    }
+
+    /// [`Self::sample`] through an entry written with minimum LOD clamp `min_lod`.
+    fn sample_clamped(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool, min_lod: f32) -> Vec<[f32; 4]> {
         let m = self.m;
         let p = m.create_compute_pipeline(self.dxil).unwrap();
         let cells = self.g[0] as usize * self.g[1] as usize * self.z;
@@ -85,7 +90,7 @@ impl Grid<'_> {
         a.write(0, &vec![0xdead_beefu32; cells * 4]);
         let res = m.create_heap(HeapKind::Resource, 4).unwrap();
         let smp = m.create_heap(HeapKind::Sampler, 2).unwrap();
-        m.write_texture(&res, 0, tex, 0.0);
+        m.write_texture(&res, 0, tex, min_lod);
         if cleared {
             m.clear_entry(&res, 0);
         }
@@ -387,6 +392,28 @@ fn sampling_a_cleared_entry_reads_transparent_black() {
     };
     assert!(g.run(&t).iter().all(|c| near(c[0], 200.0 / 255.0)), "shown");
     assert_eq!(g.sample(&t, true), vec![[0.0; 4]; 4], "cleared");
+}
+
+/// An entry's minimum LOD clamp (`IRDescriptorTableSetTexture`'s `minLODClamp`, what the host
+/// writes for a view's `ResourceMinLODClamp`) keeps a sample at LOD 0 off the finer mips. The
+/// converter applies it only with `IRCompatibilityFlagTextureMinLODClamp`: without that flag the
+/// gradient sample here read mip 0 at every clamp. Measured, not asserted: a `SampleLevel` (an
+/// explicit LOD) reads mip 0 whatever the clamp, with or without the flag (M-series, macOS 26;
+/// Metal's `level()` sample takes no clamp).
+#[test]
+fn an_entrys_min_lod_clamp_keeps_samples_off_finer_mips() {
+    let Some(m) = backend() else { return };
+    let mut d = d2(Format::Rgba8Unorm, 4, 4);
+    d.mips = 3;
+    let t = m.create_texture(&d).unwrap();
+    for (mip, (w, v)) in [(4usize, 0u8), (2, 200), (1, 50)].into_iter().enumerate() {
+        m.upload_texture(&t, mip, 0, &vec![v; w * w * 4], w * 4, 0);
+    }
+    let g = Grid { m: &m, dxil: &fixture("sample2d_grad"), g: [2, 2], z: 1, filter: Filter::Nearest };
+    let at = |min_lod| g.sample_clamped(&t, false, min_lod);
+    assert!(at(0.0).iter().all(|c| near(c[0], 0.0)), "no clamp: mip 0");
+    assert!(at(1.0).iter().all(|c| near(c[0], 200.0 / 255.0)), "clamp 1: mip 1");
+    assert!(at(2.0).iter().all(|c| near(c[0], 50.0 / 255.0)), "clamp 2: mip 2");
 }
 
 #[test]

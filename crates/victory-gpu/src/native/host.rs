@@ -1567,6 +1567,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 mips,
                 slices,
                 format,
+                min_lod,
             } => {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
                     if self.is_covered(resource) {
@@ -1618,9 +1619,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 }),
                             },
                         )?;
-                        self.backend.write_texture(&heap.heap, index, &v, 0.0);
+                        self.backend.write_texture(&heap.heap, index, &v, min_lod);
                     }
-                    _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
+                    _ => self.backend.write_texture(&heap.heap, index, tex, min_lod),
                 }
                 heap.typed_pending.borrow_mut().set(index, false, false);
                 heap.shows(index, Some(resource));
@@ -2456,6 +2457,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
             Some(i) => format!("{r:#x}:f{}:{}x{}@{:#x}", i.format, i.width, i.height, i.memory as usize),
             None => format!("{r:#x}:buf"),
         };
+        // A shader-resource view's minimum LOD clamp (in the resource's mips), when it has one.
+        let clamp = |v: &[u32; 10]| match super::descriptors::min_lod(v, 0) {
+            0.0 => String::new(),
+            c => format!(":clamp{c}"),
+        };
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             if h.kind != HeapKind::Resource {
@@ -2470,7 +2476,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             for k in 0..n.min(h.count.saturating_sub(*at)) as u64 {
                 match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
                     Some(View::Shader(r, desc)) => match texture_info_of(r) {
-                        Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}", d(r, Some(i)))); }
+                        Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}{}", d(r, Some(i)), desc.as_ref().map(clamp).unwrap_or_default())); }
                         // Named too, so a table entry the host cannot draw from shows in the trace.
                         None => {
                             let buffer = matches!(self.resources.borrow().get(&r), Some(Res::Buffer(..)));
@@ -2483,7 +2489,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     Some(View::Placed(u, res, v)) if res[0] > 1 => {
                         let address = u64::from(v[10]) | u64::from(v[11]) << 32;
-                        let s = format!("{slot}.{k}=placed:{}", d(address as usize, placed_info_of(address, &res)));
+                        let s = format!("{slot}.{k}=placed:{}{}", d(address as usize, placed_info_of(address, &res)), if u { String::new() } else { clamp(v[..10].try_into().unwrap()) });
                         if u { writes.push(s) } else { reads.push(s) }
                     }
                     // A constant buffer view: its address, size and first dwords now (up to 512 bytes).

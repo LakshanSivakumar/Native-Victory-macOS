@@ -30,12 +30,14 @@ pub enum Decoded {
     /// A texture SRV or UAV of a registered resource: optional `(first, count)` mip and array-slice
     /// ranges and an optional format override. A count of `u32::MAX` includes every remaining mip
     /// or slice; the backend clips it to the texture. With no mip, slice, or format override, bind
-    /// the original texture, including every mip and slice.
+    /// the original texture, including every mip and slice. `min_lod`: the view's minimum LOD
+    /// clamp in its own mips ([`min_lod`]; 0 for none).
     Image {
         resource: usize,
         mips: Option<(u32, u32)>,
         slices: Option<(u32, u32)>,
         format: Option<Format>,
+        min_lod: f32,
     },
     Sampler {
         desc: SamplerDesc,
@@ -178,8 +180,28 @@ pub(super) fn stride_word<T>(view: &View, resources: &HashMap<usize, Res<T>>) ->
     element | kind
 }
 
+/// A shader-resource view's `ResourceMinLODClamp`, in the mips of a host view starting at mip
+/// `first`: D3D12 gives it in the resource's (a clamp at or below the first mip clamps nothing),
+/// the host's entry clamps from the view's first mip. 0 for views without one and a clamp not
+/// finite.
+/// A title streaming a texture's finer mips in later keeps samples off them with it; the host
+/// ignored it, and sampled mips the title had not filled yet.
+pub(super) fn min_lod(d: &[u32; 10], first: u32) -> f32 {
+    // The clamp's word by dimension (after MostDetailedMip and MipLevels at 4 and 5): 1D, 3D and
+    // cube 6; 2D 7 (after PlaneSlice); 1D array and cube array 8; 2D array 9.
+    let at = match d[1] {
+        2 | 8 | 9 => 6,
+        TEXTURE_2D => 7,
+        3 | 10 => 8,
+        TEXTURE_2D_ARRAY => 9,
+        _ => return 0.0,
+    };
+    let clamp = f32::from_bits(d[at]) - first as f32;
+    if clamp.is_finite() { clamp.max(0.0) } else { 0.0 }
+}
+
 /// Object and placed views have the same SRV/UAV union layout.
-fn texture_view(resource: usize, unordered: bool, d: &[u32]) -> Option<Decoded> {
+fn texture_view(resource: usize, unordered: bool, d: &[u32; 10]) -> Option<Decoded> {
     let (mips, layers) = if unordered {
         ((d[2], 1), (d[3], d[4]))
     } else {
@@ -203,6 +225,7 @@ fn texture_view(resource: usize, unordered: bool, d: &[u32]) -> Option<Decoded> 
         mips: Some(mips),
         slices,
         format,
+        min_lod: if unordered { 0.0 } else { min_lod(d, mips.0) },
     })
 }
 
@@ -249,6 +272,7 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
         // A texture the title placed in its own memory: named by address and description.
         View::Placed(unordered, res, d) if res[0] > BUFFER => {
             let base = u64::from(d[10]) | u64::from(d[11]) << 32;
+            let d: &[u32; 10] = d[..10].try_into().unwrap();
             texture_view(super::textures::placed_key(base, res), *unordered, d)
         }
         View::Shader(r, None) | View::Unordered(r, _, None) => match *resources.get(r)? {
@@ -262,6 +286,7 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
                 mips: None,
                 slices: None,
                 format: None,
+                min_lod: 0.0,
             }),
             Res::Texture(_) => None,
         },
@@ -276,6 +301,8 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
             mips: None,
             slices: None,
             format: format(d[0]),
+            // The whole texture is bound: its mips are the resource's.
+            min_lod: if matches!(view, View::Shader(..)) { min_lod(d, 0) } else { 0.0 },
         }),
         View::ConsoleSampler(w) => Some(sampler(&crate::sampler::console_fields(w))),
         // shortcut: the plain D3D12 sampler description (13 words) is not decoded; titles on this
@@ -555,12 +582,48 @@ mod tests {
         }
     }
 
+    /// A view's `ResourceMinLODClamp` reaches the host entry, in the view's mips: the title keeps
+    /// samples off finer mips it has not streamed in yet (a clamp of 3 over a view from mip 1 is
+    /// 2 in the view's mips; one at or below the first mip clamps nothing). Unordered views have
+    /// no clamp.
+    #[test]
+    fn a_texture_views_min_lod_clamp_is_kept_in_its_own_mips() {
+        let mut resource = [0; 14];
+        resource[0] = 3; // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        let lod = |dim: u32, at: usize, first: u32, clamp: f32, unordered: bool| {
+            let mut placed = [0; 16];
+            (placed[0], placed[1], placed[4], placed[5], placed[at]) = (71, dim, first, u32::MAX, clamp.to_bits());
+            if dim == TEXTURE_2D_ARRAY {
+                placed[7] = 1; // ArraySize
+            }
+            let mut srv = [0; 10];
+            srv.copy_from_slice(&placed[..10]);
+            let views = [View::Placed(unordered, resource, placed), View::Shader(7, Some(srv))];
+            let lods: Vec<f32> = views
+                .iter()
+                .take(if unordered { 1 } else { 2 })
+                .map(|v| match decode(v, &Resources::new()) {
+                    Some(Decoded::Image { min_lod, .. }) => min_lod,
+                    d => panic!("expected a texture view, got {d:?}"),
+                })
+                .collect();
+            assert!(lods.windows(2).all(|w| w[0] == w[1]), "{lods:?}");
+            lods[0]
+        };
+        assert_eq!(lod(TEXTURE_2D, 7, 0, 3.0, false), 3.0);
+        assert_eq!(lod(TEXTURE_2D, 7, 1, 3.0, false), 2.0);
+        assert_eq!(lod(TEXTURE_2D, 7, 4, 3.0, false), 0.0);
+        assert_eq!(lod(TEXTURE_2D, 7, 0, f32::NAN, false), 0.0);
+        assert_eq!(lod(TEXTURE_2D_ARRAY, 9, 1, 2.5, false), 1.5);
+        assert_eq!(lod(TEXTURE_2D, 7, 0, 3.0, true), 0.0);
+    }
+
     #[test]
     fn default_srv_uses_the_whole_registered_resource() {
         let resources = Resources::from([(7, Res::Texture(())), (8, Res::Buffer(0x1000, 256))]);
         assert_eq!(
             decode(&View::Shader(7, None), &resources),
-            Some(Decoded::Image { resource: 7, mips: None, slices: None, format: None })
+            Some(Decoded::Image { resource: 7, mips: None, slices: None, format: None, min_lod: 0.0 })
         );
         assert_eq!(
             decode(&View::Shader(8, None), &resources),
