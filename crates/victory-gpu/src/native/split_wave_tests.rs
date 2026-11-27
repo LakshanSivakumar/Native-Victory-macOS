@@ -1901,9 +1901,9 @@ fn a_wave64_prefix_sum_whose_rows_s_bitreplicate_and_s_bfm_select_runs() {
         0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
         0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
         0x92FE_A0A0, // s_bfm_b64 exec, 32, 32
-        0xD760_0009,
-        0x0001_3F01, // v_readlane_b32 s9, v1, 31
-        0x4A02_0209, // v_add_nc_u32_e32 v1, s9, v1
+        0xD760_000A,
+        0x0001_3F01, // v_readlane_b32 s10, v1, 31
+        0x4A02_020A, // v_add_nc_u32_e32 v1, s10, v1
         0xBEFE_0408, // s_mov_b64 exec, s[8:9]
         0x7E04_0301, // v_mov_b32 v2, v1
         V_LSHLREV_V1_2_V0,
@@ -2037,4 +2037,59 @@ fn integer_pairs_pack_to_16_bits_with_saturation() {
     let want: Vec<u32> =
         (0..32i32).map(|i| s((i << 12) - 0x10000) | s(0x10002 - i) << 16).collect();
     assert_eq!(got, want, "signed");
+}
+
+#[test]
+fn split_32bit_wave64_mask_halves_and_partial_updates_run_on_the_gpu() {
+    // `vcc` holds lanes 0..39 (`vcc_lo = 0xffff_ffff`, `vcc_hi = 0x0000_00ff`).
+    // 1. `s[20:21]` = split 32-bit `~vcc` (`s20 = 0`, `s21 = 0xffff_ff00`, 24 lanes), used as a
+    //    mask (`v_cndmask_b32`) and counted via `s_bcnt1_i32_b64` (24), then `s21 &= 0xf00` (4
+    //    lanes, `SCC == 1` -> `s_cselect_b32` picks 7).
+    // 2. `s[8:9]` = 64-bit `~vcc`, then partial 32-bit `s8 = 15` (4 lanes in low half + 24 in
+    //    high half = 28), used as a mask and counted via `s_bcnt1_i32_b64` (28).
+    let w = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_076A, // s_not_b32 s20, vcc_lo
+        0xBE95_076B, // s_not_b32 s21, vcc_hi
+        0xD501_0003,
+        0x0051_0280, // v_cndmask_b32_e64 v3, 0, 1, s[20:21]
+        0xBE96_1014, // s_bcnt1_i32_b64 s22, s[20:21] (24)
+        0x8715_FF15,
+        0x0000_0F00, // s_and_b32 s21, s21, 0xf00 (lanes 40..43; SCC = 1)
+        0xD501_0004,
+        0x0051_0280, // v_cndmask_b32_e64 v4, 0, 1, s[20:21]
+        0x8517_8387, // s_cselect_b32 s23, 7, 3 (7)
+        0xBE88_086A, // s_not_b64 s[8:9], vcc
+        0xBE88_038F, // s_mov_b32 s8, 15 (lanes 0..3)
+        0xD501_0005,
+        0x0021_0280, // v_cndmask_b32_e64 v5, 0, 1, s[8:9]
+        0xBE98_1008, // s_bcnt1_i32_b64 s24, s[8:9] (4 + 24 = 28)
+        // Pack `(s24 << 16) | (s23 << 12) | (s22 << 4) | (v5 << 2) | (v4 << 1) | v3` into `v2`.
+        0x8F18_9018, // s_lshl_b32 s24, s24, 16
+        0x8F17_8C17, // s_lshl_b32 s23, s23, 12
+        0x8F16_8416, // s_lshl_b32 s22, s22, 4
+        0x8816_1716, // s_or_b32 s22, s22, s23
+        0x8816_1816, // s_or_b32 s22, s22, s24
+        0x3408_0881, // v_lshlrev_b32 v4, 1, v4
+        0x340A_0A82, // v_lshlrev_b32 v5, 2, v5
+        0x3806_0903, // v_or_b32 v3, v3, v4
+        0x3806_0B03, // v_or_b32 v3, v3, v5
+        0x3804_0616, // v_or_b32 v2, s22, v3
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal(&w), None);
+    let got = run(&w, 0, 0);
+    if got.is_empty() {
+        return;
+    }
+    let header = (28u32 << 16) | (7 << 12) | (24 << 4);
+    for (lane, &val) in got.iter().enumerate() {
+        let b0 = u32::from(lane >= 40);
+        let b1 = u32::from((40..44).contains(&lane));
+        let b2 = u32::from(lane < 4 || lane >= 40);
+        assert_eq!(val, header | (b2 << 2) | (b1 << 1) | b0, "lane {lane}");
+    }
 }
