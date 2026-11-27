@@ -59,6 +59,8 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 
 ## Solved recently
 
+- **27 November:**
+  - A flat grey world: pixel programs whose description gives no input enables now take an entry VGPR read only as 16-bit words as the fixed-point position (a guess, see native-host.md, "Pixel input enables"). Before, every pixel of a row read the same source texel. With it and main's register-image enables, a warm-cache world run on an M-series Mac (a local branch carrying this fix and other changes still to be sent) shows a recognisable lit scene (an interior with a window onto a sunlit yard, plants and a figure, at a plausible exposure) about 82 s after start, at 1.1–1.3 fps in the world and about 20 fps while loading. Still wrong in that picture: fine horizontal stripes and a crosshatch over the whole image, and black blocks in the centre.
 - **26–27 November:**
   - The Metal GPU timeout at about 53 s ([#2](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/2)): waits stay on the CPU until the GPU work is observed done.
   - Failed command buffers now still signal their fences ([#80](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/80)).
