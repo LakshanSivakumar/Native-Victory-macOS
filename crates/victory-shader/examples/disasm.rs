@@ -2,8 +2,10 @@
 //! `VICTORY_CONTAINER=<file>` takes the code of a guessed graphics container (`FSPG` part) instead,
 //! or of a title container's programs (as `VICTORY_DUMP_REFUSED` writes them; the patched code,
 //! each program under a line with its stage, wave size and threads).
+//! An `ACCC` part holding a compute container (`FSPX`) is read at its own wave size.
 
 fn main() {
+    let mut wave64 = std::env::var_os("VICTORY_WAVE32").is_none();
     let code = if let Ok(path) = std::env::var("VICTORY_CONTAINER") {
         let bytes = std::fs::read(path).expect("readable container");
         let c = victory_shader::Container::parse(&bytes).expect("a container");
@@ -21,13 +23,18 @@ fn main() {
             return;
         }
         let part = c.part(victory_shader::FourCC::ACCC).expect("an ACCC part");
-        let word = |at: usize| u32::from_le_bytes(part.data[at..at + 4].try_into().unwrap()) as usize;
-        part.data[16..16 + word(8)].to_vec()
+        if part.data.starts_with(b"FSPX") {
+            let p = victory_shader::native_programs(part.data).expect("an FSPX program").remove(0);
+            wave64 = p.wave64;
+            p.code
+        } else {
+            let word = |at: usize| u32::from_le_bytes(part.data[at..at + 4].try_into().unwrap()) as usize;
+            part.data[16..16 + word(8)].to_vec()
+        }
     } else {
         let path = std::env::var("VICTORY_PIECE").expect("VICTORY_PIECE names a dumped code piece");
         std::fs::read(path).expect("readable piece")
     };
-    let wave64 = std::env::var_os("VICTORY_WAVE32").is_none();
     match victory_shader::gfx10::decode(&code) {
         Ok(list) => {
             for i in list {
