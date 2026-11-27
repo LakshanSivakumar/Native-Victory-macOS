@@ -505,6 +505,40 @@ Each of the 91 has `mix` pairs. `mesh_tests::a_half_kept_by_mixlo_and_replaced_b
 (`victory-gpu`) draws the shape on Metal in both orders: a pixel program that interpolates with
 `v0`/`v1` and then packs (1.0, 0.5) into `v1` draws (1.0, 0.5, 1.0, 1.0).
 
+## Barycentrics read as data
+
+A pixel program's barycentric input VGPRs (`i` and `j` of each enabled pair) were usable only
+through `v_interp_*`. The host interpolates by itself, so a program that read them as data was
+refused, "barycentrics read directly". Most of these are the register a `v_fma_mixlo_f16` keeps
+the high half of before a `compr` export (see above): the console exports those bits, so the
+host needs their value.
+
+They now come from `SV_Barycentrics`. RDNA2 interpolates P0 + i·(P1 − P0) + j·(P2 − P0), so `i`
+and `j` are the weights of the second and third vertices: channels y and z.
+- **Element.** One element per interpolation mode the program reads (DXIL 2 to 7: perspective or
+  linear; centre, centroid or sample; D3D allows two). The pull model stays refused.
+- **Flags.** ShaderFlags bit 22 and `SFI0` 0x20000 are set.
+- **When.** Only in a second lowering pass, for a program the first pass refused for a barycentric
+  read (`lower_graphics`; joins the first pass gave up on for that reason are retried). The
+  programs that only interpolate keep their translation byte for byte and declare no
+  `SV_Barycentrics`.
+
+Apple's converter maps the element to `[[barycentric_coord]]`.
+`mesh_tests::barycentrics_read_as_data_weigh_the_second_and_third_corners` (`victory-gpu`) checks
+the values on Metal: over a triangle from (−1, −1) with corners (3, −1) and (−1, 3), a pixel
+program exporting `v0` and `v1` reads `(x + 1) / 4` and `(y + 1) / 4` at each pixel centre, so the
+weights are the RDNA2 ones in that vertex order.
+
+Over a 26,849-shader corpus (Series S boot to the story load, 27 November), 339 pixel programs now
+translate, and every one of them also converts with Apple's converter. No other output changes.
+They were refused as:
+- "barycentrics read directly": 278;
+- "a descriptor read only as data": 44;
+- "a lane mask holding lanes elsewhere read as data: not written by a scalar ALU instruction": 17.
+
+The last two also read a barycentric, which an earlier pass met first. 7 more go on to another
+refusal.
+
 ## LDS instructions addressed by M0
 
 `ds_append`, `ds_consume`, `ds_read_addtid_b32` and `ds_write_addtid_b32` have no address

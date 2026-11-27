@@ -1269,8 +1269,12 @@ mod tests {
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let shader = emit(&c, &native, &p, &st, &io, &res);
+            // A raw barycentric read (the input not initialized first) is declared as
+            // `SV_Barycentrics`: the program then reads the input, not the value moved in.
+            let raw = |s: &super::HostShader| s.dxil.windows(15).any(|w| w == b"SV_Barycentrics");
             if matches!(case, Complete | NonzeroBase) {
                 let shader = shader.unwrap();
+                assert!(!raw(&shader), "{case:?}: reads the raw barycentric");
                 assert!(
                     Container::parse(&shader.dxil)
                         .unwrap()
@@ -1288,14 +1292,15 @@ mod tests {
             } else {
                 eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
                 assert!(
-                    matches!(
-                        shader,
-                        Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
-                            ..
-                        })
-                    ),
-                    "{case:?}"
+                    match &shader {
+                        Ok(s) => raw(s),
+                        Err(e) => matches!(
+                            e,
+                            ShaderError::Unsupported { what: "barycentrics read directly", .. }
+                        ),
+                    },
+                    "{case:?}: {:?}",
+                    shader.as_ref().err()
                 );
             }
         }

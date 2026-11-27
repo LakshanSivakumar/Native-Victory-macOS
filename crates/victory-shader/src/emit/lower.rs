@@ -255,10 +255,15 @@ fn lower_program(parts: &Parts, guessed: bool, console_cf: bool, keep: Option<&K
     // (built from scalars, shifted) only with the console's lanes: asked
     // for when the first try finds one used.
     let mut console = false;
+    // Pixel programs read their barycentric inputs as data from `SV_Barycentrics`: asked for
+    // when the first try is refused for one.
+    let mut barycentrics = false;
     loop {
         #[cfg(test)]
         PASSES.set(PASSES.get() + 1);
-        match Lower::new(parts, &bad, console, guessed, keep, console_cf).run() {
+        let mut lower = Lower::new(parts, &bad, console, guessed, keep, console_cf);
+        lower.barycentrics = barycentrics;
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(phis)) => {
                 for (v, why) in phis {
@@ -274,6 +279,13 @@ fn lower_program(parts: &Parts, guessed: bool, console_cf: bool, keep: Option<&K
                 what: "an opaque lane mask" | "a constant lane mask",
                 ..
             })) if !console && parts.native.stage == HwStage::Cs => console = true,
+            Err(Stop::Fail(ShaderError::Unsupported { what: BARYCENTRICS_READ, .. }))
+                if !barycentrics && parts.native.stage == HwStage::Ps =>
+            {
+                barycentrics = true;
+                // Joins the first try gave up on for a barycentric have one now.
+                bad.retain(|_, why| *why != BARYCENTRICS_READ);
+            }
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
@@ -430,6 +442,8 @@ struct Lower<'a> {
     /// All lanes follow console control flow; EXEC guards vector instructions.
     console_cf: bool,
     opaque_open: HashSet<Value>,
+    /// Barycentric inputs read as data come from `SV_Barycentrics` (`lower_graphics`).
+    barycentrics: bool,
     /// Console wave64 code on 32-lane host waves ([`Options::wave32_host`]).
     host32: bool,
     /// The same, where a console wave is two host waves and the program has
@@ -717,6 +731,9 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
         .map(|o| (o.row, o.pack2))
         .collect()
 }
+
+/// Why a barycentric input has no value until a program reads it as data (`Lower::get`).
+const BARYCENTRICS_READ: Why = "barycentrics read directly";
 
 /// `buffer_atomic_sub` among the buffer atomics' DXIL operation numbers: no DXIL operation of its
 /// own, it is lowered as an add (0) of the negated data.
@@ -1210,6 +1227,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             console_cf,
             opaque_open: HashSet::new(),
+            barycentrics: false,
             host32,
             halves,
             once,
@@ -2287,7 +2305,13 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            // From `SV_Barycentrics` only in a second pass, for a program the first refused for
+            // reading one as data (`lower_graphics`): the many that only interpolate with them
+            // keep their translation and declare no `SV_Barycentrics`.
+            Input::Barycentric { kind, index } if self.barycentrics => {
+                return self.barycentric(kind, index);
+            }
+            Input::Barycentric { .. } => return Val::Missing(BARYCENTRICS_READ),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -2494,6 +2518,49 @@ impl<'a> Lower<'a> {
         };
         self.loaded_inputs.insert((id, col), out);
         out
+    }
+
+    /// A barycentric the pixel program reads as data, not only through `v_interp_*`: `i` (index 0)
+    /// and `j` (1) weigh the triangle's second and third vertices (RDNA2 ISA, "Parameter
+    /// interpolation": P0 + i * P10 + j * P20). They are channels y and z of `SV_Barycentrics`,
+    /// declared with the interpolation of the console's pair (DXIL modes 2 to 7), one element per
+    /// mode as the program first reads it (D3D allows two). The pull model stays refused.
+    fn barycentric(&mut self, kind: crate::io::Barycentric, index: u8) -> Val {
+        use crate::io::Barycentric as B;
+        let interp = match kind {
+            B::PerspectiveCenter => 2,
+            B::PerspectiveCentroid => 3,
+            B::LinearCenter => 4,
+            B::LinearCentroid => 5,
+            B::PerspectiveSample => 6,
+            B::LinearSample => 7,
+            B::PerspectivePullModel => return Val::Missing(BARYCENTRICS_READ),
+        };
+        let id = match self.s.inputs.iter().position(|e| e.kind == 28 && e.interp == interp) {
+            Some(id) => id,
+            None => {
+                let n = self.s.inputs.iter().filter(|e| e.kind == 28).count() as u32;
+                if n == 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                let row = self.s.inputs.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+                self.s.inputs.push(super::container::SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: n,
+                    kind: 28,
+                    comp: 9,
+                    interp,
+                    row: Some(row),
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_input(id, index + 1)
     }
 
     /// The vertex id input (debugging).

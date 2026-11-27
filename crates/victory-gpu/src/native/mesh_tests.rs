@@ -915,3 +915,42 @@ fn a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric() {
         assert!(got.iter().all(|p| *p == [255, 128, 255, 255]), "{order}: {got:?}");
     }
 }
+
+/// A pixel program that exports its barycentrics as data: `exp mrt0 v0, v1, 0, 1.0`, after an
+/// interpolation that makes v0 and v1 the perspective-centre pair. `i` and `j` weigh the second
+/// and third corners of the triangle program's triangle, (3, -1) and (-1, 3), from (-1, -1): at a
+/// pixel centre `i = (x + 1) / 4` and `j = (y + 1) / 4` in normalized coordinates (w is 1). They
+/// were refused as "barycentrics read directly" and come from `SV_Barycentrics` now.
+#[test]
+fn barycentrics_read_as_data_weigh_the_second_and_third_corners() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0xF800_0201, 0x0000_0006]); // exp param0 v6 (1.0)
+    let ps_words = [
+        0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+        0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_02F2, // v_mov_b32 v3, 1.0
+        0xF800_180F, 0x0302_0100, // exp mrt0 v0, v1, v2, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, &ps_words));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "barycentrics") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    let got = pixels(&t, &color);
+    for (n, p) in got.iter().enumerate() {
+        let (px, py) = ((n % 8) as f32 + 0.5, (n / 8) as f32 + 0.5);
+        let (x, y) = (px / 4.0 - 1.0, 1.0 - py / 4.0);
+        let want = [((x + 1.0) / 4.0 * 255.0).round(), ((y + 1.0) / 4.0 * 255.0).round()];
+        for c in 0..2 {
+            assert!((f32::from(p[c]) - want[c]).abs() <= 1.0, "texel {n}: {p:?}, want {want:?}");
+        }
+        assert_eq!(&p[2..], &[0, 255], "texel {n}");
+    }
+}
