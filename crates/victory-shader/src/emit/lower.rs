@@ -14862,7 +14862,7 @@ impl<'a> Lower<'a> {
     /// reach a read, plus whether any kept value of a guarded or partial
     /// write (`kept_writes`) can reach a genuine reader (`kept_reads`).
     fn resolve_kept_and_live_edges(&self) -> Result<Set<(Value, usize)>, Stop> {
-        const MAX_KNOWN: usize = 6;
+        const MAX_KNOWN: usize = 4;
         // A branchy pixel shader of the title reached thousands of sets per
         // phi, each compared with all before it, and never finished.
         const MAX_PATHS: usize = 64;
