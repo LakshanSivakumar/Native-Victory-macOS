@@ -3049,6 +3049,15 @@ comparison are in `/tmp/native-merge-followup` (425 passes, 3 ignored, the known
 
 #### Third follow-up: opaque resource keys in the view-address table
 
+The Windows native-host test path also needs a working `native::safe_read`: `mirror`
+now decodes the bytes captured by `record_at`, rather than calling `descriptor::view`
+to read the slot directly. The old non-macOS stub returned false and left a zero record,
+so the first mirror failed before decoding even a registered texture. On Windows,
+`safe_read` delegates to `host::read_into` (`ReadProcessMemory`); macOS keeps its Mach
+read. The existing default-texture-SRV test covers the backend write and subsequent
+default-view replacements. Resource keys still resolve through native registrations;
+the separate object guard below remains required for texture size words.
+
 The two view-address GPU tests' `0x4EA9_0000` fault is a native-host bug, not a fixture
 that must create COM resources. `Heap::sized` still registers opaque texture keys;
 `textures::placed_key` likewise produces hashes with the top bit set. Parent `4f35fa7c`
