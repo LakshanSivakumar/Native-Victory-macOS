@@ -1827,3 +1827,113 @@ fn a_texture_the_submission_names_is_not_given_up_under_its_draw() {
     assert_eq!(draw_sampling(&mut t, &pool, live, 2), [0x66, 0, 0, 0x66]);
     assert!(t.host.knows(live));
 }
+
+/// The budget counts a copy by its size in title memory, once per title texture: views of one
+/// object, in other formats or of other mips, name the object, and share its one host texture.
+#[test]
+fn views_of_one_texture_share_one_copy_counted_once() {
+    use crate::descriptor::View;
+    let Some((mut t, pool)) = budget_title() else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (32, 32), 6, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    t.texture_created(key, info.clone());
+    // Two views of it: RGBA8 UNORM, all mips; RGBA8 UNORM sRGB (29), mip 2 only.
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[2], srv[5]) = (28, 4, 0x1688, u32::MAX);
+    crate::descriptor::create_srv(std::ptr::null(), res, &srv, start);
+    (srv[0], srv[4], srv[5]) = (29, 2, 1);
+    crate::descriptor::create_srv(std::ptr::null(), res, &srv, start + 32);
+    for handle in [start, start + 32] {
+        let Some(View::Shader(r, _)) = crate::descriptor::view(handle) else { panic!("a view") };
+        assert_eq!(r, key, "the view names the object");
+        assert!(t.realize(r));
+    }
+    let a = t.texture_of(key).unwrap();
+    assert!(std::rc::Rc::ptr_eq(&a, &t.texture_of(key).unwrap()), "one host texture");
+    assert_eq!(t.budget.live, info.size as u64, "counted once, all mips");
+}
+
+/// Views of memory the title placed itself are keyed by address and resource description, not
+/// by the view's own description: views of one placed texture share one copy.
+#[test]
+fn placed_views_of_one_description_share_one_key() {
+    use crate::native::textures::placed_key;
+    let res = crate::resource::test_texture_at(0x10_0000_0000, (32, 32), 6, 28, Swizzle::SW_64KB_S.0, 0);
+    let words = crate::resource::texture_desc(res).unwrap();
+    let key = placed_key(0x10_0000_0000, &words);
+    // The key reads no view description at all; padding words do not change it either.
+    let mut padded = words;
+    (padded[1], padded[13]) = (0xdead, 0xbeef);
+    assert_eq!(placed_key(0x10_0000_0000, &padded), key);
+    let mut other = words;
+    other[8] = 29; // another format
+    assert_ne!(placed_key(0x10_0000_0000, &other), key, "another description: another copy");
+    assert_ne!(placed_key(0x10_0001_0000, &words), key, "another address: another copy");
+}
+
+/// Copies are counted, and held, once per title texture, not once per byte of title memory: two
+/// objects over the same memory (aliasing placed resources) and a placed description starting
+/// inside another's memory each get a host texture of their own, so the copies add up to more
+/// than the title memory under them. The trace's distinct figure counts that memory once.
+#[test]
+fn textures_over_one_memory_each_hold_a_copy_of_their_own() {
+    use crate::native::textures::{distinct_bytes, placed_key};
+    let Some((mut t, pool)) = budget_title() else { return };
+    let a = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
+    let b = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 71, Swizzle::LINEAR.0, 0);
+    let (ia, ib) = (crate::resource::texture_info(a).unwrap(), crate::resource::texture_info(b).unwrap());
+    // A description the title places at 4 KiB into the same memory (no object; a view names it).
+    let c = crate::resource::test_texture_at(pool.va(0x1000), (32, 32), 1, 28, Swizzle::LINEAR.0, 0);
+    let words = crate::resource::texture_desc(c).unwrap();
+    let ic = crate::resource::placed_info(pool.va(0x1000), &words).unwrap();
+    let kc = placed_key(pool.va(0x1000), &words);
+    t.texture_placed(pool.va(0x1000), kc, 9141);
+    for (key, info) in [(a as usize, ia.clone()), (b as usize, ib.clone()), (kc, ic.clone())] {
+        t.texture_created(key, info);
+        assert!(t.realize(key));
+    }
+    let (ta, tb, tc) = (t.texture_of(a as usize).unwrap(), t.texture_of(b as usize).unwrap(), t.texture_of(kc).unwrap());
+    assert!(!std::rc::Rc::ptr_eq(&ta, &tb) && !std::rc::Rc::ptr_eq(&ta, &tc), "three host textures");
+    let counted = (ia.size + ib.size + ic.size) as u64;
+    assert_eq!(t.budget.live, counted);
+    let under = distinct_bytes(vec![(ia.memory as usize, ia.size), (ib.memory as usize, ib.size), (ic.memory as usize, ic.size)]);
+    assert_eq!(under, ia.size as u64, "all three lie in the first one's 16 KiB");
+    assert!(counted > under);
+    assert_eq!(t.memory_under_copies(), (under, 0), "what the trace logs");
+    // The same pool pages mapped at a second title address: a texture there is over the same
+    // bytes, and counts once too.
+    let info = PoolInfo { id: 9141, base: pool.mem.primary as usize, len: pool.mem.len, memory_entry: None };
+    t.host.memory().mapped(pool.mem.primary as usize, pool.mem.len, &info, 0);
+    let d = crate::resource::test_texture_at(pool.mem.primary as u64, (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
+    let id = crate::resource::texture_info(d).unwrap();
+    t.texture_created(d as usize, id.clone());
+    assert!(t.realize(d as usize));
+    assert_eq!(t.budget.live, counted + id.size as u64);
+    assert_eq!(t.memory_under_copies(), (under, 0), "one memory at two addresses");
+}
+
+/// A copy over memory in no title pool is logged as outside them.
+#[test]
+fn a_copy_outside_the_titles_pools_is_logged_so() {
+    let Some((mut t, _pool)) = budget_title() else { return };
+    let own = vec![0u8; 16 * 16 * 4];
+    let res = crate::resource::test_texture_at(own.as_ptr() as u64, (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    t.texture_created(res as usize, info.clone());
+    assert!(t.realize(res as usize));
+    assert_eq!(t.memory_under_copies(), (info.size as u64, info.size as u64));
+}
+
+/// The trace's distinct title memory under copies: each byte once, gaps not counted.
+#[test]
+fn distinct_bytes_counts_overlaps_once() {
+    use crate::native::textures::distinct_bytes;
+    assert_eq!(distinct_bytes(vec![]), 0);
+    assert_eq!(distinct_bytes(vec![(0, 100), (0, 100)]), 100);
+    assert_eq!(distinct_bytes(vec![(50, 100), (0, 100)]), 150);
+    assert_eq!(distinct_bytes(vec![(0, 100), (10, 20), (200, 10)]), 110);
+    assert_eq!(distinct_bytes(vec![(0, 100), (100, 1)]), 101);
+}

@@ -1513,6 +1513,21 @@ pub(super) fn choose_evictions(mut candidates: Vec<(usize, u64, u64)>, over: u64
         .collect()
 }
 
+/// Bytes of title memory under `ranges` (start, length), each byte once: copies over one memory
+/// (aliasing objects, placed descriptions at other starts) are counted once here.
+pub(super) fn distinct_bytes(mut ranges: Vec<(usize, usize)>) -> u64 {
+    ranges.sort_unstable();
+    let (mut total, mut end) = (0u64, 0usize);
+    for (start, len) in ranges {
+        let stop = start.saturating_add(len);
+        if stop > end {
+            total += (stop - start.max(end)) as u64;
+            end = stop;
+        }
+    }
+    total
+}
+
 /// For the trace: textures given up under the budget, their bytes, and evicted ones made again.
 static BUDGET_TRACE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -1532,6 +1547,24 @@ impl<B: PresentBackend> Title<B> {
             && t.info.desc().is_some_and(|d| !d.format.is_depth())
             && Rc::strong_count(&t.texture) <= 2
             && !self.host.texture_in_use(key)
+    }
+
+    /// For the trace: bytes of title memory under the copies, each byte once, and bytes of copies
+    /// outside the title's pools. Copies in a pool are placed by their pool offset, so pages the
+    /// title maps at two addresses count once.
+    pub(super) fn memory_under_copies(&self) -> (u64, u64) {
+        let pools = self.host.memory();
+        let (mut ranges, mut outside) = (Vec::new(), 0);
+        for t in self.textures.values() {
+            match pools.resolve(t.info.memory as u64, 1) {
+                Some((_, at)) => ranges.push((at as usize, t.info.size)),
+                None => {
+                    ranges.push((t.info.memory as usize, t.info.size));
+                    outside += t.info.size as u64;
+                }
+            }
+        }
+        (distinct_bytes(ranges), outside)
     }
 
     /// Before the sync of a submission of `lists` (with the work held already): a texture the
@@ -1607,10 +1640,12 @@ impl<B: PresentBackend> Title<B> {
         if trace {
             self.budget.logged = Some(std::time::Instant::now());
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let (distinct, outside) = self.memory_under_copies();
             tracing::info!(
-                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}",
+                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}; {} MiB of distinct title memory under the copies, {} MiB of copies outside the title's pools",
                 self.budget.live >> 20, self.budget.limit >> 20, shown >> 20, evictable >> 20,
                 take(&BUDGET_TRACE[0]), take(&BUDGET_TRACE[1]) >> 20, take(&BUDGET_TRACE[2]),
+                distinct >> 20, outside >> 20,
             );
         }
     }

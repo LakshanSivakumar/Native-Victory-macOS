@@ -945,9 +945,29 @@ and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallback
   ask for the copy (`NativeHost::take_wanted`) and are cleared until the next submission makes it.
 * **Trace.** With `VICTORY_TRACE_TEXTURE_SYNC=1`, once a second: `host texture copies: <MiB>,
   budget <MiB>; <MiB> shown by heap entries, named by the submission's tables or viewed for
-  unordered access, <MiB> could be given up; given up in the last second <n> (<MiB>), made again <n>`. If the copies are mostly shown by
-  heap entries, the budget frees little and the levers are the ones #79 names (one copy instead of
-  two, fewer top mips).
+  unordered access, <MiB> could be given up; given up in the last second <n> (<MiB>), made again <n>;
+  <MiB> of distinct title memory under the copies, <MiB> of copies outside the title's pools`. If
+  the copies are mostly shown by heap entries, the budget frees little and the levers are the ones
+  #79 names (one copy instead of two, fewer top mips).
+* **What the count counts, and why it can pass the title's memory.** One copy per title texture,
+  by its layout's size in title memory (all mips, slices and planes; never more than the
+  footprint the title allocated, so untiling, format expansion and Metal's padding do not enter
+  it). A title texture is a resource object (its address) or, for a view of memory the title
+  placed itself, its address and resource description (`placed_key`; the view's own description,
+  format or mip range, is not part of it). Views of one object, or of one placed description, so
+  share one host texture and are counted once; the entry a view writes is a Metal texture view
+  (`create_texture_view`), with no storage of its own. But the host keeps no map from memory to copies:
+  two objects over the same memory (placed resources aliasing one heap offset), or a placed
+  description starting inside another texture's memory, each get a host texture of their own and
+  each are counted. A placed copy goes only when another description is placed at its exact
+  address (the texture sync line's "replaced" counts) or with its pool, so memory the title
+  streams something else into at other addresses keeps the old copy too, and an entry still
+  holding the old record keeps it shown. So the copies can add up to more than the title's
+  memory (10.1 GB against 7.8 GB on a 24 GB M5 Pro, Series S, #301) without a counting error: the
+  host then holds those bytes more than once. The last two trace figures tell which: distinct
+  memory well below the copies means overlapping copies; copies outside the pools are textures
+  in memory the host allocated itself. Copies in a pool are placed by their pool offset
+  (`Title::memory_under_copies`), so pages the title maps at two addresses count once.
 * Tests (`texture_tests`): `the_least_recently_used_textures_go_first_until_the_excess_is_freed`,
   `the_texture_budget_is_the_working_set_the_title_leaves`,
   `over_budget_only_textures_nothing_uses_are_given_up_and_come_back` (a copy a heap entry shows,
@@ -956,7 +976,12 @@ and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallback
   `an_entry_copied_with_plain_stores_gets_an_evicted_texture_back` (the fallback),
   `a_texture_given_up_is_back_for_the_draw_whose_table_names_it` and
   `a_texture_the_submission_names_is_not_given_up_under_its_draw` (a draw through a record stored
-  with plain stores reads the texture, not black, in the same submission).
+  with plain stores reads the texture, not black, in the same submission),
+  `views_of_one_texture_share_one_copy_counted_once`,
+  `placed_views_of_one_description_share_one_key`,
+  `textures_over_one_memory_each_hold_a_copy_of_their_own`, `distinct_bytes_counts_overlaps_once`,
+  `a_copy_outside_the_titles_pools_is_logged_so`,
+  and `a_textures_counted_size_is_never_more_than_its_footprint` (in `resource.rs`).
 
 #### Texture views over 2D arrays
 
