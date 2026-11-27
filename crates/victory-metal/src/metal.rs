@@ -49,6 +49,10 @@ pub struct Metal {
     /// Tracing: the gate buffers of the indirect dispatches encoded since the last commit.
     pub(crate) trace_args: std::cell::RefCell<Vec<(String, usize, usize)>>,
     pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
+    /// `VICTORY_PASS_TIMING=1`: GPU time per pass (`pass_timing.rs`).
+    pub(crate) pass_timing: Option<crate::pass_timing::PassTiming>,
+    /// The sample buffer of the command buffer `submit_passes` is encoding, when timed.
+    pub(crate) samples: std::cell::RefCell<Option<crate::pass_timing::Samples>>,
     /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
     pub(crate) gate:
         std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
@@ -415,6 +419,7 @@ impl Metal {
     /// shader pipeline creation returns the load error instead of panicking.
     pub fn new() -> Result<Metal, String> {
         let dev = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+        let pass_timing = crate::pass_timing::PassTiming::new(&dev);
         let asked = std::env::var("VICTORY_METAL_RESIDENCY_SETS").ok();
         let memory = physical_memory();
         let (residency_sets, pool_sets) = residency_mode(asked.as_deref(), sets_supported(&dev), memory);
@@ -459,6 +464,8 @@ impl Metal {
             request_residency: std::env::var("VICTORY_METAL_REQUEST_RESIDENCY").is_ok_and(|v| v.trim() == "1"),
             committed: Default::default(),
             pipe_names: Default::default(),
+            pass_timing,
+            samples: Default::default(),
             trace_enc: Default::default(),
             trace_args: Default::default(),
             gate: Default::default(),
@@ -481,6 +488,14 @@ impl Metal {
     }
 
     /// At most `n` passes of a submission in one command buffer (0: no limit).
+    /// Pass timing on, whatever `VICTORY_PASS_TIMING` says (`pass_timing.rs`); off if the GPU
+    /// cannot sample timestamps at stage boundaries.
+    #[cfg(test)]
+    pub(crate) fn with_pass_timing(mut self) -> Metal {
+        self.pass_timing = crate::pass_timing::PassTiming::on(&self.dev);
+        self
+    }
+
     pub fn with_passes_per_buffer(mut self, n: usize) -> Metal {
         self.passes_per_buffer = n;
         self
@@ -735,7 +750,7 @@ impl ComputeBackend for Metal {
     }
 
     fn name_pipeline(&self, p: &Pipeline, name: &str) {
-        if self.trace_fails {
+        if self.trace_fails || self.pass_timing.is_some() {
             let key = Retained::as_ptr(&p.0) as *const u8 as usize;
             self.pipe_names.borrow_mut().insert(key, name.to_string());
         }

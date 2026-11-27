@@ -1519,7 +1519,7 @@ impl GraphicsBackend for Metal {
     }
 
     fn name_render_pipeline(&self, p: &RenderPipeline, name: &str) {
-        if self.trace_fails {
+        if self.trace_fails || self.pass_timing.is_some() {
             let key = Retained::as_ptr(&p.pso) as *const u8 as usize;
             self.pipe_names.borrow_mut().insert(key, name.to_string());
         }
@@ -1609,6 +1609,11 @@ impl GraphicsBackend for Metal {
             None
         };
         let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
+        // VICTORY_PASS_TIMING: the passes' samples (not for a submission split into pieces).
+        *self.samples.borrow_mut() = match (&self.pass_timing, &pieces) {
+            (Some(t), None) => t.samples(&self.dev, work.passes.len()),
+            _ => None,
+        };
         let mut first = 0;
         for (n, pass) in work.passes.iter().enumerate() {
             let encoded = match pass {
@@ -1722,10 +1727,19 @@ impl GraphicsBackend for Metal {
             IN_FLIGHT.lock().unwrap().insert(*s, (std::time::Instant::now(), format!("{l} | {enc}")));
             GATED.lock().unwrap().insert(*s, std::mem::take(&mut *self.trace_args.borrow_mut()));
         }
+        let timed = self
+            .pass_timing
+            .as_ref()
+            .and_then(|t| self.samples.borrow_mut().take().map(|s| (t.sink(&self.dev), s)));
         let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
+            if done.error().is_none()
+                && let Some((sink, samples)) = &timed
+            {
+                sink.add(samples, done.GPUEndTime() - done.GPUStartTime());
+            }
             trace_done(serial, done);
             landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
@@ -2622,6 +2636,11 @@ impl Metal {
     /// The capped label for an encoder, kept for the command buffer's description.
     /// The command buffer's description keeps the whole label when `VICTORY_TRACE_COMMITS` logs it
     /// (a capped one hid the end of a 17-dispatch pass, #79).
+    /// A pipeline's name (`name_pipeline`), or its address.
+    fn pipe_name(&self, k: usize) -> String {
+        self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"))
+    }
+
     fn cap_label(&self, s: String) -> Retained<objc2_foundation::NSString> {
         let capped = cap_label_str(s.clone());
         let n = objc2_foundation::NSString::from_str(&capped);
@@ -2653,7 +2672,15 @@ impl Metal {
         if !ops.iter().any(nonzero) {
             return Ok(());
         }
-        let e = cb.blitCommandEncoder().ok_or("no blit encoder")?;
+        let timed = self.samples.borrow_mut().as_mut().and_then(|s| {
+            let n = ops.iter().filter(|o| nonzero(o)).count();
+            s.blit(crate::pass_timing::key("blit", "ops", n, &[]))
+        });
+        let e = match &timed {
+            Some(d) => cb.blitCommandEncoderWithDescriptor(d),
+            None => cb.blitCommandEncoder(),
+        }
+        .ok_or("no blit encoder")?;
         if let Some((f, started)) = order
             && started.get()
         {
@@ -3073,7 +3100,17 @@ impl Metal {
         if !dispatches.iter().any(runs) {
             return Ok(());
         }
-        let e = cb.computeCommandEncoder().ok_or("no compute encoder")?;
+        let timed = self.samples.borrow_mut().as_mut().and_then(|s| {
+            let ran: Vec<_> = dispatches.iter().filter(|d| runs(d)).collect();
+            let ids = crate::pass_timing::tally(ran.iter().map(|d| Retained::as_ptr(&d.pipeline.0) as *const u8 as usize));
+            let pipes: Vec<_> = ids.into_iter().map(|(k, n)| (self.pipe_name(k), n)).collect();
+            s.compute(crate::pass_timing::key("compute", "dispatches", ran.len(), &pipes))
+        });
+        let e = match &timed {
+            Some(d) => cb.computeCommandEncoderWithDescriptor(d),
+            None => cb.computeCommandEncoder(),
+        }
+        .ok_or("no compute encoder")?;
         if let Some((f, started)) = order
             && started.get()
         {
@@ -3367,6 +3404,11 @@ impl Metal {
                     None => a.setLoadAction(MTLLoadAction::Load),
                 }
             }
+        }
+        if let Some(s) = self.samples.borrow_mut().as_mut() {
+            let ids = crate::pass_timing::tally(rp.draws.iter().map(|d| Retained::as_ptr(&d.pipeline.pso) as *const u8 as usize));
+            let pipes: Vec<_> = ids.into_iter().map(|(k, n)| (self.pipe_name(k), n)).collect();
+            s.render(&desc, crate::pass_timing::key("render", "draws", rp.draws.len(), &pipes));
         }
         let e = cb.renderCommandEncoderWithDescriptor(&desc).ok_or_else(|| {
             // Metal refuses an encoder whose attachments disagree (size, sample count, format
@@ -3946,6 +3988,51 @@ mod owed_tests {
     use super::*;
     use crate::backend::ComputeBackend;
     use crate::mem::{Region, page_size};
+
+    /// `VICTORY_PASS_TIMING`: each pass of a submission is timed on the GPU and kept under its key;
+    /// a pass that writes 64 MiB takes longer than ones of a few bytes.
+    #[test]
+    fn pass_timing_times_each_pass_and_ranks_the_long_one_first() {
+        let m = Metal::new().unwrap().with_pass_timing();
+        let Some(timing) = &m.pass_timing else {
+            eprintln!("no timestamp counters at stage boundaries; skipped");
+            return;
+        };
+        const BIG: usize = 64 << 20;
+        let region = Region::new(BIG + page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let q = m.create_queue().unwrap();
+        let fence = m.create_fence(0).unwrap();
+        let fill = |o: usize, len: usize| BlitOp::Fill { dst: (&buf, at(o)), len, value: 7 };
+        let passes = [
+            Pass::Blit(vec![fill(BIG, 8)]),
+            Pass::Blit(vec![fill(0, BIG / 2), fill(BIG / 2, BIG / 2)]),
+            Pass::Blit(vec![fill(BIG + 64, 8), fill(BIG + 128, 8), fill(BIG + 192, 8)]),
+        ];
+        let signals = [(&fence, 1)];
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &signals }).unwrap();
+        assert!(m.wait(&fence, 1, 5000));
+        // The completed handler runs after the fence: wait for it.
+        let start = std::time::Instant::now();
+        let (keys, buffers) = loop {
+            let (keys, buffers) = timing.snapshot();
+            if buffers > 0 || start.elapsed().as_secs() > 5 {
+                break (keys, buffers);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(buffers, 1, "one command buffer counted");
+        let ticks = |k: &str| keys.iter().find(|e| e.0 == k).map(|e| (e.1, e.2));
+        let big = ticks("blit 2 ops").expect("the big pass is timed");
+        let small = ticks("blit 1 ops").expect("the first pass is timed");
+        let three = ticks("blit 3 ops").expect("the last pass is timed");
+        assert_eq!((big.0, small.0, three.0), (1, 1, 1), "{keys:?}");
+        assert!(big.1 > small.1 && big.1 > three.1, "64 MiB is the longest: {keys:?}");
+        // SAFETY: inside the region; the GPU is done with it.
+        assert_eq!(unsafe { *region.ptr.add(BIG - 1) }, 7, "the passes still ran");
+    }
 
     /// A submission of more passes than a command buffer takes goes in several, in order: every
     /// pass runs and the fence is signalled once the last has.
