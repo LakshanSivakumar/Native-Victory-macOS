@@ -1669,3 +1669,70 @@ fn a_compute_shader_reads_both_the_view_strides_and_the_view_addresses() {
     assert_eq!((t.host.unset_roots(), t.host.failed()), (0, 0));
     drop(records);
 }
+
+/// `docs/native-host.md`, "Indexed table buffers without a stride", on the GPU: a structured SRV of
+/// 8-byte elements in a descriptor table whose FSPX record gives no stride (0), read by index
+/// (`buffer_load_dword ... idxen offset:4`), takes the element size from the view-stride table.
+/// Each lane reads dword 1 of element `lane` and stores it to dword `lane` of a raw UAV in a
+/// second table.
+#[test]
+fn an_indexed_load_through_a_table_buffer_without_a_stride_reads_its_elements() {
+    const CS: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0403, 0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0x0
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2004, 0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen offset:4
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000, 0x8004_0201, // buffer_store_dword v2, v1, s[16:19], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    // FSPX records: an SRV (kind 0) in a table (root type 3) at user data 0, slot 0, stride not
+    // given; a raw UAV (kind 3) in a table at user data 1, slot 1.
+    let record = |kind: u8, user_data: u8, slot: u8| {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[kind, 3]);
+        r[16] = 1;
+        r[20..23].copy_from_slice(&[4, user_data, slot]);
+        r[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        r
+    };
+    let c = crate::pipeline::test_compute_container(CS, &[record(0, 0, 0), record(3, 1, 1)], 2);
+    let cs = shaders::translate(&c).expect("translates");
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    let va = super::addr_tests::VA_A;
+    // Entry 0: a structured SRV of 32 elements of 8 bytes at VA_A + 0x1000 (pool offset 0x2_1000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut srv = [0u32; 16];
+    (srv[1], srv[6], srv[7]) = (1, 32, 8);
+    [srv[10], srv[11]] = super::addr_tests::halves(va + 0x1000);
+    let elements: Vec<u32> = (0..32u32).flat_map(|i| [0xDEAD_0000 | i, 1000 + i]).collect();
+    f.put(0x2_1000, &elements);
+    let start = heap._records.as_ptr() as u64;
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    // Entry 2: a raw UAV of 64 dwords at VA_A + 0x4_0000 (pool offset 0x6_0000).
+    let mut uav = [0u32; 16];
+    (uav[1], uav[4], uav[8]) = (1, 64, 1);
+    [uav[10], uav[11]] = super::addr_tests::halves(va + 0x4_0000);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 64);
+    assert!(t.host.mirror(start + 64).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "table stride") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap.heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap.heap, 0);
+    l.set_compute_root_table(1, &heap.heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!((t.host.unset_roots(), t.host.failed()), (0, 0), "the dispatch ran");
+    assert_eq!(f.get(0x6_0000, 32), (0..32).map(|i| 1000 + i).collect::<Vec<u32>>());
+}
