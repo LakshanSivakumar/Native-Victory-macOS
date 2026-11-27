@@ -271,7 +271,7 @@ impl Lower<'_> {
         }
         let both = match op {
             Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
-            Op::MulF => self.s.m.bin(c, Bin::Mul, lo, hi),
+            Op::MulU | Op::MulF => self.s.m.bin(c, Bin::Mul, lo, hi),
             Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
             Op::And => self.s.m.bin(c, Bin::And, lo, hi),
             Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),

@@ -2038,3 +2038,133 @@ fn integer_pairs_pack_to_16_bits_with_saturation() {
         (0..32i32).map(|i| s((i << 12) - 0x10000) | s(0x10002 - i) << 16).collect();
     assert_eq!(got, want, "signed");
 }
+
+/// Uniform/constant `v_cndmask_b32` prefix scans masked via constant SGPRs (with lane 63 of the
+/// inclusive prefix also read for the wave total) and integer `WaveActiveProduct` reductions built
+/// from `v_mul_lo_u32`, `v_readfirstlane_b32`, and `s_mul_i32` run across split wave64 halves.
+#[test]
+fn whole_wave_const_uniform_prefixes_integer_products_and_readfirstlane_run_across_halves() {
+    // Program 1: active lanes are even `i < 40` (20 lanes in wave 0, 0 in wave 1). Each active
+    // lane contributes uniform `s18 = 3` (copied from `s4` before `LANES_BELOW_40` clobbers
+    // `s[4:5]`) via `v_cndmask_b32_e64 v4, 0, s18, s[22:23]`; rows and halves are masked via
+    // constant SGPR pairs in `v_cndmask_b32` without changing `EXEC`, and lane 63 of the inclusive
+    // prefix is read outside the section even though lane 63 is inactive.
+    let mut prefix_uni = vec![0xBE92_0304]; // s_mov_b32 s18, s4
+    prefix_uni.extend_from_slice(&LANES_BELOW_40);
+    prefix_uni.extend([
+        0x360A_0081, // v_and_b32 v5, 1, v0
+        0x7D84_0A80, // v_cmp_eq_u32 vcc, 0, v5
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBE96_25C1, // s_or_saveexec_b64 s[22:23], -1
+        0xD501_0004,
+        0x0058_2480, // v_cndmask_b32_e64 v4, 0, s18, s[22:23]
+        0x7E18_0304, // v_mov_b32 v12, v4
+        0x4A18_18FA,
+        0xFF01_110C, // v_add_nc_u32_dpp v12, v12, v12 row_shr:1
+        0x4A18_18FA,
+        0xFF01_120C, // v_add_nc_u32_dpp v12, v12, v12 row_shr:2
+        0x4A18_18FA,
+        0xFF01_140C, // v_add_nc_u32_dpp v12, v12, v12 row_shr:4
+        0x4A18_18FA,
+        0xFF01_180C, // v_add_nc_u32_dpp v12, v12, v12 row_shr:8
+        0xD760_000E,
+        0x0201_1F0C, // v_readlane_b32 s14, v12, 15
+        0xBE90_03FF,
+        0xFFFF_0000, // s_mov_b32 s16, 0xffff0000
+        0xBE91_0380, // s_mov_b32 s17, 0
+        0xD501_000D,
+        0x0040_1C80, // v_cndmask_b32_e64 v13, 0, s14, s[16:17]
+        0x4A18_1B0C, // v_add_nc_u32 v12, v12, v13
+        0xD760_000E,
+        0x0201_3F0C, // v_readlane_b32 s14, v12, 31
+        0xBE90_0380, // s_mov_b32 s16, 0
+        0xBE91_03FF,
+        0x0000_FFFF, // s_mov_b32 s17, 0x0000ffff
+        0xD501_000D,
+        0x0040_1C80, // v_cndmask_b32_e64 v13, 0, s14, s[16:17]
+        0x4A18_1B0C, // v_add_nc_u32 v12, v12, v13
+        0xD760_000E,
+        0x0201_5F0C, // v_readlane_b32 s14, v12, 47
+        0xBE90_0380, // s_mov_b32 s16, 0
+        0xBE91_03FF,
+        0xFFFF_0000, // s_mov_b32 s17, 0xffff0000
+        0xD501_000D,
+        0x0040_1C80, // v_cndmask_b32_e64 v13, 0, s14, s[16:17]
+        0x4A18_1B0C, // v_add_nc_u32 v12, v12, v13
+        0x4E0A_1904, // v_subrev_nc_u32 v5, v4, v12
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0xD760_000E,
+        0x0201_7F0C, // v_readlane_b32 s14, v12, 63
+        0x8F0E_900E, // s_lshl_b32 s14, s14, 16
+        0x3804_0A0E, // v_or_b32 v2, s14, v5
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ]);
+    assert_eq!(refusal(&prefix_uni), None);
+    let got = run_io(&prefix_uni, 0, 128, 3);
+    if got.is_empty() {
+        return;
+    }
+    let want: Vec<u32> = (0..128)
+        .map(|i| {
+            if i < 40 && i % 2 == 0 {
+                (60 << 16) | ((i / 2) * 3)
+            } else {
+                CANARY
+            }
+        })
+        .collect();
+    assert_eq!(got, want);
+
+    // Program 2: active lanes are `i < 40 && i % 8 == 0` (`[0, 8, 16, 24, 32]`), contributing
+    // factors `2, 3, 4, 5, 6` whose product across the two host waves is `720`.
+    let mut prod = LANES_BELOW_40.to_vec();
+    prod.extend([
+        0x360A_0087, // v_and_b32 v5, 7, v0
+        0x7D84_0A80, // v_cmp_eq_u32 vcc, 0, v5
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0x2C08_0083, // v_lshrrev_b32 v4, 3, v0
+        0x4A08_0882, // v_add_nc_u32 v4, 2, v4
+        0xBE96_25C1, // s_or_saveexec_b64 s[22:23], -1
+        0xD501_000C,
+        0x005A_0881, // v_cndmask_b32_e64 v12, 1, v4, s[22:23]
+        0x7E1A_02FA,
+        0xFF00_B10C, // v_mov_b32_dpp v13, v12 quad_perm:[1,0,3,2]
+        0xD569_000C,
+        0x0202_1B0C, // v_mul_lo_u32 v12, v12, v13
+        0x7E1A_02FA,
+        0xFF00_4E0C, // v_mov_b32_dpp v13, v12 quad_perm:[2,3,0,1]
+        0xD569_000C,
+        0x0202_1B0C, // v_mul_lo_u32 v12, v12, v13
+        0x7E1A_02FA,
+        0xFF01_410C, // v_mov_b32_dpp v13, v12 row_half_mirror
+        0xD569_000C,
+        0x0202_1B0C, // v_mul_lo_u32 v12, v12, v13
+        0x7E1A_02FA,
+        0xFF01_400C, // v_mov_b32_dpp v13, v12 row_mirror
+        0xD569_000C,
+        0x0202_1B0C, // v_mul_lo_u32 v12, v12, v13
+        0xD778_000D,
+        0x0305_830C, // v_permlanex16_b32 v13, v12, -1, -1
+        0xD569_000C,
+        0x0202_1B0C, // v_mul_lo_u32 v12, v12, v13
+        0x7E1C_050C, // v_readfirstlane_b32 s14, v12
+        0xD760_000F,
+        0x0201_410C, // v_readlane_b32 s15, v12, 32
+        0x930E_0F0E, // s_mul_i32 s14, s14, s15
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0x7E04_020E, // v_mov_b32 v2, s14
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ]);
+    assert_eq!(refusal(&prod), None);
+    let got = run_io(&prod, 0, 128, 0);
+    let want: Vec<u32> = (0..128)
+        .map(|i| if i < 40 && i % 8 == 0 { 720 } else { CANARY })
+        .collect();
+    assert_eq!(got, want);
+}
