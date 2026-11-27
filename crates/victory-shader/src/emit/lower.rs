@@ -10862,24 +10862,28 @@ impl<'a> Lower<'a> {
     /// the console compiler's if/else always skips into its join that way.
     /// Lanes that left EXEC inside a uniform loop (the BVH walks) take no
     /// edge into its header; the others take the wave's.
-    fn uniform_join(&self, b: usize, uniform_scc: impl Fn(Value) -> bool) -> bool {
+    fn uniform_exit(&self, q: usize, uniform_scc: impl Fn(Value) -> bool) -> bool {
         let st = self.x.st;
+        match st.exits[q] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } if taken != not_taken => st
+                .bools
+                .support(when)
+                .iter()
+                .all(|a| matches!(a, Atom::Uniform(v) if uniform_scc(*v))),
+            _ => true,
+        }
+    }
+
+    fn uniform_join(&self, b: usize, uniform_scc: impl Fn(Value) -> bool) -> bool {
         let preds = &self.x.p.blocks[b].preds;
         preds
             .iter()
             .filter(|&&q| self.block[q].is_some())
-            .all(|&q| match st.exits[q] {
-                LaneExit::Branch {
-                    when,
-                    taken,
-                    not_taken,
-                } if taken != not_taken => st
-                    .bools
-                    .support(when)
-                    .iter()
-                    .all(|a| matches!(a, Atom::Uniform(v) if uniform_scc(*v))),
-                _ => true,
-            })
+            .all(|&q| self.uniform_exit(q, &uniform_scc))
     }
 
     /// Whether no lane goes from IR block `q` to `b`.
@@ -10911,6 +10915,40 @@ impl<'a> Lower<'a> {
             }
         }
         some
+    }
+
+    /// Whether, at a per-lane join `b`, another edge brings a tracked mask `m` that holds some
+    /// lane taking edge `n` and disagrees with `edge_mask` on some lane taking edge `n`. In a
+    /// mixed wave the console runs that arm too and leaves `m` in the scalar register for the
+    /// skipping lanes, while an unmixed wave that skips it keeps `edge_mask`.
+    fn mask_arm_disagrees_on_edge(
+        &self,
+        b: usize,
+        args: &[Value],
+        n: usize,
+        edge_mask: Bool,
+    ) -> bool {
+        let st = self.x.st;
+        let preds = &self.x.p.blocks[b].preds;
+        let on_n = self.lane_edge(preds[n], b);
+        args.iter().enumerate().any(|(k, arg)| {
+            let Some(&m) = st.masks.get(arg).filter(|_| k != n) else {
+                return false;
+            };
+            let mut holds = on_n.clone();
+            holds.push((m, true));
+            if !st.bools.meet(&holds) {
+                return false;
+            }
+            let mut a = on_n.clone();
+            a.extend([(m, true), (edge_mask, false)]);
+            if st.bools.meet(&a) {
+                return true;
+            }
+            let mut b = on_n.clone();
+            b.extend([(m, false), (edge_mask, true)]);
+            st.bools.meet(&b)
+        })
     }
 
     /// Whether IR block `b` can reach itself.
@@ -14122,19 +14160,33 @@ impl<'a> Lower<'a> {
                         self.s.m.bool(false)
                     }
                     // A lane function the structure knows though no mask tracks it (a constant,
-                    // SCC, a join that resolved): each lane's bit of it.
+                    // SCC, a join that resolved): each lane's bit of it, unless this is a
+                    // per-lane skip edge where another arm writes a mask holding the skipping
+                    // lanes that can disagree with `m` on those lanes.
                     (None, _)
                         if let Some(&m) = self.x.st.other.get(&arg)
+                            && !(!uniform
+                                && !self.uniform_exit(q, |_| true)
+                                && self.mask_arm_disagrees_on_edge(b, &phi.args, n, m))
                             && !self.x.st.bools.support(m).iter().any(|a| {
                                 matches!(a, Atom::Opaque(_) | Atom::Quad(_))
                             }) =>
                     {
                         self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
                     }
-                    // Data that is all lanes or none (`s_mov_b64 s, -1`) is that bit on any lanes.
+                    // Data that is all lanes or none (`s_mov_b64 s, -1`) is that bit on any lanes,
+                    // unless another arm writes a mask holding the skipping lanes that disagrees.
                     (None, Some(&Val::I32(word)))
                         if !self.console_lanes
-                            && let Some(all) = self.all_or_none(word, high.map(|h| h.args[n])) =>
+                            && let Some(all) = self.all_or_none(word, high.map(|h| h.args[n]))
+                            && !(!uniform
+                                && !self.uniform_exit(q, |_| true)
+                                && self.mask_arm_disagrees_on_edge(
+                                    b,
+                                    &phi.args,
+                                    n,
+                                    if all { Bool::TRUE } else { Bool::FALSE },
+                                )) =>
                     {
                         self.s.m.bool(all)
                     }

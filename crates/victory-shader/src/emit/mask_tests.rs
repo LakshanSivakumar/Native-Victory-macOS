@@ -466,3 +466,93 @@ fn a_wave64_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
         }
     }
 }
+
+/// On a divergent skip edge into a lane-mask join, scalar data (or 0) written
+/// before the branch is overwritten on the console when the taken arm writes a
+/// mask holding the skipping lanes (such as saved EXEC), so only a mask that
+/// holds none of the skipping lanes lowers (`synthetic_tests` regression on
+/// non-Windows hosts too).
+#[test]
+fn skip_edge_constant_joined_with_mask_holding_skipping_lanes_stays_refused() {
+    let lower_wave32 = |words: &[u32]| {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 32,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, 32)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: false,
+            zero_copy_memory: false,
+            rect_list: false,
+            copy_params: [0; 32],
+            view_marks: false,
+        })
+    };
+
+    // Compare inside the taken arm (`lane < 8`, masked by EXEC `lane < 16`) holds no skipping
+    // lanes (`lane >= 16`): lowers, with skipping lanes reading 0.
+    let mut words = vec![
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0xBE86_0385, // s_mov_b32 s6, 5
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+        0xBF88_0002, // s_cbranch_execz +2
+        0xD4C4_0006,
+        0x0002_0088, // v_cmp_gt_u32 s6, 8, v0
+        0xBEFE_0308, // s_mov_b32 exec_lo, s8
+        0xD501_0003,
+        0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+        0xDC70_8000,
+        0x007D_0308, // global_store_dword v[8:9], v3, off
+        0xBF81_0000, // s_endpgm
+    ];
+    lower_wave32(&words).expect("compare mask on taken arm lowers");
+
+    // Saved EXEC (`s8`, every lane) in the taken arm holds the skipping lanes too: both a
+    // partial constant (`5`) and `0` before the branch can disagree with `s8` on skipping lanes
+    // and must be refused, whereas `-1` agrees (`1`) with top-level saved EXEC on every lane.
+    words[6..8].copy_from_slice(&[0xBE86_0308, 0xBF80_0000]); // s_mov_b32 s6, s8; s_nop 0
+    for init in [0xBE86_0385, 0xBE86_0380] {
+        words[2] = init;
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lower_wave32(&words) else {
+            panic!("skip-edge constant {init:#x} joined with saved EXEC translated");
+        };
+        assert!(what.contains("lane-mask join"), "{what}");
+    }
+    words[2] = 0xBE86_03C1; // s_mov_b32 s6, -1
+    lower_wave32(&words).expect("-1 agrees with top-level saved EXEC on every lane");
+
+    // If the taken arm writes a subset mask (`lane < 24`) that holds lanes 16..23 of the skip
+    // edge (`lane >= 16`) and clears lanes 24..31, `-1` disagrees on lanes 24..31 and is refused.
+    words[6..8].copy_from_slice(&[0xD4C4_0006, 0x0002_0098]); // v_cmp_gt_u32_e64 s6, 24, v0
+    words.insert(6, 0xBEFE_03C1); // s_mov_b32 exec_lo, -1 (unmasked compare inside taken arm)
+    words[5] = 0xBF88_0003; // s_cbranch_execz +3
+    let Err(crate::ShaderError::Unsupported { what, .. }) = lower_wave32(&words) else {
+        panic!("skip-edge -1 joined with subset mask holding some skipping lanes translated");
+    };
+    assert!(what.contains("lane-mask join"), "{what}");
+}
