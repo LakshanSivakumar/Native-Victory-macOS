@@ -124,19 +124,18 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
     let key = res as usize;
+    // One title lock for the whole test, and no probe deadline: see
+    // `a_texture_rewritten_whole_is_read_whole_only_now_and_then`.
     with_title(|t| {
         assert!(t.realize(key));
-        t.sync_dirty();
+        t.sync_dirty_without_probe_deadline();
         assert_eq!(t.uploads_of(key), 1, "the blank first upload");
-    });
-    pool.write(0, &vec![0xABu8; info.size]);
-    with_title(|t| {
-        t.sync_dirty();
+        pool.write(0, &vec![0xABu8; info.size]);
+        t.sync_dirty_without_probe_deadline();
         assert_eq!(t.uploads_of(key), 2, "uploaded again at the next submission");
-    });
-    // Its samples showed that write, as they show a streamed texture's: it is not read whole at
-    // every submission after it (thousands of those were most of what a world submission read).
-    with_title(|t| {
+        // Its samples showed that write, as they show a streamed texture's: it is not read whole
+        // at every submission after it (thousands of those were most of what a world submission
+        // read).
         let reads = (0..crate::native::textures::WHOLE_EVERY)
             .filter(|_| {
                 let jobs = t.sync_jobs();
@@ -146,20 +145,16 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
             })
             .count();
         assert!(reads <= 1, "read whole {reads} times in a whole-read period");
-    });
-    // A glyph's worth of bytes in page 3 (a page a sampling probe would skip).
-    pool.write(3 * 4096 + 100, &[1u8; 16]);
-    // (Twice the period: other tests' textures share what a submission spares for these reads.)
-    with_title(|t| {
+        // A glyph's worth of bytes in page 3 (a page a sampling probe would skip).
+        pool.write(3 * 4096 + 100, &[1u8; 16]);
+        // (Twice the period: other tests' textures share what a submission spares for these reads.)
         let n = (1..=2 * crate::native::textures::WHOLE_EVERY).find(|_| {
-            t.sync_dirty();
+            t.sync_dirty_without_probe_deadline();
             t.uploads_of(key) == 3
         });
         assert!(n.is_some(), "a small write is seen within a whole-read period or two");
-    });
-    pool.write(5 * 4096 + 100, &[1u8; 16]);
-    with_title(|t| {
-        t.sync_dirty();
+        pool.write(5 * 4096 + 100, &[1u8; 16]);
+        t.sync_dirty_without_probe_deadline();
         assert_eq!(t.uploads_of(key), 4, "and, its samples having missed one, the next at the next submission");
     });
 }
@@ -202,21 +197,32 @@ fn a_texture_rewritten_whole_is_read_whole_only_now_and_then() {
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
     let key = res as usize;
-    let sync = || with_title(|t| { t.sync_dirty(); t.uploads_of(key) }).unwrap();
-    with_title(|t| assert!(t.realize(key)));
-    assert_eq!(sync(), 1, "the blank first upload");
-    for (i, n) in [(1u8, 2), (2, 3), (3, 4)] {
-        pool.write(0, &vec![i; info.size]);
-        assert_eq!(sync(), n, "a whole rewrite is seen by the samples at once");
-        sync();
-    }
-    // A glyph's worth of bytes in page 3 (a page the samples skip).
-    pool.write(3 * 4096 + 100, &[9u8; 16]);
-    // (Twice the period: other tests' textures share what a submission spares for these reads.)
-    let n = (1..=2 * crate::native::textures::WHOLE_EVERY).find(|_| sync() == 5);
-    assert!(n.is_some(), "a write the samples miss is seen within a whole-read period or two");
-    pool.write(5 * 4096 + 100, &[9u8; 16]);
-    assert_eq!(sync(), 6, "and the next one at the next submission");
+    // The title is shared, so the test holds its lock throughout: another test's submission in
+    // between probes and uploads this texture too, and the follow-up whole read after a missed
+    // write may then already be spent when the next write comes ("at the next" fails). And no
+    // probe deadline: other tests' textures stay hot after them (the 200 of
+    // `a_hot_texture_is_probed_at_each_submission_among_hundreds`), and a round the deadline cuts
+    // short under load may not reach this one ("at once" fails).
+    with_title(|t| {
+        assert!(t.realize(key));
+        let mut sync = || {
+            t.sync_dirty_without_probe_deadline();
+            t.uploads_of(key)
+        };
+        assert_eq!(sync(), 1, "the blank first upload");
+        for (i, n) in [(1u8, 2), (2, 3), (3, 4)] {
+            pool.write(0, &vec![i; info.size]);
+            assert_eq!(sync(), n, "a whole rewrite is seen by the samples at once");
+            sync();
+        }
+        // A glyph's worth of bytes in page 3 (a page the samples skip).
+        pool.write(3 * 4096 + 100, &[9u8; 16]);
+        // (Twice the period: other tests' textures share what a submission spares for these reads.)
+        let n = (1..=2 * crate::native::textures::WHOLE_EVERY).find(|_| sync() == 5);
+        assert!(n.is_some(), "a write the samples miss is seen within a whole-read period or two");
+        pool.write(5 * 4096 + 100, &[9u8; 16]);
+        assert_eq!(sync(), 6, "and the next one at the next submission");
+    });
 }
 
 /// A texture whose last write missed the sampled pages (a streamed mip tail, or a single glyph) is
