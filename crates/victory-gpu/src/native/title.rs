@@ -113,7 +113,10 @@ impl<B: GraphicsBackend> TitleList<B> {
     }
 
     /// The segments a submission runs, in order (copies: the title may reset and re-record).
-    pub fn segments(&self) -> Vec<(NativeList<B>, Vec<Wait>)> {
+    /// The copies clone `Rc`s that the title's recording threads clone and drop under the title's
+    /// lock, and `Rc` counts are not atomic: `_locked` is there so that only a holder of the title
+    /// (inside `glue::with_title`) can take them.
+    pub fn segments<P: PresentBackend>(&self, _locked: &Title<P>) -> Vec<(NativeList<B>, Vec<Wait>)> {
         self.done
             .iter()
             .map(|(l, w)| (l.snapshot(), w.clone()))

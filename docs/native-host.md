@@ -947,7 +947,17 @@ and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallback
   another still names): `glue::submit` lets the title lock go while it reads textures between the
   two. Today `glue::submit` also runs one submission at a time (`ORDER`), so no other sync could
   come in between; the title no longer depends on that
-  (`a_texture_named_by_a_submission_in_flight_is_not_given_up_by_another`). Under the budget with
+  (`a_texture_named_by_a_submission_in_flight_is_not_given_up_by_another`). The lists that
+  `keep_named` reads are snapshots (`TitleList::segments`), and a snapshot clones thousands of
+  `Rc`s (heaps, pipelines, textures) that the recording threads clone and drop under the title
+  lock. `Rc` counts are not atomic, so a snapshot taken or dropped without that lock corrupts them
+  (a double free or use after free: the menus crashed in 43-54 s with a malloc abort or a SIGSEGV
+  when an earlier version of this change took the snapshot before the lock). Each snapshot is now
+  taken and dropped under the lock: once for `keep_named`, once for the submission.
+  `TitleList::segments` takes a `&Title`, which exists only inside `glue::with_title`, so taking
+  one without the lock does not compile. The tests cannot show the race: the `cfg(test)` submit
+  keeps the lock throughout, and nothing stops a snapshot made under the lock from being moved out
+  through a captured variable and dropped later. Under the budget with
   nothing given up, nothing is read (except at the submission the trace logs at, once a second,
   so its figures match a run with the budget on). Left: a record the title changes after that read (between submit and
   encoding, for work held behind a fence) and an entry mirrored outside a submission. Those entries
