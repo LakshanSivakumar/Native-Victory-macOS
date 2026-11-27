@@ -1110,6 +1110,14 @@ fn reachable(f: &FuncIn) -> std::collections::HashSet<u64> {
             if !seen.insert(i.ip()) {
                 break;
             }
+            // These instructions emit a nonreturning trap. Bytes after them
+            // may be jump-table data unless another edge reaches that code.
+            if matches!(
+                i.mnemonic(),
+                Mnemonic::Int | Mnemonic::Int1 | Mnemonic::Int3 | Mnemonic::Ud2 | Mnemonic::Hlt
+            ) {
+                break;
+            }
             match i.flow_control() {
                 FC::ConditionalBranch => {
                     work.push(i.near_branch_target());
@@ -1129,12 +1137,52 @@ fn reachable(f: &FuncIn) -> std::collections::HashSet<u64> {
                     break;
                 }
                 FC::Return => break,
-                FC::Exception if matches!(i.mnemonic(), Mnemonic::Ud2) => break,
                 _ => {}
             }
         }
     }
     seen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::{Decoder, DecoderOptions};
+
+    #[test]
+    fn data_after_a_terminal_trap_does_not_block_a_function() {
+        const BASE: u64 = 0x1_4000_0000;
+        let at = BASE + 0x1000;
+        for (trap, message) in [
+            (&[0xcc][..], "int3/ud2"),
+            (&[0xcd, 0x29][..], "int 0x29"),
+            (&[0x0f, 0x0b][..], "int3/ud2"),
+            (&[0xf1][..], "int 0x1"),
+            (&[0xf4][..], "hlt"),
+        ] {
+            // test eax, eax; jz success; trap; data; success: mov eax, 7; ret.
+            let mut bytes = vec![0x85, 0xc0, 0x74, trap.len() as u8 + 1];
+            bytes.extend_from_slice(trap);
+            bytes.extend_from_slice(&[0xfa, 0xb8, 7, 0, 0, 0, 0xc3]);
+            let ins: Vec<_> = Decoder::with_ip(64, &bytes, at, DecoderOptions::NONE).iter().collect();
+            let f = FuncIn {
+                begin_va: at,
+                end_va: at + bytes.len() as u64,
+                ins: &ins,
+                tables: BTreeMap::new(),
+                extra: vec![],
+                landing_pads: vec![],
+            };
+            let data = at + 4 + trap.len() as u64;
+            let live = reachable(&f);
+            assert!(!live.contains(&data));
+            assert!(live.contains(&(data + 1)));
+            let ctx = Ctx { image_base: BASE, is_func: &|va| va == at };
+            let c = lift_function(&ctx, &f).unwrap();
+            assert!(c.contains(&format!("rt_trap(\"{message}\");")), "{c}");
+            assert!(c.contains("0x7ull"), "{c}");
+        }
+    }
 }
 
 /// Every unsupported-instruction error in `f` (not just the first), for ranking what to lift next.
