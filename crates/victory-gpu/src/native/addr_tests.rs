@@ -528,7 +528,7 @@ fn compares_with_16bit_dpp_vcmpx_and_class_run_on_the_gpu() {
 }
 
 #[test]
-fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
+fn a_fragment_buffer_reads_the_pool_and_checks_record_bounds_in_guessed_and_described_pipelines() {
     let vertex = SCREEN_TRIANGLE;
     let pixel = [
         0x8004_9000, // s_add_u32 s4, s0, 16
@@ -575,24 +575,43 @@ fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
     f.put(36, &[0.5f32]); // base + 1 * stride + 4
     f.put(48, &[1.0f32]); // backing memory at the address of both out-of-bounds reads
 
-    let state = Graphics::guess_base()
+    let guessed = Graphics::guess_base()
         .for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
-    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "computed fragment") else {
-        panic!("{:?}", t.shaders);
-    };
-    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
-    desc.render_target = true;
-    let color = t.host.texture(&desc).unwrap();
-    let mut list = NativeList::default();
-    list.set_render_targets(std::slice::from_ref(&color), None);
-    list.set_graphics_pipeline(&pso, Topology::Triangles);
-    list.set_graphics_binding(binding);
-    list.set_graphics_root_constants(0, &[VA_B as u32]);
-    list.draw_instanced(3, 1, 0, 0).unwrap();
-    super::run(&t.host, &[&list]);
-    let mut pixels = [0; 8 * 8 * 4];
-    t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
-    assert_eq!(&pixels[(4 * 8 + 4) * 4..][..4], [128, 0, 0, 255]);
+    // The same shaders in a pipeline the title describes (a stream naming one R8G8B8A8_UNORM
+    // target): it gets the page table too (was refused, "reads title memory through the page
+    // table in a graphics pipeline").
+    let mut rts = 15u32.to_le_bytes().to_vec();
+    for f in [28u32, 0, 0, 0, 0, 0, 0, 0, 1] {
+        rts.extend(f.to_le_bytes());
+    }
+    rts.extend([0; 4]);
+    // No culling (D3D12_RASTERIZER_DESC: solid fill, cull none, depth clip on).
+    let raster: Vec<u8> = [10u32, 3, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0].iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut described = Graphics::default();
+    // SAFETY: whole render-target-formats and rasterizer subobjects.
+    unsafe {
+        described.read(15, rts.as_ptr());
+        described.read(10, raster.as_ptr());
+    }
+    assert!(!described.is_guessed());
+    for state in [guessed, described] {
+        let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "computed fragment") else {
+            panic!("{:?}", t.shaders);
+        };
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
+        desc.render_target = true;
+        let color = t.host.texture(&desc).unwrap();
+        let mut list = NativeList::default();
+        list.set_render_targets(std::slice::from_ref(&color), None);
+        list.set_graphics_pipeline(&pso, Topology::Triangles);
+        list.set_graphics_binding(binding);
+        list.set_graphics_root_constants(0, &[VA_B as u32]);
+        list.draw_instanced(3, 1, 0, 0).unwrap();
+        super::run(&t.host, &[&list]);
+        let mut pixels = [0; 8 * 8 * 4];
+        t.host.backend.read_texture(&color, 0, 0, &mut pixels, 8 * 4, 0);
+        assert_eq!(&pixels[(4 * 8 + 4) * 4..][..4], [128, 0, 0, 255], "guessed: {}", state.is_guessed());
+    }
 }
 
 /// A guessed vertex shader of the triangle over the whole target.

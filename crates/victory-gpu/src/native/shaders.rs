@@ -142,7 +142,7 @@ pub fn integer_targets(color: &[Format]) -> u8 {
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
-/// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
+/// give the page table (compute and graphics shaders, guessed or described). A shader that indexes the resource
 /// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
 /// stage (`bind_root_render`, `bind_root` in `victory-metal`).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
@@ -396,7 +396,8 @@ impl<B: PresentBackend> Title<B> {
         if self.refuse_mesh(vs, name) {
             return Pipe::MeshRefused(MeshRefusal::OverLimit);
         }
-        if let Some(why) = refusal(vs, ps, graphics.is_guessed() || vs.stage == victory_shader::HwStage::Ms) {
+        // The draw binds the page table for any render pipeline whose binding asks (`memory`).
+        if let Some(why) = refusal(vs, ps, true) {
             self.shaders.refuse(name, why.into());
             return if vs.stage == victory_shader::HwStage::Ms { Pipe::MeshRefused(MeshRefusal::NoPipeline) } else { Pipe::Refused };
         }
