@@ -2183,7 +2183,7 @@ impl Owed {
             }
             if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
                 tracing::warn!(
-                    "metal: a command buffer failed; paid {} fence signals and {} value writes on the CPU",
+                    "metal: a command buffer failed, was lost or was left at a stop; paid {} fence signals and {} value writes on the CPU",
                     self.signals,
                     self.fills.len()
                 );
@@ -2390,14 +2390,19 @@ const STOP_VALUE: u64 = 1 << 62;
 
 /// Stops the process's GPU work cleanly before it exits: raises every shared event a command
 /// buffer may wait on ([`track_event`]), waits up to `wait` for the command buffers in flight to
-/// complete, and pays what the ones that did not still owe on the CPU. Returns how many were in
-/// flight and how many of them did not complete.
+/// complete, then, for those still in flight (running on the GPU: no event wakes them), up to
+/// `longest` in all, and pays what the ones that did not complete still owe on the CPU. Returns
+/// how many were in flight and how many of them did not complete.
+///
+/// Guess (#357): a process that exits while its command buffers still run on the GPU is what
+/// leaves their memory allocated; one long pass ran 25 s and then completed (res5), so a bounded
+/// longer wait lets most finish first. Paying their debts on the CPU does not stop the GPU.
 ///
 /// A process killed while its command buffers sleep in the kernel on events it never signals can
 /// leave the GPU memory they hold allocated after it exits: on macOS 26.5 an M5 Max kept about
 /// 20 GB "in use" by the GPU driver, owned by no process, until a reboot (#357). Woken first, they
 /// finish and the process exits with nothing pending.
-pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
+pub fn stop_gpu(wait: std::time::Duration, longest: std::time::Duration) -> (usize, usize) {
     let events: Vec<_> = EVENTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2405,7 +2410,7 @@ pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
         .iter()
         .filter_map(objc2::rc::Weak::load)
         .collect();
-    let drained = wake_and_drain(&events, wait);
+    let drained = wake_and_drain(&events, wait, longest);
     // Then what the residency sets keep resident is given back before the process goes, not left
     // to the driver's teardown: a run that hung the GPU at world entry with ~16 GB in its heaps'
     // sets left 19.7 GB "in use" after it exited (#357). Process exit skips `Heap`'s `Drop`.
@@ -2426,6 +2431,7 @@ pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
 fn wake_and_drain(
     events: &[Retained<ProtocolObject<dyn MTLSharedEvent>>],
     wait: std::time::Duration,
+    longest: std::time::Duration,
 ) -> (usize, usize) {
     let in_flight = flights().len();
     for e in events {
@@ -2433,9 +2439,25 @@ fn wake_and_drain(
             e.setSignaledValue(STOP_VALUE);
         }
     }
-    let deadline = std::time::Instant::now() + wait;
-    while !flights().is_empty() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(2));
+    let start = std::time::Instant::now();
+    let drain_until = |deadline: std::time::Instant| {
+        while !flights().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    drain_until(start + wait);
+    if !flights().is_empty() && longest > wait {
+        let still: Vec<String> = flights()
+            .iter()
+            .map(|f| format!("q{:x} #{} for {:.1}s", f.queue, f.serial, f.since.elapsed().as_secs_f64()))
+            .collect();
+        tracing::warn!(
+            "stopping: {} command buffers still in flight {:.1}s after their events were raised (running on the GPU); waiting up to {:.0}s in all: {still:?}",
+            still.len(),
+            wait.as_secs_f64(),
+            longest.as_secs_f64()
+        );
+        drain_until(start + longest);
     }
     let left: Vec<Flight> = flights().drain(..).collect();
     for f in &left {
@@ -4332,7 +4354,8 @@ mod owed_tests {
         m.submit_passes(&q, &PassSubmission { waits: &waits, passes: &[], signals: &signals }).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(m.completed(&fence), 0, "the command buffer sleeps on its wait");
-        let (in_flight, left) = wake_and_drain(&[never.0.clone(), q.2.clone()], std::time::Duration::from_secs(5));
+        let (in_flight, left) =
+            wake_and_drain(&[never.0.clone(), q.2.clone()], std::time::Duration::from_secs(5), std::time::Duration::from_secs(5));
         assert!(in_flight >= 1);
         assert_eq!(left, 0, "every command buffer completed on the GPU");
         assert_eq!(m.completed(&fence), 3);
@@ -4359,6 +4382,48 @@ mod owed_tests {
         assert!(SETS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(&set))));
         assert!(release_sets(std::slice::from_ref(&set)) >= 1 << 20);
         assert_eq!(set.allocationCount(), 0);
+    }
+
+    /// A command buffer the stop's raised events do not wake (here asleep on an event the stop
+    /// does not know; in a game, one still running on the GPU) gets the longer wait: one that
+    /// completes within it is not left behind, and one that never does is paid and left after
+    /// `longest`, not before and not much after.
+    #[test]
+    fn a_stop_waits_longer_for_command_buffers_its_events_do_not_wake() {
+        let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
+        let ms = std::time::Duration::from_millis;
+        let m = Metal::new().unwrap();
+        let q = m.create_queue().unwrap();
+        // Finishes 300 ms into the stop: past the first wait, within the longer one.
+        let (late, fence) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
+        m.submit_passes(&q, &PassSubmission { waits: &[(&late, 1)], passes: &[], signals: &[(&fence, 2)] }).unwrap();
+        let event = late.0.clone();
+        struct Send<T>(T);
+        // SAFETY: test only; Metal's shared events may be signalled from any thread.
+        unsafe impl<T> std::marker::Send for Send<T> {}
+        let event = Send(event);
+        let finisher = std::thread::spawn(move || {
+            let event = event;
+            std::thread::sleep(ms(300));
+            event.0.setSignaledValue(1);
+        });
+        let started = std::time::Instant::now();
+        let (in_flight, left) = wake_and_drain(&[], ms(50), ms(3000));
+        finisher.join().unwrap();
+        assert!(in_flight >= 1);
+        assert_eq!(left, 0, "it completed within the longer wait");
+        assert_eq!(m.completed(&fence), 2, "on the GPU");
+        assert!(started.elapsed() < ms(2500), "the stop goes on once nothing is in flight");
+        // Never completes: left after the bound, its debt paid.
+        let (never, owed) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
+        m.submit_passes(&q, &PassSubmission { waits: &[(&never, 1)], passes: &[], signals: &[(&owed, 4)] }).unwrap();
+        let started = std::time::Instant::now();
+        let (_, left) = wake_and_drain(&[], ms(50), ms(400));
+        let took = started.elapsed();
+        assert_eq!(left, 1);
+        assert!(took >= ms(400) && took < ms(1500), "bounded: {took:?}");
+        assert_eq!(m.completed(&owed), 4, "what it owed is paid on the CPU");
+        never.0.setSignaledValue(1);
     }
 
     #[test]
