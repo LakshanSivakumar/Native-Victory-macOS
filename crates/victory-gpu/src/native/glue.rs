@@ -1379,7 +1379,7 @@ fn pass_present(resource: This) {
     if !keys.contains(&(resource as usize)) { keys.push(resource as usize); }
     with_title(|t| {
         for key in keys {
-            let Some(info) = crate::resource::texture_info(key as This) else { continue };
+            let Some(info) = pass_info(t, key) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
             let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
             // A 3D texture (a colour grading table) is read whole; arrays are skipped.
@@ -1438,6 +1438,13 @@ fn pass_present(resource: This) {
             eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{slices}{extra} file={name}", info.format, info.memory as usize);
         }
     });
+}
+
+/// What `PASSTEX` knows of title texture `key`: the host's record first, then the resource
+/// object. A placed key (top bit set, [`super::textures::placed_key`]) is a hash, not an object:
+/// reading it as one crashed the process at the window's first dump.
+pub(super) fn pass_info(t: &MetalTitle, key: usize) -> Option<super::textures::TextureInfo> {
+    t.info_of(key).cloned().or_else(|| if key >> 63 == 0 { crate::resource::texture_info(key as This) } else { None })
 }
 
 /// Work dropped because its pipeline has no host pipeline.

@@ -1146,3 +1146,13 @@ fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
     assert_eq!(f.get(0x2_2000, 32), src[..32]);
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
+
+/// The pass trace names placed textures by a hashed key with the top bit set: `PASSTEX` must not
+/// read that key as a resource object (it did, and the first dump of a world frame crashed).
+#[test]
+fn a_placed_key_the_host_does_not_know_has_no_pass_info() {
+    let Some(t) = title() else { return };
+    let key = crate::native::textures::placed_key(0xa6_1200_0000, &[0; 14]);
+    assert_eq!(key >> 63, 1);
+    assert!(crate::native::glue::pass_info(&t, key).is_none());
+}
