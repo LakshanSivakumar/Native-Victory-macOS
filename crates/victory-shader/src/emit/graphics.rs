@@ -512,6 +512,14 @@ fn infer_with(
             addr |= 1 << bit;
             left -= 2;
         }
+        // Guess (docs/native-host.md, "Pixel input enables"): the last entry VGPR, when the code
+        // reads it only as 16-bit words (SDWA `WORD_0` / `WORD_1` sources), is the fixed-point
+        // position (bit 15: x in the low word, y in the high one), not a float system value;
+        // the VGPRs before it are laid out as before.
+        if left > 0 && live_in > 0 && word_only_entry_vgprs(&p).contains(&((live_in - 1) as u8)) {
+            addr |= 1 << 15;
+            left -= 1;
+        }
         for bit in 8..=14 {
             if left > 0 {
                 addr |= 1 << bit;
@@ -1000,6 +1008,39 @@ fn explicit_entry_vgprs(p: &Program) -> Vec<u8> {
     found
 }
 
+/// Entry VGPRs every explicit read of which is a VALU source taken as a 16-bit word (SDWA
+/// `WORD_0` / `WORD_1`): how console code unpacks the fixed-point pixel position.
+fn word_only_entry_vgprs(p: &Program) -> Vec<u8> {
+    let entry: std::collections::HashMap<Value, u8> = p
+        .inputs
+        .iter()
+        .filter_map(|&(reg, v)| match reg {
+            Reg::V(n) => Some((v, n)),
+            _ => None,
+        })
+        .collect();
+    let (mut words, mut other) = (Vec::new(), Vec::new());
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        let Fields::Valu(v) = &inst.fields else { continue };
+        for (idx, s) in v.src.iter().enumerate() {
+            let Operand::Vector { reg, dwords } = *s else { continue };
+            for r in (0..dwords).filter_map(|k| reg.checked_add(k)) {
+                let Some(&n) = inst.read(Reg::V(r)).and_then(|v| entry.get(&v)) else { continue };
+                let word = dwords == 1
+                    && v.sdwa.is_some_and(|w| w.src_sel.get(idx).is_some_and(|&sel| sel == 4 || sel == 5));
+                let list = if word { &mut words } else { &mut other };
+                if !list.contains(&n) {
+                    list.push(n);
+                }
+            }
+        }
+    }
+    // Reads the walk above does not classify (interpolation, memory addresses, exports...).
+    let all = explicit_entry_vgprs(p);
+    words.retain(|n| !other.contains(n) && all.contains(n));
+    words
+}
+
 /// Entry VGPR indices read as barycentrics (`i`/`j`) by `v_interp_p1*` / `v_interp_p2*`,
 /// following plain `v_mov_b32` copies and phis.
 fn barycentric_entry_vgprs(p: &Program) -> Vec<u8> {
@@ -1316,6 +1357,28 @@ mod tests {
             panic!("not PS");
         };
         assert_eq!(input_addr, 0x8080);
+    }
+
+    #[test]
+    fn an_entry_vgpr_read_only_as_words_is_guessed_as_the_fixed_point_position() {
+        let meta = [0u8; 0x10];
+        // v_cvt_f32_u32 v0, v1 src0_sel:WORD_0; v_cvt_f32_u32 v2, v1 src0_sel:WORD_1;
+        // exp mrt0 v0, v2, v0, v2 done vm
+        let code = words(&[0x7E00_0CF9, 0x0604_1601, 0x7E04_0CF9, 0x0605_1601, 0xF800_180F, 0x0200_0200, ENDPGM]);
+        let (p, (ins, _)) = infer(HwStage::Ps, &code, &meta).unwrap();
+        let StageIo::Ps { input_addr, .. } = p.io else {
+            panic!("not PS");
+        };
+        // v0 keeps the old guess (position x), v1 is the fixed-point position.
+        assert_eq!(input_addr, (1 << 8) | (1 << 15));
+        assert!(ins.iter().any(|e| e.kind == 3 && e.name == "SV_Position"), "{ins:?}");
+        // Read whole as well (v_mov_b32 v3, v1), it stays a float system value.
+        let code = words(&[0x7E00_0CF9, 0x0604_1601, 0x7E06_0301, 0xF800_180F, 0x0300_0300, ENDPGM]);
+        let (p, _) = infer(HwStage::Ps, &code, &meta).unwrap();
+        let StageIo::Ps { input_addr, .. } = p.io else {
+            panic!("not PS");
+        };
+        assert_eq!(input_addr, (1 << 8) | (1 << 9));
     }
 
     #[test]
