@@ -2582,6 +2582,29 @@ Measured on an M5 Pro with 48 GB (macOS 27.0, Series S, headless, main `905e7aad
 
 A counted append (load a count, `buffer_atomic_cmpswap` it for one more, again until the swap returns what was loaded), the one loop in the pass that was stuck in the fifth run (compute `87893da2440de5c3`), is not the cause as far as our own programs of its shape show: `victory-gpu` `heap_tests::a_swap_agrees_with_a_load_of_the_same_dword_inside_a_view_and_past_its_end`, `lanes_that_swap_one_count_at_once_all_append` and `lanes_of_split_waves_that_swap_counts_at_once_all_append` (256 lanes in 64-lane waves on the host's 32-lane waves) all end with every lane in.
 
+### The G-buffer's shards: a mesh program's first-lane read was each host wave's (#517)
+
+With the world drawing, the G-buffer held long fans and sheets on every kind of mesh geometry
+(characters, cars, buildings): some triangles right, others spread from a point. They were there
+before lighting. The common G-buffer mesh programs are wave64 NGG groups of 128 threads, and their
+threads are console lanes (`lane_index_at`), so each 32-lane host wave is half a console wave.
+They take wave-wide values with `v_readfirstlane_b32` (7 to 10 per program), several from values
+that differ per lane: meshlets packed several to a group give each lane its own meshlet's vertex
+and primitive counts. That lowered to `waveReadLaneFirst`, the host wave's own first lane, so lanes
+32 to 63 of each console wave read lane 32's value, not lane 0's, and built their vertices and
+primitives from the wrong meshlet.
+
+A wave64 mesh program's `v_readfirstlane_b32` now reads the console wave's first active lane where
+every thread runs the block once (`once_blocks`): each host wave finds its own first lane on and
+that lane's value, its lane 0 stores the value and its lane 1 whether any lane was on, and after a
+group barrier every thread takes the lower half's value if it had a lane on, else the upper half's
+(`mesh_first_lane`, `halves.rs`; the same exchange #302 proposes for compute). Elsewhere the read
+stays per host wave. Cost: two group barriers and 4 bytes of group-shared memory per thread.
+Test: `export_tests::a_wave64_mesh_programs_first_lane_read_is_its_console_waves`. Over the
+21,579-shader corpus nothing is newly refused or newly translated, and the output of 6,959 vertex
+(mesh) programs changes. On an M3 Max (Series X, preview `b3c1a1b0`, `VICTORY_GUESS_GRAPHICS=1`),
+G-buffer dumps from 140 to 290 s show no fans, where every run before had them.
+
 ## Zero-count dispatches, draws and buffer blits
 
 D3D12 treats zero-sized dispatches (`Dispatch`, `DispatchX` with thread counts), draws with zero
