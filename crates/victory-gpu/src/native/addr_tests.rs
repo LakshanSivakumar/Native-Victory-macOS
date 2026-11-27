@@ -166,11 +166,19 @@ pub(super) fn try_translate_wave(
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
+    try_translate_native(&native, options)
+}
+
+/// [`try_translate_wave`] of a program built by the caller (its own root layout and resources).
+pub(super) fn try_translate_native(
+    native: &NativeProgram,
+    options: victory_shader::emit::Options,
+) -> Result<HostShader, victory_shader::ShaderError> {
     let mut p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     p.thread_counts = options.thread_counts;
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     // A container of no parts: `DXBC`, a digest, version 1.0, its size, no parts.
     let mut empty = b"DXBC".to_vec();
     empty.extend([0; 16]);
@@ -178,7 +186,7 @@ pub(super) fn try_translate_wave(
     empty.extend(32u32.to_le_bytes());
     empty.extend(0u32.to_le_bytes());
     let c = Container::parse(&empty).expect("container");
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_with(&c, native, &p, &st, &io, &res, options)
 }
 
 pub(super) fn title() -> Option<Title<Metal>> {
