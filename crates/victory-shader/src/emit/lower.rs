@@ -931,10 +931,12 @@ impl<'a> Lower<'a> {
                         || n.starts_with("v_permlane")
                         || n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                        // The console wave's first lane, not each host wave's (#254), unless it
-                        // is a waterfall loop's read (the lane's own), or of a scalar, a constant,
-                        // or a VGPR just moved from one under a covering EXEC.
-                        || (n == "v_readfirstlane_b32"
+                        // The console wave's first lane, not each host wave's (#254), only when
+                        // a 32-lane host splits a wave64 program (and not a waterfall read or a
+                        // scalar/constant/covering-EXEC move).
+                        || (x.wave32_host
+                            && x.native.wave64
+                            && n == "v_readfirstlane_b32"
                             && !i.writes.iter().any(|w| x.res.waterfall.reads.contains(&w.1))
                             && !first_lane_of_a_scalar(p, x.st, i))
                         // One atomic per console wave; addresses by console lane.

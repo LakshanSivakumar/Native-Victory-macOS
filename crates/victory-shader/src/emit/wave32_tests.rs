@@ -593,6 +593,10 @@ fn split_first_lane_uses_one_exchange_and_handles_empty_exec() {
     ];
     let l = host32(EMPTY_EXEC, 64);
     assert_eq!((l.barriers, l.exchanges), (2, true));
+    // Non-split-wave hosts (e.g. D3D12 / WARP with wave32_host = false) must not have WaveSize(64)
+    // forced solely because of `v_readfirstlane_b32`.
+    let plain = [0x7E18_0500, 0x7E04_020C, S_ENDPGM];
+    assert_eq!(lowered(&plain, 64, false, false).unwrap().wave_size, None);
 }
 
 #[test]
