@@ -1424,7 +1424,7 @@ fn a_loop_register_that_is_exec_on_every_edge_counts_the_lanes_still_looping() {
 }
 
 #[test]
-fn mask_number_bfm_brev_bitset_saveexec_and_wrexec_run_on_the_gpu() {
+fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
     // 1. `s_bfm_b64` with a dynamic width/offset (`((1 << 10) - 1) << 30 = 0xFF_C000_0000`,
     //    lanes `30..39` across both 32-bit halves) written to `EXEC` and read back as data.
     let bfm = [
@@ -1496,7 +1496,26 @@ fn mask_number_bfm_brev_bitset_saveexec_and_wrexec_run_on_the_gpu() {
     dispatch(&mut t, &cs_bitset, &[0, 0, c, d, 0], false);
     assert_eq!(f.get(DST, 2), [0x0000_0005, 0x0000_0008], "s_bitset0/1_b64 words");
 
-    // 4. `s_orn1_saveexec_b64` and `s_andn1_wrexec_b64`:
+    // 4. `s_wqm_b64`: only lane 37 (`quad 9`, lanes `36..39`, `hi = 0x0000_00F0`) is set in `vcc`.
+    //    Verifies `mask_dword` routes `Atom::Quad` through `mask_number` instead of returning all-1s.
+    let wqm = [
+        0x7D84_00A5u32, // v_cmp_eq_u32 vcc, 37, v0
+        0xBE88_0A6A,    // s_wqm_b64 s[8:9], vcc
+        0xBE86_047E,    // s_mov_b64 s[6:7], exec
+        0xBEFE_0481,    // s_mov_b64 exec, 1
+        0x7E06_0208,    // v_mov_b32 v3, s8
+        0x7E08_0209,    // v_mov_b32 v4, s9
+        V_LSHLREV_V1_2_V0,
+        0xDC74_8000,
+        0x0002_0301, // global_store_dwordx2 v1, v[3:4], s[2:3]
+        0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+        S_ENDPGM,
+    ];
+    let cs_wqm = translate_io(&wqm, 5, 0, 64, shaders::options());
+    dispatch(&mut t, &cs_wqm, &[0, 0, c, d, 0], false);
+    assert_eq!(f.get(DST, 2), [0x0000_0000, 0x0000_00F0], "s_wqm_b64 quad 9 words");
+
+    // 5. `s_orn1_saveexec_b64` and `s_andn1_wrexec_b64`:
     //    - Start with `EXEC = 0x0000_FF00` (lanes `8..15`), `vcc = v0 >= 12` (`lo = 0xFFFF_F000, hi = u32::MAX`).
     //    - `s_orn1_saveexec_b64 s[8:9], vcc`: `s[8:9]` saves old `EXEC = (0x0000_FF00, 0)`, and new
     //      `EXEC = !vcc | old_exec = 0x0000_0FFF | 0x0000_FF00 = (0x0000_FFFF, 0)` (lanes `0..15`).

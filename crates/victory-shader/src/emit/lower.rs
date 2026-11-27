@@ -2584,7 +2584,16 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
+        // `Atom::Quad` evaluates to `true` as an EXEC derivative shortcut (`atom`), not the
+        // mask's quad-expanded bits: route any `s_wqm`-derived mask through `mask_number`.
+        let has_quad = self
+            .x
+            .st
+            .bools
+            .support(m)
+            .iter()
+            .any(|a| matches!(a, Atom::Quad(_)));
+        if (!self.x.st.active.contains(&lo) || has_quad) && !self.ballots.contains_key(&lo) {
             let xy = self.mask_number(lo)?;
             self.ballots.insert(lo, xy);
         }

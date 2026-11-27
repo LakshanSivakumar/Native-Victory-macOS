@@ -746,6 +746,16 @@ fn pixel_and_other_width_mask_number_negatives_stay_refused() {
             "shifted on the host's lanes",
         ),
         (
+            "pixel s_wqm_b64 read as data in mask_dword",
+            &[
+                0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
+                0xBEFE_0A6A, // s_wqm_b64 exec, vcc (Atom::Quad, in st.active)
+                0xBE86_107E, // s_bcnt1_i32_b64 s6, exec (routed to mask_number, not all-1s)
+                0x7E02_0206, // v_mov_b32_e32 v1, s6
+            ][..],
+            "shifted on the host's lanes",
+        ),
+        (
             "pixel s_bitset0_b64 by non-host-lane constant",
             &[
                 0x7D88_0485, // v_cmp_gt_u32_e32 vcc, 5, v2
