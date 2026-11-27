@@ -11503,6 +11503,242 @@ impl<'a> Lower<'a> {
             })
     }
 
+    /// The mask a lane-mask phi (phi `i` of block `b`) gets along edge `n`
+    /// where the register holds no tracked mask but one the pass can
+    /// follow: a mask spilled to VGPR lanes and read back (`v_readlane_b32`
+    /// of the lanes `v_writelane_b32` filled), or a join of masks (a loop
+    /// whose back edge brings the mask an inner join or a restore left).
+    /// In wave64 both dwords must be the pair's. (Port of VIctory-macOS 6f8fe556.)
+    fn restored_mask(
+        &mut self,
+        b: usize,
+        i: usize,
+        n: usize,
+        at: usize,
+    ) -> Option<Result<V, Why>> {
+        let (p, st) = (self.x.p, self.x.st);
+        let phi = &p.blocks[b].phis[i];
+        let (mut lo, mut hi) = (phi.args[n], None);
+        if self.x.native.wave64 {
+            let Reg::S(c) = phi.reg else { return None };
+            let high = p.blocks[b].phis.iter().find(|q| q.reg == Reg::S(c + 1))?;
+            hi = Some(high.args[n]);
+        }
+        // Through restores to the value spilled.
+        for _ in 0..8 {
+            let Some(&r) = st.restored.get(&lo) else { break };
+            lo = r;
+            if let Some(h) = hi {
+                hi = Some(*st.restored.get(&h)?);
+            }
+        }
+        if hi.is_some() && self.pair_high(lo) != hi {
+            return None;
+        }
+        if let Some(&m) = st.masks.get(&lo) {
+            return Some(self.boolean(m, at));
+        }
+        (self.phi_at.contains_key(&lo) && self.joins_masks(lo, &mut Vec::new()))
+            .then(|| self.atom(Atom::Phi(lo), at))
+    }
+
+    /// Whether value `v` is defined in a block dominating block `b` (an
+    /// input, or a value from before every path to `b`). `idom` caches the
+    /// immediate dominators.
+    fn dominates_join(&self, v: Value, b: usize, idom: &mut Vec<usize>) -> bool {
+        let p = self.x.p;
+        let def = match (self.def_block.get(&v), self.phi_at.get(&v)) {
+            (Some(&d), _) | (_, Some(&(d, _))) => d,
+            _ => return true,
+        };
+        if idom.is_empty() {
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            *idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
+        }
+        let mut d = b;
+        loop {
+            if d == def {
+                return true;
+            }
+            match idom.get(d) {
+                Some(&up) if up != d && up != usize::MAX => d = up,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether scalar value `v` is data no mask is made of, followed `depth` scalar steps back: a
+    /// dword a scalar memory load gives, a program input, or scalar ALU work on such values
+    /// (constants moved in, shifts of a loaded pointer). A tracked mask, EXEC, SCC, a join or a
+    /// lane read (a mask may be read back from VGPR lanes) is not, nor anything made from one (a
+    /// mask XORed with data, say).
+    fn made_without_masks(&self, v: Value, depth: u8) -> bool {
+        let st = self.x.st;
+        if st.masks.contains_key(&v) || st.highs.contains_key(&v) || st.restored.contains_key(&v) {
+            return false;
+        }
+        let Some(inst) = self.def_inst(v) else {
+            return self.x.p.inputs.iter().any(|&(reg, x)| x == v && matches!(reg, Reg::S(_)));
+        };
+        match &inst.fields {
+            Fields::Smem { .. } => true,
+            Fields::Sop { .. } if depth > 0 => inst.reads.iter().all(|&(reg, r)| match reg {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
+                Reg::S(_) => self.made_without_masks(r, depth - 1),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+
+    /// Whether phi value `v` joins a tracked mask (directly, through
+    /// restores of spilled lanes or through other phis).
+    fn joins_masks(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+        let st = self.x.st;
+        if st.masks.contains_key(&v) {
+            return true;
+        }
+        if let Some(&r) = st.restored.get(&v) {
+            return self.joins_masks(r, seen);
+        }
+        let Some(&(b, i)) = self.phi_at.get(&v) else {
+            return false;
+        };
+        if seen.contains(&v) || seen.len() > 64 {
+            return false;
+        }
+        seen.push(v);
+        self.x.p.blocks[b].phis[i]
+            .args
+            .iter()
+            .any(|&a| self.joins_masks(a, seen))
+    }
+
+    /// [`Self::no_mask_lane_on_edge`] where the masks of the other edges
+    /// may be joins of masks or masks spilled and read back: each mask
+    /// they are made of is clear in every lane of edge `n` (data among
+    /// them, as data on another edge there, does not count).
+    fn no_mask_lane_through_joins(&self, b: usize, args: &[Value], n: usize) -> bool {
+        let on_n = self.lane_edge(self.x.p.blocks[b].preds[n], b);
+        let mut some = false;
+        for (k, &arg) in args.iter().enumerate() {
+            if k == n || !self.joins_masks(arg, &mut Vec::new()) {
+                continue;
+            }
+            some = true;
+            let budget = std::cell::Cell::new(4096);
+            if !self.mask_clear_in(arg, &on_n, &mut Vec::new(), &budget) {
+                return false;
+            }
+        }
+        some
+    }
+
+    /// Whether every lane meeting `lanes` reads 0 from mask value `v`: its
+    /// tracked mask cannot hold such a lane, or it is a join (or a restore)
+    /// of masks that each cannot. A join met again on a cycle adds no mask
+    /// (by induction over the iterations). `budget` bounds the steps.
+    fn mask_clear_in(
+        &self,
+        v: Value,
+        lanes: &[(Bool, bool)],
+        seen: &mut Vec<Value>,
+        budget: &std::cell::Cell<u32>,
+    ) -> bool {
+        let st = self.x.st;
+        if budget.get() == 0 {
+            return false;
+        }
+        budget.set(budget.get() - 1);
+        if let Some(&m) = st.masks.get(&v) {
+            let mut l = lanes.to_vec();
+            l.push((m, true));
+            if !st.bools.meet(&l) {
+                return true;
+            }
+        }
+        if let Some(&r) = st.restored.get(&v) {
+            return self.mask_clear_in(r, lanes, seen, budget);
+        }
+        if seen.contains(&v) {
+            return true;
+        }
+        if let Some(inst) = self.def_inst(v) {
+            if seen.len() > 64 {
+                return false;
+            }
+            seen.push(v);
+            return self.made_clear_in(inst, v, lanes, seen, budget);
+        }
+        let Some(&(b, i)) = self.phi_at.get(&v) else {
+            return false;
+        };
+        if seen.len() > 64 {
+            return false;
+        }
+        seen.push(v);
+        self.x.p.blocks[b].phis[i].args.iter().all(|&a| {
+            !self.joins_masks(a, &mut Vec::new()) && !st.masks.contains_key(&a)
+                || self.mask_clear_in(a, lanes, seen, budget)
+        })
+    }
+
+    /// [`Self::mask_clear_in`] for the mask `v` that `inst` writes, by what
+    /// it is made of: a compare (and a carry) holds only lanes EXEC holds
+    /// there; an AND is clear where either side is, an OR or a select where
+    /// both are, a copy where its source is; `s_*_saveexec` saves EXEC and
+    /// `s_andn2_wrexec` keeps lanes of its source only.
+    fn made_clear_in(
+        &self,
+        inst: &Inst,
+        v: Value,
+        lanes: &[(Bool, bool)],
+        seen: &[Value],
+        budget: &std::cell::Cell<u32>,
+    ) -> bool {
+        let clear = |r: Option<Value>| {
+            r.is_some_and(|x| self.mask_clear_in(x, lanes, &mut seen.to_vec(), budget))
+        };
+        let exec = || clear(inst.read(Reg::S(EXEC)));
+        if matches!(inst.fields, Fields::Valu(_)) {
+            let n = inst.name();
+            let carry = ["v_add_co", "v_sub_co", "v_subrev_co"];
+            let mask = n.starts_with("v_cmp") || carry.iter().any(|c| n.starts_with(c));
+            return mask && exec();
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        let width = if self.x.native.wave64 { "_b64" } else { "_b32" };
+        let Some(op) = inst.name().strip_prefix("s_").and_then(|o| o.strip_suffix(width)) else {
+            return false;
+        };
+        let operand = |k: usize| match src.get(k) {
+            Some(&Operand::Scalar { code: NULL, .. }) | Some(&Operand::Const(128)) => true,
+            Some(&Operand::Scalar { code, .. }) => clear(inst.read(Reg::S(code))),
+            _ => false,
+        };
+        if let Some(f) = op.strip_suffix("_saveexec") {
+            if inst.write(Reg::S(EXEC)) != Some(v) {
+                return exec();
+            }
+            return match f {
+                "and" => operand(0) || exec(),
+                "andn2" => operand(0),
+                "andn1" => exec(),
+                "or" => operand(0) && exec(),
+                _ => false,
+            };
+        }
+        match op {
+            "andn2_wrexec" | "mov" | "andn2" => operand(0),
+            "andn1_wrexec" => exec(),
+            "and" => operand(0) || operand(1),
+            "or" | "xor" | "cselect" => operand(0) && operand(1),
+            _ => false,
+        }
+    }
+
     /// Whether no lane goes from IR block `q` to `b`.
     fn never_taken(&self, q: usize, b: usize) -> bool {
         !self.x.st.bools.meet(&self.lane_edge(q, b))
@@ -14970,6 +15206,7 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(phi, incoming);
         }
         let mut mesh_split = None;
+        let mut idom = Vec::new();
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -15024,6 +15261,17 @@ impl<'a> Lower<'a> {
                 } else {
                     self.x.st.masks.get(&arg).copied()
                 };
+                // A spilled and restored mask, or a join of masks (made before the match, which
+                // borrows the values).
+                let restored = if mask.is_none()
+                    && !self.unneeded_edges().contains(&(phi.value, n))
+                    && !(number && matches!(self.vals.get(&arg), Some(&Val::I32(_))))
+                    && !(!uniform && self.no_mask_lane_on_edge(b, &phi.args, n))
+                {
+                    self.restored_mask(b, i, n, qb)
+                } else {
+                    None
+                };
                 let x = match (mask, self.vals.get(&arg)) {
                     (Some(m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
                     // Read only ANDed with an EXEC those lanes are not in, or not read at all
@@ -15057,6 +15305,43 @@ impl<'a> Lower<'a> {
                             }) =>
                     {
                         self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
+                    }
+                    // A mask spilled to VGPR lanes and read back, or a join of masks (VIctory-macOS
+                    // 6f8fe556).
+                    (None, _) if let Some(r) = restored => r.map_err(|w| unsupported(offset, w))?,
+                    // As `no_mask_lane_on_edge`, through joins of masks (a region's mask its
+                    // inner join made, the saved EXEC of an inner region): every mask they join
+                    // is clear in the lanes of this edge.
+                    // Guess, as there: where the whole wave skips the region, the data this edge
+                    // brings is a reused register the code never reads as a mask.
+                    (None, _) if !uniform && self.no_mask_lane_through_joins(b, &phi.args, n) => {
+                        self.s.m.bool(false)
+                    }
+                    // A per-lane join in compute where the register holds data written along
+                    // this edge only (a descriptor, a constant, a constant-buffer dword loaded in
+                    // a region the other lanes skip: the compiler reused a register the mask was
+                    // dead in, so lanes coming along it read no mask from it). With console lanes
+                    // the lane's bit of the number, as at a uniform join; else, or where it is no
+                    // number, 0. Only data made from no mask (`made_without_masks`) counts. Data
+                    // from before the region (an old value the region's mask replaces for every
+                    // lane on the console, the saved EXEC say) stays refused.
+                    // VIctory-macOS 6f8fe556 (the ray-traced shadows' BVH walks).
+                    // Guess: the mask was dead where the compiler reused its register, so what the
+                    // other edges' lanes read from it (their mask here; on the console, where the
+                    // region's write is the whole wave's, the data's bits) changes no result.
+                    (None, v)
+                        if self.mask_data == MaskData::Console
+                            && !self.x.native.wave64
+                            && !uniform
+                            && self.made_without_masks(arg, 8)
+                            && !self.dominates_join(arg, b, &mut idom) =>
+                    {
+                        match v {
+                            Some(&Val::I32(word)) if self.console_lanes => {
+                                self.lane_bit(qb, word, None)
+                            }
+                            _ => self.s.m.bool(false),
+                        }
                     }
                     // Data that is all lanes or none (`s_mov_b64 s, -1`) is that bit on any lanes.
                     (None, Some(&Val::I32(word)))
@@ -15600,6 +15885,135 @@ mod tests {
             vec![buffer],
         )
         .map(|_| ())
+    }
+
+    #[test]
+    fn a_mask_joined_with_a_reused_registers_data_lowers() {
+        // s20 holds a compare's mask, then (in a branch some lanes take) a
+        // sampler dword; after the join it is read as a mask (compute
+        // 43ce3255529b200a; port of VIctory-macOS 6f8fe556).
+        let body = [
+            0xD4C5_0014, // v_cmp_ne_u32 s20, 0, v1
+            0x0002_0280,
+            0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0xB014_0092, // s_movk_i32 s20, 0x92
+            0xBEFE_0315, // s_mov_b32 exec_lo, s21
+            0xD501_0000, // v_cndmask_b32 v0, 0, 1, s20
+            0x0051_0280,
+        ];
+        assert_eq!(refusal(lowers_valu(&body)), None);
+        // The old value on the skip edge instead, the region's mask the
+        // saved EXEC (every lane, the skipping ones included, on the
+        // console): refused (`synthetic_tests::
+        // a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there`).
+        let body = [
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7D88_0290, // v_cmp_gt_u32 vcc_lo, 16, v1
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0xBE86_030C, // s_mov_b32 s6, s12
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0xD501_0000, // v_cndmask_b32 v0, 0, 1, s6
+            0x0019_0280,
+        ];
+        let what = refusal(lowers_valu(&body)).expect("the saved EXEC joined with data");
+        assert!(what.contains("lane-mask join"), "{what}");
+    }
+
+    #[test]
+    fn a_mask_register_reused_for_data_a_region_loads_is_no_mask_for_its_lanes() {
+        // s20 holds a compare's mask; in a region some lanes take the compiler reuses it for a
+        // constant-buffer dword or a descriptor-table dword (`s_buffer_load_dword`,
+        // `s_load_dword`), and after the join reads it as a mask: the ray-traced shadows' BVH
+        // walks (`CS_RTShadowTrace32HQ_TiledFarOnly` 534b3645dd344ab2). Port of VIctory-macOS
+        // 6f8fe556.
+        let body = |load: [u32; 2]| {
+            let mut w = vec![
+                0xD4C5_0014,
+                0x0202_0280, // v_cmp_ne_u32_e64 s20, 0, v1
+                0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+                0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+                0xBF88_0003, // s_cbranch_execz JOIN
+            ];
+            w.extend(load);
+            w.extend([
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xBEFE_0315, // JOIN: s_mov_b32 exec_lo, s21
+                0xD501_0000,
+                0x0051_0280, // v_cndmask_b32_e64 v0, 0, 1, s20
+            ]);
+            w
+        };
+        let buffer = [0xF420_0504, 0xFA00_0010]; // s_buffer_load_dword s20, s[8:11], 0x10
+        let table = [0xF400_0502, 0xFA00_0010]; // s_load_dword s20, s[4:5], 0x10
+        for load in [buffer, table] {
+            assert_eq!(refusal(lowers_valu(&body(load))), None, "{load:x?}");
+        }
+        // Data from before the region (the saved EXEC joined with data) stays refused:
+        // `a_mask_joined_with_a_reused_registers_data_lowers`; data made from a mask (XORed with
+        // another pair) too: `victory-gpu`'s
+        // `a_mask_swapped_into_a_pair_by_64_bit_xors_in_a_32_lane_wave_is_that_mask_at_a_join`.
+    }
+
+    #[test]
+    fn a_loops_mask_its_back_edge_brings_as_a_join_of_masks_lowers() {
+        // s20 is a compare's mask on entry to a loop and is read as a mask in it; the back edge
+        // brings what an inner region left there: its own compare's mask for the lanes that ran
+        // it, the header's for the others, a join of masks and no mask itself. The header's join
+        // takes it as that join (`restored_mask`). Port of VIctory-macOS 6f8fe556; 19 of the
+        // title's compute programs join a mask so.
+        let body = [
+            0xD4C5_0014,
+            0x0002_0280, // v_cmp_ne_u32_e64 s20, 0, v1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xD501_0000,
+            0x0051_0280, // HEADER: v_cndmask_b32_e64 v0, 0, 1, s20
+            0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0002, // s_cbranch_execz INNER
+            0xD4C5_0014,
+            0x0002_0680, // v_cmp_ne_u32_e64 s20, 0, v3
+            0xBEFE_0315, // INNER: s_mov_b32 exec_lo, s21
+            0x8007_8107, // s_add_u32 s7, s7, 1
+            0xBF0A_8207, // s_cmp_lt_u32 s7, 2
+            0xBF85_FFF5, // s_cbranch_scc1 HEADER
+        ];
+        assert_eq!(refusal(lowers_valu(&body)), None);
+    }
+
+    #[test]
+    fn a_join_of_masks_a_region_made_is_no_mask_for_the_lanes_that_skipped_it() {
+        // s20 holds data (5) before a region of the lanes with v2 != 0; inside it, a compare's
+        // mask, then in an inner region another compare's: after the inner region s20 is a join
+        // of masks, and after the outer one a join of that with the data the skipping lanes
+        // bring. Every mask joined there was made inside the region, so no lane that skipped it
+        // is in any: s20 reads 0 for them (the ray-traced shadows' BVH walks,
+        // `CS_RTShadowTrace32HQ_TiledFarOnly` 534b3645dd344ab2). Port of VIctory-macOS 6f8fe556.
+        let body = [
+            0xBE94_0385, // s_mov_b32 s20, 5
+            0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0008, // s_cbranch_execz JOIN
+            0xD4C2_0014,
+            0x0002_0280, // v_cmp_eq_u32_e64 s20, 0, v1
+            0x7D8A_0680, // v_cmp_ne_u32 vcc_lo, 0, v3
+            0xBE96_3C6A, // s_and_saveexec_b32 s22, vcc_lo
+            0xBF88_0002, // s_cbranch_execz INNER
+            0xD4C5_0014,
+            0x0002_0880, // v_cmp_ne_u32_e64 s20, 0, v4
+            0xBEFE_0316, // INNER: s_mov_b32 exec_lo, s22
+            0xBEFE_0315, // JOIN: s_mov_b32 exec_lo, s21
+            0xD501_0000,
+            0x0051_0280, // v_cndmask_b32_e64 v0, 0, 1, s20
+        ];
+        assert_eq!(refusal(lowers_valu(&body)), None);
+    }
+
+    /// What a lowering was refused for, if it was.
+    fn refusal<T>(r: Result<T, crate::ShaderError>) -> Option<String> {
+        r.err().map(|e| e.to_string())
     }
 
     #[test]
