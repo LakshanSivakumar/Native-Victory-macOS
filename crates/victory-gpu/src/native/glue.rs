@@ -71,13 +71,21 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
             Ok(metal) => {
                 let console = crate::console::current();
                 let (gpu_optimal, standard) = console.title_memory();
+                let budget = super::textures::texture_budget(
+                    metal.recommended_working_set(),
+                    (gpu_optimal + standard) as u64,
+                    std::env::var("VICTORY_METAL_TEXTURE_BUDGET_MB").ok().as_deref(),
+                );
                 tracing::info!(
                     console = console.name(),
                     title_memory_mib = (gpu_optimal + standard) / (1 << 20),
                     recommended_working_set_mib = metal.recommended_working_set() / (1 << 20),
+                    texture_budget_mib = budget >> 20,
                     "native host: Metal"
                 );
-                *guard = Some(Shared(Title::new(metal, pools().clone())));
+                let mut title = Title::new(metal, pools().clone());
+                title.set_texture_budget(budget);
+                *guard = Some(Shared(title));
                 start_timer();
             }
             Err(e) => {

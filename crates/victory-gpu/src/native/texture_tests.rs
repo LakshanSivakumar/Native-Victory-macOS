@@ -1596,3 +1596,139 @@ fn a_placed_rgb9e5_view_over_an_r32_uint_object_shares_its_texture() {
     glue::resource_released(object);
     with_title(|t| assert!(!t.host.knows(key), "released with the object"));
 }
+
+/// Over the texture budget, the least recently used go first, only until the excess is freed.
+#[test]
+fn the_least_recently_used_textures_go_first_until_the_excess_is_freed() {
+    use crate::native::textures::choose_evictions;
+    // (key, bytes, last used)
+    let c = vec![(1, 100, 5), (2, 100, 1), (3, 100, 3), (4, 100, 3)];
+    assert_eq!(choose_evictions(c.clone(), 0), Vec::<usize>::new());
+    assert_eq!(choose_evictions(c.clone(), 1), vec![2]);
+    assert_eq!(choose_evictions(c.clone(), 150), vec![2, 3], "equal use: the lower key first");
+    assert_eq!(choose_evictions(c.clone(), 300), vec![2, 3, 4]);
+    assert_eq!(choose_evictions(c, 10_000), vec![2, 3, 4, 1]);
+}
+
+/// The budget is what Metal's working set leaves after the title's memory, with a floor, unless
+/// `VICTORY_METAL_TEXTURE_BUDGET_MB` says otherwise.
+#[test]
+fn the_texture_budget_is_the_working_set_the_title_leaves() {
+    use crate::native::textures::{MIN_TEXTURE_BUDGET, texture_budget};
+    const MIB: u64 = 1 << 20;
+    // An M4 with 16 GB, Series S (#8).
+    assert_eq!(texture_budget(12124 * MIB, 7776 * MIB, None), 4348 * MIB);
+    // Series X on the same Mac: the title alone is past the working set.
+    assert_eq!(texture_budget(12124 * MIB, 13824 * MIB, None), MIN_TEXTURE_BUDGET);
+    assert_eq!(texture_budget(12124 * MIB, 7776 * MIB, Some("2048")), 2048 * MIB);
+    assert_eq!(texture_budget(12124 * MIB, 7776 * MIB, Some("0")), 0, "0: no budget");
+    assert_eq!(texture_budget(12124 * MIB, 7776 * MIB, Some("lots")), 4348 * MIB);
+}
+
+/// A title host of its own over a pool of its own, and a 16x16 RGBA8 texture of `flags` at `at`
+/// in it, filled with `byte` and made.
+fn budget_title() -> Option<(Title<victory_metal::metal::Metal>, Pool)> {
+    with_title(|_| ())?;
+    let t = Title::new(victory_metal::metal::Metal::new().unwrap(), Default::default());
+    let mem = Alias::new((256 << 10).max(page_size())).unwrap();
+    let info = PoolInfo { id: 9141, base: mem.primary as usize, len: mem.len, memory_entry: None };
+    t.host.memory().pool_created(&info);
+    t.host.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+    Some((t, Pool { mem }))
+}
+
+fn budget_texture(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, at: usize, flags: u32, byte: u8) -> usize {
+    let res = crate::resource::test_texture_at(pool.va(at), (16, 16), 1, 28, Swizzle::LINEAR.0, flags);
+    let info = crate::resource::texture_info(res).unwrap();
+    pool.write(at, &vec![byte; info.size]);
+    let key = res as usize;
+    t.texture_created(key, info);
+    assert!(t.realize(key));
+    key
+}
+
+/// Over budget, only textures no heap entry shows, no recorded or submitted work holds, and that
+/// are filled only from title memory are given up; one named again is made and filled again.
+#[test]
+fn over_budget_only_textures_nothing_uses_are_given_up_and_come_back() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let idle = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let shown = budget_texture(&mut t, &pool, 0x4000, 0, 0x22);
+    let held = budget_texture(&mut t, &pool, 0x8000, 0, 0x33);
+    // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ALLOW_UNORDERED_ACCESS.
+    let target = budget_texture(&mut t, &pool, 0xC000, 1, 0x44);
+    let unordered = budget_texture(&mut t, &pool, 0x10000, 4, 0x55);
+    t.sync_textures();
+    // A heap entry shows `shown`; one showed `unordered` through an unordered access view.
+    let records = [0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let _heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), shown as _, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    let uav = [28u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_uav(std::ptr::null(), unordered as _, std::ptr::null(), &uav, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    crate::descriptor::create_srv(std::ptr::null(), shown as _, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap(), "the unordered view is gone from the heap");
+    // A recorded list copies from `held` (work the GPU has not run yet).
+    let mut list = NativeList::<victory_metal::metal::Metal>::default();
+    let src = t.texture_of(held).unwrap();
+    let dst = t.texture_of(target).unwrap();
+    list.copy_texture_region(&src, 0, 0, [0; 3], [16, 16, 1], &dst, 0, 0, [0; 3]);
+    drop((src, dst));
+
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(idle), "the one texture nothing uses is given up");
+    for key in [shown, held, target, unordered] {
+        assert!(t.host.knows(key), "{key:#x} is in use");
+    }
+    drop(list);
+    // Still over budget after that check, so the next one waits a while.
+    t.keep_to_budget();
+    assert!(t.host.knows(held), "not checked again at once");
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(!t.host.knows(held), "once the work that held it is gone");
+
+    // Named again (a view, a copy): made again and filled from title memory at the next sync.
+    assert!(t.realize(idle));
+    t.sync_textures();
+    let tex = t.texture_of(idle).unwrap();
+    let mut out = vec![0u8; 16 * 16 * 4];
+    t.host.backend.read_texture(&tex, 0, 0, &mut out, 16 * 4, 0);
+    assert!(out.iter().all(|&b| b == 0x11));
+}
+
+/// A record the title copies into a heap with plain stores (no device call, so nothing realizes
+/// it) that names an evicted texture asks for it; the next submission makes it again and the entry
+/// is written then. Until then the entry shows nothing, not what it showed before.
+#[test]
+fn an_entry_copied_with_plain_stores_gets_an_evicted_texture_back() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let gone = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    let other = budget_texture(&mut t, &pool, 0x4000, 0, 0x77);
+    let records = [0u32; 8];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 1).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), other as _, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(gone) && t.host.knows(other));
+
+    // The title's record now names the evicted texture.
+    crate::descriptor::create_srv(std::ptr::null(), gone as _, &srv, start);
+    assert!(!t.host.mirror(start).unwrap(), "not made yet");
+    assert!(!heap.shows_texture(other), "the entry no longer shows the texture it showed");
+    t.set_texture_budget(0);
+    t.sync_dirty();
+    assert!(t.host.knows(gone), "made again at the next submission");
+    assert!(t.host.mirror(start).unwrap());
+    assert!(heap.shows_texture(gone));
+}

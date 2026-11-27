@@ -205,6 +205,8 @@ pub struct Title<B: PresentBackend> {
     pub compile_wait: std::time::Duration,
     pub(super) libraries: super::shaders::Libraries<B>,
     pub(super) textures: super::textures::Textures<B>,
+    /// The byte budget of host texture copies ([`Self::keep_to_budget`]).
+    pub(super) budget: super::textures::Budget,
     /// GPU-written textures waiting to be copied back into title memory.
     pub(super) back: super::textures::Back<B>,
     /// Sampled textures realized but not yet uploaded once.
@@ -255,6 +257,7 @@ impl<B: PresentBackend> Title<B> {
             compile_wait: std::time::Duration::MAX,
             libraries: Default::default(),
             textures: Default::default(),
+            budget: Default::default(),
             back: Default::default(),
             unloaded: std::collections::HashSet::new(),
             sync_serial: 0,

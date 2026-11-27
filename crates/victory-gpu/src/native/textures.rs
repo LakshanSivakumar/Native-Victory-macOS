@@ -493,6 +493,9 @@ pub struct Tracked<B: ResourceBackend> {
     /// The GPU wrote it (a copy, draw, clear or dispatch): its host texture holds what title
     /// memory does not, and is never filled from that memory again.
     gpu_written: bool,
+    /// The submission ([`Budget::serial`]) it was last named or shown at: the texture budget gives
+    /// up the least recently used first.
+    used: u64,
 }
 
 impl<B: ResourceBackend> Tracked<B> {
@@ -861,7 +864,11 @@ impl<B: PresentBackend> Title<B> {
                 return false;
             }
         };
+        if self.host.is_evicted(key) {
+            BUDGET_TRACE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.host.register_texture(key, &tex);
+        self.budget.live += info.size as u64;
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Depth-stencil textures are GPU-written depth targets whose CPU tile layout (e.g.
@@ -904,6 +911,7 @@ impl<B: PresentBackend> Title<B> {
                 #[cfg(target_os = "macos")]
                 target_views: Vec::new(),
                 gpu_written: false,
+                used: self.budget.serial,
             },
         );
         true
@@ -917,7 +925,11 @@ impl<B: PresentBackend> Title<B> {
     /// The host texture of title texture `key`.
     pub fn texture_of(&mut self, key: usize) -> Option<Rc<B::Texture>> {
         self.realize(key);
-        self.textures.get(&key).map(|t| t.texture.clone())
+        let serial = self.budget.serial;
+        self.textures.get_mut(&key).map(|t| {
+            t.used = serial;
+            t.texture.clone()
+        })
     }
 
     /// Resolves a render-target view to its attachment and its effective format. The base
@@ -989,7 +1001,9 @@ impl<B: PresentBackend> Title<B> {
     }
 
     pub fn texture_released(&mut self, key: usize) {
-        self.textures.remove(&key);
+        if let Some(t) = self.textures.remove(&key) {
+            self.budget.live -= t.info.size as u64;
+        }
         // A placed view that shares this texture ([`Self::alias_placed`]) goes with it.
         if let Some((address, placed)) = self.shared.remove(&key)
             && self.placed.get(&address).is_some_and(|&(k, _)| k == placed)
@@ -1125,6 +1139,10 @@ impl<B: PresentBackend> Title<B> {
     pub(super) fn sync_jobs_within(&mut self, budget: Option<std::time::Duration>) -> Vec<Job> {
         self.sync_serial = self.sync_serial.wrapping_add(1);
         self.release_placed();
+        for key in self.host.take_wanted() {
+            self.realize(key);
+        }
+        self.keep_to_budget();
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
@@ -1436,6 +1454,131 @@ impl SyncCost {
                 take(&REPLACED[0]), take(&REPLACED[1])
             );
             *sum = None;
+        }
+    }
+}
+
+/// The texture budget: how many bytes of sampled host texture copies the host keeps before it
+/// gives up the least recently used of those it may ([`Title::keep_to_budget`]).
+#[derive(Default)]
+pub struct Budget {
+    /// Bytes allowed (0: no budget).
+    pub limit: u64,
+    /// Bytes of every host texture copy made from a title texture (its size in title memory).
+    pub live: u64,
+    /// Submissions so far: the clock [`Tracked::used`] is read on.
+    serial: u64,
+    /// The next submission a check over budget looks for textures to give up (a check that found
+    /// too few waits [`RECHECK`] submissions: what entries show changes as the title rewrites them).
+    next_check: u64,
+    /// When the trace last logged.
+    logged: Option<std::time::Instant>,
+}
+
+/// Submissions between checks while over budget with too little to give up.
+pub(super) const RECHECK: u64 = 64;
+
+/// The budget when Metal's working set leaves the title's memory too little (Series X on 16 GB).
+/// Guess: about what a world frame samples; a smaller one would give up and remake textures each
+/// frame.
+pub const MIN_TEXTURE_BUDGET: u64 = 1536 << 20;
+
+/// Bytes of host texture copies to allow: `VICTORY_METAL_TEXTURE_BUDGET_MB` when set (0: no
+/// budget), else what Metal's recommended working set leaves after the title's memory, at least
+/// [`MIN_TEXTURE_BUDGET`].
+pub fn texture_budget(working_set: u64, title_memory: u64, var: Option<&str>) -> u64 {
+    match var.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(mb) => mb << 20,
+        None => working_set.saturating_sub(title_memory).max(MIN_TEXTURE_BUDGET),
+    }
+}
+
+/// Which of `candidates` (key, bytes, last use) to give up to free `over` bytes: the least recently
+/// used first (the lower key first among equals, so the choice does not depend on map order).
+pub(super) fn choose_evictions(mut candidates: Vec<(usize, u64, u64)>, over: u64) -> Vec<usize> {
+    candidates.sort_unstable_by_key(|&(key, _, used)| (used, key));
+    let mut freed = 0;
+    candidates
+        .into_iter()
+        .take_while(|&(_, bytes, _)| {
+            let more = freed < over;
+            freed += bytes;
+            more
+        })
+        .map(|(key, ..)| key)
+        .collect()
+}
+
+/// For the trace: textures given up under the budget, their bytes, and evicted ones made again.
+static BUDGET_TRACE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+impl<B: PresentBackend> Title<B> {
+    /// Sets the texture budget in bytes (0: none).
+    pub fn set_texture_budget(&mut self, bytes: u64) {
+        self.budget.limit = bytes;
+    }
+
+    /// Whether `t` (title texture `key`) may be given up: a sampled texture filled only from title
+    /// memory (not a render target, depth or GPU-written texture, nor one ever viewed for unordered
+    /// access), that no heap entry shows and no recorded or submitted work holds (the host's two
+    /// references are all there are: `Title::textures` and the host's resources).
+    fn evictable(&self, key: usize, t: &Tracked<B>) -> bool {
+        !t.info.render_target()
+            && !t.gpu_written
+            && t.info.desc().is_some_and(|d| !d.format.is_depth())
+            && Rc::strong_count(&t.texture) <= 2
+            && !self.host.texture_in_use(key)
+    }
+
+    /// Past the budget, gives up the least recently used textures that may be given up
+    /// ([`Self::evictable`]) until under it. One a view names again is made and uploaded again.
+    /// Textures an entry shows are stamped used now.
+    pub(super) fn keep_to_budget(&mut self) {
+        self.budget.serial += 1;
+        let serial = self.budget.serial;
+        let trace = env_set!("VICTORY_TRACE_TEXTURE_SYNC")
+            && self.budget.logged.is_none_or(|t| t.elapsed().as_secs() >= 1);
+        let over = self.budget.live.saturating_sub(self.budget.limit);
+        let check = self.budget.limit > 0 && over > 0 && serial >= self.budget.next_check;
+        if !check && !trace {
+            return;
+        }
+        let (mut candidates, mut shown) = (Vec::new(), 0);
+        let keys: Vec<usize> = self.textures.keys().copied().collect();
+        for key in keys {
+            let t = &self.textures[&key];
+            if self.evictable(key, t) {
+                candidates.push((key, t.info.size as u64, t.used));
+            } else if self.host.texture_in_use(key) {
+                shown += t.info.size as u64;
+                self.textures.get_mut(&key).expect("listed").used = serial;
+            }
+        }
+        let evictable: u64 = candidates.iter().map(|c| c.1).sum();
+        if check {
+            for key in choose_evictions(candidates, over) {
+                let t = self.textures.get(&key).expect("a candidate");
+                let bytes = t.info.size as u64;
+                let info = t.info.clone();
+                self.host.evict_texture(key);
+                self.texture_released(key);
+                // Made again when a view names it next ([`Self::realize`]).
+                self.pending.insert(key, info);
+                BUDGET_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                BUDGET_TRACE[1].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+            if self.budget.live > self.budget.limit {
+                self.budget.next_check = serial + RECHECK;
+            }
+        }
+        if trace {
+            self.budget.logged = Some(std::time::Instant::now());
+            let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}",
+                self.budget.live >> 20, self.budget.limit >> 20, shown >> 20, evictable >> 20,
+                take(&BUDGET_TRACE[0]), take(&BUDGET_TRACE[1]) >> 20, take(&BUDGET_TRACE[2]),
+            );
         }
     }
 }
@@ -1832,6 +1975,7 @@ mod tests {
 
         let make_tracked = |hot_until: u64| Tracked::<Capture> {
             texture: Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 4, 4)),
+            used: 0,
             info: TextureInfo {
                 dimension: Dimension::Tex2d,
                 format: 28,
@@ -1972,6 +2116,7 @@ mod tests {
                     i,
                     Tracked {
                         texture: Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 128, 128)),
+                        used: 0,
                         info: TextureInfo {
                             dimension: Dimension::Tex2d,
                             format: 28,

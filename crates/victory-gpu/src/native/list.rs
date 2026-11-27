@@ -184,6 +184,12 @@ impl<B: GraphicsBackend> NativeHeap<B> {
         }
     }
 
+    /// Whether an entry shows title texture `resource`.
+    pub fn shows_texture(&self, resource: usize) -> bool {
+        let Shown { of, entries, .. } = &*self.images.borrow();
+        entries.get(&resource).is_some_and(|e| e.iter().any(|i| of.get(i) == Some(&resource)))
+    }
+
     /// The entries that show title texture `resource`, which they stop showing.
     pub fn take_entries(&self, resource: usize) -> Vec<usize> {
         let Shown { of, entries, gone } = &mut *self.images.borrow_mut();

@@ -515,7 +515,7 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines). While work stays held (the `work held for a wait that does not hold` warning, when nothing is submitted any more) the same in-flight report is made, with a line giving how many command buffers are in flight, each queue whose order event is behind the command buffers encoded with it (`queue <title queue> at <reached> of <encoded>`), and the commands dropped so far at unmapped memory.
 - `VICTORY_TRACE_WRITES=1`: on macOS, a warning for every bottom-of-pipe value write a list records (value, address, whether a pool holds it, the list), every memory-value wait (address, comparison, reference, the list) and every `ExecuteCommandLists` (queue and lists): which list of which queue owes the word another queue waits for. About 100 lines a world frame. Without it, a value write the host has to drop (its address in no mapped pool, or not preparable) is still a warning, once per page (`native host drops a value write`): a queue may wait for that word for good.
 - `VICTORY_TRACE_FREED=1`: names host and GPU uses of title memory the title's allocator has freed. `XMemAllocDefault` notes every range it hands out, `XMemFreeDefault` the ones it takes back (the block header holds the size), and `Host::resolve` — the way every host and GPU use of title memory begins — logs any range it is asked to map that overlaps a freed span, with both ranges and a serial. Part-reuse leaves the freed ends beside it. What it cannot see: the title can hook the allocator, and pools it sub-allocates inside a live block free and reuse memory without any call here; this names the `XMem`-granularity class only (#339: a host copy or a GPU write into freed memory, one candidate for the corrupted pool links).
-- `VICTORY_TRACE_TEXTURE_SYNC=1`: on macOS, once a second, what keeping the host's textures in step with title memory cost (`texture sync in the last ..`): the submissions that read textures (batches), the textures and MiB they read (those never uploaded before, those read and found unchanged, the blank ones, those with memory that could not be read at once), the time under the host's lock (probing the hot textures, with how many of them went to be read whole; probing the blank ones; uploading), the time the submitting thread spent reading without the lock and the reading threads' time by step (read, hash, detile), and the placements that replaced another at their address (with how many of those had been at that address before). See "Texture sync without the host's lock".
+- `VICTORY_TRACE_TEXTURE_SYNC=1`: on macOS, once a second, what keeping the host's textures in step with title memory cost (`texture sync in the last ..`): the submissions that read textures (batches), the textures and MiB they read (those never uploaded before, those read and found unchanged, the blank ones, those with memory that could not be read at once), the time under the host's lock (probing the hot textures, with how many of them went to be read whole; probing the blank ones; uploading), the time the submitting thread spent reading without the lock and the reading threads' time by step (read, hash, detile), and the placements that replaced another at their address (with how many of those had been at that address before). See "Texture sync without the host's lock". It also logs the texture budget once a second (`host texture copies: ..`; "A byte budget on host texture copies" below), whose size `VICTORY_METAL_TEXTURE_BUDGET_MB=<n>` sets (`0`: none).
 - `VICTORY_TRACE_RECORD_WRITERS=1`: for indirect mesh draws that leave no pixels. At each present with indirect mesh executions it logs `mesh records` (the frame's records, and how many had a group count of 0 in title memory as the execution was recorded; a culling pass that ran fills them on the GPU later, one that was dropped never does), `mesh record buffer holder` for each compute program, `ran` or `dropped`, whose descriptor tables hold a record buffer for unordered access (with the records in those buffers and the textures it reads), and `texture read by a mesh record buffer holder` with the compute programs that hold that texture for unordered access. Tables are read 64 entries deep whatever their length, so a holder is a candidate writer, not a proven one; the texture keys are those of the `VICTORY_TRACE_TARGETS` frame line.
 - `VICTORY_TRACE_PASSES=<dir>,<skip>,<presents>`: on macOS, an ordered trace of a few world frames, to find the first pass that writes nothing (`dive-lighting` research). It lets `<skip>` world presents go by (a present after 500 or more recorded draws; default 100), then for the next `<presents>` presents (default 4) writes to stderr, in the order each submission queues the work: `PASS exec=<submission> q=<queue> li=<list> ci=<command> kind=<draw|mesh|dispatch[..]|clear-rtv|copy-region|...> out=<"ran" or the drop reason> sh=[shaders] tg=[targets] rd=[shader-resource views] wr=[unordered-access views] none=<empty table entries> topo=<topology>` for every draw, dispatch, clear and copy recorded in the window; `PASSFAIL exec= li= ci= err=` for each of those the submission could not prepare (dropped then, e.g. "not in a mapped pool"); `PASSUPLOAD` for each upload of title memory over a render-target or unordered-access texture; and, at the window's last present, `PASSTEX key= fmt= WxH at= nonzero=` (plus range, mean and non-finite counts for DXGI 2, 10, 24, 26) for every texture the window named, with a `.ppm` of each in `<dir>` (only formats the dump decodes; arrays skipped). A texture is written `<key>:f<DXGI format>:<W>x<H>@<title address>`, a shader-resource view of a resource the host has no texture for `<key>:untracked`, and a view of memory that is not a texture `placed-dim<dimension>`; tables are read to the entries the shader's binding names (24 for a dropped draw or a dispatch, and never past the heap). Set `VICTORY_TRACE_PASSES_DUMP_EACH=1` to dump at every present of the window. Off unless set: the switch is read once, at the first present; outside the window every hook is one relaxed load of a flag and nothing is formatted or kept, and the commands are prepared once either way (a failure is reported from the submission's own preparation). Images hold game content: keep `<dir>` outside the repository. Runs that end with exit code 134 a minute or two after the window were seen with and without the trace on the same build (the dive's runs and the untraced c2comb run), so that abort is not the trace's.
 - `VICTORY_TRACE_DISPATCH_FLAGS=1`: logs the first `DispatchX` with each flags value (`DispatchX: the first dispatch with these flags`, with its counts and the bits the host does not know: it knows 0x20 and 0x8000, see "`DispatchX` with thread counts"), and the first `ExecuteIndirect` of a type-105 dispatch, whose counts run as group counts.
@@ -899,6 +899,51 @@ for the whole run. The host now keeps the key it placed at each address
 texture is released (guess: the title is done with it once it places another there; a view of the
 old description still in a heap would name a released texture). Every texture placed in a pool is
 released at the first submission after the pool is (`NativeHost::released_pools`).
+
+#### A byte budget on host texture copies (#294)
+
+Every host texture copy of a title texture is made when a view first names it (`Title::realize`,
+from `glue::mirror` for every view the device writes, staging heaps included) and stayed until the
+title released the texture. Nothing bounded their total: on a 16 GB M4, Series S (#8), the host made
+about 13,000 copies during the first load after the menus while the footprint grew about 7.6 GB,
+and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
+
+* **The budget.** Metal's `recommendedMaxWorkingSetSize` less the title's memory (both logged at
+  startup with it, as `texture_budget_mib`), at least 1536 MiB (`MIN_TEXTURE_BUDGET`; guess: about
+  what a world frame samples). 4348 MiB on that M4 with Series S; Series X on 16 GB gets the floor.
+  `VICTORY_METAL_TEXTURE_BUDGET_MB=<n>` sets it (`0`: no budget). A copy counts its size in title
+  memory.
+* **What may go.** At each submission over the budget (`Title::keep_to_budget`), before its
+  textures are synced, the least recently used copies that may go are given up until under it.
+  A copy may go when it is a sampled texture filled only from title memory (not a render target,
+  depth or GPU-copied texture, nor one ever shown through an unordered access view, whose host
+  texture may hold what title memory does not), no heap entry shows it, and no recorded or
+  submitted list holds it (the host's own two references are all there are). Shaders index the
+  heaps themselves (#79), so a copy an entry shows counts as used however long no bound table
+  named it; D3D12 forbids rewriting an entry that submitted work still reads, so a copy no entry
+  shows is not reached by work in flight, and Metal retains what a committed command buffer names
+  directly. A check that cannot get under the budget waits 64 submissions before the next
+  (`RECHECK`). "Least recently used" is the last submission a view, a copy or a check saw it
+  shown at.
+* **Coming back.** A given-up copy goes the way a released one does (`NativeHost::evict_texture`,
+  through `release_resource`), so it leaves the heap residency sets with its last reference and
+  does not work against `VICTORY_METAL_RESIDENCY_SETS=heap`. Its description goes back to
+  `Title::pending`: the next view the device writes makes it again and it is uploaded at the next
+  submission. A record the title copies into a heap with plain stores (`remirror_tables`, which
+  makes no texture) that names one asks for it (`NativeHost::take_wanted`); the next submission
+  makes it, and the entry is written then. Shortcut: until then that entry shows nothing, for the
+  submission that found it; making it during encoding would need the title's texture state there.
+* **Trace.** With `VICTORY_TRACE_TEXTURE_SYNC=1`, once a second: `host texture copies: <MiB>,
+  budget <MiB>; <MiB> shown by heap entries or viewed for unordered access, <MiB> could be given
+  up; given up in the last second <n> (<MiB>), made again <n>`. If the copies are mostly shown by
+  heap entries, the budget frees little and the levers are the ones #79 names (one copy instead of
+  two, fewer top mips).
+* Tests (`texture_tests`): `the_least_recently_used_textures_go_first_until_the_excess_is_freed`,
+  `the_texture_budget_is_the_working_set_the_title_leaves`,
+  `over_budget_only_textures_nothing_uses_are_given_up_and_come_back` (a copy a heap entry shows,
+  one a recorded list holds, a render target and one viewed for unordered access stay; the held one
+  goes once the list is gone; the one given up comes back with its texels),
+  `an_entry_copied_with_plain_stores_gets_an_evicted_texture_back`.
 
 #### Texture views over 2D arrays
 
