@@ -22,6 +22,7 @@ type MakeSignature = unsafe extern "C" fn(*const Descriptor, *mut *mut c_void) -
 type SetSignature = unsafe extern "C" fn(*mut c_void, *const c_void);
 type SetFlags = unsafe extern "C" fn(*mut c_void, u32);
 type SetDualSource = unsafe extern "C" fn(*mut c_void, u32);
+type SetBool = unsafe extern "C" fn(*mut c_void, bool);
 type GetReflection = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> bool;
 type CopyMeshInfo = unsafe extern "C" fn(*const c_void, u32, *mut MeshInfo) -> bool;
 type ReleaseMeshInfo = unsafe extern "C" fn(*mut MeshInfo) -> bool;
@@ -29,6 +30,12 @@ type ReleaseMeshInfo = unsafe extern "C" fn(*mut MeshInfo) -> bool;
 /// `IRDualSourceBlendingConfigurationForceEnabled`: one target's two sources are shader outputs
 /// 0 and 1, both `[[color(0)]]` (`index(0)` and `index(1)`).
 const DUAL_SOURCE_ON: u32 = 1;
+/// `IRCompilerSupportUnAlignedTypedBuffers(IRCompiler*, bool)`, a C++ symbol (no C name in the
+/// header) of the converters that have it, D3DMetal 4.0b3's among them. Off by default: a typed
+/// buffer load or store indexes the texture buffer from its start and ignores the element offset
+/// in the entry's metadata (bits 32-39, `textureViewOffsetInElements`), so a view that starts
+/// inside a 16-byte unit reads and writes the elements before its own. On, the shader adds it.
+const UNALIGNED_TYPED: &std::ffi::CStr = c"_Z38IRCompilerSupportUnAlignedTypedBuffersP10IRCompilerb";
 
 /// `IRShaderStageMesh`.
 pub const STAGE_MESH: i32 = 5;
@@ -306,6 +313,18 @@ impl Msc {
         Ok(Msc { h, id })
     }
 
+    /// Whether `dxil` is converted with [`UNALIGNED_TYPED`] on: it has typed buffers, the
+    /// converter has the switch, and `VICTORY_MSC_UNALIGNED_TYPED` is not `0` (the A/B: the
+    /// shader then ignores the element offset, as before 27 November).
+    fn unaligned_typed(&self, dxil: &[u8]) -> bool {
+        static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wanted = *WANTED.get_or_init(|| std::env::var_os("VICTORY_MSC_UNALIGNED_TYPED").is_none_or(|v| v != "0"));
+        // SAFETY: `h` is a live dlopen handle.
+        wanted
+            && !unsafe { libc::dlsym(self.h, UNALIGNED_TYPED.as_ptr()) }.is_null()
+            && victory_backend::dxil::dxil_uses_typed_buffers(dxil)
+    }
+
     /// DXIL (a DXBC-wrapped container) -> (shader stage, metallib bytes). Stage 8 is compute (`IRShaderStage`).
     pub fn convert(&self, dxil: &[u8], entry: Option<&str>) -> Result<(i32, Vec<u8>), ConvError> {
         self.convert_with(dxil, entry, None, false)
@@ -361,6 +380,11 @@ impl Msc {
         let mut parts: Vec<&[u8]> = Vec::new();
         if dual_source {
             parts.push(b"dual-source");
+        }
+        // Only modules with typed buffers convert differently with the switch, so only theirs
+        // get a key of their own; the others keep theirs and stay warm.
+        if self.unaligned_typed(dxil) {
+            parts.push(b"unaligned typed buffers");
         }
         parts.extend([
             dxil,
@@ -464,6 +488,11 @@ impl Msc {
         // SAFETY: the symbols are the converter's documented C API; every object is destroyed below.
         unsafe {
             let comp = sym::<Create>(h, "IRCompilerCreate")();
+            if self.unaligned_typed(dxil) {
+                let set = libc::dlsym(h, UNALIGNED_TYPED.as_ptr());
+                let set: SetBool = std::mem::transmute_copy(&set);
+                set(comp, true);
+            }
             // Older converters have no dual-source switch; those keep refusing such pipelines.
             // Every other conversion leaves the option alone, as before.
             if dual_source {

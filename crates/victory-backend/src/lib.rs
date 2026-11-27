@@ -2,4 +2,5 @@
 //! `victory-metal` implements them on Metal; victory-gpu's native host is generic over them.
 
 pub mod backend;
+pub mod dxil;
 pub mod resources;

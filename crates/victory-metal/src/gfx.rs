@@ -510,6 +510,37 @@ fn size(a: [usize; 3]) -> MTLSize {
     }
 }
 
+/// Typed buffer views that start inside their texture buffer's alignment, by format, byte past
+/// the aligned start and whether the entry took them (an element offset) or fell back to a raw
+/// entry (offset not a multiple of the element, or more than 255 elements in). Logged at the
+/// 1st, 2nd, 4th, ... and then every 4096th view of each, with the running count.
+fn note_unaligned_typed_view(format: Format, offset: usize, align: usize, size: u32, fits: bool) -> u64 {
+    type Seen = std::collections::HashMap<(Format, usize, bool), u64>;
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let past = offset % align;
+    let count = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let n = seen.get_or_insert_with(Default::default).entry((format, past, fits)).or_insert(0);
+        *n += 1;
+        *n
+    };
+    if count.is_power_of_two() || count.is_multiple_of(4096) {
+        let offset = format!("{offset:#x}");
+        if fits {
+            tracing::info!(
+                offset, align, past, ?format, size, count,
+                "typed buffer view offset is not aligned for MTLTextureTypeTextureBuffer; aligned texture buffer and an element offset in the entry"
+            );
+        } else {
+            tracing::warn!(
+                offset, align, past, ?format, size, count,
+                "typed buffer view offset is not aligned for MTLTextureTypeTextureBuffer; falling back to raw buffer entry (typed loads read 0, stores are lost)"
+            );
+        }
+    }
+    count
+}
+
 impl Metal {
     fn heap_entry(
         &self,
@@ -922,39 +953,39 @@ impl ResourceBackend for Metal {
             .minimumTextureBufferAlignmentForPixelFormat(pf)
             .max(elem_bytes);
         let offset = title as usize - buffer.base as usize;
-        let max_elems = (buffer.buf.length().saturating_sub(offset)) / elem_bytes;
-        let width = ((size as usize) / elem_bytes).min(max_elems).min(1 << 26);
-        if width == 0 {
+        // A texture buffer must start at a multiple of `align` (16 bytes here). A view that starts
+        // inside a 16-byte unit gets one that starts at the multiple below, and the entry's
+        // metadata says how many elements past its start the view begins
+        // (`IRDescriptorTableSetBufferView`'s `textureViewOffsetInElements`, bits 32-39, at most
+        // 255), which the converter adds to every typed index (when told to; see `Msc`). Before,
+        // such views fell back to a raw entry, whose texture is the heap's empty one: typed loads
+        // read 0 and typed stores went nowhere.
+        let start = offset / align * align;
+        let skip_bytes = offset - start;
+        let skip = skip_bytes / elem_bytes;
+        let elems = size as usize / elem_bytes;
+        if elems == 0 {
             self.write_buffer(heap, index, buffer, title, size);
             return false;
         }
-        if !offset.is_multiple_of(align) {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
-                    offset = format!("{offset:#x}"),
-                    align,
-                    ?format,
-                    size,
-                    "typed buffer view offset is not aligned for MTLTextureTypeTextureBuffer; falling back to raw buffer entry (first time)"
-                );
-            } else {
-                tracing::debug!(
-                    offset = format!("{offset:#x}"),
-                    align,
-                    ?format,
-                    size,
-                    "typed buffer view offset is not aligned for MTLTextureTypeTextureBuffer"
-                );
+        if skip_bytes != 0 {
+            let fits = skip_bytes.is_multiple_of(elem_bytes) && skip <= 255;
+            note_unaligned_typed_view(format, offset, align, size, fits);
+            if !fits {
+                self.write_buffer(heap, index, buffer, title, size);
+                return false;
             }
+        }
+        let max_elems = buffer.buf.length().saturating_sub(start) / elem_bytes;
+        let width = (elems + skip).min(max_elems).min(1 << 26);
+        if width <= skip {
             self.write_buffer(heap, index, buffer, title, size);
             return false;
         }
         let td = MTLTextureDescriptor::new();
         td.setTextureType(MTLTextureType::TypeTextureBuffer);
         td.setPixelFormat(pf);
-        // SAFETY: `width` is in `1..=(1 << 26)` and fits inside `buffer.buf`.
+        // SAFETY: `width` is in `1..=(1 << 26)` and fits inside `buffer.buf` from `start`.
         unsafe {
             td.setWidth(width);
         }
@@ -966,7 +997,7 @@ impl ResourceBackend for Metal {
         td.setUsage(usage);
         let Some(tex) = buffer
             .buf
-            .newTextureWithDescriptor_offset_bytesPerRow(&td, offset, width * elem_bytes)
+            .newTextureWithDescriptor_offset_bytesPerRow(&td, start, width * elem_bytes)
         else {
             self.write_buffer(heap, index, buffer, title, size);
             return false;
@@ -974,10 +1005,13 @@ impl ResourceBackend for Metal {
         let gpu = self.gpu_address(buffer, title);
         let tex_id = resource_id(tex.gpuResourceID());
         let keep_buf: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
+        // IRDescriptorTableSetBufferView: the view's own address, the texture buffer, and
+        // metadata = size | the view's element offset in the texture << 32.
+        let metadata = u64::from(size) | (skip as u64) << 32;
         self.heap_entry(
             heap,
             index,
-            [gpu, tex_id, size as u64],
+            [gpu, tex_id, metadata],
             Some((keep_buf, Some(tex))),
         );
         true
@@ -4211,5 +4245,44 @@ mod heap_usage_tests {
         m.residency_sets = false;
         let plain = m.create_heap(HeapKind::Resource, 1).unwrap();
         assert_eq!(m.heap_allocations(&plain, &[0]), None);
+    }
+}
+
+#[cfg(test)]
+mod unaligned_typed_view_tests {
+    use super::*;
+    use crate::mem::{Region, page_size};
+
+    /// A typed view that starts inside a 16-byte unit gets a texture of its own (made from the
+    /// multiple of the alignment below it) and its entry says how many elements in the view
+    /// starts (metadata bits 32-39), not a raw entry with no texture. One that starts inside an
+    /// element, or more than 255 elements in, still falls back to a raw entry.
+    #[test]
+    fn a_typed_view_inside_a_16_byte_unit_names_a_texture_and_its_element_offset() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(4 * page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let heap = m.create_heap(HeapKind::Resource, 8).unwrap();
+        // SAFETY: inside the region.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let words = |i: usize| -> [u64; 3] {
+            // SAFETY: `i` is inside the heap buffer; the GPU is idle.
+            unsafe { heap.buf.contents().as_ptr().cast::<[u64; 3]>().add(i).read_unaligned() }
+        };
+        for (i, (offset, format, skip)) in
+            [(0x1dd2usize, Format::R16Uint, 1u64), (0x1e88, Format::Rg32Float, 1), (0x100c, Format::R32Uint, 3)]
+                .into_iter()
+                .enumerate()
+        {
+            assert!(m.write_typed_buffer(&heap, i, &buf, at(offset), 64, format, true), "{format:?}");
+            let w = words(i);
+            assert_eq!(w[0], m.gpu_address(&buf, at(offset)), "{format:?}: the view's own address");
+            assert_ne!(w[1], 0, "{format:?}: a texture of its own");
+            assert_eq!(w[2], 64 | skip << 32, "{format:?}: size and element offset");
+        }
+        // Inside an element: raw, no texture.
+        assert!(!m.write_typed_buffer(&heap, 3, &buf, at(0x1002), 64, Format::R32Uint, false));
+        assert_eq!(words(3)[1], 0);
+        assert_eq!(words(3)[2], 64);
     }
 }

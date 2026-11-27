@@ -564,6 +564,7 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_TRACE_RESIDENCY=1`: times the residency-set calls (`add_commit`, `remove_commit`, `request`, `end`, `made`, `drop_commit`, `pool_commit`) and command buffer commits (`cb_commit`): each call over 50 ms is logged at once ("residency: slow call"), and once a second a line gives count, total and longest per kind, with the bytes and allocations of the last set seen. Lines the host's residency work up with wired memory samples (#79).
 - `VICTORY_TRACE_HEAP_SET=<frames>`: every 64 frames, with the native-draws line, what the descriptor heaps' residency sets hold: textures and buffers apart, each allocation counted once over all heaps: all of them, those no table a draw or dispatch bound has named for that many frames (`idle_*`; each entry's last use is noted where tables are remirrored, `NativeHeap::used`), and those never named by one (`never_*`). Entries a shader reaches by indexing the heap itself are never seen, so `idle` and `never` are upper bounds. Measures what an eviction of idle allocations from the sets could save (#79).
 - `VICTORY_PASSES_PER_BUFFER=<n>`: on macOS, the most passes of a submission in one command buffer (default 0: no limit, the whole submission in one; 1 is the safest value to try). See "Command buffers of at most N passes".
+- `VICTORY_MSC_UNALIGNED_TYPED=0` (default on when the converter has the switch): convert modules with typed buffers without `IRCompilerSupportUnAlignedTypedBuffers`, so typed views that start inside a 16-byte unit index from the unit's start again (the behaviour before 27 November; see "typed buffer views" below).
 - `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines). While work stays held (the `work held for a wait that does not hold` warning, when nothing is submitted any more) the same in-flight report is made, with a line giving how many command buffers are in flight, each queue whose order event is behind the command buffers encoded with it (`queue <title queue> at <reached> of <encoded>`), and the commands dropped so far at unmapped memory. Each piece of a split submission (`VICTORY_PASSES_PER_BUFFER`) is traced as a whole command buffer is, under its own passes: `metal: slow piece` or `metal: failed piece` with its time, and it is in the in-flight report (a time-out carries no encoder states, so the labels are what names the pass). An indirect dispatch's label shows its record as title memory held it at encode time (`indirect[x, y, z]`), and every indirect draw goes through the gate so that the lines above can end with what the GPU read (`gpu read <compute shader, or "draw k" / "mesh draw k" by place in the pass> [counts]`, zeros for a gate that has not run yet); `metal: an indirect dispatch past the most groups ran nothing` names the first four records of each pipeline that asked for more than the gate runs (see "ExecuteIndirect on the native host").
 - `VICTORY_TRACE_WRITES=1`: on macOS, a warning for every bottom-of-pipe value write a list records (value, address, whether a pool holds it, the list), every memory-value wait (address, comparison, reference, the list) and every `ExecuteCommandLists` (queue and lists): which list of which queue owes the word another queue waits for. About 100 lines a world frame. Without it, a value write the host has to drop (its address in no mapped pool, or not preparable) is still a warning, once per page (`native host drops a value write`): a queue may wait for that word for good.
 - `VICTORY_TRACE_FREED=1`: names host and GPU uses of title memory the title's allocator has freed. `XMemAllocDefault` notes every range it hands out, `XMemFreeDefault` the ones it takes back (the block header holds the size), and `Host::resolve` — the way every host and GPU use of title memory begins — logs any range it is asked to map that overlaps a freed span, with both ranges and a serial. Part-reuse leaves the freed ends beside it. What it cannot see: the title can hook the allocator, and pools it sub-allocates inside a live block free and reuse memory without any call here; this names the `XMem`-granularity class only (#339: a host copy or a GPU write into freed memory, one candidate for the corrupted pool links).
@@ -1174,15 +1175,35 @@ buffer SRVs/UAVs and for 4-, 8-, and 16-byte structured buffer SRVs/UAVs (guess,
 4-dword 32-bit data format, so shaders may access the same descriptor with both
 `buffer_store_format_*` / `buffer_load_format_*` and `buffer_store_dword*` / `buffer_load_dword*`).
 `Binding::of` scans the module's DXIL symbol and constant tables once
-(`list::dxil_uses_typed_buffers`) to flag shaders that use `bufferLoad`, `bufferStore`, or
+(`victory_backend::dxil::dxil_uses_typed_buffers`) to flag shaders that use `bufferLoad`, `bufferStore`, or
 `TypedBuffer` `getDimensions`. At draw/dispatch submission, `NativeHost::materialize_typed_buffers`
 is a no-op unless a bound stage sets `typed_buffers`; when set, it calls `Metal::write_typed_buffer`
 only for pending bits inside the draw or dispatch's bound `Root::Table` ranges (plus explicit
 `stride == 0` typed buffer views in the bound heap if the shader also indexes
 `ResourceDescriptorHeap` directly), leaving unbound structured buffers unmaterialized. If a view's pool offset is not a multiple of
 `minimumTextureBufferAlignmentForPixelFormat` (16 bytes on Apple Silicon), `write_typed_buffer`
-warns once and falls back to `write_buffer` so raw accesses in word 0 still work without tripping
-Metal validation. If `Binding`'s DXIL scan ever missed a `TypedBuffer` operation (or a view fell
+makes the texture buffer from the multiple below it and writes the view's element offset into the
+entry's metadata (bits 32-39, `IRDescriptorTableSetBufferView`'s `textureViewOffsetInElements`,
+at most 255); word 0 stays the view's own address for raw accesses. The converter only adds that
+offset to a typed index when it is told to: `IRCompilerSupportUnAlignedTypedBuffers(compiler,
+true)`, a C++ symbol of the converter (`_Z38IRCompilerSupportUnAlignedTypedBuffersP10IRCompilerb`,
+present in D3DMetal 4.0b3's copy, not in Apple's public header). Without it (the default) a typed
+load or store indexes the texture buffer from its aligned start, the elements before the view's
+(checked on the GPU: with the offset in the metadata, with or without the typed bit 63, the
+shader still read and wrote the elements from the aligned start). `Msc` turns it on for the
+modules that use typed buffers (`victory_backend::dxil::dxil_uses_typed_buffers`, the scan
+`Binding` uses) when the converter has it; those get a library cache key of their own
+(`unaligned typed buffers`), so their cached libraries convert again once, and the others keep
+theirs. `VICTORY_MSC_UNALIGNED_TYPED=0` leaves it off (the A/B). Only a view that starts inside an element (or more than 255 elements in) still
+falls back to `write_buffer`. Both are counted by format and byte past the aligned start and
+logged with the running count at the 1st, 2nd, 4th, ... and every 4096th view of each (info when
+taken, warn when it falls back; the message starts `typed buffer view offset is not aligned`).
+Before (27 November), every such view fell back to a raw entry with no texture
+(word 1 = 0), so its typed loads read 0 and its typed stores were lost: r190 had `Rg32Float` at
+`0x83aee88`, r195 `R16Uint` at `0x84c1dd2` (`typed_views_that_start_inside_a_16_byte_unit_read_and_write_the_titles_elements`,
+which read 0 and lost the stores before the change; `buffer_atomic_*` went through word 0 and
+worked). They need no `ShaderAtomic` usage on the texture buffer either (Metal leaves a texture
+If `Binding`'s DXIL scan ever missed a `TypedBuffer` operation (or a view fell
 back to `write_buffer`), `write_buffer` leaves word 1 (`textureViewID`) at `0` (also zeroing it and
 dropping the `MTLTexture` whenever an entry is re-mirrored), so `texture_buffer` loads and
 `get_width()` read `0` and `texture_buffer` stores are no-ops without faulting (`wrong_typed_buffer_scan_reads_zero_without_crashing`).
@@ -1199,6 +1220,8 @@ The "native draws so far" line counts the promotions so far as `typed_views`
 (an entry mirrored again and promoted again counts twice) and the title's
 resource heaps as `resource_heaps`, to weigh what the typed views and the
 longer heaps cost.
+
+**Out-of-range indices on a view that starts inside a 16-byte unit.** The converter (`IRCompilerSupportUnAlignedTypedBuffers`) adds the view's element offset to the index in 32 bits before the texture buffer's bounds check, so index 0xffffffff (-1, "past the end" on the console) of a view `skip` elements into its unit would become element `skip - 1`: inside the bounds, the element just before the view, another object's bytes. A store there would overwrite them and a load would read them, where the console drops the store and reads 0. The translator therefore holds every typed buffer load and store index of 2^31 and up at 2^31 - 1 (`Lower::typed_index`, one compare and select per access), still past the end of any view (the host's are at most 2^26 elements). Test: `heap_tests::typed_views_of_every_format_and_offset_keep_to_their_own_elements`.
 
 #### A command buffer the GPU fails still pays its signals and value writes
 
