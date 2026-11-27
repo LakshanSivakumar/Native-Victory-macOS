@@ -354,9 +354,10 @@ impl<B: PresentBackend> Title<B> {
     /// `ExecuteCommandLists` on title queue `queue`: the lists' segments join what the queue holds
     /// and whatever may run goes to the GPU.
     pub fn submit(&mut self, queue: usize, segments: Vec<(NativeList<B>, Vec<Wait>)>) {
-        self.keep_named(segments.iter().map(|(l, _)| l));
+        let named = self.keep_named(segments.iter().map(|(l, _)| l));
         self.sync_dirty();
         self.submit_synced(queue, segments);
+        self.let_named_go(named);
     }
 
     /// [`Self::submit`] once the textures are in step with title memory ([`Self::sync_dirty`]).

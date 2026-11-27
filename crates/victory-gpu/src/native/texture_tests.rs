@@ -1738,7 +1738,32 @@ fn an_entry_copied_with_plain_stores_gets_an_evicted_texture_back() {
 /// sampled through entry 0 of a heap whose record the title stored with plain stores (no device
 /// call, so the host has not mirrored it), in one submission of `t`; the centre pixel.
 fn draw_sampling(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, key: usize, queue: usize) -> [u8; 4] {
-    const W: usize = 16;
+    let (l, color, records) = sampling_list(t, pool, key);
+    let fence = queue + 100;
+    t.ensure_queue(queue).unwrap();
+    t.submit(queue, vec![(l, vec![])]);
+    t.signal_queue(queue, fence, 0, 1);
+    let start = std::time::Instant::now();
+    while !t.try_wait(fence, 0, 1) {
+        assert!(start.elapsed().as_secs() < 10, "the draw did not complete");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut out = vec![0u8; SAMPLED * SAMPLED * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut out, SAMPLED * 4, 0);
+    drop(records);
+    out[(8 * SAMPLED + 8) * 4..][..4].try_into().unwrap()
+}
+
+const SAMPLED: usize = 16;
+
+/// The list [`draw_sampling`] submits, its target, and the heaps' records (kept while it is used).
+#[allow(clippy::type_complexity)]
+fn sampling_list(
+    t: &mut Title<victory_metal::metal::Metal>,
+    pool: &Pool,
+    key: usize,
+) -> (NativeList<victory_metal::metal::Metal>, std::rc::Rc<<victory_metal::metal::Metal as ResourceBackend>::Texture>, (Vec<u32>, Vec<u32>)) {
+    const W: usize = SAMPLED;
     let v = |x: f32, y: f32| [x, y, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0];
     pool.write(0x20000, &[v(-0.5, -0.5), v(0.5, -0.5), v(0.0, 0.5)]);
     let attrs = [
@@ -1787,19 +1812,7 @@ fn draw_sampling(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, key: u
     l.set_graphics_root_table(2, &sheap, 0);
     l.set_vertex_buffer(0, pool.va(0x20000));
     l.draw_instanced(3, 1, 0, 0).unwrap();
-    let fence = queue + 100;
-    t.ensure_queue(queue).unwrap();
-    t.submit(queue, vec![(l, vec![])]);
-    t.signal_queue(queue, fence, 0, 1);
-    let start = std::time::Instant::now();
-    while !t.try_wait(fence, 0, 1) {
-        assert!(start.elapsed().as_secs() < 10, "the draw did not complete");
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    let mut out = vec![0u8; W * W * 4];
-    t.host.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
-    drop((views, smp));
-    out[(8 * W + 8) * 4..][..4].try_into().unwrap()
+    (l, color, (views, smp))
 }
 
 /// Over the texture budget, a draw samples a texture given up before through an entry the title
@@ -1826,6 +1839,37 @@ fn a_texture_the_submission_names_is_not_given_up_under_its_draw() {
     t.set_texture_budget(1);
     assert_eq!(draw_sampling(&mut t, &pool, live, 2), [0x66, 0, 0, 0x66]);
     assert!(t.host.knows(live));
+}
+
+/// Names a submission's tables read stay out of the budget's reach until that submission is with
+/// its queue, even when another submission's sync comes in between (`glue::submit` lets the title
+/// lock go between the two).
+#[test]
+fn a_texture_named_by_a_submission_in_flight_is_not_given_up_by_another() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let named = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    let idle = budget_texture(&mut t, &pool, 0x4000, 0, 0x77);
+    t.set_texture_budget(1);
+    let (a, _color, records) = sampling_list(&mut t, &pool, named);
+    let first = t.keep_named(std::iter::once(&a));
+    assert!(first.contains(&named));
+    // Another queue's submission, with nothing bound, synced in between.
+    let b = NativeList::<victory_metal::metal::Metal>::default();
+    let second = t.keep_named(std::iter::once(&b));
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(idle), "over budget: the idle one goes");
+    assert!(t.host.knows(named), "the first submission still names it");
+    t.let_named_go(second);
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(t.host.knows(named), "still in flight");
+    t.let_named_go(first);
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(!t.host.knows(named), "given up once nothing in flight names it");
+    drop((a, records));
 }
 
 /// The budget counts a copy by its size in title memory, once per title texture: views of one

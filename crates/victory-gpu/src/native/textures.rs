@@ -1474,9 +1474,10 @@ pub struct Budget {
     next_check: u64,
     /// When the trace last logged.
     logged: Option<std::time::Instant>,
-    /// Resources the tables of the submission being made (and of held work) name: never given up
-    /// at its sync ([`Title::keep_named`]).
-    named: HashSet<usize>,
+    /// Resources the tables of submissions being made (and of their held work) name, with how many
+    /// of those submissions name each: never given up until the submission is handed to its queue
+    /// ([`Title::keep_named`], [`Title::let_named_go`]).
+    named: HashMap<usize, u32>,
 }
 
 /// Submissions between checks while over budget with too little to give up.
@@ -1571,14 +1572,19 @@ impl<B: PresentBackend> Title<B> {
     /// records of the tables they bind name is made again if it was given up, and uploaded at
     /// that sync; none is given up then. The host mirrors those records when it encodes the
     /// lists, and an entry naming a texture not made yet shows nothing: the draw would sample
-    /// transparent black. Nothing is read under the budget with nothing given up.
-    pub(super) fn keep_named<'a>(&mut self, lists: impl Iterator<Item = &'a NativeList<B>>)
+    /// transparent black. The names stay out of the budget's reach until the caller hands them to
+    /// [`Self::let_named_go`], once the submission is with its queue, so another submission's sync
+    /// in between cannot give them up. Nothing is read under the budget with nothing given up
+    /// (`glue::submit` runs one submission at a time, so none goes over budget in between), unless
+    /// the trace is on.
+    #[must_use = "the names stay kept until handed to `let_named_go`"]
+    pub(super) fn keep_named<'a>(&mut self, lists: impl Iterator<Item = &'a NativeList<B>>) -> HashSet<usize>
     where
         B: 'a,
     {
         let over = self.budget.limit > 0 && self.budget.live > self.budget.limit;
-        if !over && !self.host.any_evicted() {
-            return;
+        if !over && !self.host.any_evicted() && !env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
+            return HashSet::new();
         }
         // shortcut: a record changed after this read (before held work is encoded) still gets the
         // cleared entry and `take_wanted`; reading again at encoding needs the title's state there.
@@ -1591,7 +1597,23 @@ impl<B: PresentBackend> Title<B> {
                 self.realize(key);
             }
         }
-        self.budget.named = named;
+        for &key in &named {
+            *self.budget.named.entry(key).or_default() += 1;
+        }
+        named
+    }
+
+    /// The submission that [`Self::keep_named`] returned `named` for is with its queue: what only
+    /// it named may be given up again.
+    pub(super) fn let_named_go(&mut self, named: HashSet<usize>) {
+        for key in named {
+            if let Some(n) = self.budget.named.get_mut(&key) {
+                *n -= 1;
+                if *n == 0 {
+                    self.budget.named.remove(&key);
+                }
+            }
+        }
     }
 
     /// Past the budget, gives up the least recently used textures that may be given up
@@ -1599,7 +1621,6 @@ impl<B: PresentBackend> Title<B> {
     /// Textures an entry shows, or the submission's tables name ([`Self::keep_named`]), are
     /// stamped used now.
     pub(super) fn keep_to_budget(&mut self) {
-        let named = std::mem::take(&mut self.budget.named);
         self.budget.serial += 1;
         let serial = self.budget.serial;
         let trace = env_set!("VICTORY_TRACE_TEXTURE_SYNC")
@@ -1613,9 +1634,10 @@ impl<B: PresentBackend> Title<B> {
         let keys: Vec<usize> = self.textures.keys().copied().collect();
         for key in keys {
             let t = &self.textures[&key];
-            if !named.contains(&key) && self.evictable(key, t) {
+            let named = self.budget.named.contains_key(&key);
+            if !named && self.evictable(key, t) {
                 candidates.push((key, t.info.size as u64, t.used));
-            } else if named.contains(&key) || self.host.texture_in_use(key) {
+            } else if named || self.host.texture_in_use(key) {
                 shown += t.info.size as u64;
                 self.textures.get_mut(&key).expect("listed").used = serial;
             }

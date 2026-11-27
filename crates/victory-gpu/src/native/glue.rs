@@ -187,9 +187,10 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
         let list = crate::list::native(l);
         segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
     }
+    let mut named = Default::default();
     if unlocked {
         let jobs = with_title(|t| {
-            t.keep_named(segments.iter().map(|(l, _)| l));
+            named = t.keep_named(segments.iter().map(|(l, _)| l));
             t.sync_jobs()
         })
         .unwrap_or_default();
@@ -207,6 +208,7 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             t.gpu_written(key);
         }
         if t.ensure_queue(queue as usize).is_err() {
+            t.let_named_go(named);
             return;
         }
         if unlocked {
@@ -214,6 +216,7 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
         } else {
             t.submit(queue as usize, segments);
         }
+        t.let_named_go(named);
         // `VICTORY_TRACE_DESCRIPTORS=sites`: the heaps' pages are closed again for the next
         // interval, so the title's first store into each is seen.
         if super::descriptor_trace::sites() {
