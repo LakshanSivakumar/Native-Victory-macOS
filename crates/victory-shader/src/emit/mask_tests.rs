@@ -1011,3 +1011,17 @@ fn a_merge_of_another_mask_is_no_merge_of_the_old_one() {
     assert!(err.to_string().contains("a lane-mask join of an untracked mask"), "{err}");
 }
 
+
+/// A mesh program (the NGG stage) gets eight system SGPRs and at most 32 user SGPRs from s8,
+/// so an SGPR from s40 up that it reads before writing holds what the last wave left: zero, as
+/// in compute. The world's mesh programs read such registers on paths only an empty EXEC
+/// takes (`3a0627643418e45d` exports `s49` and `s50` after an EXEC skip over their load); they
+/// were refused as "a hardware SGPR input". An SGPR below s40 may be user data the layout does
+/// not name, and stays refused.
+#[test]
+fn a_mesh_program_reads_sgprs_past_its_user_data_as_zero() {
+    let read = |sgpr: u32| mesh(&[0x7E02_0200 | sgpr]); // v_mov_b32 v1, s<sgpr>
+    assert!(read(49).is_ok(), "{:?}", read(49).err());
+    let err = read(39).err().expect("refused");
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+}
