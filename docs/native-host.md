@@ -2168,6 +2168,16 @@ Tests (`victory-gpu`): `native::memory::tests::read_mapped_with_coalesces_adjace
 `native::tests::texture_tests::streamed_mips_across_scattered_pool_pages_upload_each_step_without_whole_rereads`.
 
 
+## The ray-tracing structure builder's pipelines are never put off
+
+`XboxBvhBuilder.dll`, a title DLL that runs in the process like the title's own code, builds and refits the ray-tracing structures in title memory with 52 compute programs embedded in its image (their containers' digests are in the DLL; all 52 translate, also for dispatches of thread counts). Many of its dispatches run only while a level streams in, one stage after another; the top level is rebuilt each frame.
+
+What went wrong: its pipelines were put off like any other past the frame's budget for new pipelines ("Pipelines off the frame"), and a put-off pipeline's dispatches are dropped. In one run on 27 November (an M4 Pro, Series S, to the world), 28 of the 52 programs lost about 7,700 dispatches in 77 s of the world load, and every run since logs "a dispatch of thread counts without a host compute pipeline" there. What those dispatches build at the load is not built again, so the structures stay partly built for the run. VIctory-macOS found the same on Wine (its #481: on a fork, the garbage bounds of a partial build crashed the title).
+
+The fix (`glue::builder_made`, a port of that change): the builder's pipelines are known by their bytecode, which lies in the DLL's image (`pipeline::note_title_dll`, called by the loader's `note`). They are never put off: translated and compiled at their first dispatch however long it takes (`BUILDER_WAIT`, 120 s), for group counts and for thread counts. If one of them cannot be made (refused, a failed compile), every dispatch of the builder is dropped from then on (logged once: `a BVH builder pipeline is not made`), so no stage runs on what a missing one never wrote; the structures keep what they held, as with no builder. Logged: `BVH builder mapped`, and `BVH builder pipelines made at once` at the 1st, 2nd, 4th, ... made. Cost: the frames that make them wait for them (52 programs, most small). This is a host policy, not console behaviour.
+
+Test: `bvh_tests::the_bvh_builders_pipelines_are_made_past_the_frames_budget_or_held_back_together` (with the frame's budget spent on the test's thread, an ordinary pipeline is put off and the builder's are made, by thread counts too; one that cannot be made holds all back).
+
 ## World geometry drawn as shards (open)
 
 The world's G-buffer base colour (1280x720, sRGB) is right for most meshes, but some are long
