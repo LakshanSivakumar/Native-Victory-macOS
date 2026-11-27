@@ -3012,16 +3012,8 @@ fn skipped_draw(pipeline: usize) -> bool {
 /// 64 KiB pages of the 16 MiB from the address's page that no pool maps (`unmapped`, with the first
 /// eight as page offsets). A program that reads title memory through the page table reads 0 there.
 fn trace_root_memory(t: &MetalTitle, l: &MetalList) {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let hashes = HASHES.get_or_init(|| skip_hashes(&std::env::var("VICTORY_TRACE_ROOT_MEMORY").unwrap_or_default()));
-    if hashes.is_empty() {
-        return;
-    }
-    let names = stage_hashes(l.pipeline);
-    if !names.iter().any(|s| s.split(' ').nth(1).is_some_and(|h| hashes.iter().any(|x| x == h))) {
-        return;
-    }
+    let Some(names) = root_traced(l.pipeline) else { return };
     let n = SEEN.fetch_add(1, Ordering::Relaxed);
     if n >= 400 {
         return;
@@ -3034,6 +3026,34 @@ fn trace_root_memory(t: &MetalTitle, l: &MetalList) {
         let unmapped: Vec<u64> = (0..SPAN >> 16).map(|k| page + (k << 16)).filter(|&p| memory.resolve(p, 1).is_none()).collect();
         let first: Vec<String> = unmapped.iter().take(8).map(|p| format!("+{:#x}", p - page)).collect();
         tracing::info!(draw = n, present = PRESENTS.load(Ordering::Relaxed), shaders = ?names, slot, address = format!("{address:#x}"), mapped, unmapped = unmapped.len(), first = ?first, "root view memory");
+    }
+}
+
+/// The stage names of `pipeline` when it has a shader `VICTORY_TRACE_ROOT_MEMORY` names.
+fn root_traced(pipeline: usize) -> Option<Vec<String>> {
+    let hashes = root_trace_hashes();
+    if hashes.is_empty() {
+        return None;
+    }
+    let names = stage_hashes(pipeline);
+    names.iter().any(|s| s.split(' ').nth(1).is_some_and(|h| hashes.iter().any(|x| x == h))).then_some(names)
+}
+
+fn root_trace_hashes() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| skip_hashes(&std::env::var("VICTORY_TRACE_ROOT_MEMORY").unwrap_or_default()))
+}
+
+/// `VICTORY_TRACE_ROOT_MEMORY` also logs the first 400 draws' arguments of those pipelines
+/// (`draw arguments`): a guessed vertex program that splits `SV_VertexID` itself depends on the
+/// first vertex and instance.
+fn trace_draw_arguments(l: &MetalList, args: [i64; 5]) {
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(names) = root_traced(l.pipeline) else { return };
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n < 400 {
+        let [count, instances, first, base, first_instance] = args;
+        tracing::info!(draw = n, shaders = ?names, count, instances, first, base, first_instance, "draw arguments");
     }
 }
 
@@ -3137,6 +3157,9 @@ fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<b
 
 pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
+    if !root_trace_hashes().is_empty() {
+        with_list(this, |_, l| trace_draw_arguments(l, [vertices.into(), instances.into(), first.into(), 0, first_instance.into()]));
+    }
     if tracing_targets() {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -3196,6 +3219,9 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
 
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
+    if !root_trace_hashes().is_empty() {
+        with_list(this, |_, l| trace_draw_arguments(l, [indices.into(), instances.into(), first.into(), base.into(), first_instance.into()]));
+    }
     with_list(this, |t, l| {
         let made = graphics(t, l, false);
         trace_flow_draw(t, l, if made.is_some() { "encoded" } else { "dropped" }, &format!("indexed indices {indices} instances {instances} first {first} base {base}"));
