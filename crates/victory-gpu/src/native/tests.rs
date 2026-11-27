@@ -16,6 +16,8 @@ use victory_metal::metal::Metal;
 
 #[path = "addr_tests.rs"]
 mod addr_tests;
+#[path = "guarded_write_tests.rs"]
+mod guarded_write_tests;
 #[path = "heap_tests.rs"]
 mod heap_tests;
 #[path = "legacy_fma_tests.rs"]
