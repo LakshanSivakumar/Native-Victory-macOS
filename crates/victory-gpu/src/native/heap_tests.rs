@@ -968,3 +968,63 @@ fn long_resource_heap_cost_benchmark() {
     }
     drop((short, long, f));
 }
+
+/// Loads an image SRV from the table at `s4` by adding a `v_readfirstlane_b32` byte offset (`32`,
+/// entry 1) with `s_add_u32 s0, s4, s8; s_add_u32 s1, 0, src_scc`, and stores its green channel
+/// (`1.0`) to the raw UAV at byte offset `64` (entry 2) of the same table (`#258`).
+const CS_TABLE_SCC_CARRY: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0040, // s_load_dwordx4 s[12:15], s[10:11], 0x40
+    0x7E08_02A0, // v_mov_b32 v4, 32 (entry 1 byte offset)
+    0x7E10_0504, // v_readfirstlane_b32 s8, v4
+    0x8000_0804, // s_add_u32 s0, s4, s8
+    0x8001_FD80, // s_add_u32 s1, 0, src_scc
+    0xF40C_0400, 0xFA00_0000, // s_load_dwordx8 s[16:23], s[0:1], 0x0
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF000_1F08, 0x0004_0200, // image_load v[2:5], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_compute_shader_loads_a_texture_with_scc_carry() {
+    // SRV range (kind 2) of 2 textures at dwords 0..16, and raw UAV (kind 3) at dword 16, in
+    // table (root type 3) at user data 4, slot 0.
+    let mut srv = [0u8; 32];
+    srv[0] = 0x41;
+    srv[4..6].copy_from_slice(&[2, 3]);
+    srv[12] = 1; // upper_bound = 1 (2 entries: 0 and 1)
+    srv[16] = 2; // count = 2
+    srv[20..23].copy_from_slice(&[8, 4, 0]);
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[8] = 16; // table_offset_dwords = 16 (byte 64, entry 2)
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_TABLE_SCC_CARRY, &[srv, uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "table scc carry") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap.heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap.heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 2), [0x3F80_0000, super::addr_tests::CANARY]);
+}
