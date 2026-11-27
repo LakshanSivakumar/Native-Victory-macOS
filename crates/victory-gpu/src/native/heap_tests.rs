@@ -896,6 +896,81 @@ fn an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor() {
     drop(records);
 }
 
+/// The size query of the texture at table entry 1 (`image_get_resinfo`), width and height stored.
+const CS_SIZE: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF40C_0405, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[10:11], 0x20
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF038_1308, 0x0004_0200, // image_get_resinfo v[2:3], v0, s[16:23] dmask:0x3 dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0
+    0xE070_0004, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0 offset:4
+    0xBF81_0000, // s_endpgm
+];
+
+/// What the host reports as the size of a texture entry no view was ever written to (the heap's
+/// zeroed entry, as also left by a released or evicted texture), and of one a view of no resource
+/// (D3D12's null descriptor) was written to over a texture's view: 0 by 0, the size the null-test
+/// rule of `Lower::descriptor_data` takes for a null view. The view of no resource used to leave
+/// the entry as it was, showing the texture's size.
+#[test]
+fn a_texture_entry_never_written_or_null_has_size_0() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut image = [0u8; 32];
+    image[0] = 0x41;
+    image[4..6].copy_from_slice(&[0, 3]);
+    image[8] = 8;
+    image[16] = 1;
+    image[20..23].copy_from_slice(&[8, 4, 1]);
+    let c = crate::pipeline::test_compute_container(CS_SIZE, &[uav, image], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+    assert!(t.host.mirror(start).unwrap());
+    let canary = super::addr_tests::CANARY;
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "null size") else { panic!("{:?}", t.shaders) };
+    let size = |t: &Title<Metal>| {
+        f.put(0x2_0000, &[canary; 2]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        f.get(0x2_0000, 2)
+    };
+    assert_eq!(size(&t), [0, 0], "an entry never written");
+    // A 5x8 texture's view there, then a view of no resource (D3D12's null descriptor).
+    let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 5, 8)).unwrap();
+    let key = 0x4EA9_0300;
+    t.host.register_texture(key, &tex);
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    assert_eq!(size(&t), [5, 8], "a view");
+    crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    assert_eq!(size(&t), [0, 0], "a view of no resource");
+    drop(records);
+}
+
 /// `buffer_store_format_xyzw` and `buffer_load_format_xyzw` with `idxen` through a 16-byte
 /// structured writable buffer view, an `R32G32B32A32_UINT` typed writable buffer view, an
 /// `R32G32B32A32_FLOAT` view, and an `R8G8B8A8_UNORM` view write and read back through the same

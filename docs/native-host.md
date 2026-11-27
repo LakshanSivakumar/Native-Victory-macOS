@@ -2423,6 +2423,17 @@ dwords N to N", 28 "a value the translation could not make", 2 others). Of the w
 run's 677 dropped compute dispatches a frame (20261127-235056), the 85 programs now translated
 made 181.
 
+**What the host reports as a null image's size.** A texture entry of a resource heap that no
+view was written to is the zeroed entry the backend made the heap with (`create_heap`), as is
+one whose texture was released or evicted (`clear_entry`); a size query of it reads 0 by 0 on
+Metal, which is what the null test above takes for a null view. A view of no resource
+(`create_srv` with a null resource, D3D12's null descriptor) used to leave the entry as it was,
+so a size query read the size of the texture shown there before; `NativeHost::mirror` now clears
+the entry for it. Test (Metal): `heap_tests::a_texture_entry_never_written_or_null_has_size_0`
+(0 by 0 never written, 5 by 8 for a view, 0 by 0 again after a null view; the last refused to
+mirror before). Still not 0: a record the title zeroes with plain stores keeps its old entry
+(as for buffers, see the stride table), so a size query there reads the old view's size.
+
 **Descriptors spilled on several paths.** The console compiler spills descriptor dwords to lanes
 of a VGPR (`v_writelane_b32`) and reads them back (`v_readlane_b32`) after joins where the arms
 spilled different descriptors to the same lanes (a register allocator's spill slots: one VGPR

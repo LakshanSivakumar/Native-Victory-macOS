@@ -1569,6 +1569,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         self.backend.clear_entry(&heap.heap, index);
                         heap.shows(index, None);
                     }
+                    // A view of no resource (D3D12's null descriptor): reads 0 and sizes 0, as the
+                    // zeroed entry does, not as the view shown there before.
+                    if resource == 0 {
+                        self.backend.clear_entry(&heap.heap, index);
+                        heap.shows(index, None);
+                        heap.typed_pending.borrow_mut().set(index, false, false);
+                        heap.pending_mirror.borrow_mut().remove(&index);
+                        heap.mirrored.borrow_mut().insert(index, stamp);
+                        return Ok(true);
+                    }
                     return Ok(false);
                 };
                 // A depth texture: an unordered access view shows a plane of its writable twin
