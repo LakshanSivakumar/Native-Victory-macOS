@@ -931,6 +931,12 @@ impl<'a> Lower<'a> {
                         || n.starts_with("v_permlane")
                         || n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        // The console wave's first lane, not each host wave's (#254), unless it
+                        // is a waterfall loop's read (the lane's own), or of a scalar, a constant,
+                        // or a VGPR just moved from one under a covering EXEC.
+                        || (n == "v_readfirstlane_b32"
+                            && !i.writes.iter().any(|w| x.res.waterfall.reads.contains(&w.1))
+                            && !first_lane_of_a_scalar(p, x.st, i))
                         // One atomic per console wave; addresses by console lane.
                         || matches!(n, "ds_append" | "ds_consume")
                         || n.contains("addtid")
@@ -9361,6 +9367,9 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
+                if let Some(r) = self.split_first_lane(inst, a)? {
+                    return int(self, r);
+                }
                 self.s.flags |= flags::WAVE_OPS;
                 let r = self.s.op(
                     c,
@@ -14651,8 +14660,7 @@ impl<'a> Lower<'a> {
                     }
                     // Data that is all lanes or none (`s_mov_b64 s, -1`) is that bit on any lanes.
                     (None, Some(&Val::I32(word)))
-                        if !self.console_lanes
-                            && let Some(all) = self.all_or_none(word, high.map(|h| h.args[n])) =>
+                        if let Some(all) = self.all_or_none(word, high.map(|h| h.args[n])) =>
                     {
                         self.s.m.bool(all)
                     }
@@ -14877,6 +14885,51 @@ fn barrier_phases(p: &Program) -> Vec<Option<u64>> {
             return entry;
         }
     }
+}
+
+/// Whether `v_readfirstlane_b32` `i` reads a scalar, a constant, or a VGPR whose value a plain
+/// `v_mov_b32` moved from one under an EXEC that covers `i`'s active lanes: every active lane
+/// holds the same value, so each half's first lane reads it without turning on `console_lanes`.
+fn first_lane_of_a_scalar(p: &Program, st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    let reg = match v.src.first() {
+        Some(Operand::Vector { reg, .. }) => *reg,
+        Some(_) => return true,
+        None => return false,
+    };
+    let Some(value) = i.read(Reg::V(reg)) else {
+        return false;
+    };
+    let at_exec = i.read(Reg::S(EXEC));
+    let at_mask = at_exec.and_then(|e| st.masks.get(&e).or_else(|| st.other.get(&e)).copied());
+    p.blocks.iter().flat_map(|b| b.insts.iter()).any(|d| {
+        if !d.writes.iter().any(|w| w.1 == value) || d.name() != "v_mov_b32" {
+            return false;
+        }
+        let Fields::Valu(m) = &d.fields else {
+            return false;
+        };
+        if m.dpp.is_some()
+            || m.sdwa.is_some()
+            || !matches!(
+                m.src.first(),
+                Some(Operand::Scalar { .. } | Operand::Const(_) | Operand::Literal(_))
+            )
+        {
+            return false;
+        }
+        let def_exec = d.read(Reg::S(EXEC));
+        def_exec == at_exec
+            || matches!(
+                (
+                    at_mask,
+                    def_exec.and_then(|e| st.masks.get(&e).or_else(|| st.other.get(&e)).copied()),
+                ),
+                (Some(am), Some(dm)) if !st.bools.meet(&[(am, true), (dm, false)])
+            )
+    })
 }
 
 /// SCC values that can differ between the host waves of one console wave:

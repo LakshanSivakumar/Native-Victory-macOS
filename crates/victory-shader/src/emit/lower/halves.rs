@@ -8,13 +8,15 @@
 //! also makes the host lane the console's). What stays inside 32 lanes is
 //! the host's own: DPP rows and quads, `ds_swizzle` (its masks keep bit 5),
 //! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers and
-//! `v_readfirstlane` (read per half: the console reads the first lane EXEC
-//! leaves on, and the translation has always read the first lane that runs,
-//! so a value that is not the same in both halves is where it differs).
+//! `v_readfirstlane` of a value the same in every lane of the console wave
+//! ([`Lower::wave_uniform`]). Any other `v_readfirstlane` reads the first lane of
+//! the console's 64-lane EXEC across the halves, or is refused (#254,
+//! [`Lower::split_first_lane`]).
 //!
 //! What reaches across the two halves goes through group-shared memory (the
 //! `xchg` array, one dword per thread) between two group barriers: a ballot
-//! of a mask read as data, `v_readlane_b32` and the reductions and prefixes
+//! of a mask read as data, `v_readlane_b32`, `v_readfirstlane_b32` of a value
+//! that differs between lanes, and the reductions and prefixes
 //! of whole-wave sections. A ballot is each
 //! half's 32 bits, joined; a lane read is a load at the source lane's slot;
 //! a reduction is each half's result, combined; a prefix combines the lower
@@ -44,7 +46,7 @@
 //! runs the wave in lockstep) gets the group barriers `narrow_waves` adds
 //! ([`split_wave_barriers`](super::split_wave_barriers)), or is refused.
 
-use super::{Lower, Why};
+use super::{Lower, Map, Set, Why};
 use crate::emit::bitcode::{Attr, Bin, V, pred};
 use crate::emit::shader::flags;
 use crate::emit::wave::Op;
@@ -168,8 +170,308 @@ impl Lower<'_> {
         })
     }
 
+    /// `v_readfirstlane_b32` of a console wave split into two host waves (#254). The console reads
+    /// the first lane of its 64-lane EXEC, and every lane sees that value; `waveReadLaneFirst`
+    /// reads the first lane of each host wave, its own half.
+    ///
+    /// - A value the same in every active lane of the console wave ([`Self::wave_uniform`]) is
+    ///   read per half as before: each half's first lane holds it (0 barriers).
+    /// - Otherwise, where both halves arrive together ([`Self::exchange_site`]), each half finds
+    ///   its own first active lane via a single host ballot + `waveReadLaneAt`, then exchanges
+    ///   `(val, has_any)` across the two halves in **one** LDS round-trip (2 barriers, no
+    ///   `mask_dword(EXEC)`). When both halves have empty EXEC, the lower half's lane 0 is
+    ///   returned (matching RDNA 2 ISA). If `EXEC` is untracked, falls back to
+    ///   [`Self::lockstep_first_lane`] + [`Self::wide_read_lane`].
+    /// - Otherwise the program is refused; a group of one console wave is then tried in lockstep,
+    ///   which reads it exactly.
+    pub(super) fn split_first_lane(
+        &mut self,
+        inst: &crate::ir::Inst,
+        a: V,
+    ) -> Result<Option<V>, Why> {
+        use crate::gfx10::{Fields, Operand};
+        use crate::ir::{EXEC, Reg};
+        if !self.host32 || !self.halves {
+            return Ok(None);
+        }
+        let source = match &inst.fields {
+            Fields::Valu(f) => match f.src.first() {
+                Some(&Operand::Vector { reg, .. }) => {
+                    inst.read(Reg::V(reg)).map(|v| (Reg::V(reg), v))
+                }
+                Some(&Operand::Scalar { code, .. }) => {
+                    inst.read(Reg::S(code)).map(|v| (Reg::S(code), v))
+                }
+                // A constant is the same in every lane.
+                Some(Operand::Const(_) | Operand::Literal(_)) => return Ok(None),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((reg, v)) = source
+            && self.wave_uniform(inst, reg, v)
+        {
+            return Ok(None);
+        }
+        if self.exchange_site(self.cur_ir).is_err() {
+            return Err(
+                "a first lane read across the two host waves of a console wave, in divergent code",
+            );
+        }
+        // Fast path: when EXEC is a tracked lane function, compute each host half's first active
+        // lane locally and exchange (val, has_any) across the two halves in a single 2-barrier
+        // round-trip (avoiding `mask_dword(EXEC)` and its extra 2-barrier ballot).
+        let exec_bool = inst
+            .read(Reg::S(EXEC))
+            .and_then(|v| self.x.st.masks.get(&v).or_else(|| self.x.st.other.get(&v)).copied());
+        if let Some(m) = exec_bool {
+            let c = self.cur;
+            let on = self.boolean(m, c)?;
+            let my_mask = self.host_ballot(c, on).0;
+            let i32t = self.s.t.i32;
+            let (z, one, two, three, five, six, not63) = (
+                self.s.m.i32(0),
+                self.s.m.i32(1),
+                self.s.m.i32(2),
+                self.s.m.i32(3),
+                self.s.m.i32(5),
+                self.s.m.i32(6),
+                self.s.m.i32(!63),
+            );
+            let has_any = self.s.m.cmp(c, pred::NE, my_mask, z);
+            let first = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[my_mask]);
+            let my_lane = self.s.m.select(c, has_any, first, z);
+            let my_val = self.read_lane(a, my_lane);
+            let my_any = self.s.m.select(c, has_any, one, z);
+            let f = self.console_flat();
+            let wave_base = self.s.m.bin(c, Bin::And, f, not63);
+            let half_raw = self.s.m.bin(c, Bin::LShr, f, five);
+            let half = self.s.m.bin(c, Bin::And, half_raw, one);
+            // Each console wave owns 64 dwords in `xchg` (`s.xchg_dwords = lanes.next_multiple_of(64)`):
+            // +0/+1 hold lower/upper half's first-lane value, +2/+3 hold whether that half is non-empty.
+            let val_idx = self.s.m.bin(c, Bin::Or, wave_base, half);
+            let any_off = self.s.m.bin(c, Bin::Add, half, two);
+            let any_idx = self.s.m.bin(c, Bin::Or, wave_base, any_off);
+            let val_slot = self.xchg_slot(c, val_idx);
+            let any_slot = self.xchg_slot(c, any_idx);
+            self.s.m.store(c, val_slot, my_val);
+            self.s.m.store(c, any_slot, my_any);
+            self.xchg_barrier(c);
+            let lo_val_slot = self.xchg_slot(c, wave_base);
+            let lo_val = self.s.m.load(c, lo_val_slot);
+            let hi_val_idx = self.s.m.bin(c, Bin::Or, wave_base, one);
+            let hi_val_slot = self.xchg_slot(c, hi_val_idx);
+            let hi_val = self.s.m.load(c, hi_val_slot);
+            let lo_any_idx = self.s.m.bin(c, Bin::Or, wave_base, two);
+            let lo_any_slot = self.xchg_slot(c, lo_any_idx);
+            let lo_any = self.s.m.load(c, lo_any_slot);
+            let hi_any_idx = self.s.m.bin(c, Bin::Or, wave_base, three);
+            let hi_any_slot = self.xchg_slot(c, hi_any_idx);
+            let hi_any = self.s.m.load(c, hi_any_slot);
+            self.xchg_barrier(c);
+            let pair = self.s.m.bin(c, Bin::LShr, f, six);
+            let lo_half = self.s.m.bin(c, Bin::Shl, pair, one);
+            let hi_half = self.s.m.bin(c, Bin::Add, lo_half, one);
+            let hi_any = match self.xchg_written(c, hi_half, 5) {
+                Some(there) => self.s.m.select(c, there, hi_any, z),
+                None => hi_any,
+            };
+            let lo_empty = self.s.m.cmp(c, pred::EQ, lo_any, z);
+            let hi_nonempty = self.s.m.cmp(c, pred::NE, hi_any, z);
+            let use_hi = self.s.m.bin(c, Bin::And, lo_empty, hi_nonempty);
+            return Ok(Some(self.s.m.select(c, use_hi, hi_val, lo_val)));
+        }
+        let lane = self.lockstep_first_lane(inst)?;
+        Ok(Some(self.wide_read_lane(a, lane)?))
+    }
+
+    /// Whether `v`, what `reg` holds where `at` reads it, is provably the same in every lane that
+    /// is on in `at`'s EXEC, in both halves of the console wave. Conservative and memoized: what
+    /// it cannot prove is not uniform.
+    ///
+    /// Uniform are: constants; program inputs in SGPRs (user data); scalar instructions of uniform
+    /// values (not reading a lane mask as per-lane data); scalar phis at uniform joins whose
+    /// incoming values are all uniform; non-waterfall `v_readfirstlane_b32` results; values an
+    /// earlier whole-wave section left uniform; and VALU instructions of uniform values with no
+    /// DPP and no lane-mask operand, made under an EXEC that covers every lane active at `at`
+    /// (`at_exec => def_exec`) and not carried out of a divergent loop.
+    pub(super) fn wave_uniform(
+        &self,
+        at: &crate::ir::Inst,
+        reg: crate::ir::Reg,
+        v: crate::ir::Value,
+    ) -> bool {
+        use crate::ir::{EXEC, Reg};
+        let execs = (at.read(Reg::S(EXEC)), at.read(Reg::S(EXEC + 1)));
+        let at_mask = execs
+            .0
+            .and_then(|e| self.x.st.masks.get(&e).or_else(|| self.x.st.other.get(&e)).copied());
+        let mut memo = Map::default();
+        let mut visiting = Set::default();
+        self.uniform_in(execs, at_mask, self.cur_ir, reg, v, &mut memo, &mut visiting)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn uniform_in(
+        &self,
+        execs: (Option<crate::ir::Value>, Option<crate::ir::Value>),
+        at_mask: Option<crate::structure::Bool>,
+        at_block: usize,
+        reg: crate::ir::Reg,
+        v: crate::ir::Value,
+        memo: &mut Map<crate::ir::Value, bool>,
+        visiting: &mut Set<crate::ir::Value>,
+    ) -> bool {
+        use crate::gfx10::{Fields, Operand};
+        use crate::ir::{EXEC, Reg, VCC};
+        if let Some(&cached) = memo.get(&v) {
+            return cached;
+        }
+        if !visiting.insert(v) {
+            // A cycle (loop phi): only accept if the cycle's header is a uniform join, which the
+            // phi arm below checks before recursing.
+            return true;
+        }
+        let res = (|| {
+            if self.section_uniform(v) {
+                return true;
+            }
+            let mask =
+                |r: Reg| matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1 || c == VCC || c == VCC + 1);
+            if mask(reg) {
+                // A lane mask read as a number: with the halves on it is the console's 64 bits in
+                // both (a ballot through `xchg`), so the same in every lane.
+                return self.halves;
+            }
+            let p = self.x.p;
+            let Some(inst) = self.def_inst(v) else {
+                let Some(&b) = self.def_block.get(&v) else {
+                    // A program input: user data in SGPRs is the wave's; VGPR inputs are per lane.
+                    return matches!(reg, Reg::S(_));
+                };
+                let Some(phi) = p.blocks[b].phis.iter().find(|ph| ph.value == v) else {
+                    return false;
+                };
+                let args: Vec<_> = phi.args.iter().copied().filter(|&x| x != v).collect();
+                let Some(&first) = args.first() else {
+                    return false;
+                };
+                if matches!(phi.reg, Reg::S(_)) {
+                    // A scalar phi is wave-uniform only at a uniform join (where the whole console
+                    // wave enters along the same edge; rejects values carried out of divergent
+                    // loops or divergent if-joins).
+                    if !self.uniform_join(b, |_| true) {
+                        return false;
+                    }
+                    return args
+                        .iter()
+                        .all(|&x| self.uniform_in(execs, at_mask, at_block, phi.reg, x, memo, visiting));
+                }
+                // A vector join merges lanes from different paths: uniform only when every
+                // non-self edge brings the exact same uniform SSA value.
+                return args.iter().all(|&x| x == first)
+                    && self.uniform_in(execs, at_mask, at_block, phi.reg, first, memo, visiting);
+            };
+            let name = inst.name();
+            let dst = match &inst.fields {
+                Fields::Valu(f) => match f.dst {
+                    Some(Operand::Vector { reg, dwords }) => Some((reg, dwords.max(1))),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let old = |r: Reg| {
+                matches!((r, dst), (Reg::V(x), Some((d, n))) if x >= d && x < d.saturating_add(n))
+            };
+            match &inst.fields {
+                // A first-lane read is the console wave's first lane since #254 (exact, or
+                // refused); a waterfall loop's read is the lane's own.
+                Fields::Valu(_) if name == "v_readfirstlane_b32" => {
+                    !inst.writes.iter().any(|w| self.waterfall_reads.contains(&w.1))
+                }
+                Fields::Valu(f) => {
+                    if f.dpp.is_some()
+                        || name.starts_with("v_mbcnt")
+                        || name.starts_with("v_cmp")
+                        || name.starts_with("v_readlane")
+                        || name.starts_with("v_writelane")
+                        || name.starts_with("v_interp")
+                        || f.src.iter().any(|o| matches!(o, Operand::Attr { .. }))
+                    {
+                        return false;
+                    }
+                    // Made where at least `at`'s active lanes were on: identical EXEC, entry EXEC,
+                    // or `at_mask => def_mask` (every lane active at `at` was active at `def`).
+                    // Reject if `def` is in a different block that could be inside a divergent
+                    // loop `at_block` is outside (not proven same-iteration).
+                    let def = (inst.read(Reg::S(EXEC)), inst.read(Reg::S(EXEC + 1)));
+                    let entry = |x: Option<crate::ir::Value>| {
+                        x.is_some_and(|x| self.def_inst(x).is_none() && !self.def_block.contains_key(&x))
+                    };
+                    let exec_covers = def == execs
+                        || (entry(def.0) && entry(def.1))
+                        || matches!(
+                            (
+                                at_mask,
+                                def.0.and_then(|e| {
+                                    self.x.st.masks.get(&e).or_else(|| self.x.st.other.get(&e)).copied()
+                                }),
+                            ),
+                            (Some(am), Some(dm)) if !self.x.st.bools.meet(&[(am, true), (dm, false)])
+                        );
+                    if !exec_covers {
+                        return false;
+                    }
+                    // Guard against a VALU defined inside a divergent loop and read outside it
+                    // without an intervening phi (possible when the loop has a single exit).
+                    if let Some(&db) = self.def_block.get(&v)
+                        && db != at_block
+                        && self.rpo[db] > 0
+                        && !self.once[db]
+                        && self.in_cycle_not_containing(db, at_block)
+                    {
+                        return false;
+                    }
+                    inst.reads.iter().all(|&(r, x)| {
+                        if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1) || old(r) {
+                            return true;
+                        }
+                        !mask(r)
+                            && self.uniform_in(execs, at_mask, at_block, r, x, memo, visiting)
+                    })
+                }
+                Fields::Sop { .. } | Fields::Smem { .. } => inst
+                    .reads
+                    .iter()
+                    .all(|&(r, x)| self.uniform_in(execs, at_mask, at_block, r, x, memo, visiting)),
+                _ => false,
+            }
+        })();
+        visiting.remove(&v);
+        memo.insert(v, res);
+        res
+    }
+
+    /// Whether IR block `db` can reach itself without passing through `at_block` (i.e. `db` is in
+    /// a loop that `at_block` is outside).
+    fn in_cycle_not_containing(&self, db: usize, at_block: usize) -> bool {
+        let p = self.x.p;
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack: Vec<usize> = p.blocks[db].exit.successors();
+        while let Some(x) = stack.pop() {
+            if x == db {
+                return true;
+            }
+            if x == at_block || std::mem::replace(&mut seen[x], true) {
+                continue;
+            }
+            stack.extend(p.blocks[x].exit.successors());
+        }
+        false
+    }
+
     /// The console lane `v_readfirstlane_b32` reads in lockstep (`lockstep.rs`): the lowest bit of
-    /// EXEC as `inst` reads it, as a number (0 when none is set).
+    /// EXEC as `inst` reads it, as a number (0 when none is set, as the console reads lane 0).
     pub(super) fn lockstep_first_lane(&mut self, inst: &crate::ir::Inst) -> Result<V, Why> {
         use crate::ir::{EXEC, Reg};
         let c = self.cur;
@@ -186,8 +488,14 @@ impl Lower<'_> {
         let fhi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
         let (z, k32, k63) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(63));
         let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
-        let low = self.s.m.cmp(c, pred::NE, lo, z);
-        let r = self.s.m.select(c, low, flo, fhi);
+        // An empty EXEC reads lane 0 (RDNA 2 ISA): `FirstbitLo(0)` is all ones, which plus 32
+        // would wrap to lane 31 (found in review of #254 by evan-kolberg).
+        let (low, high) = (
+            self.s.m.cmp(c, pred::NE, lo, z),
+            self.s.m.cmp(c, pred::NE, hi, z),
+        );
+        let upper = self.s.m.select(c, high, fhi, z);
+        let r = self.s.m.select(c, low, flo, upper);
         Ok(self.s.m.bin(c, Bin::And, r, k63))
     }
 

@@ -266,8 +266,11 @@ fn lds_a_wave_shares_unsynced_in_divergent_code_is_refused() {
 
 #[test]
 fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
-    // `v_readfirstlane` reads each host wave's own first lane (0 and 32 here), so a branch on
-    // what it gives can split the console wave: the halves would not meet at a barrier.
+    // `v_readfirstlane` reads the console wave's first lane in both halves since #254, through a
+    // single 2-barrier exchange of its own. The branch analysis still counts an SCC made from one
+    // as split (`split_scc`, which the per-half read of mesh programs needs), so nothing after the
+    // branch exchanges: the `v_readlane` there gets none of its own (its value, unused here, is
+    // dropped), and LDS behind the branch gets no barrier.
     const FIRST: [u32; 3] = [
         0x7E04_0500, // v_readfirstlane_b32 s2, v0
         0xBF06_8002, // s_cmp_eq_u32 s2, 0
@@ -281,7 +284,7 @@ fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
         S_ENDPGM,
     ]);
     let l = host32(&readlane, 64);
-    assert_eq!((l.barriers, l.exchanges), (0, false));
+    assert_eq!((l.barriers, l.exchanges), (2, true));
     // LDS written and read behind such a branch (over 6 words): no barrier fits.
     let mut lds = FIRST.to_vec();
     lds[2] = 0xBF84_0006; // s_cbranch_scc0 6
@@ -576,4 +579,130 @@ fn permlane16_and_permlanex16_lower_within_host32_half() {
     assert_eq!(l.wave_size, Some(32));
     // Both stay within the 32-lane half, so no cross-half LDS exchange barriers are needed.
     assert_eq!(l.barriers, 0);
+}
+
+#[test]
+fn split_first_lane_uses_one_exchange_and_handles_empty_exec() {
+    // s_mov_b64 exec, 0; v_readfirstlane_b32 s12, v0; s_mov_b64 exec, -1; v_mov_b32 v2, s12
+    const EMPTY_EXEC: &[u32] = &[
+        0xBEFE_0480, // s_mov_b64 exec, 0
+        0x7E18_0500, // v_readfirstlane_b32 s12, v0
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7E04_020C, // v_mov_b32_e32 v2, s12
+        S_ENDPGM,
+    ];
+    let l = host32(EMPTY_EXEC, 64);
+    assert_eq!((l.barriers, l.exchanges), (2, true));
+}
+
+#[test]
+fn split_first_lane_uniform_valu_under_wider_exec_needs_no_exchange() {
+    // v1 = s0 + s1 under entry EXEC; inside a divergent branch (v0 < 40), readfirstlane v1.
+    // Every active lane in the branch wrote the same uniform value to v1, so no exchange is needed.
+    const PROG: &[u32] = &[
+        0x7E02_0200, // v_mov_b32_e32 v1, s0
+        0x7D88_00A8, // v_cmp_gt_u32_e32 vcc, 40, v0  (40 > v0 => v0 < 40)
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBF88_0002, // s_cbranch_execz +2
+        0x7E18_0501, // v_readfirstlane_b32 s12, v1
+        0x7E04_020C, // v_mov_b32_e32 v2, s12
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        S_ENDPGM,
+    ];
+    let l = host32(PROG, 64);
+    assert_eq!((l.barriers, l.exchanges), (0, false));
+}
+
+#[test]
+fn split_first_lane_narrowed_valu_after_exec_widens_is_not_uniform() {
+    // Negative for `wave_uniform` (#254): v2 is initialized from v0 (lane-varying), then under
+    // narrowed EXEC (lanes 8 and 9) overwritten with a constant 77. After EXEC widens back to all
+    // lanes, v2 differs per lane (77 in lanes 8..9, v0 elsewhere), so `v_readfirstlane_b32` MUST
+    // NOT be treated as wave_uniform and must exchange across halves (2 barriers).
+    const PROG: &[u32] = &[
+        0x7E04_0300, // v_mov_b32_e32 v2, v0
+        0xBEFE_04FF,
+        0x0000_0300, // s_mov_b64 exec, 0x300 (lanes 8 and 9)
+        0x7E04_02FF,
+        0x0000_004D, // v_mov_b32_e32 v2, 77
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7E18_0502, // v_readfirstlane_b32 s12, v2
+        0x7E06_020C, // v_mov_b32_e32 v3, s12
+        S_ENDPGM,
+    ];
+    let l = host32(PROG, 64);
+    assert_eq!((l.barriers, l.exchanges), (2, true));
+}
+
+#[test]
+fn split_first_lane_divergent_branch_refuses_two_waves_and_runs_lockstep_for_one() {
+    // 4TheDoctor's branch form (#254): branch on lanes 8..9 (and 40..41), then `v_readfirstlane_b32`
+    // of v0 inside the branch. With 128 threads (2 console waves) lockstep does not apply and the
+    // fast path must refuse; with 64 threads (1 console wave) lockstep translates it.
+    for half_val in [4u32, 20u32] {
+        let prog = [
+            0x3406_0081, // v_lshrrev_b32_e32 v3, 1, v0
+            0x7D84_0680 | half_val, // v_cmp_eq_u32_e32 vcc, half_val, v3
+            0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+            0xBF88_0005, // s_cbranch_execz +5
+            0x7E18_0500, // v_readfirstlane_b32 s12, v0
+            0x7E04_020C, // v_mov_b32_e32 v2, s12
+            0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+            0xD834_0000,
+            0x0000_0201, // ds_write_b32 v1, v2
+            0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            S_ENDPGM,
+        ];
+        // 128 threads (2 console waves): fast path refuses.
+        let r = lowered(&prog, 128, true, true);
+        let err = match r {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected refusal for 128 threads (half_val={half_val})"),
+        };
+        assert!(
+            err.contains("first lane read across the two host waves"),
+            "unexpected error for half_val={half_val}: {err}"
+        );
+        // 64 threads (1 console wave): fast path refuses, then lockstep translates it.
+        assert!(lowered(&prog, 64, true, true).is_err());
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (1 << 15) | (2 << 1),
+                threads: [64, 1, 1],
+            }),
+            code: prog.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::lockstep(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lockstep_ok = lower::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: true,
+            zero_copy_memory: false,
+            rect_list: false,
+            copy_params: [0; 32],
+            view_marks: false,
+        });
+        assert!(
+            lockstep_ok.is_ok(),
+            "expected 1-wave lockstep to translate (half_val={half_val})"
+        );
+    }
 }
