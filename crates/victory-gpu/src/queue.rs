@@ -696,6 +696,8 @@ extern "system" fn present(
     if frame % 64 == 0 {
         crate::native::glue::log_draw_counts(frame);
     }
+    #[cfg(target_os = "macos")]
+    crate::native::glue::log_pipeline_counts(frame);
     #[cfg(windows)]
     account_frame(frame);
     #[cfg(feature = "diagnostics")]

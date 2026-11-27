@@ -930,10 +930,86 @@ fn frame_left() -> std::time::Duration {
     BUDGET.lock().unwrap_or_else(|e| e.into_inner()).left(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET)
 }
 
+/// [`frame_left`] for tests, which read it to see whether a compile spent its frame.
+#[cfg(test)]
+pub(crate) fn frame_left_now() -> std::time::Duration {
+    frame_left()
+}
+
+/// Spends what the current frame has left of its budget for new pipelines: from here on [`pipe`]
+/// puts off the frame's pipelines whose shaders are not translated yet, and [`compile_wait`] waits
+/// 20 ms a pipeline then nothing, until the next frame starts with the budget whole again.
+pub(crate) fn spend_frame_budget() {
+    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spend(crate::frame::current(), std::time::Instant::now());
+}
+
+/// A pipeline compile that ended in `error`: if Metal's compiler died on it rather than refusing
+/// a shader the host cannot run ([`victory_metal::is_compiler_crash`]), the frame spends the rest
+/// of its pipeline budget. One frame on 27 November spent 7.3 s on nine crashes of the same
+/// pipeline's compiles (issue #181), about 0.85 s each; with the budget spent, that frame's other
+/// new pipelines are put off and retried in later frames, where the crash memory refuses the bad
+/// ones at once. A single crash can still cost the frame the ~0.85 s it takes, or on macOS 15 the
+/// ~30 s the compiler retries for, out of its budget.
+pub(crate) fn compile_failed(name: &str, error: &str) {
+    if !victory_metal::is_compiler_crash(error) {
+        return;
+    }
+    spend_frame_budget();
+    // The frame this was last logged for: one warning a frame, however many pipelines crash.
+    static WARNED: Mutex<u64> = Mutex::new(u64::MAX);
+    let frame = crate::frame::current();
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if *warned != frame {
+        *warned = frame;
+        tracing::warn!(frame, pipeline = name, "a compile crashed Metal's compiler; no new pipelines this frame");
+    }
+}
+
+/// A compile that ended in a crash of Metal's compiler spends the rest of the frame's budget
+/// (issue #181: nine of them held one frame for 7.3 s) and is what `compile_wait` sees, so the
+/// frame is handed no new pipeline; one refused for a reason of the host's spends nothing.
+#[cfg(test)]
+#[test]
+fn a_compiler_crash_spends_the_frame_budget() {
+    fn whole_frame() {
+        *BUDGET.lock().unwrap_or_else(|e| e.into_inner()) = crate::prewarm::FrameBudget::new();
+    }
+    struct Whole;
+    impl Drop for Whole {
+        fn drop(&mut self) {
+            whole_frame();
+        }
+    }
+    // The budget is the process's and every other test reads it under `TITLE`: hold it, and start
+    // the frame here, so no test of theirs runs while this one has spent the budget.
+    let _title = lock();
+    whole_frame();
+    let _whole = Whole;
+    let before = frame_left_now();
+    assert!(!before.is_zero(), "a frame starts with its budget");
+    // A refusal of `make_render`'s, not a crash.
+    compile_failed("a guessed pipeline", "a target format the host does not know");
+    let left = frame_left_now();
+    assert!(!left.is_zero(), "a refusal is not a crash");
+    assert!(left <= before);
+    assert!(!frame_spent_by_crash());
+
+    compile_failed(
+        "a guessed pipeline",
+        "Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. \
+         This error occurred after multiple retries.",
+    );
+    assert!(frame_left_now().is_zero(), "a crash spends the frame");
+    assert!(frame_spent_by_crash(), "and `compile_wait` tells it from a frame out of time");
+}
+
 /// How long a new pipeline may hold the current frame while Metal makes it: what the frame has
 /// left of its budget; past it, the few ms a pipeline the disk cache and the archive hold takes
 /// (so a warm frame that outlasts its budget puts none off), until one is not made in them; then
-/// nothing. A cold world frame asks for some 800 past its budget: 20 ms each would be 16 s.
+/// nothing. A cold world frame asks for some 800 past its budget: 20 ms each would be 16 s. A
+/// frame a crash spent gets nothing: the compiler service is down for the rest of it, and the
+/// 20 ms window let 12 pipelines of one frame fail within 0.22 s, each refused and remembered as
+/// a crash of its own.
 fn compile_wait(t: &MetalTitle) -> std::time::Duration {
     const ARCHIVED: std::time::Duration = std::time::Duration::from_millis(20);
     /// The frame last past its budget, and the pipelines put off before that.
@@ -942,12 +1018,21 @@ fn compile_wait(t: &MetalTitle) -> std::time::Duration {
     if !left.is_zero() {
         return left;
     }
+    if frame_spent_by_crash() {
+        return std::time::Duration::ZERO;
+    }
     let frame = crate::frame::current();
     let mut past = PAST.lock().unwrap_or_else(|e| e.into_inner());
     if past.0 != frame {
         *past = (frame, t.shaders.put_off);
     }
     if past.1 == t.shaders.put_off { ARCHIVED } else { left }
+}
+
+/// Whether a compile that crashed Metal's compiler spent the current frame ([`frame_left`] is
+/// zero for a frame that is merely past its time too; this tells the two apart).
+fn frame_spent_by_crash() -> bool {
+    BUDGET.lock().unwrap_or_else(|e| e.into_inner()).spent_by_crash()
 }
 
 /// When this frame made its first new pipeline, and pipelines put off since ([`pipe`]).
@@ -1059,6 +1144,34 @@ pub(crate) fn log_draw_counts(frame: u64) {
         tracing::info!(frame, shaders_cached, shaders_translated, libraries_cached, libraries_converted, "native shader cache so far");
     }
     super::descriptor_trace::log(frame);
+}
+
+/// A present with pipeline work of its own: the pipelines the title's shader path has made, put
+/// off and served from its cache so far (`VICTORY_TRACE_PIPELINES=1`). Off, this is one read of
+/// the switch and a branch. On, the three counters are read through `with_title`: plain fields of
+/// `Title::shaders`, under the lock the frame's own draws and dispatches already take, and the
+/// present's thread holds nothing else by then, so the read costs a lock that is almost never
+/// contended and copies no data; cheaper than the draw line that takes the same lock every 64
+/// frames. A frame whose counters did not move writes nothing.
+#[inline(never)]
+pub(crate) fn log_pipeline_counts(frame: u64) {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_PIPELINES").is_some_and(|v| !v.is_empty() && v != "0")) {
+        return;
+    }
+    let Some((made, put_off, cached)) =
+        with_title(|t| (t.shaders.pipelines, t.shaders.put_off, t.shaders.cached))
+    else {
+        return;
+    };
+    /// The counters as last logged.
+    static LAST: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if (made, put_off, cached) == *last {
+        return;
+    }
+    *last = (made, put_off, cached);
+    tracing::info!(frame, made, put_off, cached, "native pipelines so far");
 }
 
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.

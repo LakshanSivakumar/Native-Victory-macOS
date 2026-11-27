@@ -28,20 +28,45 @@ pub(crate) const FIRST_BIND_BUDGET: Duration = Duration::from_secs(10);
 pub(crate) struct FrameBudget {
     frame: u64,
     started: Option<Instant>,
+    /// [`FrameBudget::spend`] was called for this frame: none of its budget is left, whatever
+    /// time has passed, and a compile crashed Metal's compiler to take it.
+    crashed: bool,
 }
 
 impl FrameBudget {
     pub(crate) const fn new() -> Self {
-        FrameBudget { frame: 0, started: None }
+        FrameBudget { frame: 0, started: None, crashed: false }
     }
 
     /// What frame `frame`, making a new pipeline at `now`, has left of `budget` since its first
     /// (zero: spent).
     pub(crate) fn left(&mut self, frame: u64, now: Instant, budget: Duration) -> Duration {
         if frame != self.frame || self.started.is_none() {
-            *self = FrameBudget { frame, started: Some(now) };
+            *self = FrameBudget { frame, started: Some(now), crashed: false };
+        }
+        if self.crashed {
+            return Duration::ZERO;
         }
         self.started.map_or(budget, |t| budget.saturating_sub(now.saturating_duration_since(t)))
+    }
+
+    /// Spends what frame `frame` has left of its budget: [`Self::left`] is zero for it from `now`
+    /// on, and the next frame starts with the full budget again, as one that never spends. A
+    /// compile that crashed Metal's compiler spends its frame: the frame's other new pipelines
+    /// are put off rather than each paying a crash of its own (issue #181).
+    pub(crate) fn spend(&mut self, frame: u64, now: Instant) {
+        if frame != self.frame || self.started.is_none() {
+            *self = FrameBudget { frame, started: Some(now), crashed: false };
+        }
+        self.crashed = true;
+    }
+
+    /// Whether a compile that crashed Metal's compiler spent this frame, rather than the frame
+    /// running out of time. The compiler service may be down for the rest of such a frame, so it
+    /// gets no new pipeline at all; a frame merely past its time still gets the short wait a
+    /// pipeline the archive holds takes. False for the next frame.
+    pub(crate) fn spent_by_crash(&self) -> bool {
+        self.crashed
     }
 }
 
@@ -175,6 +200,36 @@ mod tests {
         assert_eq!(b.left(6, at(150), budget), budget);
         assert!(!b.left(6, at(249), budget).is_zero());
         assert!(b.left(6, at(250), budget).is_zero());
+    }
+
+    #[test]
+    fn a_spent_frame_starts_the_next_one_whole() {
+        // A compile that crashed Metal's compiler spends the frame's budget (issue #181: nine
+        // crashes held one frame for 7.3 s): the rest of that frame's new pipelines are put off,
+        // and the next frame tries again with the full budget, as one that never spent. A frame
+        // that is merely past its time is told apart: it still gets the short wait a pipeline the
+        // archive holds takes.
+        let mut b = FrameBudget::new();
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let budget = Duration::from_millis(100);
+        // A frame that has made no pipeline yet can spend too.
+        b.spend(4, at(0));
+        assert!(b.left(4, at(0), budget).is_zero());
+        assert!(b.spent_by_crash());
+        assert_eq!(b.left(5, at(10), budget), budget);
+        assert!(!b.spent_by_crash(), "the next frame is not spent by the crash");
+        assert_eq!(b.left(5, at(99), budget), Duration::from_millis(11));
+        b.spend(5, at(99));
+        assert!(b.left(5, at(99), budget).is_zero());
+        assert!(b.left(5, at(150), budget).is_zero(), "spent outlasts the frame's remaining time");
+        assert!(b.spent_by_crash());
+        assert_eq!(b.left(6, at(200), budget), budget);
+        assert!(!b.spent_by_crash());
+        // A frame that runs out of time is spent too, but not by a crash.
+        assert_eq!(b.left(6, at(249), budget), Duration::from_millis(51));
+        assert!(b.left(6, at(300), budget).is_zero());
+        assert!(!b.spent_by_crash(), "a frame out of time did not crash");
     }
 
     #[test]
