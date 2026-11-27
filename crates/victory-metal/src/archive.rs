@@ -36,6 +36,11 @@ type Dev = Retained<ProtocolObject<dyn MTLDevice>>;
 impl Archive {
     /// The archive for this GPU, if libraries are kept on disk.
     pub(crate) fn open(dev: &Dev) -> Option<Arc<Archive>> {
+        // Keep the regular library cache available on hosts where Metal cannot safely
+        // open or populate a binary pipeline archive.
+        if std::env::var_os("VICTORY_NO_PIPELINE_ARCHIVE").is_some_and(|value| value == "1") {
+            return None;
+        }
         Self::open_in(dev, crate::disk::dir()?)
     }
 
