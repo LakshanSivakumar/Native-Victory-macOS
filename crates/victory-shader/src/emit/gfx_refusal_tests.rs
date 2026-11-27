@@ -3159,3 +3159,247 @@ fn a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("lane-mask join") && err.contains("0x48"), "{err:?}");
 }
+
+/// One wide scalar load (`s_load_dwordx16`) can load two adjacent descriptors from a table (e.g.
+/// slot 0 in `s[8:11]` and slot 1 in `s[16:19]` or `s[16:23]`). Previously `load_use` kept only
+/// the first descriptor per load, so reading the second descriptor's record count or dimensions
+/// was refused as `"a dword outside the descriptor"`. Each descriptor in the load now rebuilds
+/// its own size dwords, while padding between them and unmodeled dwords stay refused with their
+/// exact reasons.
+#[test]
+fn wide_descriptor_load_rebuilds_each_descriptor_and_keeps_outside_refused() {
+    use crate::native::tests::{fspx, fspx_resource};
+
+    // s_load_dwordx16 s[8:23], s[4:5], 0 loads:
+    //   slot 0 (dwords 0..4): raw UAV in s[8:11]
+    //   slot 1 (dwords 8..12): raw SRV in s[16:19]
+    let two_buffers = |read: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF410_0202,
+            0xFA00_0000, // s_load_dwordx16 s[8:23], s[4:5], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 offen
+            read,        // v_mov_b32 v2, s<n>
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+
+    // Reading slot 0's record count (s10) or slot 1's record count (s18) both translate.
+    for (label, read) in [("slot 0 record count", 0x7E04_020A), ("slot 1 record count", 0x7E04_0212)]
+    {
+        if let Err(e) = translate_with(&two_buffers(read), Options::default()) {
+            panic!("{label}: {e}");
+        }
+    }
+
+    // Padding between the two 4-dword buffers (s12 = dword 4) and unmodeled dwords of slot 1
+    // (s16 = base address, s19 = format) stay refused with their exact reasons.
+    let prefix = "a descriptor's address or format read as data: ";
+    for (read, why) in [
+        (0x7E04_020C, "a dword outside the descriptor"),
+        (0x7E04_0210, "a buffer's base address (dword 0)"),
+        (0x7E04_0213, "a buffer's dword 3 (format and type)"),
+    ] {
+        let err = translate_with(&two_buffers(read), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{read:#x}: {err:?}"
+        );
+    }
+
+    // Slot 0 = raw UAV buffer (s[8:11]), slot 1 = 2D image SRV (s[16:23]):
+    // image width/height (s18 = image dword 2) translates; image dword 5 (s21) stays refused.
+    let buffer_and_image = |read: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF410_0202,
+            0xFA00_0000, // s_load_dwordx16 s[8:23], s[4:5], 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_1F08,
+            0x0004_0200, // image_load v[2:5], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+            read,        // v_mov_b32 v6, s<n>
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A04_0D02, // v_add_nc_u32 v2, v2, v6
+            0xE070_0000,
+            0x8002_0200, // buffer_store_dword v2, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    if let Err(e) = translate_with(&buffer_and_image(0x7E0C_0212), Options::default()) {
+        panic!("slot 1 image dword 2: {e}");
+    }
+    let err = translate_with(&buffer_and_image(0x7E0C_0215), Options::default()).err();
+    assert!(
+        matches!(err, Some(ShaderError::Unsupported { what, .. })
+            if what.strip_prefix(prefix) == Some("an image's dwords 5 to 7")),
+        "{err:?}"
+    );
+
+    // Slot 0 = CBV (s[8:11], not read as data), slot 1 = raw SRV buffer (s[16:19]):
+    // the CBV in slot 0 does not poison reading slot 1's record count (s18), while reading
+    // slot 0's own descriptor dword (s10) stays refused as a constant buffer descriptor.
+    let cbv_and_srv = |read: u32| {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF410_0202,
+            0xFA00_0000, // s_load_dwordx16 s[8:23], s[4:5], 0
+            0xF408_0602,
+            0xFA00_0040, // s_load_dwordx4 s[24:27], s[4:5], 0x40 (output UAV)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0704,
+            0xFA00_0000, // s_buffer_load_dword s28, s[8:11], 0 (uses slot 0 as CBV)
+            0xE030_1000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 offen (uses slot 1 as SRV)
+            read,        // v_mov_b32 v2, s<n>
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0x4A02_021C, // v_add_nc_u32 v1, s28, v1
+            0xE070_0000,
+            0x8006_0100, // buffer_store_dword v1, off, s[24:27], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let resources = [
+            fspx_resource(2, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+            fspx_resource(3, 3, 16, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    if let Err(e) = translate_with(&cbv_and_srv(0x7E04_0212), Options::default()) {
+        panic!("cbv + srv slot 1 record count: {e}");
+    }
+    let err = translate_with(&cbv_and_srv(0x7E04_020A), Options::default()).err();
+    assert!(
+        matches!(err, Some(ShaderError::Unsupported { what, .. })
+            if what == "a constant buffer's descriptor read as data"),
+        "{err:?}"
+    );
+}
+
+/// Reloading only a used descriptor's size/count dwords at an offset inside the descriptor
+/// (`s_load_dword` at `+8` for a buffer's record count, `s_load_dwordx4` at `+4` for an image's
+/// size dwords) matches the used descriptor instead of falling through to `view_addresses`, while
+/// a reload of a buffer's dword 1 alone (`+4`, masked to address high bits) still reaches
+/// `view_addresses`.
+#[test]
+fn partial_reload_of_used_descriptor_size_dwords_translates() {
+    use crate::native::tests::{fspx, fspx_resource};
+
+    // Buffer used at offset 0x20, record count reloaded with s_load_dword at 0x28.
+    let buf_partial = {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xF400_0402,
+            0xFA00_0028, // s_load_dword s16, s[4:5], 0x28 (dword 2 = record count)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 offen
+            0x7E04_0210, // v_mov_b32 v2, s16
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    if let Err(e) = translate_with(&buf_partial, Options::default()) {
+        panic!("buffer partial reload at +8: {e}");
+    }
+
+    // 2D image used at offset 0x20, size dwords 1..4 reloaded with s_load_dwordx4 at 0x24.
+    let img_partial = {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF40C_0302,
+            0xFA00_0020, // s_load_dwordx8 s[12:19], s[4:5], 0x20
+            0xF408_0502,
+            0xFA00_0024, // s_load_dwordx4 s[20:23], s[4:5], 0x24 (image dwords 1..4)
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_1F08,
+            0x0003_0200, // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+            0x7E0C_0215, // v_mov_b32 v6, s21 (image dword 2 = width/height)
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A04_0D02, // v_add_nc_u32 v2, v2, v6
+            0xE070_0000,
+            0x8002_0200, // buffer_store_dword v2, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    if let Err(e) = translate_with(&img_partial, Options::default()) {
+        panic!("image partial reload at +4: {e}");
+    }
+
+    // Buffer used at offset 0x20, dword 1 alone reloaded at 0x24 and masked to 16 address bits:
+    // does not overlap dword 2 (record count), so it still goes to view_addresses and translates.
+    let buf_addr_hi = {
+        let code = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xF400_0402,
+            0xFA00_0024, // s_load_dword s16, s[4:5], 0x24 (dword 1 only)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 offen
+            0x8710_FF10,
+            0x0000_FFFF, // s_and_b32 s16, s16, 0xFFFF
+            0x7E04_0210, // v_mov_b32 v2, s16
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let shader = translate_with(&buf_addr_hi, Options::default())
+        .expect("buffer dword 1 address bits via view_addresses");
+    assert!(shader.view_addresses);
+}

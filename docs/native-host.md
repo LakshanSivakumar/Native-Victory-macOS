@@ -1889,6 +1889,18 @@ native Metal host serves view addresses (see "View addresses on the native host"
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
 compute programs refused with the old message.
 
+One cause of `"a dword outside the descriptor"` (3 compute shaders in the #4 refusal table) was a
+single wide load (`s_load_dwordx8` or `s_load_dwordx16`) carrying more than one descriptor from a
+table or heap: `Lower::load_uses` previously kept only the first `(use_site, first)` per scalar
+load, so every dword of a second descriptor in the same load got `rel` past the first descriptor's
+end. `Lower::descriptor_data` now tracks every distinct `first` offset used from a load, queries
+`getDimensions` per descriptor (skipping additional descriptors whose dwords are not read as data,
+so unchanged single-use loads keep identical DXIL, and isolating CBV/unsupported descriptors to
+their own dword range), and also matches offset-shifted or partial reloads of a used descriptor's
+size/count dwords within the same 32-byte slot without stealing address-only dword-1 reloads from
+`view_addresses`. Tests: `gfx_refusal_tests::wide_descriptor_load_rebuilds_each_descriptor_and_keeps_outside_refused`
+and `gfx_refusal_tests::partial_reload_of_used_descriptor_size_dwords_translates`.
+
 Most pixel programs refused with these reasons (and with "a descriptor read only as data") read no
 descriptor word at all (27 November, offline corpus). The console compiler reuses a register that
 last held a descriptor dword (often a sampler's, loaded from the sampler heap) for a constant it
