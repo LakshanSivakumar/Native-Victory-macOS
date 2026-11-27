@@ -1956,3 +1956,52 @@ fn a_whole_wave_half_sum_reads_across_the_host_waves() {
     let want: Vec<u32> = (0..128).map(|i| if i < 40 { 0x0000_5380 } else { CANARY }).collect();
     assert_eq!(got, want, "60.0, and lane 63 (off) holds the identity");
 }
+
+#[test]
+fn a_loop_carried_mask_changing_exited_lanes_runs_in_lockstep() {
+    // Pass 1 sets s8/s[8:9] = 0 and drops the early lanes; passes 2+ set exited lanes' bits via
+    // `s_orn2` with EXEC. Fast path refuses the cross-exit read; 64-lane compute falls back to
+    // lockstep and produces the wave's final mask.
+    let orn2_32 = [
+        0xBE88_0380, // s_mov_b32 s8, 0
+        0xBE8A_037E, // s_mov_b32 s10, exec_lo
+        0x4C06_009F, // v_sub_nc_u32 v3, 31, v0
+        // loop:
+        0x8B08_7E08, // s_orn2_b32 s8, s8, exec_lo
+        0x4A06_0688, // v_add_nc_u32 v3, 8, v3
+        0x7DA8_06A0, // v_cmpx_gt_u32 32, v3
+        0xBF89_FFFC, // s_cbranch_execnz loop
+        0xBEFE_030A, // s_mov_b32 exec_lo, s10
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    let why32 = refusal32(&orn2_32).expect("32-lane fast path refuses");
+    assert!(why32.contains("divergent loop"), "{why32}");
+
+    let orn2_64 = [
+        0xBE88_0480, // s_mov_b64 s[8:9], 0
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0x4C06_00BF, // v_sub_nc_u32 v3, 63, v0
+        // loop:
+        0x8B88_7E08, // s_orn2_b64 s[8:9], s[8:9], exec
+        0x4A06_0690, // v_add_nc_u32 v3, 16, v3
+        0x7DA8_06C0, // v_cmpx_gt_u32 64, v3
+        0xBF89_FFFC, // s_cbranch_execnz loop
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s[8:9]
+        V_LSHLREV_V1_2_V0,
+        0xDC70_8000, 0x0002_0201, // global_store_dword v1, v2, s[2:3]
+        S_ENDPGM,
+    ];
+    let why64 = refusal(&orn2_64).expect("64-lane fast path refuses");
+    assert!(why64.contains("divergent loop"), "{why64}");
+
+    let got = run_lockstep(&orn2_64, 0, 64);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..48], [1; 48]);
+    assert_eq!(got[48..], [0; 16]);
+}

@@ -645,6 +645,17 @@ wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the
 A branch or operand that depends on a first-lane read can differ between the host waves and
 stays refused.
 
+In the per-lane fast path, a loop mask read after a divergent loop is refused ("a loop-carried
+lane mask read after a divergent loop") unless it is defined outside and dominates the loop, or,
+for a per-lane bit read, each pass only ORs into it `EXEC` or a compare made in that pass, both 0
+for lanes that have already exited (an in-loop `v_cmp` itself is refused because later passes
+write 0 into exited lanes' bits on the console while each host lane keeps its last compare), with
+`EXEC` never widened inside the loop (`exec_unwidened`: saved active subsets propagated via
+`s_mov`, `s_and`/`s_andn2` narrowings, `st.restored`, xor copies, and `st.active` loop joins).
+That keeps the shadow pass's and the G-buffer's accumulated masks. Otherwise a lane that
+left on an earlier pass would read its exit-pass value rather than the wave's final mask; one-wave
+compute shaders fall back to `lockstep`.
+
 ## Liveness of phi edges: a bound on the paths walked
 
 `Lower::live_edges` decides which incoming edges of a join can bring a value to a read: it walks back from the read phis, carrying the last four branch conditions a lane took (`MAX_KNOWN`), and an edge is dead if they contradict. It kept every distinct set of conditions it had walked a phi with and compared each new one with all of them. Six of the title's pixel shaders (`0c138380aac06bee`, `1dc240e3ad667c4a`, `3b005093d9f023ac`, `6569ab9190d883bc`, `b84cdfce7b2dcc1e`, `cf5c1203d7f09fa0`) are branchy enough that a phi gathered thousands of sets (150 phis, 3,520 sets on one after 32,768 steps) and the translation never finished. Once the root-view and descriptor changes of late November let these shaders get that far, the world frame's pipeline of vertex `fd0cfdb9141c858c` and pixel `b84cdfce7b2dcc1e` stopped every run: the thread making it waited on the translation under the title lock, nothing else logged but the audio thread, and the title's watchdog fired 30 s later (+120-133 s, warm or cold). Now a phi walked with 64 sets (`MAX_PATHS`) is walked once more knowing nothing, which covers every later set; knowing less only keeps more edges live (a refusal at worst, never wrong code), as the existing rule of four conditions already does. Over the 12,279 containers one run translated (dumped to a scratch folder, translated offline by the `guess` example, arm64 release), the six now finish in 2 s each (two translate, four are refused for a lane mask read as data) and the other 12,273 give byte-identical results; the slowest translation is a compute shader of 10-11 s, before and after. Test: `emit::lower::tests::liveness_through_joins_of_many_conditions_ends` (six joins of twelve branches each: 0.02 s, 80 s without the bound).
