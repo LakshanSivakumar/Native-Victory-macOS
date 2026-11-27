@@ -2362,3 +2362,79 @@ fn a_lane_read_in_a_group_of_96_whose_last_wave_is_one_host_wave() {
     assert_eq!(got[64..80], [0; 16], "wave 1: a lane the group lacks");
     assert_eq!(got[80..], [CANARY; 16]);
 }
+
+/// A per-wave loop of 16 or 17 trips (by console wave), each reading lane 35 across the halves:
+/// two pair barriers a trip in lockstep of several waves, two group barriers in a group of one
+/// (assembled with llvm-mc; branch distances filled in).
+const STRESS: [u32; 20] = [
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x4A06_00FF,
+    0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+    0x2C0C_0086, // v_lshrrev_b32 v6, 6, v0
+    0x360C_0C81, // v_and_b32 v6, 1, v6
+    0x4A08_0C90, // v_add_nc_u32 v4, 16, v6
+    0x7E0A_0280, // v_mov_b32 v5, 0
+    0xBE86_047E, // s_mov_b64 s[6:7], exec
+    0x7D8A_0880, // loop: v_cmp_ne_u32 vcc, 0, v4
+    0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+    0xBF88_0005, // s_cbranch_execz end
+    0xD760_0008,
+    0x0201_4703, // v_readlane_b32 s8, v3, 35
+    0x4A0A_0A08, // v_add_nc_u32 v5, s8, v5
+    0x4A08_08C1, // v_add_nc_u32 v4, -1, v4
+    0xBF82_FFF8, // s_branch loop
+    0xBEFE_0406, // end: s_mov_b64 exec, s[6:7]
+    0xDC70_8000,
+    0x0002_0501, // global_store_dword v1, v5, s[2:3]
+    S_ENDPGM,
+];
+
+/// The GPU time of `groups` groups of `threads` running [`STRESS`], and what they stored.
+fn stress(threads: u32, groups: u32) -> Option<(std::time::Duration, Vec<u32>)> {
+    let mut t = title()?;
+    let f = Fixture::new(&t);
+    let cs = translate_io(&STRESS, 5, 0, threads, several_waves());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "stress") else { panic!("not made: {:?}", t.shaders) };
+    let [c, d] = halves(VA_A + 0x4_0000);
+    let mut l = NativeList::default();
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_constants(0, &[0, 0, c, d, 0]);
+    l.dispatch(groups, 1, 1).unwrap();
+    let start = std::time::Instant::now();
+    super::run(&t.host, &[&l]);
+    let took = start.elapsed();
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    Some((took, f.get(DST, threads as usize)))
+}
+
+/// Whether the pair barrier holds up at the scale of a world dispatch (#438: a GPU time-out in a
+/// game run once `eee76bf6` was bound): the same loop of lane reads in 16,384 groups of one console
+/// wave (group barriers) and in 4,096 groups of four (pair barriers), the same threads in all.
+/// Ignored: a measurement, run with `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn pair_barriers_at_the_scale_of_a_world_dispatch() {
+    let Some((one, got1)) = stress(64, 16_384) else { return };
+    let (four, got4) = stress(256, 4_096).unwrap();
+    eprintln!("one console wave a group: {one:?}; four a group (pair barriers): {four:?}");
+    // Each lane adds its wave's lane 35 (1000 + 64w + 35) once a trip: 16 trips, 17 in odd waves.
+    let want = |w: u32| (1035 + 64 * w) * (16 + (w & 1));
+    assert!(got1.iter().all(|&v| v == want(0)), "one wave: {:?}", &got1[..4]);
+    for w in 0..4 {
+        let at = (w * 64) as usize;
+        assert!(got4[at..at + 64].iter().all(|&v| v == want(w)), "wave {w}: {:?}", &got4[at..at + 4]);
+    }
+}
+
+/// Where the pair barrier stops holding (a measurement): groups of four console waves, more and
+/// more of them, timed, and whether every wave stored the right sums.
+#[test]
+#[ignore = "measurement"]
+fn pair_barriers_by_group_count() {
+    let want = |w: u32| (1035 + 64 * w) * (16 + (w & 1));
+    for groups in [1u32, 8, 32, 64, 128, 256, 512, 1024] {
+        let Some((took, got)) = stress(256, groups) else { return };
+        let right = (0..4).all(|w| got[(w * 64) as usize..][..64].iter().all(|&v| v == want(w)));
+        eprintln!("groups {groups:5}: {took:?} right={right}");
+    }
+}
