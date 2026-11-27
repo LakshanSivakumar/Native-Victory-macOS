@@ -316,6 +316,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         thread_counts: false,
         // shortcut: this key has no options; integer targets are made on the native host only.
         integer_targets: 0,
+        pixel_reads: None,
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
