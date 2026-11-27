@@ -361,6 +361,9 @@ struct Lower<'a> {
     /// With `halves`, blocks where both halves of a console wave arrive
     /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
+    /// Values of `ds_read_b32`s proven identical across every lane of every
+    /// wave after a barrier ([`barrier_reads`]).
+    barrier_reads: Set<Value>,
     /// Why the program cannot run on a 32-lane host.
     refuse: Option<Why>,
     /// The group's lane in console order, made in the entry block.
@@ -915,7 +918,8 @@ impl<'a> Lower<'a> {
             // the title has it. Compute keeps the views: no case seen, and a lookup per access.
             || (x.zero_copy_memory && x.native.stage != HwStage::Cs);
         let mut console_lanes = console;
-        let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
+        let (mut host32, mut halves, mut once, mut alike_reads, mut refuse) =
+            (false, false, Vec::new(), Set::default(), None);
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -1006,8 +1010,9 @@ impl<'a> Lower<'a> {
                     s.wave_size = Some(32);
                 }
                 if halves {
+                    alike_reads = barrier_reads(p, x.st);
                     once = if one_wave { wave_blocks(p, x.st) } else { once_blocks(p) };
-                    for (o, at_barrier) in once.iter_mut().zip(barrier_blocks(p, x.st)) {
+                    for (o, at_barrier) in once.iter_mut().zip(barrier_blocks(p, x.st, &alike_reads)) {
                         *o |= at_barrier;
                     }
                     s.xchg_dwords = lanes.next_multiple_of(64);
@@ -1115,6 +1120,7 @@ impl<'a> Lower<'a> {
             host32,
             halves,
             once,
+            barrier_reads: alike_reads,
             console_flat: None,
             refuse,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -14729,9 +14735,9 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
 /// the other waits at the exchange's group barrier. As in [`wave_blocks`], such an SCC in the
 /// block's reach condition excludes it, unless the first lane read is of an LDS word both halves
 /// read alike after a barrier ([`barrier_reads`]).
-pub(crate) fn barrier_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+pub(crate) fn barrier_blocks(p: &Program, st: &Structured, alike: &Set<Value>) -> Vec<bool> {
     let n = p.blocks.len();
-    let split = split_scc(p, &barrier_reads(p, st));
+    let split = split_scc(p, alike);
     (0..n)
         .map(|b| {
             if !p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier") {

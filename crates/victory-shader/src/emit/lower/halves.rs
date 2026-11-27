@@ -213,11 +213,7 @@ impl Lower<'_> {
         {
             return Ok(None);
         }
-        if self.exchange_site(self.cur_ir).is_err() {
-            return Err(
-                "a first lane read across the two host waves of a console wave, in divergent code",
-            );
-        }
+        self.exchange_site(self.cur_ir)?;
         // Fast path: when EXEC is a tracked lane function, compute each host half's first active
         // lane locally and exchange (val, has_any) across the two halves in a single 2-barrier
         // round-trip (avoiding `mask_dword(EXEC)` and its extra 2-barrier ballot).
@@ -338,7 +334,7 @@ impl Lower<'_> {
         }
         let mut child_cycle = false;
         let res = (|| {
-            if self.section_uniform(v) {
+            if self.section_uniform(v) || self.barrier_reads.contains(&v) {
                 return true;
             }
             let mask =

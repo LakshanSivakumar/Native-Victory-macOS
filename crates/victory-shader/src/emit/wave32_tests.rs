@@ -664,7 +664,7 @@ fn split_first_lane_divergent_branch_refuses_two_waves_and_runs_lockstep_for_one
             Ok(_) => panic!("expected refusal for 128 threads (half_val={half_val})"),
         };
         assert!(
-            err.contains("first lane read across the two host waves"),
+            err.contains(lower::DIVERGENT_EXCHANGE),
             "unexpected error for half_val={half_val}: {err}"
         );
         // 64 threads (1 console wave): fast path refuses, then lockstep translates it.
