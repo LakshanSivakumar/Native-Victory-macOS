@@ -421,6 +421,8 @@ fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+/// A spilled descriptor dword whose lane the edges of a join bring differently again.
+const SPILL: &str = "a spilled descriptor joined twice";
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -1500,8 +1502,9 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
+        // A phi, or a read-back of an SGPR spill whose lane a VGPR join brings ([`Self::spill_phi`]).
         let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Value(v) => self.phis[v.0 as usize].or_else(|| self.spill_phi(v).map(|(b, i, _)| (b, i))),
             Term::Const(_) => None,
         };
         let Some((block, _)) = words.iter().find_map(phi_of) else {
@@ -1527,11 +1530,14 @@ impl<'a> Tracer<'a> {
         let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
             let edge: Vec<Term> = words
                 .iter()
-                .map(|w| match phi_of(w) {
-                    Some((_, i)) => self.origin(phis[i].args[j]),
-                    None => *w,
+                .map(|w| match (phi_of(w), *w) {
+                    (Some((_, i)), Term::Value(v)) => match self.spill_phi(v) {
+                        Some((_, _, lane)) => self.slot(phis[i].args[j], lane, &mut Vec::new()).ok().flatten().ok_or(SPILL),
+                        None => Ok(self.origin(phis[i].args[j])),
+                    },
+                    _ => Ok(*w),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             self.classify(&edge, joins, known)
         };
         let args = match taken.iter().position(|&t| t) {
@@ -1544,6 +1550,58 @@ impl<'a> Tracer<'a> {
         };
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
+    }
+
+    /// For a `v_readlane_b32` of a constant lane whose VGPR value, past `v_writelane_b32` of other
+    /// lanes, is a phi: that phi's block and index, and the lane. The SGPR spilled there is what
+    /// each edge's VGPR holds in that lane ([`Self::slot`]).
+    fn spill_phi(&self, v: Value) -> Option<(usize, usize, u32)> {
+        let read = self.def(v).filter(|i| i.name() == "v_readlane_b32")?;
+        let Fields::Valu(f) = &read.fields else { return None };
+        let [Operand::Vector { reg, .. }, lane] = f.src[..] else { return None };
+        let lane = lane_of(lane)?;
+        let mut x = read.read(Reg::V(reg))?;
+        loop {
+            if let Some((b, i)) = self.phis[x.0 as usize] {
+                return Some((b, i, lane));
+            }
+            let w = self.def(x).filter(|i| i.name() == "v_writelane_b32")?;
+            let Fields::Valu(f) = &w.fields else { return None };
+            let (Some(Operand::Vector { reg, .. }), [_, at]) = (f.dst, &f.src[..]) else { return None };
+            if lane_of(*at)? == lane {
+                return None;
+            }
+            x = w.read(Reg::V(reg))?;
+        }
+    }
+
+    /// The origin of what lane `lane` of VGPR value `v` holds when only `v_writelane_b32` fills
+    /// it: the SGPR (or constant) written there, the same through every edge of a join.
+    fn slot(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Term>, ()> {
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            // A loop's back edge brings what the loop entered with.
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(t) = self.slot(a, lane, seen)? {
+                    if found.is_some_and(|f| f != t) {
+                        return Err(());
+                    }
+                    found = Some(t);
+                }
+            }
+            return Ok(found);
+        }
+        let w = self.def(v).filter(|i| i.name() == "v_writelane_b32").ok_or(())?;
+        let Fields::Valu(f) = &w.fields else { return Err(()) };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (f.dst, &f.src[..]) else { return Err(()) };
+        if lane_of(*at).ok_or(())? != lane {
+            return self.slot(w.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        self.term(w, value).map(Some).ok_or(())
     }
 
     /// Whether some lane goes from block `q` to `b` (true without the

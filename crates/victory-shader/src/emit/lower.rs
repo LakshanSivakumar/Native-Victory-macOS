@@ -16251,6 +16251,84 @@ mod tests {
         lower_wave(&words, layout, used, false).unwrap();
     }
 
+    /// Buffer descriptor 0 or 1 of the table at s0, chosen by the root constant in s1, spilled to
+    /// lanes 0-3 of v5 on each arm and read back after the join for a load.
+    const SPILLED_ON_TWO_PATHS: [u32; 42] = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_000C, // s_cbranch_scc1 ELSE
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD761_0005,
+        0x0001_0008, // v_writelane_b32 v5, s8, 0
+        0xD761_0005,
+        0x0001_0209, // v_writelane_b32 v5, s9, 1
+        0xD761_0005,
+        0x0001_040A, // v_writelane_b32 v5, s10, 2
+        0xD761_0005,
+        0x0001_060B, // v_writelane_b32 v5, s11, 3
+        0xBF82_000B, // s_branch JOIN
+        0xF408_0202,
+        0xFA00_0010, // ELSE: s_load_dwordx4 s[8:11], s[4:5], 0x10
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD761_0005,
+        0x0001_0008, // v_writelane_b32 v5, s8, 0
+        0xD761_0005,
+        0x0001_0209, // v_writelane_b32 v5, s9, 1
+        0xD761_0005,
+        0x0001_040A, // v_writelane_b32 v5, s10, 2
+        0xD761_0005,
+        0x0001_060B, // v_writelane_b32 v5, s11, 3
+        0xD760_000C,
+        0x0001_0105, // JOIN: v_readlane_b32 s12, v5, 0
+        0xD760_000D,
+        0x0001_0305, // v_readlane_b32 s13, v5, 1
+        0xD760_000E,
+        0x0001_0505, // v_readlane_b32 s14, v5, 2
+        0xD760_000F,
+        0x0001_0705, // v_readlane_b32 s15, v5, 3
+        0xE030_2000,
+        0x8003_0102, // buffer_load_dword v1, v2, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+
+    /// Two structured buffers of dwords at table dwords 0 and 4 of s0; a root constant at s1.
+    fn two_buffers() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let used = |at, slot| UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot,
+        };
+        (vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)], vec![used(0, 0), used(4, 1)])
+    }
+
+    #[test]
+    fn a_descriptor_spilled_on_two_paths_is_the_one_of_the_path_taken() {
+        let (layout, used) = two_buffers();
+        lower_with(&SPILLED_ON_TWO_PATHS, layout, used).unwrap();
+    }
+
+    /// [`SPILLED_ON_TWO_PATHS`] with the else arm writing its dword 0 to lane 4: lane 0 holds
+    /// descriptor 0's dword 0 on one path and what it held on entry on the other, and stays refused.
+    #[test]
+    fn a_descriptor_spilled_on_only_one_path_stays_refused() {
+        let mut w = SPILLED_ON_TWO_PATHS;
+        w[21] = 0x0001_0808; // v_writelane_b32 v5, s8, 4
+        let (layout, used) = two_buffers();
+        assert!(lower_with(&w, layout, used).is_err());
+    }
+
     #[test]
     fn compute_spills_beside_a_descriptor_word_read_back() {
         // Dword 0 of a buffer descriptor (no host value) and a root constant

@@ -2423,6 +2423,25 @@ dwords N to N", 28 "a value the translation could not make", 2 others). Of the w
 run's 677 dropped compute dispatches a frame (20261127-235056), the 85 programs now translated
 made 181.
 
+**Descriptors spilled on several paths.** The console compiler spills descriptor dwords to lanes
+of a VGPR (`v_writelane_b32`) and reads them back (`v_readlane_b32`) after joins where the arms
+spilled different descriptors to the same lanes (a register allocator's spill slots: one VGPR
+holds hundreds). `restored` takes a read-back only when every edge brings one SGPR value, so
+these were "a descriptor neither loaded nor built" (305 compute programs, 111 of the world's,
+210 dispatches a frame). `Tracer::phi` now takes a read-back whose VGPR, past writes to other
+lanes, is a phi (`spill_phi`) as a phi of that block too: on each edge the dword is the SGPR
+written to that lane on the edge's path (`slot`; a further join must agree on it, else "a
+spilled descriptor joined twice"), and the descriptor is classified per edge as for SGPR phis,
+which lowering then joins as a heap index at the join. Not a guess: `v_writelane_b32` writes the
+lane whatever EXEC is and `v_readlane_b32` reads it, so the dword read back is the SGPR the path
+taken spilled there, as for SGPR joins. Tests:
+`lower::tests::a_descriptor_spilled_on_two_paths_is_the_one_of_the_path_taken` (refused without
+the rule) and `a_descriptor_spilled_on_only_one_path_stays_refused`. Corpus against the
+shifted-index commit: 4 vertex programs newly translated, 0 regressed, 0 outputs changed, and
+the 305 compute programs now stop later: 123 "an image's dwords N to N", 114 "a lane mask
+holding lanes elsewhere read as data: a program input", 65 "a buffer's dword 1", 3 "a register
+joining a lane mask and data".
+
 ## The device's own memory ceiling, logged at native host startup (issue #8)
 
 16 GB Macs still run the title out of GPU memory past the menus (`kIOGPUCommandBufferCallbackErrorOutOfMemory`),
