@@ -2619,3 +2619,34 @@ fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
     assert_eq!(draw_sampling(&mut t, &pool, old, 4), [0x44, 0, 0, 0x44]);
     drop(views);
 }
+
+/// The overlap trace (#352): an upload over another copy's range counts by what that copy was to
+/// it: an identical layout at the same start (here in another host format, as one in the same
+/// format shares the copy and is never uploaded on its own), a different one, or a copy no longer
+/// there. A key sharing a copy counts nothing.
+#[test]
+fn an_upload_over_another_copy_counts_what_that_copy_was() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let made = |t: &mut Title<victory_metal::metal::Metal>, format, swizzle: Swizzle| {
+        let res = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, format, swizzle.0, 0);
+        t.texture_created(res as usize, crate::resource::texture_info(res).unwrap());
+        assert!(t.realize(res as usize));
+        res as usize
+    };
+    let a = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let size = t.budget.live;
+    let shares = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    assert!(std::rc::Rc::ptr_eq(&t.texture_of(a).unwrap(), &t.texture_of(shares).unwrap()));
+    assert_eq!(t.budget.live, size, "shared, not counted again");
+    // B8G8R8A8 (87): the same layout as RGBA8 (28), another host format, its own copy.
+    let b = made(&mut t, 87, Swizzle::LINEAR);
+    let c = made(&mut t, 28, Swizzle::SW_64KB_S);
+    t.note_upload(a);
+    t.note_upload(shares);
+    t.note_upload(b);
+    t.note_upload(c);
+    t.texture_released(c);
+    t.note_upload(a);
+    assert_eq!(t.overlap.take_counts(), [(1, size), (1, size), (1, size)]);
+    assert_eq!(t.overlap.take_counts(), [(0, 0); 3], "counts since the last line");
+}
