@@ -11716,6 +11716,7 @@ impl<'a> Lower<'a> {
                 // `n` have gone on. An arm inside a loop's body is no back edge.
                 k != n
                     && !self.dominates(b, preds[k])
+                    && !self.merge_keeps_edge(b, args, n, k)
                     && st.masks.get(arg).is_some_and(|&m| {
                         [true, false].into_iter().any(|set| {
                             let mut lanes = on_n.clone();
@@ -11739,6 +11740,79 @@ impl<'a> Lower<'a> {
                         differs(&self.lane_edge(from, q), known)
                     })
             })
+    }
+
+    /// Whether edge `k` into the join `b` brings the console compiler's merge of a boolean
+    /// into a lane mask, `s_andn2 t, old, exec` then `s_or d, t, vcc` with `vcc` a compare
+    /// under that EXEC, whose `old` is what edge `n` brings, as the wave runs from edge `n`'s
+    /// block to the merge. The lanes of edge `n` are outside that EXEC (they skip the merge's
+    /// block), where a compare writes 0, so `d` holds their bit of `old`: what edge `n` brings.
+    fn merge_keeps_edge(&self, b: usize, args: &[Value], n: usize, k: usize) -> bool {
+        let p = self.x.p;
+        let w = if self.x.native.wave64 { "_b64" } else { "_b32" };
+        let dwords = if self.x.native.wave64 { 2 } else { 1 };
+        let start = p.blocks[b].preds[n];
+        // Blocks the wave can run after edge `n`'s block before it reaches the join.
+        let mut after = vec![false; p.blocks.len()];
+        let mut stack = p.blocks[start].exit.successors();
+        while let Some(x) = stack.pop() {
+            if x != b && !std::mem::replace(&mut after[x], true) {
+                stack.extend(p.blocks[x].exit.successors());
+            }
+        }
+        let def = |v: Value| self.def_inst(v);
+        let scalar = |i: &Inst, s: usize| match i.fields {
+            Fields::Sop { ref src, .. } => match src.get(s) {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => Some(code),
+                _ => None,
+            },
+            _ => None,
+        };
+        // The one instruction writing every dword of the pair at `code` that `i` reads.
+        let pair_def = |i: &Inst, code: u8| -> Option<&Inst> {
+            let d = def(i.read(Reg::S(code))?)?;
+            (1..dwords)
+                .all(|h| i.read(Reg::S(code + h)).and_then(def).is_some_and(|x| std::ptr::eq(x, d)))
+                .then_some(d)
+        };
+        let exec = |i: &Inst| (0..dwords).map(|h| i.read(Reg::S(EXEC + h))).collect::<Vec<_>>();
+        // What `v` is, through copies and the joins the wave enters from edge `n`'s block on:
+        // at those, the one edge such a block brings it.
+        let resolve = |mut v: Value| {
+            for _ in 0..64 {
+                if let Some(c) = def(v).and_then(|i| crate::structure::copied(i, v, def)) {
+                    v = c;
+                    continue;
+                }
+                let Some(&(q, i)) = self.phi_at.get(&v).filter(|&&(q, _)| after[q]) else { break };
+                let mut from = p.blocks[q].preds.iter().enumerate().filter(|&(_, &x)| x == start || after[x]);
+                match (from.next(), from.next()) {
+                    (Some((e, _)), None) => v = p.blocks[q].phis[i].args[e],
+                    _ => break,
+                }
+            }
+            v
+        };
+        let Some(or) = def(args[k]).filter(|i| i.name() == format!("s_or{w}")) else { return false };
+        if !self.def_block.get(&args[k]).is_some_and(|&d| after[d]) || after[start] {
+            return false;
+        }
+        (0..2).any(|s| {
+            let (Some(t), Some(c)) = (scalar(or, s), scalar(or, 1 - s)) else { return false };
+            let (Some(t), Some(cmp)) = (pair_def(or, t), pair_def(or, c)) else { return false };
+            let Some(old) = scalar(t, 0) else { return false };
+            t.name() == format!("s_andn2{w}")
+                && scalar(t, 1) == Some(EXEC)
+                && cmp.name().starts_with("v_cmp_")
+                && matches!(cmp.fields, Fields::Valu(_))
+                && exec(cmp) == exec(t)
+                && (0..dwords).all(|h| {
+                    let want = if h == 0 { Some(args[n]) } else { self.pair_high(args[n]) };
+                    // A value made again on the way to the merge is another value there.
+                    want.is_some_and(|x| !self.def_block.get(&x).is_some_and(|&d| after[d]))
+                        && t.read(Reg::S(old + h)).map(resolve) == want
+                })
+        })
     }
 
     /// Whether IR block `b` dominates `q`: no path from the entry gets to `q` but through `b`.
