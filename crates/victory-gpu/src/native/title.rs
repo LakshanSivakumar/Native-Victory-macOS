@@ -233,7 +233,7 @@ pub struct Title<B: PresentBackend> {
     pub(super) shared: HashMap<usize, (u64, usize)>,
     queues: HashMap<usize, Rc<B::Queue>>,
     fences: HashMap<usize, Rc<B::Fence>>,
-    held: Held<Rc<NativeList<B>>>,
+    pub(super) held: Held<Rc<NativeList<B>>>,
     /// Operations held behind work, indexed by the token in a FIFO Signal item.
     actions: HashMap<usize, QueuedAction<B>>,
     next_action: usize,
@@ -354,6 +354,7 @@ impl<B: PresentBackend> Title<B> {
     /// `ExecuteCommandLists` on title queue `queue`: the lists' segments join what the queue holds
     /// and whatever may run goes to the GPU.
     pub fn submit(&mut self, queue: usize, segments: Vec<(NativeList<B>, Vec<Wait>)>) {
+        self.keep_named(segments.iter().map(|(l, _)| l));
         self.sync_dirty();
         self.submit_synced(queue, segments);
     }

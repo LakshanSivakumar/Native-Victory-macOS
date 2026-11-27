@@ -20,6 +20,7 @@
 
 use super::descriptors::format;
 use super::host::NativeHost;
+use super::list::NativeList;
 use super::title::Title;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -1473,6 +1474,9 @@ pub struct Budget {
     next_check: u64,
     /// When the trace last logged.
     logged: Option<std::time::Instant>,
+    /// Resources the tables of the submission being made (and of held work) name: never given up
+    /// at its sync ([`Title::keep_named`]).
+    named: HashSet<usize>,
 }
 
 /// Submissions between checks while over budget with too little to give up.
@@ -1530,10 +1534,39 @@ impl<B: PresentBackend> Title<B> {
             && !self.host.texture_in_use(key)
     }
 
+    /// Before the sync of a submission of `lists` (with the work held already): a texture the
+    /// records of the tables they bind name is made again if it was given up, and uploaded at
+    /// that sync; none is given up then. The host mirrors those records when it encodes the
+    /// lists, and an entry naming a texture not made yet shows nothing: the draw would sample
+    /// transparent black. Nothing is read under the budget with nothing given up.
+    pub(super) fn keep_named<'a>(&mut self, lists: impl Iterator<Item = &'a NativeList<B>>)
+    where
+        B: 'a,
+    {
+        let over = self.budget.limit > 0 && self.budget.live > self.budget.limit;
+        if !over && !self.host.any_evicted() {
+            return;
+        }
+        // shortcut: a record changed after this read (before held work is encoded) still gets the
+        // cleared entry and `take_wanted`; reading again at encoding needs the title's state there.
+        let held: Vec<Rc<NativeList<B>>> = self.held.segments().cloned().collect();
+        let mut all: Vec<&NativeList<B>> = lists.collect();
+        all.extend(held.iter().map(|l| &**l));
+        let named = self.host.resources_named(all.into_iter());
+        for &key in &named {
+            if self.host.is_evicted(key) {
+                self.realize(key);
+            }
+        }
+        self.budget.named = named;
+    }
+
     /// Past the budget, gives up the least recently used textures that may be given up
     /// ([`Self::evictable`]) until under it. One a view names again is made and uploaded again.
-    /// Textures an entry shows are stamped used now.
+    /// Textures an entry shows, or the submission's tables name ([`Self::keep_named`]), are
+    /// stamped used now.
     pub(super) fn keep_to_budget(&mut self) {
+        let named = std::mem::take(&mut self.budget.named);
         self.budget.serial += 1;
         let serial = self.budget.serial;
         let trace = env_set!("VICTORY_TRACE_TEXTURE_SYNC")
@@ -1547,9 +1580,9 @@ impl<B: PresentBackend> Title<B> {
         let keys: Vec<usize> = self.textures.keys().copied().collect();
         for key in keys {
             let t = &self.textures[&key];
-            if self.evictable(key, t) {
+            if !named.contains(&key) && self.evictable(key, t) {
                 candidates.push((key, t.info.size as u64, t.used));
-            } else if self.host.texture_in_use(key) {
+            } else if named.contains(&key) || self.host.texture_in_use(key) {
                 shown += t.info.size as u64;
                 self.textures.get_mut(&key).expect("listed").used = serial;
             }
@@ -1575,7 +1608,7 @@ impl<B: PresentBackend> Title<B> {
             self.budget.logged = Some(std::time::Instant::now());
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
-                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}",
+                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}",
                 self.budget.live >> 20, self.budget.limit >> 20, shown >> 20, evictable >> 20,
                 take(&BUDGET_TRACE[0]), take(&BUDGET_TRACE[1]) >> 20, take(&BUDGET_TRACE[2]),
             );

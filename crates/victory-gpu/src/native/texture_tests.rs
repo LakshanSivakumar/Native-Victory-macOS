@@ -1703,9 +1703,10 @@ fn over_budget_only_textures_nothing_uses_are_given_up_and_come_back() {
     assert!(out.iter().all(|&b| b == 0x11));
 }
 
-/// A record the title copies into a heap with plain stores (no device call, so nothing realizes
-/// it) that names an evicted texture asks for it; the next submission makes it again and the entry
-/// is written then. Until then the entry shows nothing, not what it showed before.
+/// The fallback when a record naming an evicted texture is mirrored outside the scan of a
+/// submission's tables ([`Title::keep_named`]): the entry asks for the texture, the next submission
+/// makes it again and the entry is written then. Until then the entry shows nothing (a draw would
+/// sample transparent black), not what it showed before.
 #[test]
 fn an_entry_copied_with_plain_stores_gets_an_evicted_texture_back() {
     let Some((mut t, pool)) = budget_title() else { return };
@@ -1731,4 +1732,98 @@ fn an_entry_copied_with_plain_stores_gets_an_evicted_texture_back() {
     assert!(t.host.knows(gone), "made again at the next submission");
     assert!(t.host.mirror(start).unwrap());
     assert!(heap.shows_texture(gone));
+}
+
+/// Draws a triangle covering the centre of a 16x16 target, red vertex colour times texture `key`
+/// sampled through entry 0 of a heap whose record the title stored with plain stores (no device
+/// call, so the host has not mirrored it), in one submission of `t`; the centre pixel.
+fn draw_sampling(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, key: usize, queue: usize) -> [u8; 4] {
+    const W: usize = 16;
+    let v = |x: f32, y: f32| [x, y, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0];
+    pool.write(0x20000, &[v(-0.5, -0.5), v(0.5, -0.5), v(0.0, 0.5)]);
+    let attrs = [
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+        VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+    ];
+    let pso = t
+        .host
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &super::fixture("tri_vs"),
+            ps: Some(&super::fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let color = t.host.texture(&rt).unwrap();
+    let (views, smp) = (vec![0u32; 8], vec![0u32; 4]);
+    let (vstart, sstart) = (views.as_ptr() as u64, smp.as_ptr() as u64);
+    let vheap = t.host.heap(HeapKind::Resource, vstart, 1).unwrap();
+    let sheap = t.host.heap(HeapKind::Sampler, sstart, 1).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, vstart);
+    let mut sw = [0u32; 27];
+    (sw[1], sw[2], sw[6], sw[7], sw[8]) = (1, 1, 3, 3, 3);
+    crate::descriptor::create_sampler_x(std::ptr::null_mut(), &sw, sstart);
+    assert!(t.host.mirror(sstart).unwrap());
+
+    let mut l = NativeList::default();
+    l.set_render_targets(std::slice::from_ref(&color), None);
+    l.clear_render_target(&color, [0.0, 0.0, 1.0, 1.0]);
+    l.set_graphics_pipeline(&pso, Topology::Triangles);
+    l.set_heaps(Some(&vheap), Some(&sheap));
+    l.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l.set_graphics_root_table(1, &vheap, 0);
+    l.set_graphics_root_table(2, &sheap, 0);
+    l.set_vertex_buffer(0, pool.va(0x20000));
+    l.draw_instanced(3, 1, 0, 0).unwrap();
+    let fence = queue + 100;
+    t.ensure_queue(queue).unwrap();
+    t.submit(queue, vec![(l, vec![])]);
+    t.signal_queue(queue, fence, 0, 1);
+    let start = std::time::Instant::now();
+    while !t.try_wait(fence, 0, 1) {
+        assert!(start.elapsed().as_secs() < 10, "the draw did not complete");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut out = vec![0u8; W * W * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    drop((views, smp));
+    out[(8 * W + 8) * 4..][..4].try_into().unwrap()
+}
+
+/// Over the texture budget, a draw samples a texture given up before through an entry the title
+/// stored with plain stores in the table it binds: the texture is made again for that draw, in
+/// that submission (it sampled transparent black, the entry cleared, until the next one).
+#[test]
+fn a_texture_given_up_is_back_for_the_draw_whose_table_names_it() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let gone = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(gone));
+    assert_eq!(draw_sampling(&mut t, &pool, gone, 1), [0x66, 0, 0, 0x66]);
+    assert!(t.host.knows(gone));
+}
+
+/// Over the texture budget, a texture no entry the host mirrored shows, which the table of a draw
+/// in the submission names through a record the title stored with plain stores, is not given up
+/// at that submission's sync, under the draw.
+#[test]
+fn a_texture_the_submission_names_is_not_given_up_under_its_draw() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let live = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    t.set_texture_budget(1);
+    assert_eq!(draw_sampling(&mut t, &pool, live, 2), [0x66, 0, 0, 0x66]);
+    assert!(t.host.knows(live));
 }

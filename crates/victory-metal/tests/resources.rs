@@ -67,6 +67,12 @@ struct Grid<'a> {
 
 impl Grid<'_> {
     fn run(&self, tex: &<Metal as ResourceBackend>::Texture) -> Vec<[f32; 4]> {
+        self.sample(tex, false)
+    }
+
+    /// [`Self::run`], with the texture's entry cleared (`clear_entry`) before the dispatch when
+    /// `cleared`.
+    fn sample(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool) -> Vec<[f32; 4]> {
         let m = self.m;
         let p = m.create_compute_pipeline(self.dxil).unwrap();
         let cells = self.g[0] as usize * self.g[1] as usize * self.z;
@@ -80,6 +86,9 @@ impl Grid<'_> {
         let res = m.create_heap(HeapKind::Resource, 4).unwrap();
         let smp = m.create_heap(HeapKind::Sampler, 2).unwrap();
         m.write_texture(&res, 0, tex, 0.0);
+        if cleared {
+            m.clear_entry(&res, 0);
+        }
         m.write_buffer(&res, 1, &a.buf, a.at(0), (cells * 16) as u32);
         let s = m
             .create_sampler(&SamplerDesc {
@@ -359,6 +368,25 @@ fn sample_2d_array_and_3d() {
             "voxel {x},{y},{z}: {c:?}"
         );
     }
+}
+
+/// What a shader samples through an entry `clear_entry` emptied (as the host does for a texture
+/// given up under the texture budget, or released): zeros, a transparent black texel, not the
+/// texture it showed and not a fault.
+#[test]
+fn sampling_a_cleared_entry_reads_transparent_black() {
+    let Some(m) = backend() else { return };
+    let t = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();
+    m.upload_texture(&t, 0, 0, &[200u8; 16], 8, 0);
+    let g = Grid {
+        m: &m,
+        dxil: &fixture("sample2d"),
+        g: [2, 2],
+        z: 1,
+        filter: Filter::Nearest,
+    };
+    assert!(g.run(&t).iter().all(|c| near(c[0], 200.0 / 255.0)), "shown");
+    assert_eq!(g.sample(&t, true), vec![[0.0; 4]; 4], "cleared");
 }
 
 #[test]

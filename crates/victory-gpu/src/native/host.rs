@@ -993,6 +993,64 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.gpu_written.borrow_mut().extend(written);
     }
 
+    /// The entries of the table bound at root `slot` from entry `at` that a submission checks
+    /// ([`Self::remirror_tables`]): as many as the shader's table ranges reach, at least
+    /// [`Self::TABLE_CHECK`], within the heap.
+    fn table_span(h: &NativeHeap<B>, slot: usize, at: usize, binding: Option<&Binding>) -> std::ops::Range<usize> {
+        at..(at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count)
+    }
+
+    /// The resources the records of the tables `lists`' draws and dispatches bind name now: the
+    /// entries [`Self::remirror_tables`] mirrors when the lists are encoded, so a texture named
+    /// there must be made before (the texture budget).
+    pub(crate) fn resources_named<'a>(
+        &self,
+        lists: impl Iterator<Item = &'a NativeList<B>>,
+    ) -> std::collections::HashSet<usize>
+    where
+        B: 'a,
+    {
+        use crate::descriptor::View;
+        let (mut tables, mut named) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for cmd in lists.flat_map(|l| &l.cmds) {
+            let (root, binding) = match cmd {
+                Cmd::Dispatch { root, pso, .. } => (root, pso.binding.as_ref()),
+                Cmd::Draw { root, binding, .. } => (root, binding.as_deref()),
+                _ => continue,
+            };
+            for (slot, r) in root.iter().enumerate() {
+                let Some(Root::Table(h, at)) = r else { continue };
+                let span = Self::table_span(h, slot, *at, binding);
+                if h.kind != HeapKind::Resource || !tables.insert((h.start, span.clone())) {
+                    continue;
+                }
+                let step = Self::step(h.kind) as usize;
+                let mut records = vec![0u8; span.len() * step];
+                if !super::safe_read((h.start + (span.start * step) as u64) as *const u8, &mut records) {
+                    continue;
+                }
+                for (i, record) in records.chunks(step).enumerate() {
+                    if record[..12] == [0; 12] {
+                        continue;
+                    }
+                    match crate::descriptor::view(h.start + ((span.start + i) * step) as u64) {
+                        Some(View::Shader(r, _) | View::Unordered(r, ..)) => named.insert(r),
+                        Some(View::Placed(_, res, d)) => {
+                            named.insert(super::textures::placed_key(u64::from(d[10]) | u64::from(d[11]) << 32, &res))
+                        }
+                        _ => continue,
+                    };
+                }
+            }
+        }
+        named
+    }
+
+    /// Whether any texture is given up under the texture budget and not made again.
+    pub(crate) fn any_evicted(&self) -> bool {
+        !self.evicted.borrow().is_empty()
+    }
+
     /// Mirrors again the entries of each table `root` binds whose title record changed since
     /// they were last mirrored. The title copies records into its shader-visible heaps with plain
     /// stores (the content draws' constant buffers, from frame ~700), which no device call reports,
@@ -1002,10 +1060,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let res_gen = self.resources_epoch.get();
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
-            let check = table_check_count(slot, binding, Self::TABLE_CHECK);
             let (mut checked, mut changed) = (0, 0);
             let step = Self::step(h.kind) as usize;
-            let end = (*at + check).min(h.count);
+            let end = Self::table_span(h, slot, *at, binding).end;
             if heap_set_trace().is_some() {
                 let frame = (crate::frame::current() as u32).saturating_add(1);
                 let mut used = h.used.borrow_mut();

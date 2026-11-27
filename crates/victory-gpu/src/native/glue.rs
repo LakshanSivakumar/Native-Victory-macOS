@@ -182,8 +182,17 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
     // test's submission with textures read but not yet uploaded would upset: there the lock is
     // kept from the probes to the uploads (`Title::submit`).
     let unlocked = !cfg!(test);
+    let mut segments = Vec::new();
+    for &l in lists.iter().filter(|l| !l.is_null()) {
+        let list = crate::list::native(l);
+        segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
+    }
     if unlocked {
-        let jobs = with_title(|t| t.sync_jobs()).unwrap_or_default();
+        let jobs = with_title(|t| {
+            t.keep_named(segments.iter().map(|(l, _)| l));
+            t.sync_jobs()
+        })
+        .unwrap_or_default();
         for batch in super::textures::batches(jobs) {
             // Without the lock: the title's other threads go on recording.
             let prepared = super::textures::prepare(&batch);
@@ -199,11 +208,6 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
         }
         if t.ensure_queue(queue as usize).is_err() {
             return;
-        }
-        let mut segments = Vec::new();
-        for &l in lists.iter().filter(|l| !l.is_null()) {
-            let list = crate::list::native(l);
-            segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
         }
         if unlocked {
             t.submit_synced(queue as usize, segments);

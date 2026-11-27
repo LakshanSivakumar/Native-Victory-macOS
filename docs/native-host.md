@@ -929,13 +929,23 @@ and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallback
   through `release_resource`), so it leaves the heap residency sets with its last reference and
   does not work against `VICTORY_METAL_RESIDENCY_SETS=heap`. Its description goes back to
   `Title::pending`: the next view the device writes makes it again and it is uploaded at the next
-  submission. A record the title copies into a heap with plain stores (`remirror_tables`, which
-  makes no texture) that names one asks for it (`NativeHost::take_wanted`); the next submission
-  makes it, and the entry is written then. Shortcut: until then that entry shows nothing, for the
-  submission that found it; making it during encoding would need the title's texture state there.
+  submission. A record the title copies into a heap with plain stores is mirrored only when a
+  list binding its table is encoded (`remirror_tables`, which makes no texture), after the sync.
+  An entry naming a copy not made then is cleared, and a shader samples a cleared entry as
+  transparent black: `(0, 0, 0, 0)` on an M2 Pro, macOS 26.6
+  (`sampling_a_cleared_entry_reads_transparent_black` in `victory-metal/tests/resources.rs`; a
+  measurement, not a documented Metal guarantee). So before a submission's sync, when over the
+  budget or with any copy given up, the host reads the records of every table the submission's
+  draws and dispatches bind, and those of work held behind fences (`Title::keep_named`,
+  `NativeHost::resources_named`, the same entries `remirror_tables` checks): a given-up copy they
+  name is made again and uploaded at that sync, and none they name is given up at it. A draw then
+  samples it in the same submission, at the cost of that upload. Under the budget with nothing
+  given up, nothing is read. Left: a record the title changes after that read (between submit and
+  encoding, for work held behind a fence) and an entry mirrored outside a submission. Those entries
+  ask for the copy (`NativeHost::take_wanted`) and are cleared until the next submission makes it.
 * **Trace.** With `VICTORY_TRACE_TEXTURE_SYNC=1`, once a second: `host texture copies: <MiB>,
-  budget <MiB>; <MiB> shown by heap entries or viewed for unordered access, <MiB> could be given
-  up; given up in the last second <n> (<MiB>), made again <n>`. If the copies are mostly shown by
+  budget <MiB>; <MiB> shown by heap entries, named by the submission's tables or viewed for
+  unordered access, <MiB> could be given up; given up in the last second <n> (<MiB>), made again <n>`. If the copies are mostly shown by
   heap entries, the budget frees little and the levers are the ones #79 names (one copy instead of
   two, fewer top mips).
 * Tests (`texture_tests`): `the_least_recently_used_textures_go_first_until_the_excess_is_freed`,
@@ -943,7 +953,10 @@ and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallback
   `over_budget_only_textures_nothing_uses_are_given_up_and_come_back` (a copy a heap entry shows,
   one a recorded list holds, a render target and one viewed for unordered access stay; the held one
   goes once the list is gone; the one given up comes back with its texels),
-  `an_entry_copied_with_plain_stores_gets_an_evicted_texture_back`.
+  `an_entry_copied_with_plain_stores_gets_an_evicted_texture_back` (the fallback),
+  `a_texture_given_up_is_back_for_the_draw_whose_table_names_it` and
+  `a_texture_the_submission_names_is_not_given_up_under_its_draw` (a draw through a record stored
+  with plain stores reads the texture, not black, in the same submission).
 
 #### Texture views over 2D arrays
 
