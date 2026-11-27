@@ -90,6 +90,9 @@ const BOUNDS_CHECK: u32 = 1;
 /// `IRCompatibilityFlagTextureMinLODClamp`: samples honour the minimum LOD clamp a texture entry
 /// carries (`IRDescriptorTableSetTexture`'s `minLODClamp`). Without it the converter ignores it.
 const TEXTURE_MIN_LOD_CLAMP: u32 = 1 << 2;
+/// `IRCompatibilityFlagSamplerLODBias`: samples add the LOD bias a sampler entry carries
+/// (`IRDescriptorTableSetSampler`'s `lodBias`). Without it the converter ignores it.
+const SAMPLER_LOD_BIAS: u32 = 1 << 3;
 
 impl Parameter {
     fn of(p: &RootParam) -> Parameter {
@@ -381,8 +384,9 @@ impl Msc {
         let layout_text = format!("{layout:?}");
         // A dual-source conversion is a different shader laid out for the same DXIL, so it gets
         // an entry of its own. Conversions made before the min-LOD clamp flag
-        // ([`TEXTURE_MIN_LOD_CLAMP`]) ignore the clamp: every key changed so none is read back.
-        let mut parts: Vec<&[u8]> = vec![b"min-lod-clamp"];
+        // and the LOD bias flag ([`TEXTURE_MIN_LOD_CLAMP`], [`SAMPLER_LOD_BIAS`]) ignore both:
+        // every key changed so none is read back.
+        let mut parts: Vec<&[u8]> = vec![b"min-lod-clamp lod-bias"];
         if dual_source {
             parts.push(b"dual-source");
         }
@@ -609,7 +613,7 @@ impl Msc {
                 sym::<SetSignature>(h, "IRCompilerSetGlobalRootSignature")(comp, signature);
             }
             let bounds = if layout.is_some_and(|l| l.bounds_checked) { BOUNDS_CHECK } else { 0 };
-            sym::<SetFlags>(h, "IRCompilerSetCompatibilityFlags")(comp, bounds | TEXTURE_MIN_LOD_CLAMP);
+            sym::<SetFlags>(h, "IRCompilerSetCompatibilityFlags")(comp, bounds | TEXTURE_MIN_LOD_CLAMP | SAMPLER_LOD_BIAS);
             if let Some(e) = entry {
                 let e = CString::new(e).unwrap();
                 sym::<SetEntry>(h, "IRCompilerSetEntryPointName")(comp, e.as_ptr());

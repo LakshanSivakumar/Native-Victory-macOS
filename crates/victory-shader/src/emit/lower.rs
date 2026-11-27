@@ -12,7 +12,9 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::graphics;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_INTEGER, VIEW_MIN_LOD_STEPS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -7265,6 +7267,26 @@ impl<'a> Lower<'a> {
         self.s.m.bin(self.cur, Bin::And, word, bits)
     }
 
+    /// `lod` raised to the minimum LOD clamp of the texture view `h` names,
+    /// from the view-stride table ([`VIEW_MIN_LOD_STEPS`]); `lod` itself if
+    /// the handle's heap index is not known. For samples at an explicit
+    /// level: the host's entry carries the clamp too, but Metal applies it
+    /// only to samples that pick their own level.
+    fn view_min_lod(&mut self, h: V, lod: V) -> V {
+        let Some(&index) = self.s.texture_index.get(&h) else {
+            return lod;
+        };
+        let c = self.cur;
+        let past = self.s.m.i32(super::HEAP_VIEWS);
+        let at = self.s.m.bin(c, Bin::Add, index, past);
+        let q = self.view_word(at);
+        let q = self.s.m.cast(c, Cast::UiToFp, q, self.s.t.f32);
+        let step = self.s.m.f32((1.0 / VIEW_MIN_LOD_STEPS as f32).to_bits());
+        let clamp = self.s.m.bin(c, Bin::Mul, q, step);
+        // FMax.
+        self.binary(35, lod, clamp)
+    }
+
     /// Dword `index` of the view-stride table: the stride and the format
     /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`]).
     fn view_word(&mut self, index: V) -> V {
@@ -12668,6 +12690,7 @@ impl<'a> Lower<'a> {
                     } else {
                         self.s.m.f32(0)
                     };
+                    let lod = self.view_min_lod(h, lod);
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

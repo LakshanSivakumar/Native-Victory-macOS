@@ -509,6 +509,40 @@ fn a_texture_just_uploaded_is_not_read_again_until_it_changes() {
     assert!((1..=4).any(|_| submit().1 == 3), "a write is seen");
 }
 
+/// A texture whose memory was partly unreadable when first uploaded (a page the title had not
+/// mapped yet: zeros there) is uploaded again once that page can be read, though no byte of title
+/// memory changed: the zeros it read were not the memory's.
+#[test]
+fn a_page_that_becomes_readable_after_the_upload_is_uploaded() {
+    use victory_platform::mem::{Protect, protect};
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    let page = page_size().max(16384);
+    let Some(pool) = pool(9131, 8) else { return };
+    // 128x128 RGBA8, linear: 64 KiB, its rows 32 at a time a 16 KiB page.
+    let res = crate::resource::test_texture_at(pool.va(0), (128, 128), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    with_title(|_| pool.write(0, &vec![0xABu8; info.size])).unwrap();
+    let hole = pool.va(page) as *mut u8;
+    // SAFETY: a page of this test's pool; protected and opened again only here.
+    unsafe { protect(hole, page, Protect::NO_ACCESS).unwrap() };
+    let texel = || read_mip(key, 0, 128, 128)[page + 4];
+    with_title(|t| {
+        assert!(t.realize(key));
+        t.sync_dirty_without_probe_deadline();
+    });
+    assert_eq!(read_mip(key, 0, 128, 128)[page - 4], 0xAB, "the readable page");
+    assert_eq!(texel(), 0, "the unreadable page reads zeros");
+    // SAFETY: as above.
+    unsafe { protect(hole, page, Protect::READ_WRITE).unwrap() };
+    let filled = (0..200).any(|_| {
+        with_title(|t| t.sync_dirty_without_probe_deadline());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        texel() == 0xAB
+    });
+    assert!(filled, "the page read zeros after it became readable");
+}
+
 /// A block-compressed texture: 16 bytes a 4x4 block, in the console's layout, detiled as blocks.
 #[test]
 fn a_block_compressed_title_texture_is_detiled_as_blocks() {

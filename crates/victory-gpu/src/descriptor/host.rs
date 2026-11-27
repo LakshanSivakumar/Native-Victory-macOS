@@ -126,9 +126,10 @@ impl HostHeap {
         };
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
+        // which has no bounds, at indices clamped below `HEAP_VIEWS`; then
+        // as many minimum LOD clamps, which this host leaves 0 (none).
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer(u64::from(victory_shader::emit::HEAP_VIEWS) * 8))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
@@ -495,11 +496,12 @@ impl HostHeap {
 
     fn write_stride(&self, index: u32, stride: u32) {
         let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        // Shaders read no stride past it; the clamps follow.
+        if index >= victory_shader::emit::HEAP_VIEWS {
             return;
         }
         // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
+        // `HEAP_VIEWS` (then the clamps).
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
     }
 

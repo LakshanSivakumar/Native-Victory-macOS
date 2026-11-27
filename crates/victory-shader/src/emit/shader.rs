@@ -16,9 +16,14 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// parameter) of the view-stride table: dword `i` is the byte stride of
 /// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
 /// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
+/// Dword [`HEAP_VIEWS`]` + i` is the minimum LOD clamp of the texture shader
+/// view at index `i`, in 256ths of a mip ([`VIEW_MIN_LOD_STEPS`]; 0 for
+/// none).
 pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-stride table dword holding the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// Steps of a mip in a minimum LOD clamp of the view-stride table.
+pub const VIEW_MIN_LOD_STEPS: u32 = 256;
 /// In a view-stride table dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;

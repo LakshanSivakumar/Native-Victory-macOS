@@ -200,6 +200,20 @@ pub(super) fn min_lod(d: &[u32; 10], first: u32) -> f32 {
     if clamp.is_finite() { clamp.max(0.0) } else { 0.0 }
 }
 
+/// The view-stride table's dword `HEAP_VIEWS + i` for `view` at index `i`: a texture shader
+/// view's minimum LOD clamp in 256ths of a mip (`VIEW_MIN_LOD_STEPS`), for samples at an
+/// explicit level, which Metal does not clamp; 0 for anything else.
+pub(super) fn min_lod_word<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> u32 {
+    let steps = victory_shader::emit::VIEW_MIN_LOD_STEPS as f32;
+    match view {
+        View::Shader(..) | View::Placed(false, ..) => match decode(view, resources) {
+            Some(Decoded::Image { min_lod, .. }) => (min_lod * steps).round() as u32,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 /// Object and placed views have the same SRV/UAV union layout.
 fn texture_view(resource: usize, unordered: bool, d: &[u32; 10]) -> Option<Decoded> {
     let (mips, layers) = if unordered {

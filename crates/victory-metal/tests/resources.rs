@@ -73,11 +73,17 @@ impl Grid<'_> {
     /// [`Self::run`], with the texture's entry cleared (`clear_entry`) before the dispatch when
     /// `cleared`.
     fn sample(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool) -> Vec<[f32; 4]> {
-        self.sample_clamped(tex, cleared, 0.0)
+        self.sample_with(tex, cleared, 0.0, 0.0)
     }
 
     /// [`Self::sample`] through an entry written with minimum LOD clamp `min_lod`.
     fn sample_clamped(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool, min_lod: f32) -> Vec<[f32; 4]> {
+        self.sample_with(tex, cleared, min_lod, 0.0)
+    }
+
+    /// [`Self::sample`] with the texture's entry clamped at `min_lod` and the sampler's entry
+    /// biased by `lod_bias`.
+    fn sample_with(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool, min_lod: f32, lod_bias: f32) -> Vec<[f32; 4]> {
         let m = self.m;
         let p = m.create_compute_pipeline(self.dxil).unwrap();
         let cells = self.g[0] as usize * self.g[1] as usize * self.z;
@@ -105,7 +111,7 @@ impl Grid<'_> {
                 max_anisotropy: 1,
             })
             .unwrap();
-        m.write_sampler(&smp, 0, &s, 0.0);
+        m.write_sampler(&smp, 0, &s, lod_bias);
         let w = [Dispatch {
             pipeline: &p,
             root: RootArgs::default()
@@ -414,6 +420,27 @@ fn an_entrys_min_lod_clamp_keeps_samples_off_finer_mips() {
     assert!(at(0.0).iter().all(|c| near(c[0], 0.0)), "no clamp: mip 0");
     assert!(at(1.0).iter().all(|c| near(c[0], 200.0 / 255.0)), "clamp 1: mip 1");
     assert!(at(2.0).iter().all(|c| near(c[0], 50.0 / 255.0)), "clamp 2: mip 2");
+}
+
+/// A sampler entry's LOD bias (`IRDescriptorTableSetSampler`'s `lodBias`, what the host writes
+/// for a sampler's `MipLODBias`) moves a sample to a coarser mip. The converter applies it only
+/// with `IRCompatibilityFlagSamplerLODBias`: without that flag the `SampleLevel` here read mip 0
+/// at every bias. Measured, not asserted: a `SampleGrad` reads mip 0 whatever the bias, with or
+/// without the flag (Metal's gradient sample takes no bias).
+#[test]
+fn a_sampler_entrys_lod_bias_moves_samples_to_coarser_mips() {
+    let Some(m) = backend() else { return };
+    let mut d = d2(Format::Rgba8Unorm, 4, 4);
+    d.mips = 3;
+    let t = m.create_texture(&d).unwrap();
+    for (mip, (w, v)) in [(4usize, 0u8), (2, 200), (1, 50)].into_iter().enumerate() {
+        m.upload_texture(&t, mip, 0, &vec![v; w * w * 4], w * 4, 0);
+    }
+    let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [2, 2], z: 1, filter: Filter::Nearest };
+    let at = |bias| g.sample_with(&t, false, 0.0, bias);
+    assert!(at(0.0).iter().all(|c| near(c[0], 0.0)), "no bias: mip 0");
+    assert!(at(1.0).iter().all(|c| near(c[0], 200.0 / 255.0)), "bias 1: mip 1");
+    assert!(at(2.0).iter().all(|c| near(c[0], 50.0 / 255.0)), "bias 2: mip 2");
 }
 
 #[test]
