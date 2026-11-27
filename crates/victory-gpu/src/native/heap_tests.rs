@@ -32,9 +32,14 @@ struct Heap {
 
 impl Heap {
     fn new(t: &Title<Metal>) -> Heap {
-        let records = vec![0u32; 8 * 3];
+        Self::sized(t, 3)
+    }
+
+    /// The same with `count` entries (those after the first two are empty).
+    fn sized(t: &Title<Metal>, count: usize) -> Heap {
+        let records = vec![0u32; 8 * count];
         let start = records.as_ptr() as u64;
-        let heap = t.host.heap(HeapKind::Resource, start, 3).unwrap();
+        let heap = t.host.heap(HeapKind::Resource, start, count).unwrap();
         for (i, texel) in [[255, 0, 0, 255], [0, 255, 0, 255]].into_iter().enumerate() {
             let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
             t.host.backend.upload_texture(&tex, 0, 0, &texel, 4, 0);
@@ -257,29 +262,42 @@ fn a_mesh_shader_loads_a_texture_by_heap_index() {
     assert!(pixels.iter().all(|p| *p == [255, 128, 128, 255]), "{pixels:?}");
 }
 
-/// A texture the title releases leaves the heap: the entries showing it are cleared, where they
-/// used to keep the host texture alive and resident until the title wrote another view there.
-/// Entries of other textures stay, and a texture only forgotten (another description placed at
-/// its address) keeps its entries.
+/// Forgetting a texture retains its heap entries for work that may still read them.
+/// Re-registration refreshes them; final release clears them and prevents stale remirroring.
 #[test]
 fn a_released_texture_leaves_the_heap() {
-    let Some(t) = title() else { return };
-    let heap = Heap::new(&t);
+    use crate::native::host::{NativeHost, mirror_tests::Recording};
+    let h = NativeHost::new(Recording::default());
+    let records = [0u32; 16];
+    let start = records.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 2).unwrap();
     let (red, green) = (0x4EA9_0000, 0x4EA9_0001);
-    t.host.forget_resource(red);
-    assert_eq!(t.host.cleared(), 0, "forgetting a texture leaves its entries");
-    t.host.register_texture(red, &t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap());
-    t.host.release_resource(green);
-    assert_eq!(t.host.cleared(), 1);
-    assert!(!t.host.knows(green) && t.host.knows(red));
-    assert!(heap.heap.mirrored.borrow().contains_key(&1), "its old record is not mirrored again");
-    assert!(heap.heap.take_entries(green).is_empty() && heap.heap.take_entries(red) == [0]);
-    // Released again, or a buffer: nothing to clear.
-    t.host.release_resource(green);
-    assert_eq!(t.host.cleared(), 1);
-    // A texture at the released one's address: the entry is checked again, the other is not.
-    t.host.register_texture(green, &t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap());
-    assert!(!heap.heap.mirrored.borrow().contains_key(&1) && heap.heap.mirrored.borrow().contains_key(&0));
+    for (i, key) in [red, green].into_iter().enumerate() {
+        h.register_texture(key, &Rc::new(i + 1));
+        crate::descriptor::create_srv(std::ptr::null(), key as _, std::ptr::null(), start + 32 * i as u64);
+        assert!(h.mirror(start + 32 * i as u64).unwrap());
+    }
+    h.forget_resource(red);
+    assert!(!h.knows(red));
+    assert_eq!(h.cleared(), 0, "forgetting retains entries for work in flight");
+    assert!(heap.shows_texture(red) && heap.shows_texture(green));
+    assert_eq!(heap.heap.borrow()[&0], (1, u32::MAX), "the backend retains the old view");
+    assert!(heap.mirrored.borrow().contains_key(&0), "forgetting preserves the old stamp");
+    h.register_texture(red, &Rc::new(3));
+    assert!(h.mirror(start).unwrap(), "the resource version invalidates the retained stamp");
+    assert_eq!(heap.heap.borrow()[&0], (3, u32::MAX));
+    h.release_resource(green);
+    assert_eq!(h.cleared(), 1);
+    assert!(!h.knows(green) && h.knows(red));
+    assert_eq!(heap.heap.borrow()[&1], (0, 0));
+    assert!(heap.mirrored.borrow().contains_key(&1), "its old record is not mirrored again");
+    assert!(!heap.shows_texture(green) && heap.shows_texture(red));
+    h.release_resource(green);
+    assert_eq!(h.cleared(), 1, "releasing again clears nothing");
+    h.register_texture(green, &Rc::new(4));
+    assert!(!heap.mirrored.borrow().contains_key(&1));
+    assert!(h.mirror(start + 32).unwrap());
+    assert_eq!(heap.heap.borrow()[&1], (4, u32::MAX));
 }
 
 /// A compute program of the title's shape: a raw UAV in the table at user data 4, and the
@@ -1126,7 +1144,7 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
 
 /// If `Binding`'s DXIL scan ever missed a `TypedBuffer` operation (`typed_buffers == false` on
 /// purpose), `NativeHost::mirror` wrote `[gpu, 0, size]` (`textureViewID == 0`), so both SRV and
-/// UAV `texture_buffer` loads and `getDimensions` read zero cleanly on Metal without faulting —
+/// UAV `texture_buffer` loads and `getDimensions` read zero cleanly on Metal without faulting -
 /// both on a fresh heap slot and after overwriting a previously promoted slot.
 #[test]
 fn wrong_typed_buffer_scan_reads_zero_without_crashing() {
@@ -1668,4 +1686,285 @@ fn a_compute_shader_reads_both_the_view_strides_and_the_view_addresses() {
     assert_eq!(f.get(0x2_0000, 2), [0x1234_5678, super::addr_tests::CANARY]);
     assert_eq!((t.host.unset_roots(), t.host.failed()), (0, 0));
     drop(records);
+}
+
+
+/// The original whole-dword probe: the image descriptor at heap entry 1 (dwords 1-3) and
+/// the buffer descriptor at entry 2 (dwords 0-1), including fields the address table lacks,
+/// stored through the raw UAV in the table at user data 4. No image or buffer instruction uses
+/// either load, so the translator would read them from the heap's view addresses (`t1` of the
+/// memory space). Kept intact as a negative test; `view_address_program` adds actual field
+/// extraction for the execution tests. Entry 0's image load identifies s6 as the resource heap.
+const CS_VIEW_ADDRESSES: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xBE80_0306, // s_mov_b32 s0, s6
+    0xBE81_0380, // s_mov_b32 s1, 0
+    0xF40C_0400, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[0:1], 0x20
+    0xF408_0600, 0xFA00_0040, // s_load_dwordx4 s[24:27], s[0:1], 0x40
+    0xF40C_0700, 0xFA00_0000, // s_load_dwordx8 s[28:35], s[0:1], 0x0
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF000_1F08, 0x0007_0800, // image_load v[8:11], v[0:1], s[28:35] dmask:0xf dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7E06_0211, // v_mov_b32 v3, s17
+    0x7E08_0212, // v_mov_b32 v4, s18
+    0x7E0A_0213, // v_mov_b32 v5, s19
+    0x7E0C_0218, // v_mov_b32 v6, s24
+    0x7E0E_0219, // v_mov_b32 v7, s25
+    0xE070_0000, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0
+    0xE070_0004, 0x8003_0400, // buffer_store_dword v4, off, s[12:15], 4
+    0xE070_0008, 0x8003_0500, // buffer_store_dword v5, off, s[12:15], 8
+    0xE070_000C, 0x8003_0600, // buffer_store_dword v6, off, s[12:15], 12
+    0xE070_0010, 0x8003_0700, // buffer_store_dword v7, off, s[12:15], 16
+    0xBF81_0000, // s_endpgm
+];
+
+
+fn view_address_container(code: &[u32]) -> Vec<u8> {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    crate::pipeline::test_compute_container(code, &[uav], 7)
+}
+
+fn view_address_program() -> HostShader {
+    // Keep the original whole-dword fixture above intact, including its unsupported fields.
+    // A title's size query instead extracts width, height and first level. Exercise those
+    // computations, and an address mask hoisted into an SGPR, without pre-masking the image.
+    let mut query = CS_VIEW_ADDRESSES.to_vec();
+    let at = query.iter().position(|&w| w == 0x7E06_0211).unwrap();
+    query.splice(at..at, [
+        0x9011_9E11,             // s_lshr_b32 s17, s17, 30
+        0x8F14_8212,             // s_lshl_b32 s20, s18, 2
+        0x8811_1411,             // s_or_b32 s17, s17, s20
+        0x8711_FF11, 0xFFFF,     // s_and_b32 s17, s17, 0xffff
+        0x8111_8111,             // s_add_i32 s17, s17, 1 (width)
+        0x9392_FF12, 0x0010_000E, // s_bfe_u32 s18, s18, offset:14 width:16
+        0x8112_8112,             // s_add_i32 s18, s18, 1 (height)
+        0x9393_FF13, 0x0004_000C, // s_bfe_u32 s19, s19, offset:12 width:4 (first level)
+        0xBE94_03FF, 0xFFFF,     // s_mov_b32 s20, 0xffff
+        0x8719_1419,             // s_and_b32 s25, s25, s20 (address high bits)
+    ]);
+    let c = view_address_container(&query);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.view_addresses && !cs.view_marks);
+    cs
+}
+
+#[test]
+fn view_address_program_translates_without_a_gpu() {
+    let cs = view_address_program();
+    assert!(cs.view_addresses && !cs.view_marks);
+    // Unlike the title's queries, the original raw stores observe image address, format and
+    // tiling too. Those fields were zero before the merge, not correct console descriptors.
+    let err = victory_shader::emit::translate_with(&view_address_container(CS_VIEW_ADDRESSES), shaders::options()).unwrap_err();
+    assert!(err.to_string().contains("a view address field the table gives as 0: an image's base address, minimum level or format (dword 1)"), "{err}");
+}
+
+/// A shader that reads descriptors as numbers is not refused on the native host: it gets the
+/// heap's view addresses, made from the heap as it is at the first such dispatch and kept current
+/// by later mirrored writes (the D3D12 host's `view_addresses`).
+#[test]
+fn a_compute_shader_reads_view_addresses_on_the_gpu() {
+    let cs = view_address_program();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    let start = heap._records.as_ptr() as u64;
+    // Entry 1: a shader view of a `width` x `height` 2D texture of one level the title placed
+    // itself (the record carries the resource description).
+    let texture = |width: u32, height: u32| {
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4], resource[6], resource[7], resource[9]) = (3, width, height, 1 | 1 << 16, 1);
+        let mut view = [0u32; 16];
+        (view[0], view[1], view[5]) = (28, 4, 1);
+        crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &view, start + 32);
+    };
+    texture(64, 32);
+    // Entry 2: a raw buffer UAV of 64 dwords at `VA_A` (pool offset 0x2_0000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    let [lo, hi] = super::addr_tests::halves(super::addr_tests::VA_A);
+    [view[10], view[11]] = [lo, hi];
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start + 64);
+    assert!(t.host.mirror(start + 64).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "view addresses") else { panic!("{:?}", t.shaders) };
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    let run = |t: &Title<Metal>| {
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap.heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap.heap, 2);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        f.get(0x2_0000, 6)
+    };
+    // The program reconstructs the title's dimensions and first level from descriptor fields.
+    let canary = super::addr_tests::CANARY;
+    assert_eq!(run(&t), [64, 32, 0, lo, hi & 0xFFFF, canary]);
+    // The title writes another view at entry 1: the mirrored write brings its words up to date.
+    texture(128, 16);
+    let _ = t.host.mirror(start + 32);
+    assert_eq!(run(&t), [128, 16, 0, lo, hi & 0xFFFF, canary]);
+}
+
+
+/// A buffer view over 64 KiB pages of two pools (a title maps physical pages into its
+/// reservations in any order and makes views across them): the host shows the range through one
+/// buffer of its own, so a shader's stores through the view land in both pools' pages, where
+/// the view used to be null (nothing read, nothing written). Then the title maps another pool's
+/// page into the range: the next mirrored write of the view reaches that page.
+#[test]
+fn a_buffer_view_over_pages_of_two_pools_reaches_both_on_the_gpu() {
+    use crate::native::memory::{PoolInfo, PoolObserver};
+    use victory_metal::mem::Alias;
+    let cs = view_address_program();
+    let Some(mut t) = title() else { return };
+    let heap = Heap::new(&t);
+    let start = heap._records.as_ptr() as u64;
+    // Three pools of 128 KiB; title pages at `VA`: pool 11's second page, then pool 12's first.
+    const VA: usize = 0x23_4560_0000;
+    const PAGE: usize = 0x1_0000;
+    let pools: Vec<(Alias, PoolInfo)> = (11..14)
+        .map(|id| {
+            let mem = Alias::new(2 * PAGE).unwrap();
+            let info = PoolInfo { id, base: mem.primary as usize, len: 2 * PAGE, memory_entry: None };
+            (mem, info)
+        })
+        .collect();
+    let words = |pool: usize, at: usize, n: usize| -> Vec<u32> {
+        // SAFETY: inside the pool's own mapping; read after the fence wait.
+        unsafe { std::slice::from_raw_parts(pools[pool].0.primary.add(at).cast::<u32>(), n).to_vec() }
+    };
+    let m = t.host.memory();
+    pools.iter().for_each(|p| m.pool_created(&p.1));
+    m.mapped(VA, PAGE, &pools[0].1, PAGE);
+    m.mapped(VA + PAGE, PAGE, &pools[1].1, 0);
+    // Entry 1: any texture view (the program reads its size fields). Entry 2: a raw buffer UAV
+    // of 64 dwords that starts 8 bytes before the page boundary.
+    let mut resource = [0u32; 14];
+    (resource[0], resource[4], resource[6], resource[7], resource[9]) = (3, 64, 32, 1 | 1 << 16, 1);
+    let mut view = [0u32; 16];
+    (view[0], view[1], view[5]) = (28, 4, 1);
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &view, start + 32);
+    let at = (VA + PAGE - 8) as u64;
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(at);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start + 64);
+    assert!(t.host.mirror(start + 64).unwrap(), "a view over two pools is mirrored");
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "span") else { panic!("{:?}", t.shaders) };
+    let run = |t: &Title<Metal>| {
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap.heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap.heap, 2);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+    };
+    run(&t);
+    // The five dwords the program stores: the texture's size fields, then the view's address.
+    let stored = [64, 32, 0, at as u32, (at >> 32) as u32 & 0xFFFF];
+    assert_eq!(words(0, 2 * PAGE - 8, 2), stored[..2], "the end of pool 11's page");
+    assert_eq!(words(1, 0, 4), [stored[2], stored[3], stored[4], 0], "the start of pool 12's page");
+    assert_eq!(t.host.unmapped(), 0);
+    // The title maps pool 13's first page where pool 12's was and writes the view again.
+    m.mapped(VA + PAGE, PAGE, &pools[2].1, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start + 64);
+    assert!(t.host.mirror(start + 64).unwrap());
+    run(&t);
+    assert_eq!(words(2, 0, 4), [stored[2], stored[3], stored[4], 0], "the start of pool 13's page");
+}
+
+
+/// A heap entry no bound table covers follows the title's memory: the title writes a buffer view
+/// once, while none of its range is mapped, then maps the first page, then the second, then
+/// another pool's page in place of the second. Nothing reports the view again, and no table
+/// check reaches it (the bound table starts 20 entries on), yet each submission's stores land in
+/// the pages mapped at that time. Without `NativeHost::refresh_spans` the entry kept the null
+/// view, then the first buffer made for the range (zeros where pages came later).
+#[test]
+fn a_heap_entry_outside_every_table_shows_pages_mapped_after_the_view_was_made() {
+    use crate::native::memory::{PoolInfo, PoolObserver};
+    use victory_metal::mem::Alias;
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_HEAP_BUFFER, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let heap = Heap::sized(&t, 40);
+    let start = heap._records.as_ptr() as u64;
+    const VA: usize = 0x23_4570_0000;
+    const PAGE: usize = 0x1_0000;
+    let pools: Vec<(Alias, PoolInfo)> = (21..24)
+        .map(|id| {
+            let mem = Alias::new(2 * PAGE).unwrap();
+            let info = PoolInfo { id, base: mem.primary as usize, len: 2 * PAGE, memory_entry: None };
+            (mem, info)
+        })
+        .collect();
+    let word = |pool: usize, at: usize| -> u32 {
+        // SAFETY: inside the pool's own mapping; read after the fence wait.
+        unsafe { pools[pool].0.primary.add(at).cast::<u32>().read() }
+    };
+    let clear = |pool: usize, at: usize| {
+        // SAFETY: inside the pool's own mapping; nothing is in flight.
+        unsafe { pools[pool].0.primary.add(at).cast::<u32>().write(0) }
+    };
+    let m = t.host.memory();
+    pools.iter().for_each(|p| m.pool_created(&p.1));
+    // Entry 2: a raw buffer UAV of 64 dwords that starts 8 bytes before a page boundary.
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves((VA + PAGE - 8) as u64);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start + 64);
+    assert!(t.host.mirror(start + 64).is_err(), "a view of unmapped memory is the null view");
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "heap buffer") else { panic!("{:?}", t.shaders) };
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    let run = |t: &Title<Metal>| {
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap.heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap.heap, 20);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+    };
+    const ONE: u32 = 0x3F80_0000;
+    // Nothing mapped: the stores go nowhere.
+    run(&t);
+    // The first page (pool 21's second): the entry left null is written when the table changes.
+    m.mapped(VA, PAGE, &pools[0].1, PAGE);
+    run(&t);
+    assert_eq!(word(0, 2 * PAGE - 8), ONE, "the page mapped after the view was written");
+    // The second page (pool 22's first): the range is now two pool runs, shown through a span.
+    m.mapped(VA + PAGE, PAGE, &pools[1].1, 0);
+    clear(0, 2 * PAGE - 8);
+    run(&t);
+    assert_eq!([word(0, 2 * PAGE - 8), word(1, 0)], [ONE, ONE], "both pages of the span");
+    // Pool 23's first page in place of pool 22's: the span is made again and the entry with it.
+    m.mapped(VA + PAGE, PAGE, &pools[2].1, 0);
+    clear(1, 0);
+    run(&t);
+    assert_eq!([word(1, 0), word(2, 0)], [0, ONE], "the page mapped in place of another");
+    // The second page unmapped: the first is still reached, the old page is not.
+    m.unmapped(VA + PAGE, PAGE);
+    clear(0, 2 * PAGE - 8);
+    clear(2, 0);
+    run(&t);
+    assert_eq!([word(0, 2 * PAGE - 8), word(2, 0)], [ONE, 0], "a page unmapped from the span");
+    assert_eq!((t.host.unmapped(), t.host.unset_roots(), t.host.failed()), (0, 0, 0));
 }

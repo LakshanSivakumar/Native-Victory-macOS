@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 victory-backend.workspace = true
+victory-shader.workspace = true
 blake3.workspace = true
 
 # Everything is macOS-only; on other targets the crate builds as an empty binary.
@@ -20,6 +21,7 @@ block2 = "0.6"
 libc = "0.2"
 tracing.workspace = true
 objc2-quartz-core = "0.3"
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColorSpace"] }
 
 [lints]
 workspace = true

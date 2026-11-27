@@ -73,6 +73,24 @@ fn a_mesh_style_vertex_program_makes_a_mesh_pipeline() {
     assert_eq!(pso.mesh_threads(), Some([128, 1, 1]));
 }
 
+#[test]
+fn an_over_limit_mesh_keeps_its_dispatch_refusal_reason() {
+    use crate::native::title::MeshRefusal;
+    let mut ms = translate(HwStage::Vs, TRIANGLE);
+    // Raise the declared maximum in our synthetic shader so no conversion is attempted.
+    let offset = {
+        let c = victory_shader::Container::parse(&ms.dxil).unwrap();
+        c.part(victory_shader::FourCC::PSV0).unwrap().data.as_ptr() as usize - ms.dxil.as_ptr() as usize
+    };
+    ms.dxil[offset + 16..offset + 18].copy_from_slice(&4096u16.to_le_bytes());
+    assert!(shaders::metal_mesh_bytes(&ms.dxil).unwrap() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES);
+    let Some(mut t) = title() else { return };
+    let guessed = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    for state in [Graphics::default(), guessed] {
+        assert!(matches!(t.render_pipe(&ms, None, &state, "large mesh"), Pipe::MeshRefused(MeshRefusal::OverLimit)));
+    }
+}
+
 /// An 8x8 RGBA8 target cleared to black, `pso` and `binding` set on a list.
 fn list_into(
     t: &Title<Metal>,
@@ -729,9 +747,10 @@ fn a_pixel_program_writes_exact_bits_to_an_r32uint_target() {
     let ms = translate(HwStage::Vs, TRIANGLE);
     let Some(mut t) = title() else { return };
     let state = Graphics::guess_base().for_draw(formats.to_vec(), None, vec![], &[], false);
-    // Translated as today (float outputs), Metal refuses it.
+    // Float outputs mismatch the integer attachment: a mesh conversion refusal.
     let float = shaders::translate(&c).unwrap();
-    assert!(matches!(t.render_pipe(&ms, Some(&float), &state, "float"), Pipe::Refused));
+    assert!(matches!(t.render_pipe(&ms, Some(&float), &state, "float"),
+        Pipe::MeshRefused(crate::native::title::MeshRefusal::ConversionFailed)));
     assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("color attachment")), "{:?}", t.shaders.refused);
     let ps = shaders::translate_targets(&c, integer).unwrap();
     let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "integer") else {

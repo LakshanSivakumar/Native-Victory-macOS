@@ -9,9 +9,9 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
+//! Native pipelines support vertex or mesh plus pixel streams and compute. The
+//! inferred console graphics path still needs its raw mesh-stage registers decoded.
+//! Tessellation, geometry and plain graphics descriptions keep their containers only. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -62,15 +62,16 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     /// The container's length, as logged once its bytes are gone.
     size: usize,
-    /// The container, until `translated` has made its translation (or its
-    /// refusal) and let it go: a run holds one per distinct shader its title
-    /// passes, and nothing reads it after. Off Windows nothing translates,
-    /// so only tests keep it.
+    /// Classified before prewarming can release the container.
+    #[cfg(target_os = "macos")]
+    builder: bool,
+    /// Shared source container. Native graphics retains it for rectangle-list translation
+    /// and mesh/pixel linking; other stages release it after translation.
     #[cfg(any(windows, test, target_os = "macos"))]
     container: Mutex<Vec<u8>>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
-    /// Its translation for the native host (container let go once made).
+    /// Its standalone translation for the native host.
     #[cfg(target_os = "macos")]
     native: std::sync::OnceLock<Result<Arc<victory_shader::emit::HostShader>, String>>,
     /// Its translation for rectangle lists (guessed vertex shaders; made at the first such draw).
@@ -91,8 +92,10 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// A native container may contain multiple hardware programs. Keep the stream's selected
+/// stage in the identity, so sharing a container cannot turn its mesh consumer into a pixel stage.
+type ShaderKey = (&'static str, [u8; 32]);
+static SHADERS: Mutex<Option<HashMap<ShaderKey, Arc<Shader>>>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
@@ -100,7 +103,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry((stage, *full.as_bytes()))
         .or_insert_with(|| {
             let s = Arc::new(Shader::new(stage, bytes));
             // Tests that read containers back would race the translation, which lets them go.
@@ -170,6 +173,17 @@ fn prewarm(shader: &Arc<Shader>) {
     }
 }
 
+/// Inspect both archive DXIL/XDAT and the native host's ACCC/FSPX pieces, through
+/// the same parser as translation. Malformed/unknown containers still get the usual refusal.
+#[cfg(target_os = "macos")]
+fn is_builder_container(bytes: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC, NativeProgram};
+    let Ok(c) = Container::parse(bytes) else { return false };
+    c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(NativeProgram::is_spilled))
+}
+
 /// The list of first binds ([`crate::prewarm::FirstBinds`]), read from the cache folder on first use.
 #[cfg(target_os = "macos")]
 fn with_first_binds<R>(f: impl FnOnce(&mut crate::prewarm::FirstBinds) -> R) -> R {
@@ -187,6 +201,8 @@ impl Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
             size: bytes.len(),
+            #[cfg(target_os = "macos")]
+            builder: stage == "compute" && is_builder_container(bytes),
             #[cfg(any(windows, test, target_os = "macos"))]
             container: Mutex::new(bytes.to_vec()),
             #[cfg(windows)]
@@ -216,9 +232,8 @@ impl Shader {
                 {
                     let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}_{}.bin", self.stage, self.hash)), &*container);
                 }
-                // A vertex shader keeps its container (a rectangle-list draw translates it again),
-                // and a pixel shader its (integer colour targets do: the title may have freed it).
-                if self.stage != "vertex" && self.stage != "pixel" {
+                // A vertex shader keeps its container: a rectangle-list draw translates it again.
+                if !matches!(self.stage, "vertex" | "mesh" | "pixel") {
                     *container = Vec::new();
                 }
                 made
@@ -230,6 +245,21 @@ impl Shader {
 
 #[cfg(target_os = "macos")]
 impl Shader {
+    /// Link before conversion, with the native page-table layout and wave32 host options.
+    pub(crate) fn native_linked(&self, pixel: Option<&Shader>) -> Result<(Arc<victory_shader::emit::HostShader>, Option<Arc<victory_shader::emit::HostShader>>), String> {
+        type Pair = (Arc<victory_shader::emit::HostShader>, Option<Arc<victory_shader::emit::HostShader>>);
+        type Key = ([u8; 32], Option<[u8; 32]>);
+        static CACHE: std::sync::OnceLock<Mutex<HashMap<Key, Result<Pair, String>>>> = std::sync::OnceLock::new();
+        let mesh = self.container.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let ps = pixel.map(|p| p.container.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        let key = (*blake3::hash(&mesh).as_bytes(), ps.as_ref().map(|p| *blake3::hash(p).as_bytes()));
+        let mut cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        cache.entry(key).or_insert_with(|| {
+            victory_shader::emit::translate_linked(&mesh, ps.as_deref(), crate::native::shaders::options())
+                .map(|(m,p)| (Arc::new(m), p.map(Arc::new))).map_err(|e| e.to_string())
+        }).clone()
+    }
+
     /// Whether the translation for the native host is made (or refused) already.
     pub(crate) fn native_ready(&self) -> bool {
         self.native.get().is_some()
@@ -424,6 +454,8 @@ struct Pipeline {
     packet: [u32; 8],
     /// Each used stage's container.
     shaders: Vec<Arc<Shader>>,
+    #[cfg(target_os = "macos")]
+    builder: bool,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
     /// What its host pipeline is made from, and the host pipeline once made
@@ -435,6 +467,12 @@ struct Pipeline {
     graphics: Option<Box<crate::native::state::Graphics>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+
+/// Whether this pipeline is one of the title's ray-tracing structure builder stages.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_builder(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder
+}
 
 /// A title pipeline's stages (name, shader) and graphics state, for the native host.
 #[cfg(target_os = "macos")]
@@ -674,6 +712,8 @@ fn hand_out(
         host,
         #[cfg(target_os = "macos")]
         graphics,
+        #[cfg(target_os = "macos")]
+        builder: matches!(shaders.as_slice(), [shader] if shader.builder),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -744,6 +784,16 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
+/// Whether the console pipeline methods (0x1b8, 0x1c8, 0x218) are answered. They take hardware
+/// code without stage descriptions, so the native host has to guess graphics stages (a mesh
+/// producer is read as a vertex shader and refused). `VICTORY_CONSOLE_PIPELINES=0` answers
+/// `E_NOTIMPL` instead, as the D3D12 host does: the title then falls back to stream pipelines
+/// (0x2b0), whose containers describe every stage.
+pub(crate) fn console_pipelines() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSOLE_PIPELINES").is_none_or(|v| v != "0"))
+}
+
 /// Device methods 0x1c8 and 0x218: a pipeline state from a console description whose layout is
 /// not known yet (`(desc, iid, out)`, the pipeline state's IID; title+0x2477578 and +0x24800d5).
 /// With graphics inference enabled on macOS, read the shader pieces of the first slot.
@@ -754,6 +804,9 @@ pub(crate) extern "system" fn create_unread_1c8(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    if !console_pipelines() {
+        return object::E_NOTIMPL;
+    }
     // `VICTORY_GUESS_GRAPHICS=1`: a pipeline from the pieces of the first slot, with the
     // inferred state of `victory_shader::emit::graphics` and `native::state::Graphics::guessed`.
     #[cfg(target_os = "macos")]
@@ -863,6 +916,9 @@ pub(crate) extern "system" fn create_compute_pieces(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    if !console_pipelines() {
+        return object::E_NOTIMPL;
+    }
     if desc.is_null() {
         return E_INVALIDARG;
     }
@@ -1157,6 +1213,16 @@ fn read_stream(
     (shaders, graphics)
 }
 
+/// A described stream for native draw-path tests, with the same creation and shader ownership
+/// as a title stream. `stream` includes its subobject headers and live bytecode pointers.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_stream(stream: &[u8]) -> This {
+    let desc = StreamDesc { size: stream.len(), stream: stream.as_ptr() };
+    let mut out = std::ptr::null();
+    assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out), crate::object::S_OK);
+    out
+}
+
 /// A compute pipeline whose shader is `code` (a container, or any bytes).
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn test_compute(code: &[u8]) -> This {
@@ -1393,6 +1459,17 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn shared_container_preserves_the_selected_mesh_and_pixel_stages() {
+        let bytes = b"synthetic multi-program container identity";
+        let mesh = shader("mesh", bytes);
+        let pixel = shader("pixel", bytes);
+        assert_eq!((mesh.stage, pixel.stage), ("mesh", "pixel"));
+        assert!(!Arc::ptr_eq(&mesh, &pixel));
+        assert!(Arc::ptr_eq(&mesh, &shader("mesh", bytes)));
+        assert!(Arc::ptr_eq(&pixel, &shader("pixel", bytes)));
+    }
 
     /// A registered shader is translated without anyone calling `native()`.
     #[cfg(target_os = "macos")]
@@ -1651,6 +1728,36 @@ mod pieces_tests {
 
     fn container_of(code: &[u32], records: &[[u8; 32]]) -> Vec<u8> {
         test_compute_container(code, records, 5)
+    }
+
+    #[test]
+    fn builder_pipeline_is_tagged_before_prewarming_releases_its_container() {
+        let mut root = [0u8; 32];
+        root[0] = 0x41;
+        root[4..6].copy_from_slice(&[2, 0]); // CBV, root constants
+        root[16] = 2;
+        root[20..23].copy_from_slice(&[2, 16, 0]);
+        let bytes = container_of(&[0xBF81_0000], &[root]);
+        assert!(is_builder_container(&bytes));
+        let c = victory_shader::Container::parse(&bytes).unwrap();
+        let part = c.part(victory_shader::FourCC::ACCC).unwrap().data;
+        let dxil = victory_shader::dxbc::build(&[(victory_shader::FourCC::DXIL, part)]);
+        assert!(is_builder_container(&dxil));
+        assert!(!is_builder_container(b"malformed"));
+        assert!(!is_builder_container(&container_of(&[0xBF81_0000], &[])));
+        assert!(!Shader::new("pixel", &bytes).builder);
+        let shader = shader("compute", &bytes);
+        assert!(shader.builder);
+        let _ = shader.native();
+        assert!(shader.container.lock().unwrap().is_empty());
+        // Two pipeline creations sharing a shader still inherit its tag after prewarm.
+        for _ in 0..2 {
+            let mut out = std::ptr::null();
+            assert_eq!(hand_out(vec![shader.clone()], None, &PIPELINE_IIDS[0], &mut out), object::S_OK);
+            assert!(is_builder(out));
+            assert_eq!(release(out), 0);
+        }
+        assert!(!is_builder(std::ptr::null()));
     }
 
     /// On the native host's path (the container made from the title's pieces, translated with

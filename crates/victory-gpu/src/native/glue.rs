@@ -15,7 +15,8 @@ use crate::object::This;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use victory_backend::resources::HeapKind;
+use victory_backend::resources::{HeapKind};
+use victory_metal::frame_time::{self, Metric, Timer};
 use victory_metal::metal::Metal;
 
 pub type MetalTitle = Title<Metal>;
@@ -55,14 +56,57 @@ pub(crate) fn signal_event(event: usize) {
     }
 }
 
-fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
-    TITLE.lock().unwrap_or_else(|e| e.into_inner())
+struct TitleGuard {
+    guard: std::sync::MutexGuard<'static, Option<Shared>>,
+    held: Option<std::time::Instant>,
+    kind: Metric,
+}
+
+impl TitleGuard {
+    fn kind(mut self, kind: Metric) -> Self {
+        self.kind = kind;
+        self
+    }
+}
+
+impl std::ops::Deref for TitleGuard {
+    type Target = Option<Shared>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for TitleGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for TitleGuard {
+    fn drop(&mut self) {
+        if let Some(held) = self.held {
+            frame_time::lock_released(held, self.kind);
+        }
+        // The original mutex guard unlocks after this accounting, at the same scope boundary.
+    }
+}
+
+fn lock() -> TitleGuard {
+    let waiting = frame_time::start();
+    let guard = TITLE.lock().unwrap_or_else(|e| e.into_inner());
+    let held = waiting.map(frame_time::lock_acquired);
+    TitleGuard { guard, held, kind: Metric::HoldOther }
 }
 
 /// Runs `f` on the native host, made on first use; `None` if there is no Metal device (the call
 /// is then ignored, as when there is no host GPU on Windows).
 pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
-    let mut guard = lock();
+    with_title_kind(Metric::HoldOther, f)
+}
+
+fn with_title_kind<R>(kind: Metric, f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
+    let mut guard = lock().kind(kind);
     if guard.is_none() {
         if FAILED.load(Ordering::Relaxed) {
             return None;
@@ -108,7 +152,8 @@ fn start_timer() {
         .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                if let Some(t) = lock().as_mut() {
+                if let Some(t) = lock().kind(Metric::HoldTimer).as_mut() {
+                    frame_time::count(Metric::TimerTicks, 1);
                     refresh(&mut t.0);
                 }
             }
@@ -124,7 +169,7 @@ fn refresh(t: &mut MetalTitle) {
             let stuck = t.stuck(std::time::Duration::from_secs(2));
             if !stuck.is_empty() {
                 *last = Some(std::time::Instant::now());
-                tracing::warn!("work held for a wait that does not hold: {stuck:?}");
+                tracing::warn!("pending queue work or incomplete fence: {stuck:?}");
                 // What a held queue or a fence waits for may be owed by a command buffer the GPU
                 // lost (out of memory): those are paid from the CPU so the title goes on.
                 let lost = victory_metal::gfx::recover_lost();
@@ -162,7 +207,7 @@ pub(crate) fn with_list<R>(
     if this.is_null() {
         return None;
     }
-    with_title(|t| {
+    with_title_kind(Metric::HoldList, |t| {
         let list = crate::list::native(this);
         let mut list = list.lock().unwrap_or_else(|e| e.into_inner());
         f(t, &mut list)
@@ -173,13 +218,16 @@ pub(crate) fn with_list<R>(
 
 /// `ExecuteCommandLists`.
 pub(crate) fn submit(queue: This, lists: &[This]) {
+    frame_time::count(Metric::Submits, 1);
     if env_set!("VICTORY_TRACE_WRITES") {
         tracing::warn!("submit to queue {queue:p}: lists {lists:?}");
     }
     // One submission at a time, in the order they came: the lock below is let go while the
     // textures are read, and the next submission must not overtake this one meanwhile.
     static ORDER: Mutex<()> = Mutex::new(());
+    let order_wait = Timer::new(Metric::OrderWait);
     let _order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    drop(order_wait);
     // Tests share one title and count the uploads of their own `sync_dirty` calls, which another
     // test's submission with textures read but not yet uploaded would upset: there the lock is
     // kept from the probes to the uploads (`Title::submit`).
@@ -196,7 +244,7 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
     };
     let mut named = Default::default();
     if unlocked {
-        let jobs = with_title(|t| {
+        let jobs = with_title_kind(Metric::HoldSync, |t| {
             if t.names_wanted() {
                 named = t.keep_named(segments(t).iter().map(|(l, _)| l));
             }
@@ -205,11 +253,13 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
         .unwrap_or_default();
         for batch in super::textures::batches(jobs) {
             // Without the lock: the title's other threads go on recording.
+            let prepare = Timer::new(Metric::SyncPrepare);
             let prepared = super::textures::prepare(&batch);
-            with_title(|t| t.sync_apply(prepared));
+            drop(prepare);
+            with_title_kind(Metric::HoldSync, |t| t.sync_apply(prepared));
         }
     }
-    with_title(|t| {
+    with_title_kind(Metric::HoldSubmit, |t| {
         // What the GPU drew, cleared or wrote through views is no longer filled from title
         // memory, which the title changes under its render targets (noise uploaded over them).
         let drew = std::mem::take(&mut *DREW.lock().unwrap_or_else(|e| e.into_inner()));
@@ -263,6 +313,7 @@ pub(crate) fn fence_signal(fence: This, value: u64) {
 
 /// The value fence `fence` has completed, queues pumped first.
 pub(crate) fn fence_poll(fence: This) -> u64 {
+    frame_time::count(Metric::FencePolls, 1);
     let initial = crate::fence::initial(fence);
     with_title(|t| {
         t.pump();
@@ -279,6 +330,7 @@ pub(crate) fn fence_released(fence: This) {
 /// Blocks until fence `fence` reaches `value` (the title's `SetEventOnCompletion` with no event):
 /// held work keeps moving while it waits. False after `timeout`.
 pub(crate) fn fence_wait(fence: This, value: u64, timeout: std::time::Duration) -> bool {
+    let _wait = Timer::counted(Metric::FenceWait, Metric::FenceWaits);
     let initial = crate::fence::initial(fence);
     let start = std::time::Instant::now();
     loop {
@@ -433,7 +485,25 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
                 tracing::info!(n, key = format!("{key:#x}"), w, h, format = info.format, max, mean = sum / count.max(1) as f64, lit = lit as f64 / (rgb.len() * 3).max(1) as f64, "target dumped");
                 continue;
             }
+            // 16- and 32-bit single-channel targets (depth and shadow maps among them): no image,
+            // but how much of the target differs from its first texel says whether anything was
+            // rasterised into it. Depth with stencil (DXGI 19, 20, 44 to 47) cannot be read back.
+            if let Some(bpp) = match info.format { 53..=59 => Some(2usize), 39..=43 => Some(4), _ => None } {
+                let Some(tex) = t.texture_of(*key) else { continue };
+                let mut raw = vec![0u8; w * h * bpp];
+                victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
+                let first = raw[..bpp].to_vec();
+                let differ = raw.chunks_exact(bpp).filter(|p| *p != first.as_slice()).count();
+                let distinct = raw.chunks_exact(bpp).step_by(7).collect::<std::collections::HashSet<_>>().len();
+                let grey = |p: &[u8]| if bpp == 2 { p[1] } else { (f32::from_le_bytes([p[0], p[1], p[2], p[3]]).clamp(0.0, 1.0) * 255.0) as u8 };
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                out.extend(raw.chunks_exact(bpp).flat_map(|p| [grey(p); 3]));
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_single{}.ppm", info.memory as usize, info.format)), out);
+                tracing::info!(n, key = format!("{key:#x}"), w, h, format = info.format, first = format!("{first:02x?}"), differ = differ as f64 / (w * h).max(1) as f64, distinct, "single-channel target dumped");
+                continue;
+            }
             if !matches!(info.format, 28 | 87 | 91 | 29) {
+                tracing::info!(n, key = format!("{key:#x}"), w, h, format = info.format, draws = ?stats.get(key), "target not dumped (format not read back)");
                 continue;
             }
             let Some(tex) = t.texture_of(*key) else { continue };
@@ -477,7 +547,7 @@ fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
 
 /// A texture operation the native host does not do (copies, resolves), counted by the trace.
 pub(crate) fn dropped_op(what: &str, dst: This, src: This) {
-    crate::list::DROPPED_KINDS[3].fetch_add(1, Ordering::Relaxed);
+    TEXTURE_COPIES_DROPPED.fetch_add(1, Ordering::Relaxed);
     warn_once("a texture copy or resolve");
     // Once per operation and title formats (0: a buffer or not a texture), so a refused kind of
     // copy shows what it was.
@@ -591,7 +661,7 @@ fn trace_record_writers() {
 }
 
 #[inline(never)]
-fn trace_present(resource: This) {
+fn trace_present(resource: This, planes: &[This]) {
         let stats = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let ops = std::mem::take(&mut *DROPPED_OPS.lock().unwrap_or_else(|e| e.into_inner()));
         let reasons = std::mem::take(&mut *DROP_REASONS.lock().unwrap_or_else(|e| e.into_inner()));
@@ -618,6 +688,7 @@ fn trace_present(resource: This) {
         let pi = crate::resource::texture_info(resource);
         tracing::info!(
             present = ?resource,
+            ?planes,
             at = pi.as_ref().map_or(0, |i| i.memory as usize),
             fmt = pi.as_ref().map_or(0, |i| i.format),
             targets = ?described,
@@ -671,6 +742,7 @@ fn trace_present_draw(t: &MetalTitle, l: &MetalList) {
 /// others (`Title::present`). The traces name the first.
 pub(crate) fn present(queue: This, planes: &[This]) {
     let Some(&resource) = planes.first() else { return };
+    let present = Timer::new(Metric::Present);
     if present_every().is_some() {
         let mut shown = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
         for &p in planes {
@@ -688,11 +760,12 @@ pub(crate) fn present(queue: This, planes: &[This]) {
     if ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
+    flow_present();
     if tracing_record_writers() {
         trace_record_writers();
     }
     if tracing_targets() {
-        trace_present(resource);
+        trace_present(resource, planes);
     }
     pass_present(resource);
     let shown = with_title(|t| {
@@ -707,6 +780,8 @@ pub(crate) fn present(queue: This, planes: &[This]) {
         }
         _ => {}
     }
+    drop(present);
+    frame_time::report();
 }
 
 /// Frames presented to the layer so far.
@@ -737,6 +812,7 @@ pub(crate) fn pipeline_released(pipeline: This) {
     let key = pipeline as usize;
     with_title(|t| {
         t.pipelines.remove(&key);
+        t.rect_pipes.retain(|(k, _), _| *k != key);
         t.console_pipes.retain(|(k, _), _| *k != key);
         t.thread_pipes.remove(&key);
     });
@@ -790,6 +866,57 @@ pub(crate) fn targets(this: This, color: &[u64], depth: u64) {
             l.targets.depth = None;
         }
         l.list.set_render_targets(&color, depth.as_ref().filter(|_| !drop_depth));
+    });
+}
+
+/// `ClearUnorderedAccessViewUint` / `...Float` of the view at descriptor slot `cpu` (ignored on
+/// the native host before): a texture view's level is cleared as a render pass's load action
+/// does, if the texture is also a render target; a depth texture's on the plane of its
+/// writable twin the view names; a buffer view is filled, when the value is one byte repeated
+/// (what a fill can write). Grand Theft Auto VI was not seen calling these in its first world
+/// frames (2026-11-27), so this is exercised by the GPU test only.
+/// shortcut: the whole view, whatever the rectangles; slice 0 of an array; a texture that is
+/// unordered access alone is not cleared (`NativeHost::unordered_clear_target`).
+pub(crate) fn clear_unordered(this: This, cpu: u64, values: [u32; 4], float: bool) {
+    let Some(view) = crate::descriptor::view(cpu) else {
+        warn_once("an unordered access clear of a slot without a view");
+        return;
+    };
+    with_list(this, |t, l| {
+        // The texture the view names is realized first (the host only knows realized ones).
+        if let crate::descriptor::View::Unordered(r, ..) = &view
+            && crate::resource::is_resource(*r as This)
+            && crate::resource::texture_info(*r as This).is_some()
+        {
+            let _ = t.texture_of(*r);
+        }
+        let Some((target, format, size)) = t.host.unordered_clear_target(&view) else {
+            warn_once("an unordered access clear of a view the host cannot make");
+            return;
+        };
+        if tracing_targets() {
+            static SEEN: Mutex<Vec<(String, [u32; 4], bool)>> = Mutex::new(Vec::new());
+            let what = format!("{format} {size:?}");
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 96 && !seen.contains(&(what.clone(), values, float)) {
+                tracing::info!(what, values = format!("{values:08x?}"), float, "unordered access clear (first with these values)");
+                seen.push((what, values, float));
+            }
+        }
+        match target {
+            super::host::ClearTarget::Texture(texture) => {
+                let color = if float { values.map(f32::from_bits) } else { values.map(|v| v as f32) };
+                l.list.clear_render_target(&texture, color);
+            }
+            super::host::ClearTarget::Buffer(addr, len) => {
+                let bytes = values[0].to_le_bytes();
+                if bytes.iter().all(|&b| b == bytes[0]) {
+                    l.list.fill(addr, len, bytes[0]);
+                } else {
+                    warn_once("an unordered access clear of a buffer to a value that is not one byte repeated: not done");
+                }
+            }
+        }
     });
 }
 
@@ -904,30 +1031,29 @@ fn heap_of(t: &mut MetalTitle, handle: u64) -> Option<(Rc<super::list::NativeHea
     }
 }
 
-/// The title wrote a view at `handle` (the call `descriptor::mirror` is on Windows).
-pub(crate) fn mirror(handle: u64) {
+/// The title created a view (`placement`) or copied an existing descriptor to `handle`.
+pub(crate) fn mirror(handle: u64, placement: bool) {
+    let _mirror = Timer::counted(Metric::DeviceMirror, Metric::DeviceMirrors);
     with_title(|t| {
         match crate::descriptor::view(handle) {
             // A texture the title placed in its own memory has no resource object: the host
-            // makes one the first time a view names it.
+            // reuses a GPU-written object's texture there, or makes one at the first view.
             Some(crate::descriptor::View::Placed(_, res, d)) if res[0] > 1 => {
                 let address = u64::from(d[10]) | u64::from(d[11]) << 32;
                 let key = super::textures::placed_key(address, &res);
-                if !t.host.knows(key)
+                if (placement || !t.host.knows(key))
                     && let Some(info) = crate::resource::placed_info(address, &res)
                     && let Some((pool, _)) = t.host.memory().resolve(address, 1)
                 {
-                    t.texture_placed(address, key, pool.id, info.size);
-                    if !t.alias_placed(address, key, &info) {
-                        t.texture_created(key, info);
-                        t.realize(key);
-                    }
+    let _realize = Timer::new(Metric::Realize);
+                    t.placed_view(address, key, pool.id, info, placement);
                 }
             }
             // A view of a texture object that no list has used yet.
             Some(
                 crate::descriptor::View::Shader(r, _) | crate::descriptor::View::Unordered(r, ..),
             ) => {
+                let _realize = Timer::new(Metric::Realize);
                 t.realize(r);
             }
             _ => {}
@@ -949,12 +1075,15 @@ pub(crate) fn set_pipeline(this: This, pipeline: This) {
 
 /// The host pipeline of title pipeline `key` for a draw into `targets`, made at first use. A
 /// console pipeline's state names no target formats, so it is made again for each set of targets.
-fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> {
-    if let Some(p) = t.pipelines.get(&key) {
+fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats, rect: bool) -> Pipe<Metal> {
+    if rect && let Some(p) = t.rect_pipes.get(&(key, targets.clone())) {
+        return p.clone();
+    }
+    if !rect && let Some(p) = t.pipelines.get(&key) {
         return p.clone();
     }
     let console_key = (key, targets.clone());
-    if let Some(p) = t.console_pipes.get(&console_key) {
+    if !rect && let Some(p) = t.console_pipes.get(&console_key) {
         return p.clone();
     }
     // A cold first world frame binds ~1,300 pipelines; translating them all here holds the frame
@@ -979,11 +1108,13 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
     // A pipeline Metal is still compiling when the budget ends is put off the same way.
     t.compile_wait = compile_wait(t);
     let put_off = t.shaders.put_off;
-    let (made, console) = make_pipe(t, key, targets);
+    let (made, console) = make_pipe(t, key, targets, rect);
     if t.shaders.put_off != put_off {
         return made;
     }
-    if console {
+    if rect {
+        t.rect_pipes.insert(console_key, made.clone());
+    } else if console {
         t.console_pipes.insert(console_key, made.clone());
     } else {
         t.pipelines.insert(key, made.clone());
@@ -1360,6 +1491,7 @@ pub(crate) fn warn_once(what: &'static str) {
 /// Draws the title recorded, and those that went on to the host list.
 static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ENCODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(super) static TEXTURE_COPIES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Presents whose resource had no host texture.
 static NO_TEXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1374,17 +1506,21 @@ pub(crate) fn draw_counts() -> (u64, u64, u64, u64) {
     )
 }
 
+
 /// The frame log's line of native draw counters, and the commands dropped by kind (kept out of
 /// `PresentX`, whose frame it would otherwise enlarge).
 #[inline(never)]
 pub(crate) fn log_draw_counts(frame: u64) {
     let (recorded, encoded, no_pipeline, no_texture) = draw_counts();
-    let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
+    let [mesh, mesh_indirect] = MESH_DROPPED.each_ref().map(|c| c.load(Ordering::Relaxed));
     let copies_recorded = COPIES[0].load(Ordering::Relaxed);
+    let copies = TEXTURE_COPIES_DROPPED.load(Ordering::Relaxed);
+    let [mesh_drawn, mesh_refused_over_limit, mesh_refused_conversion, mesh_refused_no_pipeline] = MESH_COUNTS.each_ref().map(|c| c.load(Ordering::Relaxed));
     let indirect = crate::list::indirect_dropped();
-    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps], metal_mb) = with_title(|t| {
+    let bvh_builder_skipped = BVH_BUILDER_SKIPPED.load(Ordering::Relaxed);
+    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, twin_copies], metal_mb) = with_title(|t| {
         let h = &t.host;
-        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64], victory_backend::backend::ComputeBackend::allocated_bytes(&h.backend) >> 20)
+        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64, h.twin_copies()], victory_backend::backend::ComputeBackend::allocated_bytes(&h.backend) >> 20)
     })
     .unwrap_or_default();
     // Where the memory is when command buffers stall (#79): Metal's own count and the process footprint.
@@ -1392,12 +1528,16 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let footprint_mb = victory_platform::mem::footprint() >> 20;
     #[cfg(not(target_os = "macos"))]
     let footprint_mb = 0usize;
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, metal_mb, footprint_mb, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, mesh_drawn, mesh_refused_over_limit, mesh_refused_conversion, mesh_refused_no_pipeline, bvh_builder_skipped, twin_copies, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, metal_mb, footprint_mb, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
     if let Some(n) = super::host::heap_set_trace()
         && let Some([all, idle, never]) = with_title(|t| t.host.heap_set_report(n)).flatten()
     {
         let mb = |b: u64| b >> 20;
         tracing::info!(frame, idle_frames = n, textures = all.0, textures_mb = mb(all.1), buffers = all.2, buffers_mb = mb(all.3), idle_textures = idle.0, idle_textures_mb = mb(idle.1), idle_buffers = idle.2, idle_buffers_mb = mb(idle.3), never_textures = never.0, never_textures_mb = mb(never.1), never_buffers = never.2, never_buffers_mb = mb(never.3), "heap set: allocations (once over all heaps) no bound table named for that many frames (idle), or ever (never)");
+    }
+    if dropped_unmapped > 0 && env_set!("VICTORY_TRACE_TARGETS") {
+        let (kinds, top) = with_title(|t| t.host.unmapped_kinds(12)).unwrap_or_default();
+        tracing::info!(frame, kinds, ?top, "commands dropped at unmapped title memory so far, by kind");
     }
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *TRACE.get_or_init(|| std::env::var_os("VICTORY_TRACE_SHADER_CACHE").is_some_and(|v| !v.is_empty() && v != "0")) {
@@ -1413,9 +1553,22 @@ pub(crate) fn log_draw_counts(frame: u64) {
     super::descriptor_trace::log(frame);
 }
 
+/// `VICTORY_DEBUG_DEPTH_ALWAYS=<hash>[+w],...`: pipelines with a stage of one of these hashes
+/// draw with the depth test ALWAYS (`+w`: and write depth), to tell a depth test that fails from
+/// a pixel shader that writes nothing. `Some(write)` for such a pipeline.
+fn debug_depth_always(stages: &[(&'static str, std::sync::Arc<crate::pipeline::Shader>)]) -> Option<bool> {
+    static LIST: OnceLock<Vec<(String, bool)>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_DEBUG_DEPTH_ALWAYS")
+            .map(|v| v.split(',').filter(|h| !h.is_empty()).map(|h| (h.trim_end_matches("+w").to_owned(), h.ends_with("+w"))).collect())
+            .unwrap_or_default()
+    });
+    stages.iter().find_map(|(_, sh)| list.iter().find(|(h, _)| sh.hash.ends_with(h.as_str())).map(|&(_, w)| w))
+}
+
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
 /// The second result says the pipeline depends on the draw's targets.
-fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<Metal>, bool) {
+fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats, rect: bool) -> (Pipe<Metal>, bool) {
     let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
         return (Pipe::Refused, false);
     };
@@ -1430,8 +1583,11 @@ fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<M
     if console && env_set!("VICTORY_TRACE_BIND") {
         tracing::info!(pipeline = key, ?targets, state = ?graphics.as_ref().map(|g| &g.0), "console pipeline state at its draw");
     }
-    let graphics = graphics.map(|g| g.0);
-    (make_host_pipe(t, stages, graphics), console)
+    let mut graphics = graphics.map(|g| g.0);
+    if let (Some(g), Some(write)) = (graphics.as_mut(), debug_depth_always(&stages)) {
+        g.debug_depth_always(write);
+    }
+    (make_host_pipe(t, stages, graphics, rect), console)
 }
 
 /// The host pipeline of compute pipeline `key` for dispatches of thread counts, made at first
@@ -1467,7 +1623,8 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
 fn make_host_pipe(
     t: &mut MetalTitle,
     stages: Vec<(&'static str, Arc<crate::pipeline::Shader>)>,
-    graphics: Option<super::state::Graphics>,
+    graphics: Option<Graphics>,
+    rect: bool,
 ) -> Pipe<Metal> {
     if stages.is_empty() && graphics.as_ref().is_some_and(|g| g.is_guessed()) {
         return Pipe::Skipped;
@@ -1477,12 +1634,36 @@ fn make_host_pipe(
         .map(|(stage, s)| format!("{stage} {}", s.hash))
         .collect::<Vec<_>>()
         .join(" ");
+    if let Some((_, mesh)) = stages.iter().find(|s| s.0 == "mesh") {
+        if stages.iter().any(|s| !matches!(s.0, "mesh" | "pixel")) {
+            t.refused_translation(&name, "console amplification/other stages are not translated".into());
+            return Pipe::MeshRefused(super::title::MeshRefusal::ConversionFailed);
+        }
+        let pixel = stages.iter().find(|s| s.0 == "pixel").map(|s| s.1.as_ref());
+        return match (graphics.as_ref(), mesh.native_linked(pixel)) {
+            // Use the source mesh identity for the once-per-shader output-limit warning,
+            // regardless of the stream's stage order or which pixel shader it pairs with.
+            (Some(g), Ok((ms, ps))) => t.render_pipe(&ms, ps.as_deref(), g, &format!("mesh {}", mesh.hash)),
+            (_, Err(e)) => {
+                t.refused_translation(&name, e);
+                Pipe::MeshRefused(super::title::MeshRefusal::ConversionFailed)
+            }
+            _ => Pipe::MeshRefused(super::title::MeshRefusal::NoPipeline),
+        };
+    }
     // A pixel shader drawing into integer targets is translated for them (Metal refuses a float
     // output for an integer attachment).
     let integer = graphics.as_ref().and_then(|g| g.color_formats().ok()).map_or(0, |c| super::shaders::integer_targets(&c));
     let mut hosts = Vec::new();
     for (stage, shader) in &stages {
-        let made = shader.native().map(Arc::clone).map_err(str::to_owned);
+        let rectangle = rect && *stage == "vertex" && graphics.as_ref().is_some_and(|g| !g.is_guessed());
+        if rectangle && frame_left().is_zero() && !shader.rect_ready() {
+            let shader = shader.clone();
+            put_off(format!("{} rect", shader.hash), move || { let _ = shader.native_rect(); });
+            t.shaders.put_off += 1;
+            return Pipe::Refused;
+        }
+        let made = (if rectangle { shader.native_rect() } else { shader.native() }).map(Arc::clone).map_err(str::to_owned);
         let made = match made {
             Ok(_) if *stage == "pixel" && integer != 0 => {
                 if frame_left().is_zero() && !shader.targets_cached(integer) {
@@ -1547,6 +1728,52 @@ pub fn install_compute_pipeline(key: usize, dxil: &[u8], threads: [usize; 3]) ->
     .unwrap_or_else(|| Err("no native host GPU".into()))
 }
 
+/// Requested dispatches suppressed by the builder policy; indirect counts are the maximum
+/// records requested, since the count buffer belongs to the GPU and is never read on the CPU.
+static BVH_BUILDER_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn skip_builder_dispatches(pipeline: usize, count: u32) -> bool {
+    if crate::pipeline::is_builder(pipeline as This) && !super::shaders::builder_runs() {
+        BVH_BUILDER_SKIPPED.fetch_add(u64::from(count), Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+
+/// Debugging, `VICTORY_DEBUG_FILL_INPUT=<shader hash>:<root slot>.<entry>:<byte>`: each time a
+/// compute shader with that hash is dispatched, level 0 of the texture its table at that root
+/// slot shows at that entry is filled with the byte, from the CPU, at once (not ordered with
+/// the GPU's work: for a texture nothing else writes). Stands in for a pass the host does not
+/// run yet: `5741294cf872ffb9:0.95:255` gives the tiled lighting a sun shadow mask of "lit
+/// everywhere" where the tiled cascade shadow shaders that write it are refused.
+fn debug_fill_input(t: &mut MetalTitle, l: &MetalList) {
+    static SPEC: OnceLock<Option<(String, usize, usize, u8)>> = OnceLock::new();
+    let Some((hash, slot, entry, byte)) = SPEC.get_or_init(|| {
+        let v = std::env::var("VICTORY_DEBUG_FILL_INPUT").ok()?;
+        let mut parts = v.split(':');
+        let (hash, at, byte) = (parts.next()?, parts.next()?, parts.next()?);
+        let (slot, entry) = at.split_once('.')?;
+        Some((hash.to_owned(), slot.parse().ok()?, entry.parse().ok()?, byte.parse().ok()?))
+    }) else {
+        return;
+    };
+    if !stage_hashes(l.pipeline).iter().any(|s| s.ends_with(hash.as_str())) {
+        return;
+    }
+    let Some(key) = t.host.table_texture(l.list.compute_args(), *slot, *entry) else { return };
+    if !crate::resource::is_resource(key as This) {
+        return;
+    }
+    let Some(info) = crate::resource::texture_info(key as This) else { return };
+    let (Some((bytes, 1)), Some(tex)) = (crate::resource::element(info.format), t.texture_of(key)) else { return };
+    let (w, h) = (info.width as usize, info.height as usize);
+    let row = w * bytes as usize;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!(shader = hash, slot, entry, byte, format = info.format, w, h, "VICTORY_DEBUG_FILL_INPUT: a compute shader's input texture is filled before each of its dispatches"));
+    victory_backend::resources::ResourceBackend::upload_texture(&t.host.backend, &tex, 0, 0, &vec![*byte; row * h], row, row * h);
+}
+
 #[cfg(test)]
 pub(crate) fn install_test_render_pipeline(
     key: usize,
@@ -1558,26 +1785,964 @@ pub(crate) fn install_test_render_pipeline(
 }
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
-    with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
-        Pipe::Compute(pso) => {
-            trace_record_dispatch(t, l, "ran");
-            if pass_on() {
-                pass_note(t, l, &format!("dispatch[{x},{y},{z}]"), "ran", true, 1);
+    with_list(this, |t, l| {
+        if skip_builder_dispatches(l.pipeline, 1) {
+            flow_snap_compute_missed(l, "dropped (builder policy)");
+            return;
+        }
+        match pipe(t, l.pipeline, &TargetFormats::default(), false) {
+            Pipe::Compute(pso) => {
+                trace_record_dispatch(t, l, "ran");
+                if pass_on() {
+                    pass_note(t, l, &format!("dispatch[{x},{y},{z}]"), "ran", true, 1);
+                }
+                trace_flow_compute(t, l, pso.binding.as_ref().map(|b| b.table_entries.as_slice()), "encoded", &format!("groups [{x}, {y}, {z}]"), None);
+                debug_fill_input(t, l);
+                l.list.set_compute_pipeline(&pso);
+                if let Err(e) = flow_snap_compute(t, l, pso.binding.as_ref().map(|b| b.table_entries.as_slice()), ![x, y, z].contains(&0), |l| l.list.dispatch(x, y, z)) {
+                    tracing::warn!(error = %e, "dispatch");
+                }
             }
-            l.list.set_compute_pipeline(&pso);
-            if let Err(e) = l.list.dispatch(x, y, z) {
-                tracing::warn!(error = %e, "dispatch");
+            p => {
+                flow_snap_compute_missed(l, if matches!(p, Pipe::Refused) { "refused" } else { "dropped" });
+                dropped_dispatch(t, l, &format!("groups [{x}, {y}, {z}]"), None);
             }
         }
-        _ => dropped_dispatch(t, l, &format!("groups [{x}, {y}, {z}]")),
     });
+}
+
+/// Encoded mesh dispatches and refused dispatches (over limit, conversion, no pipeline).
+static MESH_COUNTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Refused direct and indirect mesh dispatches, alongside their detailed reasons.
+pub(crate) static MESH_DROPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub(crate) fn refuse_mesh(reason: super::title::MeshRefusal, indirect: bool) {
+    MESH_DROPPED[usize::from(indirect)].fetch_add(1, Ordering::Relaxed);
+    use super::title::MeshRefusal::*;
+    let i = match reason { OverLimit => 1, ConversionFailed => 2, NoPipeline => 3 };
+    MESH_COUNTS[i].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Mesh work uses graphics root arguments and targets, with counts kept on the GPU for indirect work.
+pub(crate) fn dispatch_mesh(this: This, groups: [u32; 3], record: Option<u64>) {
+    dispatch_mesh_from(this, groups, record, None);
+}
+
+/// `VICTORY_TRACE_MESH_COUNTS=1`: what the mesh dispatches ask for, read from title memory when
+/// they are recorded: the thread-group counts of each record and the value of its count buffer.
+/// The GPU writes both (culling), so these are the values of the frame before; a tally every
+/// 20,000 dispatches says how many ask for no groups at all, and the first 24 are listed.
+fn trace_mesh_counts(groups: [u32; 3], record: Option<u64>, count: Option<(u64, u32)>) {
+    use std::sync::atomic::AtomicU64;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| env_set!("VICTORY_TRACE_MESH_COUNTS")) {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    static EMPTY: AtomicU64 = AtomicU64::new(0);
+    static PAST_COUNT: AtomicU64 = AtomicU64::new(0);
+    static UNREAD: AtomicU64 = AtomicU64::new(0);
+    static GROUPS: AtomicU64 = AtomicU64::new(0);
+    let read3 = |at: u64| {
+        let mut b = [0u8; 12];
+        super::safe_read(at as *const u8, &mut b).then(|| [0, 4, 8].map(|i| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])))
+    };
+    let asked = match record { Some(at) => read3(at), None => Some(groups) };
+    let limit = count.and_then(|(at, _)| {
+        let mut b = [0u8; 4];
+        super::safe_read(at as *const u8, &mut b).then(|| u32::from_le_bytes(b))
+    });
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    match asked {
+        None => drop(UNREAD.fetch_add(1, Ordering::Relaxed)),
+        Some(g) if g.contains(&0) => drop(EMPTY.fetch_add(1, Ordering::Relaxed)),
+        Some(g) => drop(GROUPS.fetch_add(g.iter().map(|&x| u64::from(x)).product(), Ordering::Relaxed)),
+    }
+    if let (Some((_, index)), Some(limit)) = (count, limit) && index >= limit {
+        PAST_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    if n <= 24 {
+        tracing::info!(n, ?asked, record = record.map(|r| format!("{r:#x}")), count_value = ?limit, index = count.map(|c| c.1), "mesh dispatch asked");
+    }
+    if n % 20_000 == 0 {
+        tracing::info!(
+            dispatches = n,
+            no_groups = EMPTY.load(Ordering::Relaxed),
+            past_count = PAST_COUNT.load(Ordering::Relaxed),
+            unread = UNREAD.load(Ordering::Relaxed),
+            groups = GROUPS.load(Ordering::Relaxed),
+            "mesh dispatches so far (values of the frame before)"
+        );
+    }
+}
+
+fn dispatch_mesh_from(this: This, groups: [u32; 3], record: Option<u64>, count: Option<(u64, u32)>) {
+    RECORDED.fetch_add(1, Ordering::Relaxed);
+    trace_mesh_counts(groups, record, count);
+    with_list(this, |t, l| {
+        use super::title::MeshRefusal;
+        let targets = l.targets.clone();
+        // A described mesh stage (a stream pipeline) is made by `pipe`; a guessed pipeline whose
+        // vertex program exports primitives is made for this dispatch's targets by `guess`.
+        // Both are mesh pipelines of the host: `Pipe::Render` with a mesh thread-group size.
+        let made = match pipe(t, l.pipeline, &targets, false) {
+            Pipe::Guess(g) if l.targets_ready => guess(t, l, &g, false),
+            p => p,
+        };
+        let failure = match made {
+            Pipe::Render(pso, binding) if l.targets_ready && pso.mesh_threads().is_some() => {
+                // A mesh shader declares its own topology and ignores the list's.
+                l.list.set_graphics_pipeline(&pso, victory_backend::resources::Topology::Triangles);
+                l.list.set_graphics_binding(binding);
+                if pass_on() {
+                    pass_note(t, l, &format!("mesh{groups:?} record={record:?}"), "ran", false, 1);
+                }
+                let [x, y, z] = groups;
+                let result = match record {
+                    Some(record) => l.list.dispatch_mesh_indirect(record, count),
+                    None => l.list.dispatch_mesh(x, y, z),
+                };
+                match result {
+                    Ok(()) => {
+                        ENCODED.fetch_add(1, Ordering::Relaxed);
+                        MESH_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+                        l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                        trace_present_draw(t, l);
+                        return;
+                    }
+                    Err(e) => tracing::warn!(error = %e, "mesh dispatch"),
+                }
+                MeshRefusal::NoPipeline
+            }
+            Pipe::MeshRefused(r) => r,
+            Pipe::Skipped => {
+                warn_once("a mesh dispatch whose guessed 0x1c8 stage registers are undecoded");
+                MeshRefusal::NoPipeline
+            }
+            _ => MeshRefusal::NoPipeline,
+        };
+        // The frame trace's "dropped" of the targets this dispatch would have drawn into.
+        if pass_on() {
+            pass_note(t, l, "mesh", &format!("refused {failure:?}"), false, 1);
+        }
+        trace_drop(l);
+        refuse_mesh(failure, record.is_some());
+    });
+}
+
+/// `VICTORY_TRACE_FLOW=<seconds>[,<frames>]`: every compute dispatch and indirect mesh execution
+/// recorded in `frames` (default 2) presents, from the first present `seconds` after the first
+/// one on: its shaders, whether it was encoded or dropped, its group counts or the address and
+/// values of its indirect record (read from title memory as it is when recorded), and the views
+/// its root parameters name (`NativeHost::root_views`). The lines are "flow: ..." in recording
+/// order, so what writes the buffers a later dispatch reads can be followed through a frame.
+fn flow_capturing() -> bool {
+    FLOW_ON.load(Ordering::Relaxed)
+}
+
+static FLOW_ON: AtomicBool = AtomicBool::new(false);
+/// The indirect records the capture saw, to be read again once the GPU has run the frame
+/// (`flow_late`): sequence number, whether a mesh execution's, address.
+static FLOW_RECORDS: Mutex<Vec<(u32, bool, u64)>> = Mutex::new(Vec::new());
+static FLOW_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The R32_FLOAT textures the captured compute work names (depth pyramids among them), read
+/// back with the late records.
+static FLOW_TEXTURES: Mutex<Vec<FlowTexture>> = Mutex::new(Vec::new());
+
+/// Keep the view's level-0 extent and address: placed keys have no resource object to query later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FlowTexture {
+    key: usize,
+    address: u64,
+    format: u32,
+    width: usize,
+    height: usize,
+    depth: usize,
+    dim: victory_backend::resources::TexDim,
+}
+
+/// Both `sN.M tex 0x...` and `uN.M placed tex 0x...` from `NativeHost::root_views`.
+fn flow_texture_view(view: &str) -> Option<(&str, FlowTexture)> {
+    let (head, rest) = view.split_once(" tex 0x")?;
+    let name = head.strip_suffix(" placed").unwrap_or(head);
+    let (slot, entry) = name.strip_prefix(['s', 'u'])?.split_once('.')?;
+    slot.parse::<usize>().ok()?;
+    entry.parse::<usize>().ok()?;
+    let (key, rest) = rest.split_once(" at 0x")?;
+    let (address, rest) = rest.split_once(" fmt ")?;
+    let (format, rest) = rest.split_once(' ')?;
+    let (size, mip) = rest.split_once(" mip ")?;
+    let (width, height) = size.split_once('x')?;
+    mip.parse::<usize>().ok()?;
+    Some((name, FlowTexture {
+        key: usize::from_str_radix(key, 16).ok()?,
+        address: u64::from_str_radix(address, 16).ok()?,
+        format: format.parse().ok()?,
+        width: width.parse().ok()?,
+        height: height.parse().ok()?,
+        depth: 1,
+        dim: victory_backend::resources::TexDim::D2,
+    }))
+}
+
+fn flow_resource_texture(key: usize) -> Option<FlowTexture> {
+    // `texture_info` dereferences an object; a placed key must never reach it.
+    let info = crate::resource::is_resource(key as This).then(|| crate::resource::texture_info(key as This)).flatten()?;
+    let desc = info.desc()?;
+    Some(FlowTexture {
+        key, address: info.memory as u64, format: info.format, width: desc.width, height: desc.height,
+        depth: if desc.dim == victory_backend::resources::TexDim::D3 { desc.depth_or_layers } else { 1 },
+        dim: desc.dim,
+    })
+}
+
+/// Canonical DXGI numbers for placed keys, whose format comes from `Title::format_of`.
+fn flow_dxgi_format(format: victory_backend::resources::Format) -> u32 {
+    use victory_backend::resources::Format::*;
+    match format {
+        Rgba8Unorm => 28,
+        Rgba8UnormSrgb => 29,
+        Bgra8Unorm => 87,
+        Bgra8UnormSrgb => 91,
+        Rgba16Float => 10,
+        R32Float => 41,
+        D32Float => 40,
+        D32FloatS8 => 20,
+        Bc1 => 71,
+        Bc2 => 74,
+        Bc3 => 77,
+        Bc4 => 80,
+        Bc5 => 83,
+        Bc6h => 95,
+        Bc7 => 98,
+        R8Unorm => 61,
+        A8Unorm => 65,
+        R16Unorm => 56,
+        Rgba32Float => 2,
+        Rg32Float => 16,
+        Rgb10a2Unorm => 24,
+        Rg11b10Float => 26,
+        Rgba8Uint => 30,
+        Rg16Float => 34,
+        Rg16Unorm => 35,
+        R32Uint => 42,
+        R8Uint => 62,
+        Rgb9e5Float => 67,
+        Bc7Srgb => 99,
+        Rgba32Uint => 3,
+        Rgba16Unorm => 11,
+        Rgba16Snorm => 13,
+        Rg32Uint => 17,
+        Rg16Uint => 36,
+        Rg8Unorm => 49,
+        Rg8Uint => 50,
+        Rg8Snorm => 51,
+        R16Float => 54,
+        R16Uint => 57,
+        D16Unorm => 55,
+        Bc1Srgb => 72,
+        Bc3Srgb => 78,
+        Bgr5a1Unorm => 86,
+        Abgr4Unorm => 115,
+        Bc6hSigned => 96,
+        // Formats only buffer views use have no texture statistics.
+        _ => 0,
+    }
+}
+
+/// Called after realization or registry lookup. Shared placed views keep their named format.
+fn flow_texture_info(t: &MetalTitle, named: FlowTexture) -> Option<FlowTexture> {
+    let desc = t.texture_desc(named.key)?;
+    Some(FlowTexture {
+        format: t.format_of(named.key).map_or(named.format, flow_dxgi_format),
+        width: desc.width,
+        height: desc.height,
+        depth: if desc.dim == victory_backend::resources::TexDim::D3 { desc.depth_or_layers } else { 1 },
+        dim: desc.dim,
+        ..flow_resource_texture(named.key).unwrap_or(named)
+    })
+}
+
+fn flow_note_textures(views: &[String]) {
+    let mut seen = FLOW_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, texture) in views.iter().filter_map(|v| flow_texture_view(v)) {
+        if texture.format == 41
+            && !seen.iter().any(|t| t.key == texture.key)
+            && seen.len() < 12
+        {
+            seen.push(texture);
+        }
+    }
+}
+
+/// Level 0 of each noted texture: its range, the share of texels that are 0 and that are 1 or
+/// more, and the mean of each cell of an 8 x 4 grid.
+fn flow_late_textures(after: u32) {
+    let keys = FLOW_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    with_title(|t| {
+        for named in keys {
+            let key = named.key;
+            let Some(tex) = t.texture_of(key).or_else(|| t.host.texture_at(key)) else { continue };
+            let Some(info) = flow_texture_info(t, named) else { continue };
+            let (w, h, depth) = (info.width, info.height, info.depth);
+            if info.format != 41 || flow_texels([w, h, depth]).is_none() {
+                continue;
+            }
+            let mut raw = vec![0u8; w * h * depth * 4];
+            victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * 4, w * h * 4);
+            let px: Vec<f32> = raw.chunks_exact(4).map(|p| f32::from_le_bytes([p[0], p[1], p[2], p[3]])).collect();
+            let (mut min, mut max, mut zero, mut one) = (f32::INFINITY, f32::NEG_INFINITY, 0usize, 0usize);
+            for &v in &px {
+                min = min.min(v);
+                max = max.max(v);
+                zero += usize::from(v == 0.0);
+                one += usize::from(v >= 1.0);
+            }
+            let grid: Vec<String> = (0..4)
+                .map(|gy| {
+                    (0..8)
+                        .map(|gx| {
+                            let (x0, x1, y0, y1) = (gx * w / 8, ((gx + 1) * w / 8).max(gx * w / 8 + 1), gy * h / 4, ((gy + 1) * h / 4).max(gy * h / 4 + 1));
+                            let (mut sum, mut n) = (0f64, 0u32);
+                            for z in 0..depth {
+                                for y in y0..y1.min(h) {
+                                    for x in x0..x1.min(w) {
+                                        sum += f64::from(px[(z * h + y) * w + x]);
+                                        n += 1;
+                                    }
+                                }
+                            }
+                            format!("{:.5}", sum / f64::from(n.max(1)))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            let n = (w * h * depth) as f64;
+            tracing::info!(after, key = format!("{key:#x}"), at = format!("{:#x}", info.address), w, h, depth = format!("depth {depth}"), min, max, zero = zero as f64 / n, one_or_more = one as f64 / n, ?grid, "flow: late texture");
+            // The other levels (a depth pyramid's coarse levels are what large objects are tested
+            // against): each level's range, and its texels where there are 32 or fewer.
+            let levels = crate::resource::is_resource(key as This)
+                .then(|| crate::resource::texture_info(key as This)).flatten()
+                .map_or(1, |i| i.layout.mips.len().min(12));
+            let mut ranges = Vec::new();
+            for mip in 1..levels {
+                let (mw, mh, md) = ((w >> mip).max(1), (h >> mip).max(1), (depth >> mip).max(1));
+                let mut raw = vec![0u8; mw * mh * md * 4];
+                victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, mip, 0, &mut raw, mw * 4, mw * mh * 4);
+                let px: Vec<f32> = raw.chunks_exact(4).map(|p| f32::from_le_bytes([p[0], p[1], p[2], p[3]])).collect();
+                let lo = px.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = px.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let zero = px.iter().filter(|v| **v == 0.0).count() as f64 / px.len().max(1) as f64;
+                let nan = px.iter().filter(|v| !v.is_finite()).count();
+                let texels = if px.len() <= 32 { format!(" {px:?}") } else { String::new() };
+                ranges.push(format!("mip {mip} {mw}x{mh} depth {md} min {lo} max {hi} zero {zero:.4} not_finite {nan}{texels}"));
+            }
+            if !ranges.is_empty() {
+                tracing::info!(after, key = format!("{key:#x}"), ?ranges, "flow: late texture levels");
+            }
+        }
+    });
+}
+
+/// The textures the captured draws into HDR targets name or draw into (any format), read back
+/// with the late records (`flow_late_draw_textures`).
+static FLOW_DRAW_TEXTURES: Mutex<Vec<FlowTexture>> = Mutex::new(Vec::new());
+
+/// `VICTORY_TRACE_FLOW_DUMP=<hash>,<hash>`: for these shaders, the words (at most 96) of every
+/// buffer of `limit` bytes or fewer they name, as title memory has them when the dispatch or
+/// draw is recorded (constants the title's CPU wrote).
+fn flow_buffer_words(hashes: &[String], views: &[String], limit: u64) {
+    static DUMP: OnceLock<Vec<String>> = OnceLock::new();
+    let dump = DUMP.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_FLOW_DUMP").map(|v| v.split(',').map(str::to_owned).collect()).unwrap_or_default()
+    });
+    if !hashes.iter().any(|h| dump.iter().any(|d| h.ends_with(d.as_str()))) {
+        return;
+    }
+    for v in views {
+        let mut parts = v.split(' ');
+        let (Some(name), Some(range)) = (parts.next(), parts.next()) else { continue };
+        let Some((at, len)) = range.split_once('+') else { continue };
+        let parse = |x: &str| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok();
+        let (Some(at), Some(len)) = (parse(at), parse(len)) else { continue };
+        if len == 0 || len > limit {
+            continue;
+        }
+        let mut bytes = vec![0u8; len.min(384) as usize];
+        if super::safe_read(at as *const u8, &mut bytes) {
+            let words: Vec<String> = bytes.chunks_exact(4).map(|b| format!("{:08x}", u32::from_le_bytes([b[0], b[1], b[2], b[3]]))).collect();
+            tracing::info!(shader = ?hashes, view = name, at = format!("{at:#x}"), words = words.join(" "), "flow: buffer words");
+        }
+    }
+}
+
+/// `VICTORY_TRACE_FLOW` with `VICTORY_TRACE_FLOW_DRAWS=1`: every draw the capture records into
+/// a set of targets with an HDR colour target (DXGI 10 or 26): its shaders, the call, whether
+/// it was encoded, its targets and the views its root parameters name; the pipeline's depth,
+/// stencil, cull and colour state the first time the capture meets it.
+fn trace_flow_draw(t: &MetalTitle, l: &MetalList, state: &str, how: &str) {
+    if !flow_capturing() || !env_set!("VICTORY_TRACE_FLOW_DRAWS") {
+        return;
+    }
+    let hdr = l.target_keys.iter().any(|&k| crate::resource::texture_info(k as This).is_some_and(|i| matches!(i.format, 10 | 26)));
+    if !hdr {
+        return;
+    }
+    let hashes = stage_hashes(l.pipeline);
+    let (root, binding) = l.list.graphics_args();
+    let entries: Option<Vec<(u8, usize)>> =
+        binding.map(|b| b.table_entries.iter().chain(b.ps.iter().flat_map(|ps| &ps.table_entries)).copied().collect());
+    let views = t.host.root_views(root, entries.as_deref());
+    let targets: Vec<String> = l
+        .target_keys
+        .iter()
+        .map(|&k| {
+            let i = crate::resource::texture_info(k as This);
+            let (f, w, h) = i.map_or((0, 0, 0), |i| (i.format, i.width, i.height));
+            format!("{k:#x} fmt {f} {w}x{h}")
+        })
+        .collect();
+    {
+        let mut seen = FLOW_DRAW_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let named = views.iter().filter_map(|v| flow_texture_view(v).map(|(_, t)| t));
+        for texture in l.target_keys.iter().filter_map(|&k| flow_resource_texture(k)).chain(named) {
+            if !seen.iter().any(|t| t.key == texture.key) && seen.len() < 400 {
+                seen.push(texture);
+            }
+        }
+    }
+    static STATES: Mutex<Vec<(usize, TargetFormats)>> = Mutex::new(Vec::new());
+    let id = (l.pipeline, l.targets.clone());
+    let new = {
+        let mut seen = STATES.lock().unwrap_or_else(|e| e.into_inner());
+        !seen.contains(&id) && {
+            seen.push(id);
+            true
+        }
+    };
+    let seq = flow_seq(false, None);
+    if new && let Some((_, Some(g))) = crate::pipeline::native_stages(l.pipeline as This) {
+        let described = g.names_targets();
+        let g = if described { g } else { super::console_state::graphics_state_for(&g, l.targets.color.clone(), l.targets.depth) };
+        tracing::info!(seq, pipeline = ?hashes, described, guessed = g.is_guessed(), depth = ?g.depth_test(), stencil = ?g.stencil(), cull = ?g.cull(), color = ?g.color_state(), "flow: draw pipeline state");
+    }
+    tracing::info!(seq, pipeline = ?hashes, state, how, topology = l.topology, ?targets, depth_target = ?l.targets.depth, ?views, "flow: draw");
+    // The constants of the first few draws of the shaders `VICTORY_TRACE_FLOW_DUMP` names.
+    static DUMPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if DUMPED.load(Ordering::Relaxed) < 6 {
+        let constants: Vec<String> = views.iter().filter(|v| v.starts_with('c')).cloned().collect();
+        flow_buffer_words(&hashes, &constants, 0x1000);
+        DUMPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Where in a `w` x `h` level the texels `hit` names lie: 8 rows of 14 cells, each the
+/// percentage of its texels that are hits (a tile of the title's 7 x 4 lighting tiles is two
+/// cells by two, so a half-drawn tile shows as three cells of its four).
+fn texel_grid(w: usize, h: usize, hit: impl Fn(usize) -> bool) -> Vec<String> {
+    let (cols, rows) = (14usize, 8usize);
+    let mut cells = vec![(0u32, 0u32); cols * rows];
+    for y in 0..h {
+        for x in 0..w {
+            let c = &mut cells[(y * rows / h.max(1)) * cols + x * cols / w.max(1)];
+            c.1 += 1;
+            c.0 += u32::from(hit(y * w + x));
+        }
+    }
+    cells.chunks(cols).map(|r| r.iter().map(|&(n, of)| format!("{:3}", n * 100 / of.max(1))).collect::<Vec<_>>().join("")).collect()
+}
+
+/// The eight most common values of `values`, with their counts.
+fn top_values(values: impl Iterator<Item = u64>) -> String {
+    let mut counts = std::collections::HashMap::<u64, u32>::new();
+    values.for_each(|v| *counts.entry(v).or_default() += 1);
+    let mut list: Vec<_> = counts.into_iter().collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    list.iter().take(8).map(|(v, n)| format!("{v:x}x{n}")).collect::<Vec<_>>().join(" ")
+}
+
+/// What a texture level holds, for the flow trace: the share of texels that are not zero, the
+/// bitwise OR of all texels (first 8 bytes), every texel if there are 64 or fewer, else the
+/// eight most common texels with their counts (hexadecimal, as little-endian words).
+fn texel_stats(raw: &[u8], bpp: usize) -> String {
+    let texels = raw.len() / bpp.max(1);
+    let hex = |p: &[u8]| p.iter().rev().map(|b| format!("{b:02x}")).collect::<String>();
+    let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count();
+    let mut or = [0u8; 8];
+    for p in raw.chunks_exact(bpp) {
+        p.iter().take(8).enumerate().for_each(|(i, b)| or[i] |= b);
+    }
+    let detail = if texels <= 64 {
+        format!("all [{}]", raw.chunks_exact(bpp).map(hex).collect::<Vec<_>>().join(" "))
+    } else {
+        let mut counts: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
+        for p in raw.chunks_exact(bpp) {
+            *counts.entry(p).or_default() += 1;
+        }
+        let distinct = counts.len();
+        let mut top: Vec<_> = counts.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        top.truncate(8);
+        format!("distinct {distinct} top [{}]", top.iter().map(|(p, n)| format!("{}x{n}", hex(p))).collect::<Vec<_>>().join(" "))
+    };
+    format!("nonzero {:.5} or {} {detail}", nonzero as f64 / texels.max(1) as f64, hex(&or[..bpp.min(8)]))
+}
+
+/// Level 0 of each texture the captured HDR draws name (and the compute shaders of
+/// `VICTORY_TRACE_FLOW_TEXTURES=<hash>,...`), of every depth twin plane, and of the copies
+/// `VICTORY_TRACE_FLOW_SNAP` made: [`texel_stats`], and the largest finite channel of the HDR
+/// formats (DXGI 10, 26).
+fn flow_late_draw_textures(after: u32) {
+    let keys = FLOW_DRAW_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    with_title(|t| {
+        let hdr_max = |format: u32, raw: &[u8], bpp: usize| {
+            matches!(format, 10 | 26).then(|| raw.chunks_exact(bpp).flat_map(|p| decode_hdr(format, p)).filter(|v| v.is_finite()).fold(0f32, f32::max))
+        };
+        for named in keys {
+            let key = named.key;
+            let Some(tex) = t.texture_of(key).or_else(|| t.host.texture_at(key)) else { continue };
+            let Some(info) = flow_texture_info(t, named) else { continue };
+            let (w, h, depth) = (info.width, info.height, info.depth);
+            let Some((bytes, block)) = crate::resource::element(info.format) else { continue };
+            // Depth cannot be read back this way; block formats are source art.
+            if block != 1 || matches!(info.format, 19 | 20 | 39 | 40 | 44..=47 | 53 | 55 | 118..=120) || flow_texels([w, h, depth]).is_none() {
+                continue;
+            }
+            let bpp = bytes as usize;
+            let mut raw = vec![0u8; w * h * depth * bpp];
+            victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
+            tracing::info!(after, key = format!("{key:#x}"), at = format!("{:#x}", info.address), format = info.format, w, h, depth = format!("depth {depth}"), stats = texel_stats(&raw, bpp), hdr_max = ?hdr_max(info.format, &raw, bpp), "flow: late draw texture");
+            // The title's material number is the low five bits of a G-buffer target's alpha.
+            if after == 1 && matches!(info.format, 28 | 29) && w * h > 1 << 16 {
+                tracing::info!(key = format!("{key:#x}"), format = info.format, alpha = top_values(raw.chunks_exact(4).map(|p| u64::from(p[3]))), alpha_low5 = top_values(raw.chunks_exact(4).map(|p| u64::from(p[3] & 31))), "flow: late draw texture alpha");
+            }
+            if after == 1 && depth == 1 && matches!(info.format, 10) && w * h > 1 << 16 {
+                tracing::info!(key = format!("{key:#x}"), w, h, grid = ?texel_grid(w, h, |i| raw[i * bpp..][..bpp].iter().any(|&b| b != 0)), "flow: late draw texture where not zero");
+            }
+        }
+        if after == 1 {
+            for (key, plane, tex, [w, h, bpp]) in t.host.twin_planes() {
+                if bpp == 0 || w * h > 1 << 22 {
+                    continue;
+                }
+                let info = crate::resource::is_resource(key as This).then(|| crate::resource::texture_info(key as This)).flatten();
+                let mut raw = vec![0u8; w * h * bpp];
+                victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
+                tracing::info!(key = format!("{key:#x}"), at = format!("{:#x}", info.as_ref().map_or(0, |i| i.memory as usize)), format = info.as_ref().map_or(0, |i| i.format), plane, w, h, stats = texel_stats(&raw, bpp), "flow: late twin plane");
+            }
+            // Each twin's depth texture next to its twin's depth plane, both as they are now:
+            // the texels that differ, what the depth texture holds there (with
+            // `VICTORY_DEBUG_DEPTH_ALWAYS=<hash>+w` the depth those draws rasterised), and where.
+            for (key, depth, plane, [w, h, bpp]) in t.host.twin_depths() {
+                if bpp != 4 || w * h == 0 || w * h > 1 << 22 {
+                    continue;
+                }
+                let (mut d, mut p) = (vec![0u8; w * h * 4], vec![0u8; w * h * 4]);
+                if !t.host.backend.debug_read_depth(&depth, &mut d) {
+                    continue;
+                }
+                victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &plane, 0, 0, &mut p, w * 4, w * h * 4);
+                let word = |b: &[u8], i: usize| u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+                let differ: Vec<usize> = (0..w * h).filter(|&i| word(&d, i) != word(&p, i)).collect();
+                tracing::info!(
+                    key = format!("{key:#x}"),
+                    w,
+                    h,
+                    differ = differ.len() as f64 / (w * h) as f64,
+                    depth = texel_stats(&d, 4),
+                    depth_where_differs = top_values(differ.iter().map(|&i| u64::from(word(&d, i)))),
+                    twin_where_differs = top_values(differ.iter().map(|&i| u64::from(word(&p, i)))),
+                    grid = ?texel_grid(w, h, |i| word(&d, i) != word(&p, i)),
+                    "flow: late depth texture against its twin"
+                );
+            }
+            for (seq, what, tex, format, [w, h, depth]) in std::mem::take(&mut t.flow_snaps) {
+                let Some((bytes, _)) = crate::resource::element(format) else { continue };
+                let Some(texels) = flow_texels([w, h, depth]) else { continue };
+                let bpp = bytes as usize;
+                let mut raw = vec![0u8; texels * bpp];
+                victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
+                tracing::info!(seq, what, format, w, h, depth = format!("depth {depth}"), stats = texel_stats(&raw, bpp), hdr_max = ?hdr_max(format, &raw, bpp), grid = ?(depth == 1).then(|| texel_grid(w, h, |i| raw[i * bpp..][..bpp].iter().any(|&b| b != 0))), "flow: target as the GPU had it");
+            }
+        }
+    });
+}
+
+/// `VICTORY_TRACE_FLOW_SNAP=<hash>,...`: after the 1st, 30th, 60th, 90th and 120th captured
+/// draw of a pipeline with one of these stage hashes (`VICTORY_TRACE_FLOW_SNAP_AT=<n>,<n>,...`
+/// names other draws, at most 16), a copy of its first colour target, made on the GPU where the
+/// draw is (read back after the capture: "flow: target as the GPU had it"). With pixel shader
+/// hashes the count is of those pipelines' draws alone.
+fn flow_snap_target(t: &mut MetalTitle, l: &mut MetalList) {
+    static AT: OnceLock<Vec<u32>> = OnceLock::new();
+    static DRAWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let hashes = flow_snap_hashes();
+    if hashes.is_empty() || !flow_capturing() {
+        return;
+    }
+    let stages = stage_hashes(l.pipeline);
+    if !stages.iter().any(|s| hashes.iter().any(|h| s.ends_with(h.as_str()))) {
+        return;
+    }
+    let n = DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+    let at = AT.get_or_init(|| snap_draws(std::env::var("VICTORY_TRACE_FLOW_SNAP_AT").ok().as_deref()));
+    if !at.contains(&n) {
+        return;
+    }
+    let Some(&key) = l.target_keys.first() else { return };
+    let Some(info) = crate::resource::texture_info(key as This) else { return };
+    let (Some(desc), Some(src)) = (info.desc(), t.texture_of(key)) else { return };
+    let (w, h) = (desc.width, desc.height);
+    if !flow_snap_copyable(desc.format, [w, h, 1]) { return };
+    let Ok(copy) = t.host.texture(&victory_backend::resources::TextureDesc { mips: 1, depth_or_layers: 1, render_target: false, unordered_access: false, ..desc }) else { return };
+    l.list.copy_texture_region(&src, 0, 0, [0; 3], [w, h, 1], &copy, 0, 0, [0; 3]);
+    let seq = FLOW_SEQ.load(Ordering::Relaxed);
+    t.flow_snaps.push((seq, format!("draw {n} of {stages:?}"), copy, info.format, [w, h, 1]));
+}
+
+fn flow_snap_hashes() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| std::env::var("VICTORY_TRACE_FLOW_SNAP").map(|v| v.split(',').map(str::to_owned).collect()).unwrap_or_default())
+}
+
+/// Claim a compute hash once, independently of the draw counter and `_SNAP_AT`.
+fn snap_compute_hash(stages: &[String], hashes: &[String], seen: &mut Vec<String>) -> Option<String> {
+    let hash = stages.iter().filter_map(|s| s.strip_prefix("compute "))
+        .find(|s| hashes.iter().any(|h| s.ends_with(h.as_str())))?;
+    if seen.iter().any(|s| s == hash) {
+        return None;
+    }
+    seen.push(hash.to_owned());
+    Some(hash.to_owned())
+}
+
+fn flow_snap_compute_hash(pipeline: usize) -> Option<String> {
+    if !flow_capturing() || flow_snap_hashes().is_empty() {
+        return None;
+    }
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    snap_compute_hash(&stage_hashes(pipeline), flow_snap_hashes(), &mut SEEN.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn flow_snap_compute_missed(l: &MetalList, state: &str) {
+    if let Some(hash) = flow_snap_compute_hash(l.pipeline) {
+        tracing::info!(hash, state, "flow: snapshot dispatch was not encoded");
+    }
+}
+
+/// Only table UAV textures, with repeated views of one key represented by the first name.
+fn flow_uav_textures(views: &[String]) -> Vec<(&str, FlowTexture)> {
+    let mut seen = std::collections::HashSet::new();
+    views.iter().filter_map(|v| flow_texture_view(v))
+        .filter(|(name, texture)| name.starts_with('u') && seen.insert(texture.key)).collect()
+}
+
+/// Whole mips only: never mistake a truncated readback for empty depth slices.
+fn flow_texels([w, h, depth]: [usize; 3]) -> Option<usize> {
+    w.checked_mul(h)?.checked_mul(depth).filter(|&n| n > 0 && n <= 1 << 22)
+}
+
+fn flow_snap_copyable(format: victory_backend::resources::Format, size: [usize; 3]) -> bool {
+    !format.is_depth() && format.block().0 == 1 && flow_texels(size).is_some()
+}
+
+fn flow_snap_copy(t: &mut MetalTitle, l: &mut MetalList, src: &Rc<victory_metal::gfx::Texture>, info: FlowTexture, what: String) {
+    let Some(format) = super::descriptors::format(info.format) else { return };
+    let size = [info.width, info.height, info.depth];
+    if !flow_snap_copyable(format, size) { return };
+    let desc = victory_backend::resources::TextureDesc {
+        dim: info.dim,
+        depth_or_layers: info.depth,
+        ..victory_backend::resources::TextureDesc::d2(format, info.width, info.height)
+    };
+    let Ok(copy) = t.host.texture(&desc) else { return };
+    l.list.copy_texture_region(src, 0, 0, [0; 3], size, &copy, 0, 0, [0; 3]);
+    t.flow_snaps.push((FLOW_SEQ.load(Ordering::Relaxed), what, copy, info.format, size));
+}
+
+/// Bracket the first captured dispatch of each requested compute hash, including one indirect
+/// record, with at most four level-0 UAV copies on each side. `CopyTexture` commands split the
+/// host's compute batches into separate blit / compute / blit passes, so no copy is encoded
+/// inside a compute encoder that still binds the source as a UAV.
+fn flow_snap_compute(
+    t: &mut MetalTitle,
+    l: &mut MetalList,
+    entries: Option<&[(u8, usize)]>,
+    has_work: bool,
+    encode: impl FnOnce(&mut MetalList) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(hash) = flow_snap_compute_hash(l.pipeline) else { return encode(l) };
+    if !has_work {
+        tracing::info!(hash, state = "zero groups", "flow: snapshot dispatch was not encoded");
+        return encode(l);
+    }
+    let views = t.host.root_views(l.list.compute_args(), entries);
+    let mut sources = Vec::new();
+    let textures: Vec<_> = flow_uav_textures(&views).into_iter().filter_map(|(name, named)| {
+        let src = t.texture_of(named.key).or_else(|| t.host.texture_at(named.key))?;
+        let info = flow_texture_info(t, named)?;
+        let format = super::descriptors::format(info.format)?;
+        if !flow_snap_copyable(format, [info.width, info.height, info.depth]) || sources.iter().any(|s| Rc::ptr_eq(s, &src)) {
+            return None;
+        }
+        sources.push(src.clone());
+        Some((name, info, src))
+    }).take(4).collect();
+    let start = t.flow_snaps.len();
+    for (name, info, src) in &textures {
+        flow_snap_copy(t, l, src, *info, format!("before compute {hash} {name}"));
+    }
+    let result = encode(l);
+    if let Err(error) = &result {
+        // The diagnostic copies stay ordered in the list, but are not reported as a dispatch.
+        t.flow_snaps.truncate(start);
+        tracing::info!(hash, state = "refused", %error, "flow: snapshot dispatch was not encoded");
+    } else {
+        for (name, info, src) in &textures {
+            flow_snap_copy(t, l, src, *info, format!("after compute {hash} {name}"));
+        }
+    }
+    result
+}
+
+/// The draws `VICTORY_TRACE_FLOW_SNAP` copies the target after: the numbers `list` names (from
+/// 1, at most 16 of them), or the 1st, 30th, 60th, 90th and 120th.
+fn snap_draws(list: Option<&str>) -> Vec<u32> {
+    let named: Vec<u32> =
+        list.map(|v| v.split(',').filter_map(|n| n.trim().parse().ok()).filter(|&n| n > 0).take(16).collect()).unwrap_or_default();
+    if named.is_empty() { vec![1, 30, 60, 90, 120] } else { named }
+}
+
+fn flow_seq(mesh: bool, record: Option<u64>) -> u32 {
+    let seq = FLOW_SEQ.fetch_add(1, Ordering::Relaxed);
+    if let Some(r) = record {
+        FLOW_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).push((seq, mesh, r));
+    }
+    seq
+}
+
+/// The captured records as title memory has them `after` presents after the capture ended:
+/// what the GPU wrote there, where the GPU writes them. One line per compute record, and the
+/// mesh records as counts (asking for no groups, asking for some, unreadable) with the sequence
+/// numbers of up to 400 that ask for some.
+fn flow_late(after: u32) {
+    let records = FLOW_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (mut none, mut some, mut unread, mut groups) = (0u32, Vec::new(), 0u32, 0u64);
+    let mut persistent = (0u32, 0u32);
+    for (seq, mesh, at) in records {
+        let now = flow_words(at);
+        if !mesh {
+            tracing::info!(after, seq, record = format!("{at:#x}"), ?now, "flow: late compute record");
+            continue;
+        }
+        // Records in the title's persistent buffers (the high pools here) still hold what the
+        // GPU wrote; per-frame memory may have been reused by now.
+        if at >= 0xa_0000_0000 {
+            match now {
+                Some(g) if !g.contains(&0) => persistent.1 += 1,
+                Some(_) => persistent.0 += 1,
+                None => {}
+            }
+        }
+        match now {
+            None => unread += 1,
+            Some(g) if g.contains(&0) => none += 1,
+            Some(g) => {
+                groups += g.iter().map(|&x| u64::from(x)).product::<u64>();
+                some.push((seq, g[0]));
+            }
+        }
+    }
+    some.truncate(400);
+    tracing::info!(after, none, some = some.len(), unread, persistent_none = persistent.0, persistent_some = persistent.1, groups, with_groups = ?some, "flow: late mesh records");
+}
+
+/// At a present: starts and stops the capture.
+fn flow_present() {
+    use std::sync::atomic::AtomicU32;
+    static OPTIONS: OnceLock<Option<(u64, u32)>> = OnceLock::new();
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static LEFT: AtomicU32 = AtomicU32::new(u32::MAX);
+    let Some((after, frames)) = *OPTIONS.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRACE_FLOW").ok()?;
+        let mut parts = v.split(',');
+        let after = parts.next()?.parse().ok()?;
+        Some((after, parts.next().and_then(|f| f.parse().ok()).unwrap_or(2)))
+    }) else {
+        return;
+    };
+    if START.get_or_init(std::time::Instant::now).elapsed().as_secs() < after {
+        return;
+    }
+    match LEFT.load(Ordering::Relaxed) {
+        u32::MAX => {
+            LEFT.store(frames, Ordering::Relaxed);
+            FLOW_ON.store(true, Ordering::Relaxed);
+            tracing::info!("flow: capture starts");
+        }
+        0 => {
+            // The presents after the capture: the records again, three times.
+            static AFTER: AtomicU32 = AtomicU32::new(0);
+            let after = AFTER.fetch_add(1, Ordering::Relaxed) + 1;
+            if after <= 3 {
+                flow_late(after);
+                flow_late_snapshots(after);
+                flow_late_textures(after);
+                flow_late_draw_textures(after);
+            }
+        }
+        n => {
+            LEFT.store(n - 1, Ordering::Relaxed);
+            tracing::info!(left = n - 1, "flow: present");
+            if n == 1 {
+                FLOW_ON.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn flow_words(at: u64) -> Option<[u32; 3]> {
+    let mut b = [0u8; 12];
+    super::safe_read(at as *const u8, &mut b).then(|| [0, 4, 8].map(|i| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])))
+}
+
+/// Record pages as the GPU has them when the captured mesh work reads them. The values of
+/// persistent record buffers read from the CPU say little: the title's reset pass and its
+/// cullers rewrite them every frame, and the GPU runs behind the recording. So the first time a
+/// captured mesh execution takes a record from a 64 KiB page for a set of targets, a GPU copy of
+/// the page into memory of the host's own is recorded just before it, in order with the cullers
+/// that wrote it; [`flow_late_snapshots`] reads the copies.
+struct FlowSnapshots {
+    /// The copies' memory (a pool of its own in the pool table, shown at its host address).
+    base: usize,
+    /// `(sequence number of the mesh execution, title page, targets, first target)` per slot.
+    taken: Vec<(u32, u64, usize, usize)>,
+    seen: std::collections::HashSet<(u64, Vec<usize>)>,
+}
+
+const FLOW_SNAPSHOT_SLOTS: usize = 128;
+const FLOW_PAGE: usize = 1 << 16;
+static FLOW_SNAPSHOTS: Mutex<Option<FlowSnapshots>> = Mutex::new(None);
+
+/// Records the copy of `records`' page for `targets` if this capture has none yet.
+fn flow_snapshot(l: &mut MetalList, seq: u32, records: u64) {
+    use super::memory::{PoolInfo, PoolObserver};
+    let mut guard = FLOW_SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        let len = FLOW_SNAPSHOT_SLOTS * FLOW_PAGE;
+        let Some(region) = victory_metal::mem::Region::new(len, None) else { return };
+        let base = region.ptr as usize;
+        // Kept for the run: the GPU writes it.
+        std::mem::forget(region);
+        let info = PoolInfo { id: usize::MAX - 0xF10, base, len, memory_entry: None };
+        pools().pool_created(&info);
+        pools().mapped(base, len, &info, 0);
+        *guard = Some(FlowSnapshots { base, taken: Vec::new(), seen: Default::default() });
+    }
+    let snaps = guard.as_mut().expect("made above");
+    let page = records & !(FLOW_PAGE as u64 - 1);
+    if snaps.taken.len() >= FLOW_SNAPSHOT_SLOTS || !snaps.seen.insert((page, l.target_keys.clone())) {
+        return;
+    }
+    let slot = snaps.taken.len();
+    snaps.taken.push((seq, page, l.target_keys.len(), l.target_keys.first().copied().unwrap_or(0)));
+    l.list.copy_buffer_region((snaps.base + slot * FLOW_PAGE) as u64, page, FLOW_PAGE);
+}
+
+/// The snapshot pages: for each, the captured mesh records in it from its execution on (up to
+/// the next snapshot of the same page), how many ask for groups, and the first of those.
+fn flow_late_snapshots(after: u32) {
+    let guard = FLOW_SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(snaps) = guard.as_ref() else { return };
+    let records = FLOW_RECORDS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for (slot, &(seq, page, targets, first)) in snaps.taken.iter().enumerate() {
+        let until = snaps.taken[slot + 1..].iter().find(|s| s.1 == page).map_or(u32::MAX, |s| s.0);
+        let (mut n, mut some, mut groups, mut list) = (0u32, 0u32, 0u64, Vec::new());
+        for &(rseq, mesh, at) in &records {
+            if !mesh || rseq < seq || rseq >= until || at & !(FLOW_PAGE as u64 - 1) != page {
+                continue;
+            }
+            n += 1;
+            let copy = snaps.base + slot * FLOW_PAGE + (at - page) as usize;
+            if (at - page) as usize + 12 > FLOW_PAGE {
+                continue;
+            }
+            // SAFETY: inside the snapshot memory, which is never unmapped.
+            let g: [u32; 3] = unsafe { (copy as *const [u32; 3]).read_unaligned() };
+            if !g.contains(&0) {
+                some += 1;
+                groups = groups.saturating_add(g.iter().map(|&x| u64::from(x)).fold(1u64, u64::saturating_mul));
+                if list.len() < 40 {
+                    list.push((rseq, g[0]));
+                }
+            }
+        }
+        tracing::info!(after, slot, seq, page = format!("{page:#x}"), targets, first_target = format!("{first:#x}"), records = n, with_groups = some, groups, first = ?list, "flow: record page as the GPU had it");
+    }
+}
+
+fn trace_flow_mesh(this: This, records: u64, stride: u32, max: u32) {
+    if !flow_capturing() {
+        return;
+    }
+    with_list(this, |t, l| {
+        let hashes = stage_hashes(l.pipeline);
+        let (root, binding) = l.list.graphics_args();
+        let entries: Option<Vec<(u8, usize)>> = binding.map(|b| {
+            b.table_entries.iter().chain(b.ps.iter().flat_map(|ps| &ps.table_entries)).copied().collect()
+        });
+        let views = t.host.root_views(root, entries.as_deref());
+        let targets: Vec<String> = l.target_keys.iter().map(|k| format!("{k:#x}")).collect();
+        let seq = flow_seq(true, Some(records));
+        flow_snapshot(l, seq, records);
+        // The pipeline's depth and stencil state, the first time the capture meets it.
+        static STATES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let new = {
+            let mut seen = STATES.lock().unwrap_or_else(|e| e.into_inner());
+            !seen.contains(&l.pipeline) && {
+                seen.push(l.pipeline);
+                true
+            }
+        };
+        if new && let Some((_, Some(g))) = crate::pipeline::native_stages(l.pipeline as This) {
+            tracing::info!(seq, pipeline = ?hashes, depth = ?g.depth_test(), stencil = ?g.stencil(), color = ?g.color_state(), "flow: mesh pipeline state");
+        }
+        tracing::info!(seq, pipeline = ?hashes, record = format!("{records:#x}"), stride, max, asked = ?flow_words(records), ?targets, ?views, "flow: mesh");
+    });
+}
+
+fn trace_flow_compute(t: &MetalTitle, l: &MetalList, entries: Option<&[(u8, usize)]>, state: &str, how: &str, record: Option<u64>) {
+    if !flow_capturing() {
+        return;
+    }
+    let hashes = stage_hashes(l.pipeline);
+    let views = t.host.root_views(l.list.compute_args(), entries);
+    flow_note_textures(&views);
+    // `VICTORY_TRACE_FLOW_TEXTURES=<hash>,...`: every texture these shaders name is read back
+    // with the draws' ("flow: late draw texture").
+    static NOTE: OnceLock<Vec<String>> = OnceLock::new();
+    let note = NOTE.get_or_init(|| std::env::var("VICTORY_TRACE_FLOW_TEXTURES").map(|v| v.split(',').map(str::to_owned).collect()).unwrap_or_default());
+    if hashes.iter().any(|h| note.iter().any(|d| h.ends_with(d.as_str()))) {
+        let mut seen = FLOW_DRAW_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, texture) in views.iter().filter_map(|v| flow_texture_view(v)) {
+            if !seen.iter().any(|t| t.key == texture.key) && seen.len() < 400 {
+                seen.push(texture);
+            }
+        }
+    }
+    flow_buffer_words(&hashes, &views, 0x200);
+    let seq = flow_seq(false, record);
+    tracing::info!(seq, shader = ?hashes, state, how, record = record.map(|r| format!("{r:#x}")), asked = ?record.and_then(flow_words), ?views, "flow: compute");
 }
 
 /// A dispatch dropped for want of a host compute pipeline; with `VICTORY_TRACE_TARGETS`, counted
 /// by its shader, `how` (group counts, or indirect) and the textures its tables hold as
 /// unordered-access views (what it may have written) for the frame line.
-fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) {
+fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str, record: Option<u64>) {
     dropped("a dispatch without a host compute pipeline");
+    trace_flow_compute(t, l, None, "dropped", how, record);
     if pass_on() {
         pass_note(t, l, &format!("dispatch {how}"), "a dispatch without a host compute pipeline", true, 1);
     }
@@ -1608,20 +2773,28 @@ fn stage_hashes(pipeline: usize) -> Vec<String> {
 /// them it is dropped: run as group counts, its lanes past the counts would write over memory
 /// that is not theirs.
 pub(crate) fn dispatch_threads(this: This, threads: [u32; 3]) {
-    with_list(this, |t, l| match thread_pipe(t, l.pipeline) {
-        Pipe::Compute(pso) => {
-            if pass_on() {
-                pass_note(t, l, &format!("dispatch-threads{threads:?}"), "ran", true, 1);
-            }
-            l.list.set_compute_pipeline(&pso);
-            if let Err(e) = l.list.dispatch_threads(threads) {
-                tracing::warn!(error = %e, "dispatch of thread counts");
-            }
+    with_list(this, |t, l| {
+        if skip_builder_dispatches(l.pipeline, 1) {
+            flow_snap_compute_missed(l, "dropped (builder policy)");
+            return;
         }
-        _ => {
-            dropped("a dispatch of thread counts without a host compute pipeline");
-            if pass_on() {
-                pass_note(t, l, &format!("dispatch-threads{threads:?}"), "a dispatch of thread counts without a host compute pipeline", true, 1);
+        match thread_pipe(t, l.pipeline) {
+            Pipe::Compute(pso) => {
+                if pass_on() {
+                    pass_note(t, l, &format!("dispatch-threads{threads:?}"), "ran", true, 1);
+                }
+                trace_flow_compute(t, l, pso.binding.as_ref().map(|b| b.table_entries.as_slice()), "encoded", &format!("threads {threads:?}"), None);
+                l.list.set_compute_pipeline(&pso);
+                if let Err(e) = flow_snap_compute(t, l, pso.binding.as_ref().map(|b| b.table_entries.as_slice()), !threads.contains(&0), |l| l.list.dispatch_threads(threads)) {
+                    tracing::warn!(error = %e, "dispatch of thread counts");
+                }
+            }
+            p => {
+                dropped("a dispatch of thread counts without a host compute pipeline");
+                if pass_on() {
+                    pass_note(t, l, &format!("dispatch-threads{threads:?}"), "a dispatch of thread counts without a host compute pipeline", true, 1);
+                }
+                flow_snap_compute_missed(l, if matches!(p, Pipe::Refused) { "refused" } else { "dropped" });
             }
         }
     });
@@ -1770,7 +2943,7 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     made
 }
 
-/// Sets the draw pipeline, topology and bindings. Returns rectangle mode for a drawable pipeline.
+/// Sets pipeline, topology and bindings. Returns whether the draw uses guessed rectangle strips.
 /// `mesh`: the call is a mesh dispatch, which only a mesh pipeline runs (and a draw only a vertex
 /// pipeline).
 fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
@@ -1796,21 +2969,12 @@ fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<b
         trace_drop(l);
         return None;
     }
-    // A rectangle list (topology 17) of a guessed pipeline is drawn as instances of four
-    // vertices, a triangle strip, each instance a rectangle (`Options::rect_list`). A described
-    // pipeline has no fourth-corner shader translation, so it falls back to its supplied vertices
-    // drawn as triangles rather than issuing 4-vertex instanced strips.
+    // Guessed pipelines keep their attribute-based strips. Described pipelines replay the
+    // vertex program and complete its outputs; the backend expands their draw arguments.
     let rect = l.topology == 17;
     let targets = l.targets.clone();
-    let (made, rect) = match pipe(t, l.pipeline, &targets) {
+    let (made, strip) = match pipe(t, l.pipeline, &targets, rect) {
         Pipe::Guess(g) => (guess(t, l, &g, rect), rect),
-        p if rect => {
-            if env_set!("VICTORY_TRACE_RECTS") {
-                tracing::info!(pipeline = ?l.pipeline, kind = ?std::mem::discriminant(&p), "rect draw of a pipeline that is not guessed");
-            }
-            warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
-            (p, false)
-        }
         Pipe::Skipped => {
             warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
             trace_reason("a mesh pipeline");
@@ -1832,11 +2996,12 @@ fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<b
         trace_drop(l);
         return None;
     }
-    let topology = if rect {
+    let topology = if strip {
         Some(victory_backend::resources::Topology::TriangleStrip)
-    } else if l.topology == 17 || mesh {
-        // Described rectangle lists draw each 3-corner rectangle as a triangle; a mesh shader
-        // declares its own topology and ignores the list's.
+    } else if rect && !mesh {
+        Some(victory_backend::resources::Topology::Rectangles)
+    } else if mesh {
+        // A mesh shader declares its own topology and ignores the list's.
         Some(victory_backend::resources::Topology::Triangles)
     } else {
         super::state::topology(l.topology)
@@ -1852,7 +3017,7 @@ fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<b
     };
     l.list.set_graphics_pipeline(&pso, topology);
     l.list.set_graphics_binding(binding);
-    Some(rect)
+    Some(strip)
 }
 
 pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_instance: u32) {
@@ -1876,7 +3041,9 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
         return;
     }
     with_list(this, |t, l| {
-        if let Some(rect) = graphics(t, l, false) {
+        let made = graphics(t, l, false);
+        trace_flow_draw(t, l, if made.is_some() { "encoded" } else { "dropped" }, &format!("draw vertices {vertices} instances {instances} first {first} first_instance {first_instance}"));
+        if let Some(rect) = made {
             if rect && env_set!("VICTORY_TRACE_RECTS") {
                 static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
                 let mut seen = SEEN.lock().unwrap();
@@ -1911,33 +3078,15 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
 /// bound mesh pipeline runs `[x, y, z]` groups, as an indirect one runs its record's (#353). With
 /// no mesh pipeline it is dropped for the reason `graphics` gives, and counted in the frame line's
 /// `mesh=` as before.
-pub(crate) fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
-    RECORDED.fetch_add(1, Ordering::Relaxed);
-    with_list(this, |t, l| {
-        if graphics(t, l, true).is_none() {
-            crate::list::DROPPED_KINDS[0].fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if pass_on() {
-            pass_note_op(l, &format!("mesh[{x},{y},{z}]"), None, None);
-        }
-        match l.list.dispatch_mesh(x, y, z) {
-            Ok(()) => {
-                ENCODED.fetch_add(1, Ordering::Relaxed);
-                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
-                trace_present_draw(t, l);
-            }
-            Err(e) => tracing::warn!(error = %e, "mesh dispatch"),
-        }
-    });
-}
 
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
-        if let Some(rect) = graphics(t, l, false) {
-            if rect {
-                // shortcut: indexed rectangle lists are not drawn.
+        let made = graphics(t, l, false);
+        trace_flow_draw(t, l, if made.is_some() { "encoded" } else { "dropped" }, &format!("indexed indices {indices} instances {instances} first {first} base {base}"));
+        if let Some(rect) = made {
+            if rect || l.topology == 17 {
+                // Indexed expansion also needs the other two indices, not just a vertex ID.
                 dropped("an indexed rectangle-list draw");
                 if pass_on() {
                     pass_note_op(l, "DROPPED-indexed-rect-list", None, None);
@@ -1974,45 +3123,36 @@ pub(crate) fn execute_indirect(
     let at = |i: u32| records + u64::from(i) * u64::from(stride);
     match command {
         Command::DispatchMesh => {
-            RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
+            trace_flow_mesh(this, records, stride, max);
+            if tracing_record_writers() && record_writers_of().is_none() {
+                let zero = (0..max)
+                    .filter(|&i| super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0))
+                    .count() as u64;
+                let mut trace = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+                let n = trace.get_or_insert_default().executions.entry(at(0)).or_default();
+                n[0] += u64::from(max);
+                n[1] += zero;
+            }
+            for i in 0..max { dispatch_mesh_from(this, [0; 3], Some(at(i)), count.map(|c| (c, i))); }
+            true
+        },
+        Command::Dispatch => {
             with_list(this, |t, l| {
-                if graphics(t, l, true).is_none() {
+                if skip_builder_dispatches(l.pipeline, max) {
+                    if max > 0 {
+                        flow_snap_compute_missed(l, "dropped (builder policy)");
+                    }
                     return;
                 }
-                if pass_on() {
-                    pass_note_op(l, &format!("mesh-records n={max} counted={}", count.is_some()), None, None);
-                }
-                if tracing_record_writers() && record_writers_of().is_none() {
-                    let zero = (0..max)
-                        .filter(|&i| super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0))
-                        .count() as u64;
-                    let mut trace = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner());
-                    let n = trace.get_or_insert_default().executions.entry(at(0)).or_default();
-                    n[0] += u64::from(max);
-                    n[1] += zero;
-                }
-                for i in 0..max {
-                    match l.list.dispatch_mesh_indirect(at(i), count.map(|c| (c, i))) {
-                        Ok(()) => {
-                            ENCODED.fetch_add(1, Ordering::Relaxed);
-                            l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                match pipe(t, l.pipeline, &TargetFormats::default(), false) {
+                    Pipe::Compute(pso) => {
+                        trace_record_dispatch(t, l, "ran");
+                        if pass_on() {
+                            pass_note(t, l, "indirect dispatch", "ran", true, max);
                         }
-                        Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
-                    }
-                }
-                trace_present_draw(t, l);
-            });
-            true
-        }
-        Command::Dispatch => {
-            with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
-                Pipe::Compute(pso) => {
-                    trace_record_dispatch(t, l, "ran");
-                    if pass_on() {
-                        pass_note(t, l, "dispatch-indirect", "ran", true, max);
-                    }
-                    l.list.set_compute_pipeline(&pso);
-                    for i in 0..max {
+                        trace_flow_compute(t, l, pso.binding.as_ref().map(|b| b.table_entries.as_slice()), "encoded", "indirect", Some(records));
+                        l.list.set_compute_pipeline(&pso);
+                        for i in 0..max {
                         if let Some(of) = record_writers_of()
                             && stage_hashes(l.pipeline).iter().any(|h| h.strip_prefix("compute ").is_some_and(|h| of.contains(h)))
                         {
@@ -2036,16 +3176,23 @@ pub(crate) fn execute_indirect(
                                 tracing::warn!(shader = ?stage_hashes(l.pipeline), ?command, counted = count.is_some(), stride, record = format_args!("{:#x}", at(i)), ?now, "an indirect dispatch (the first three of each pipeline)");
                             }
                         }
-                        let r = match count {
-                            Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
-                            None => l.list.dispatch_indirect(at(i)),
-                        };
-                        if let Err(e) = r {
-                            tracing::warn!(error = %e, "indirect dispatch");
+                            let r = flow_snap_compute(t, l, pso.binding.as_ref().map(|b| b.table_entries.as_slice()), true, |l| match count {
+                                Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
+                                None => l.list.dispatch_indirect(at(i)),
+                            });
+                            if let Err(e) = r {
+                                tracing::warn!(error = %e, "indirect dispatch");
+                            }
                         }
                     }
+                    p => {
+                        // A zero maximum records no dispatch, so it cannot consume the hash's snapshot.
+                        if max > 0 {
+                            flow_snap_compute_missed(l, if matches!(p, Pipe::Refused) { "refused" } else { "dropped" });
+                        }
+                        dropped_dispatch(t, l, "indirect", Some(records));
+                    }
                 }
-                _ => dropped_dispatch(t, l, "indirect"),
             });
             true
         }
@@ -2053,7 +3200,7 @@ pub(crate) fn execute_indirect(
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
             with_list(this, |t, l| match graphics(t, l, false) {
                 // shortcut: an indexed rectangle list is not drawn, as directly.
-                Some(true) if command == Command::DrawIndexed => {
+                Some(rect) if (rect || l.topology == 17) && command == Command::DrawIndexed => {
                     dropped("an indirect rectangle-list draw");
                     if pass_on() {
                         pass_note_op(l, &format!("DROPPED-indirect-rect-list n={max}"), None, None);
@@ -2062,6 +3209,7 @@ pub(crate) fn execute_indirect(
                     true
                 }
                 Some(rect) => {
+                    trace_flow_draw(t, l, "encoded", &format!("indirect max {max} records {records:#x} now {:?}", flow_words(records)));
                     for i in 0..max {
                         let indexed = command == Command::DrawIndexed;
                         let r = match count {
@@ -2074,6 +3222,7 @@ pub(crate) fn execute_indirect(
                             Ok(()) => {
                                 ENCODED.fetch_add(1, Ordering::Relaxed);
                                 l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                                flow_snap_target(t, l);
                             }
                             Err(e) => tracing::warn!(error = %e, "indirect draw"),
                         }
@@ -2157,6 +3306,10 @@ pub(crate) fn copy_buffer(this: This, dst: (This, u64), src: (This, u64), len: u
 
 /// `CopyMemoryToMemoryX` and buffer copies: title addresses.
 pub(crate) fn copy_memory(this: This, dst: u64, src: u64, len: u64) {
+    if flow_capturing() {
+        let seq = flow_seq(false, None);
+        tracing::info!(seq, dst = format!("{dst:#x}"), src = format!("{src:#x}"), len, "flow: copy");
+    }
     with_list(this, |_, l| {
         l.list.copy_buffer_region(dst, src, len as usize);
     });
@@ -2576,4 +3729,122 @@ pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
 /// Counters of the host for tests and the frame line.
 pub fn stats() -> Option<super::title::Stats> {
     with_title(|t| t.stats.clone())
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::{FlowTexture, flow_dxgi_format, flow_snap_copyable, flow_texture_view, flow_uav_textures, snap_compute_hash, snap_draws, texel_grid, top_values};
+
+    #[test]
+    fn texture_views_keep_keys_and_level_zero_extents_including_placed_views() {
+        assert_eq!(flow_texture_view("s2.7 tex 0x123 at 0x9000 fmt 10 128x64 mip 3"), Some(("s2.7", FlowTexture {
+            key: 0x123, address: 0x9000, format: 10, width: 128, height: 64, depth: 1, dim: victory_backend::resources::TexDim::D2,
+        })));
+        assert_eq!(flow_texture_view("u0.95 placed tex 0x8000000000000123 at 0xa00000000 fmt 41 7x4 mip 0"), Some(("u0.95", FlowTexture {
+            key: 0x8000000000000123, address: 0xa00000000, format: 41, width: 7, height: 4, depth: 1, dim: victory_backend::resources::TexDim::D2,
+        })));
+        for view in [
+            "u0.1 0x123+0x100", "r0 0x123", "k0 [00000000]",
+            "s0.0 placed tex at 0x123 fmt 10 2x2 mip 0",
+            "s0.0 tex 0xno at 0x123 fmt 10 2x2 mip 0",
+            "u0.0 tex 0x1 at 0xno fmt 10 2x2 mip 0",
+            "u0.0 tex 0x1 at 0x123 fmt bad 2x2 mip 0",
+            "u0.0 tex 0x1 at 0x123 fmt 10 bad mip 0",
+            "u0.0 tex 0x1 at 0x123 fmt 10 2x2 mip bad",
+            "u.0 tex 0x1 at 0x123 fmt 10 2x2 mip 0",
+            "c0.0 tex 0x1 at 0x123 fmt 10 2x2 mip 0",
+        ] {
+            assert_eq!(flow_texture_view(view), None, "{view}");
+        }
+    }
+
+    #[test]
+    fn snapshot_uavs_exclude_srvs_buffers_and_duplicate_texture_keys() {
+        let views: Vec<String> = [
+            "s0.0 tex 0x1 at 0x1000 fmt 10 16x16 mip 0",
+            "u0.1 0x2000+0x400",
+            "u0.2 tex 0x1 at 0x1000 fmt 10 16x16 mip 0",
+            "u1.4 tex 0x1 at 0x1000 fmt 10 16x16 mip 1",
+            "u1.5 placed tex 0x8000000000000002 at 0x3000 fmt 41 8x4 mip 2",
+            "s1.6 placed tex 0x8000000000000003 at 0x4000 fmt 61 7x4 mip 0",
+        ].map(str::to_owned).into();
+        let picked: Vec<_> = flow_uav_textures(&views).into_iter().map(|(name, t)| (name, t.key, t.width, t.height)).collect();
+        assert_eq!(picked, [("u0.2", 1, 16, 16), ("u1.5", 0x8000000000000002, 8, 4)]);
+    }
+
+    #[test]
+    fn snapshot_texture_limits_skip_depth_blocks_empty_and_overflowing_extents() {
+        use victory_backend::resources::Format;
+        assert!(flow_snap_copyable(Format::Rgba16Float, [2048, 1024, 2]));
+        assert!(flow_snap_copyable(Format::R32Float, [7, 4, 17]));
+        for size in [[2048, 1025, 2], [1, 1, 0], [0, 1, 1], [1, 0, 1], [usize::MAX, 2, 1], [2, 1, usize::MAX]] {
+            assert!(!flow_snap_copyable(Format::R8Unorm, size));
+        }
+        for format in [Format::D32Float, Format::D32FloatS8, Format::D16Unorm, Format::Bc1, Format::Bc7] {
+            assert!(!flow_snap_copyable(format, [16, 16, 4]));
+        }
+    }
+
+    #[test]
+    fn snapshot_compute_hashes_are_once_per_shader_and_separate_from_draws() {
+        let hashes = ["abcd".to_owned(), "5678".to_owned()];
+        let mut seen = Vec::new();
+        assert_eq!(snap_compute_hash(&["pixel 0000abcd".into()], &hashes, &mut seen), None);
+        assert_eq!(snap_compute_hash(&["compute 0000ffff".into()], &hashes, &mut seen), None);
+        assert!(seen.is_empty());
+        assert_eq!(snap_compute_hash(&["compute 0000abcd".into()], &hashes, &mut seen).as_deref(), Some("0000abcd"));
+        assert_eq!(snap_compute_hash(&["compute 0000abcd".into()], &hashes, &mut seen), None);
+        assert_eq!(snap_compute_hash(&["compute 00005678".into()], &hashes, &mut seen).as_deref(), Some("00005678"));
+        assert_eq!(snap_compute_hash(&["compute 1111abcd".into()], &[], &mut seen), None);
+        assert_eq!(seen, ["0000abcd", "00005678"]);
+    }
+
+    #[test]
+    fn placed_host_formats_keep_their_texel_interpretation() {
+        for dxgi in 0..=191 {
+            if let Some(format) = super::super::descriptors::format(dxgi) {
+                let canonical = flow_dxgi_format(format);
+                assert_eq!(super::super::descriptors::format(canonical), Some(format), "DXGI {dxgi}");
+                assert!(crate::resource::element(canonical).is_some());
+            }
+        }
+        use victory_backend::resources::Format;
+        assert_eq!(flow_dxgi_format(Format::R32Float), 41);
+        assert_eq!(flow_dxgi_format(Format::Rgba16Float), 10);
+        assert_eq!(flow_dxgi_format(Format::Rg11b10Float), 26);
+    }
+
+    /// The snapshots are after the draws the switch names, or after the usual five.
+    #[test]
+    fn the_snapshot_draws_are_the_ones_named() {
+        assert_eq!(snap_draws(None), [1, 30, 60, 90, 120]);
+        assert_eq!(snap_draws(Some("")), [1, 30, 60, 90, 120]);
+        assert_eq!(snap_draws(Some("2, 38,x,0,44")), [2, 38, 44]);
+        assert_eq!(snap_draws(Some(&(1..40).map(|n| n.to_string()).collect::<Vec<_>>().join(","))).len(), 16);
+    }
+
+    /// The grid is 8 rows of 14 cells with the percentage of hits in each: a 28 x 16 level whose
+    /// upper-left triangle of the first 4 x 4 block is hit shows it in that block's cells only.
+    #[test]
+    fn the_texel_grid_places_hits_in_their_cells() {
+        let (w, h) = (28usize, 16usize);
+        let grid = texel_grid(w, h, |i| {
+            let (x, y) = (i % w, i / w);
+            x + y < 4
+        });
+        assert_eq!(grid.len(), 8);
+        assert!(grid.iter().all(|row| row.len() == 14 * 3));
+        // Cells are 2 x 2 texels: (0, 0) all hit, (1, 0) and (0, 1) three of four, (1, 1) none.
+        assert_eq!(&grid[0][..9], "100 75  0");
+        assert_eq!(&grid[1][..6], " 75  0");
+        assert!(grid[2..].iter().all(|row| row.split_whitespace().all(|c| c == "0")));
+        // A level smaller than the grid does not divide by zero.
+        assert_eq!(texel_grid(1, 1, |_| true).len(), 8);
+    }
+
+    #[test]
+    fn the_top_values_are_ordered_by_count_then_value() {
+        assert_eq!(top_values([6u64, 0, 6, 30, 6, 0, 7].into_iter()), "6x3 0x2 7x1 1ex1");
+        assert_eq!(top_values(std::iter::empty()), "");
+    }
 }

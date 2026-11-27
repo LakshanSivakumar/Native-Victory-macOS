@@ -43,6 +43,7 @@ pub mod shaders;
 pub mod state;
 pub mod textures;
 pub mod title;
+pub(crate) mod twin;
 
 #[cfg(target_os = "macos")]
 pub type Host = host::NativeHost<victory_metal::metal::Metal>;

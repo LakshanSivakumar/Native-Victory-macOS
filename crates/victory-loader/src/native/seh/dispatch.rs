@@ -371,6 +371,12 @@ extern "C" fn raise_exception(
 /// # Safety
 /// `ctx` and `rec` stay valid until the thread is resumed.
 unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
+    // Recover the opt-in, byte-checked pool trap before title handlers (including breakpad).
+    // SAFETY: both are valid for this dispatch, and the faulting image is mapped.
+    if unsafe { super::step_over::step_over(&mut *ctx, &*rec) } {
+        // SAFETY: only RIP advanced past the verified int3.
+        unsafe { resume(ctx) };
+    }
     // SAFETY: both are ours for this dispatch.
     if unsafe { super::super::dump::write_trap(&*ctx, &*rec) } {
         // SAFETY: forwarded from the caller.

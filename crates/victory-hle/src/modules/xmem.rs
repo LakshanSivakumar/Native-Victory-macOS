@@ -236,6 +236,19 @@ pub extern "system" fn XMemVirtualQuery(
 // `XMemAlloc` attributes: alignment as log2 (5 bits at 24, 4 bytes and up
 // from 2), then the memory type, then bit 33: a 32-bit address.
 const ALIGNMENT_SHIFT: u64 = 24;
+/// The allocator id (8 bits at 16); 128 is the GPU's own (`victory_gpu::resource`).
+#[cfg(not(windows))]
+const ALLOCATOR_SHIFT: u64 = 16;
+#[cfg(not(windows))]
+const GRAPHICS_ALLOCATOR: u64 = 128;
+
+/// Blocks [`XMemAllocDefault`] took from graphics memory: a free gives them back there.
+#[cfg(not(windows))]
+fn graphics_blocks() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+    static BLOCKS: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner())
+}
 const ALLOC_32BIT: u64 = 1 << 33;
 /// Our block header: the block's size and alignment, just below the
 /// pointer handed out.
@@ -310,6 +323,35 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
     }
 }
 
+/// Zeroed graphics memory for what the GPU side allocates itself (heaps, committed resources of a
+/// title without an allocator): committed `XMemVirtualAlloc` graphics memory, which has a
+/// physical-page pool behind it, so the native host's GPU reaches it at its title address. Null
+/// for an alignment such memory cannot give (the caller falls back to the host heap).
+#[cfg(not(windows))]
+pub fn graphics_alloc(size: usize, align: usize) -> *mut u8 {
+    const KIB_64: usize = 64 << 10;
+    const MIB_2: usize = 2 << 20;
+    let pages = match align {
+        0..=KIB_64 => 0,
+        a if a <= MIB_2 => PAGES_2M,
+        _ => return std::ptr::null_mut(),
+    };
+    XMemVirtualAlloc(
+        std::ptr::null_mut(),
+        size,
+        MEM_RESERVE | MEM_COMMIT | pages,
+        GRAPHICS,
+        PAGE_READWRITE,
+    )
+    .cast()
+}
+
+/// Gives back what [`graphics_alloc`] returned.
+#[cfg(not(windows))]
+pub fn graphics_free(address: *mut u8) {
+    super::xmem_posix::release_reservation(address as usize);
+}
+
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
@@ -320,6 +362,19 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
         );
+    }
+    // The GPU's own allocator id (what `victory_gpu::resource` asks committed resources' memory
+    // with, and a title's hook hands on to this routine): graphics memory, which the native
+    // host's GPU reaches. From the host heap it was memory no pool backs, and every copy from or
+    // into such a buffer was dropped (Grand Theft Auto VI's exposure read-back and the three
+    // textures it uploads each frame).
+    #[cfg(not(windows))]
+    if attributes >> ALLOCATOR_SHIFT & 0xFF == GRAPHICS_ALLOCATOR {
+        let block = graphics_alloc(size, 1 << (attributes >> ALIGNMENT_SHIFT & 0x1f));
+        if !block.is_null() {
+            graphics_blocks().insert(block as usize);
+            return block.cast();
+        }
     }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
@@ -354,6 +409,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
     unsafe {
+        #[cfg(not(windows))]
+        if graphics_blocks().remove(&(address as usize)) {
+            graphics_free(address.cast());
+            return;
+        }
         if attributes & ALLOC_32BIT != 0 {
             #[cfg(windows)]
             VirtualFree(address, 0, MEM_RELEASE);

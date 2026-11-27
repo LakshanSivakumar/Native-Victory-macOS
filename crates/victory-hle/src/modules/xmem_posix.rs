@@ -329,6 +329,44 @@ mod tests {
         assert_eq!(std::mem::offset_of!(BasicInformation, flags), 0x30);
     }
 
+    /// Memory the GPU side asks of the system allocator (its allocator id, as a title's hook hands
+    /// the request on) and memory for its heaps has a pool behind it, at its own address, so the
+    /// native host's GPU reaches a buffer placed there; from the host heap every copy into or out
+    /// of such a buffer was dropped as "not in a mapped pool". A free gives the pool back; other
+    /// allocator ids stay in the host heap.
+    #[test]
+    fn the_gpu_allocators_memory_is_pool_backed() {
+        use super::super::xmem::{XMemAllocDefault, XMemFreeDefault, graphics_alloc, graphics_free};
+        use super::super::xmem_physical::pool_shown_at;
+        // Allocator 128, 64 KiB alignment, as `victory_gpu::resource` asks a read-back buffer.
+        let attributes = 128u64 << 16 | 1 << 14 | 16 << 24 | 3 << 29;
+        let p = XMemAllocDefault(GRANULE, attributes).cast::<u8>();
+        assert!(!p.is_null());
+        assert_eq!(p as usize % GRANULE, 0);
+        assert!((p as usize) < 1 << 40, "below 2^40, where the console keeps graphics memory");
+        let pool = pool_shown_at(p as usize).expect("pool-backed");
+        assert_eq!(pool_shown_at(p as usize + GRANULE - 1), Some(pool));
+        // SAFETY: 64 KiB were allocated; fresh pool pages read zero.
+        unsafe {
+            assert_eq!((p.read(), p.add(GRANULE - 1).read()), (0, 0));
+            p.add(GRANULE - 1).write(7);
+        }
+        XMemFreeDefault(p.cast(), attributes);
+        assert_ne!(pool_shown_at(p as usize), Some(pool), "the pool went with the free");
+        // Another allocator's block is the host heap's, as before.
+        let q = XMemAllocDefault(4096, 16 << 24);
+        assert!(!q.is_null());
+        assert_eq!(pool_shown_at(q as usize), None);
+        XMemFreeDefault(q, 16 << 24);
+        // A heap's memory: 2 MiB alignment is kept, more is refused (the caller's own heap then).
+        let h = graphics_alloc(3 * MIB, 2 * MIB);
+        assert!(!h.is_null());
+        assert_eq!(h as usize % (2 * MIB), 0);
+        assert!(pool_shown_at(h as usize + 3 * MIB - 1).is_some());
+        graphics_free(h);
+        assert!(graphics_alloc(GRANULE, 4 * MIB).is_null());
+    }
+
     #[test]
     fn virtual_alloc_meets_console_constraints() {
         const GPU_READ_WRITE: u32 = 0x2000;

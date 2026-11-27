@@ -53,6 +53,7 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 ## 5. Everything after that
 
 - Reverb: the audio DSP's convolution has a synthetic CPU fallback behind `VICTORY_GUESS_DSP=1` (a fixed decaying-noise tail, not the title's own impulse response); default behaviour is unchanged (silence) until a real run judges whether it sounds right ([#17](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/17)). The hardware's impulse-response layout is still undocumented; `VICTORY_TRACE_DSP=1` logs the title's own `ir` data to help settle it.
+- Described vertex-ID rectangle lists now expand shader outputs and direct/indirect arguments to both triangles. Hand-built coverage tests compile; Metal and game verification remain pending (see `docs/native-host.md`).
 - The Brightness logo draws as half a rectangle ([#16](https://github.com/LakshanSivakumar/Native-Victory-macOS/issues/16)).
 - Mesh-shader pipelines: direct and indirect mesh dispatches run on the native host (#353 for the direct ones), under a guessed record layout and a guessed `DispatchMeshX` group count.
 - Culling, depth, stencil and write mask in guessed pipelines are still partly guessed.
@@ -78,3 +79,9 @@ The whole game executable (about 440,000 functions) lifts to C in seconds and co
 - Pick a refused shader shape from section 3. It's self-contained and testable without the game.
 - Turn a finding in native-host.md into a unit test.
 - Improve `tools/macos/native-setup.sh` and `run-native.sh` for setups we haven't seen.
+
+
+Native mesh progress: decoded FSSM mesh/pixel pipelines now translate together and reach
+Metal mesh pipeline creation, direct dispatch and type-10 indirect encoding. The 32 KiB
+output guard is unconditional. Raw 0x1c8 mesh stage registers, console amplification
+translation and GPU pixel verification remain open; world rendering is not yet proven.

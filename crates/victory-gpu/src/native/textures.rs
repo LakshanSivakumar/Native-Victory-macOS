@@ -596,6 +596,7 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
             let n = buf.len().min(size - off);
             unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
             h.update(&buf[..n]);
+            scan_pace(n);
         }
         let h = h.finalize();
         watch_in(watched, |w| {
@@ -615,6 +616,23 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
             }
         });
     }
+}
+
+/// `VICTORY_TEXTURE_SCAN_MBPS=<n>`: the scanner reads at most `n` MiB of title memory a second
+/// (unset or 0: as fast as it can, as before). The scanner touches every watched texture's
+/// memory each round; on a Mac near its memory limit that keeps pulling the title's cold texture
+/// pages back out of the compressor. With a limit, a write to a texture that is neither hot nor
+/// blank is seen later (a round takes the watched bytes divided by the rate).
+fn scan_pace(bytes: usize) {
+    static RATE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let Some(rate) = *RATE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_SCAN_MBPS").ok()?.parse::<u64>().ok().filter(|&n| n > 0)
+    }) else {
+        return;
+    };
+    // The time `bytes` are allowed to take at `rate` MiB a second, slept after the read.
+    let nanos = (bytes as u64).saturating_mul(1_000_000_000) / (rate << 20);
+    std::thread::sleep(std::time::Duration::from_nanos(nanos));
 }
 
 fn start_scanner() {
@@ -1114,6 +1132,9 @@ impl<B: PresentBackend> Title<B> {
     /// Makes the host texture of title texture `key` if it has none yet and registers it for
     /// views. `false` when there is none (not a title texture, or one the host cannot represent).
     pub fn realize(&mut self, key: usize) -> bool {
+        if self.host.is_covered(key) {
+            return false;
+        }
         if self.textures.contains_key(&key) || self.copies_of.contains_key(&key) {
             return true;
         }
@@ -1136,6 +1157,11 @@ impl<B: PresentBackend> Title<B> {
         if let Some(owner) = self.identical_copy(&info) {
             let tex = self.textures[&owner].texture.clone();
             self.host.register_texture(key, &tex);
+            self.host.register_depth(key, &tex, &desc);
+            if desc.render_target && !desc.format.is_depth() {
+                self.host.register_attachable(key);
+            }
+            self.host.set_dropped_levels(key, info.dropped_levels(), desc.mips);
             self.copies_of.insert(key, (owner, info));
             SHARED_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return true;
@@ -1149,6 +1175,11 @@ impl<B: PresentBackend> Title<B> {
         };
         self.at_memory.entry(info.memory as usize).or_default().push(key);
         self.host.register_texture(key, &tex);
+        if desc.format.is_depth() {
+            self.host.register_depth(key, &tex, &desc);
+        } else if desc.render_target {
+            self.host.register_attachable(key);
+        }
         self.host.set_dropped_levels(key, info.dropped_levels(), desc.mips);
         self.budget.live += info.size as u64;
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1245,6 +1276,13 @@ impl<B: PresentBackend> Title<B> {
     pub fn format_of(&self, key: usize) -> Option<Format> {
         let key = self.owner_of(key);
         self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
+    }
+
+    /// The realized texture description, also for a shared placed copy.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn texture_desc(&self, key: usize) -> Option<TextureDesc> {
+        let key = self.shared.iter().find(|(_, (_, placed))| *placed == key).map_or(key, |(&object, _)| object);
+        self.copies_of.get(&key).map(|(_, i)| i).or_else(|| self.textures.get(&self.owner_of(key)).map(|t| &t.info)).and_then(TextureInfo::host_desc)
     }
 
     /// The host texture of title texture `key`.
@@ -1377,13 +1415,21 @@ impl<B: PresentBackend> Title<B> {
         watch(|w| w.released(key));
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn texture_watched(&self, key: usize) -> bool {
+        watch(|w| w.entries.contains_key(&key))
+    }
+
     /// A view placed texture `key` at title `address` (in pool `pool`). The title has no object to
     /// release for it, so the texture another description placed at that address before goes
     /// now (guess: the title is done with it once it places another there), and every texture
     /// placed in a pool goes when the pool is released ([`Self::sync_dirty`]).
     pub fn texture_placed(&mut self, address: u64, key: usize, pool: usize, size: usize) {
-        // A view of a copy given up before comes back at its own address: not a new placement.
-        if self.placed.get(&address).is_none_or(|&(k, _)| k != key) {
+        // Only a title placement reaches here, never a table scan or descriptor copy. A
+        // placement at the same address can now reclaim memory covered since the last one.
+        self.host.placed_again(key);
+        self.covered.remove(&key);
+        if self.covered_clear || self.placed.get(&address).is_none_or(|&(k, _)| k != key) {
             self.give_up_overlapped(address, key, size as u64);
         }
         self.placed_reach = self.placed_reach.max(size as u64);
@@ -1401,6 +1447,36 @@ impl<B: PresentBackend> Title<B> {
             }
             self.host.forget_resource(old);
             self.texture_released(old);
+        }
+    }
+
+    /// A placed descriptor created by the title (`placement`), or an existing record copied
+    /// to another heap slot. Only creation changes which placement owns overlapping memory.
+    #[cfg(target_os = "macos")]
+    pub(super) fn placed_view(
+        &mut self,
+        address: u64,
+        key: usize,
+        pool: usize,
+        info: TextureInfo,
+        placement: bool,
+    ) {
+        if placement {
+            self.texture_placed(address, key, pool, info.size);
+        } else if self.host.is_covered(key)
+            || self.placed.get(&address).is_some_and(|&(k, _)| k != key)
+        {
+            return;
+        }
+        if !self.host.knows(key) {
+            // A record first encountered after its memory was mapped is tracked for pool
+            // release too, but its discovery is not evidence of a new placement.
+            self.placed.entry(address).or_insert((key, pool));
+            self.placed_reach = self.placed_reach.max(info.size as u64);
+            if !self.alias_placed(address, key, &info) {
+                self.texture_created(key, info);
+                self.realize(key);
+            }
         }
     }
 
@@ -1426,28 +1502,51 @@ impl<B: PresentBackend> Title<B> {
                 })
             })
             .collect();
-        self.covered.extend(over);
+        for old in over {
+            if !self.covered_clear || self.covered_history.placed_over(key, old) {
+                self.covered.insert(old, key);
+            } else {
+                self.covered.remove(&old);
+            }
+        }
     }
 
-    /// At each sync: covered copies ([`Self::give_up_overlapped`]) that nothing uses any more are
-    /// given up as the budget gives one up ([`Self::evictable`]: no heap entry shows one, so no
-    /// work in flight reads it through an entry, and no list holds one), and none a submission in
-    /// flight names. One still shown waits until the title writes another record over that entry.
-    /// One named again later is made again from title memory.
+    /// At each sync, give up covered copies with no submission naming them and no list holding
+    /// them. Guess: entries left showing a memory-only copy are stale; keep their records null
+    /// until the title places it again. VICTORY_COVERED_CLEAR=0 keeps upstream's wait.
     fn give_up_covered(&mut self) {
-        let keys: Vec<usize> = self.covered.iter().copied().collect();
-        for k in keys {
+        let keys: Vec<(usize, usize)> = self.covered.iter().map(|(&k, &by)| (k, by)).collect();
+        for (k, by) in keys {
             let Some(t) = self.textures.get(&k) else {
                 self.covered.remove(&k);
                 continue;
             };
-            if self.budget.named.contains_key(&k) || !self.evictable(k, t) {
+            if self.budget.named.contains_key(&k) || !self.holds_only_memory(k, t)
+                || Rc::strong_count(&t.texture) > 2
+            {
+                continue;
+            }
+            let clear = self.host.texture_in_use(k);
+            if clear && !self.covered_clear {
+                continue;
+            }
+            if self.covered_clear && !self.covered_history.may_cover(by, k) {
+                self.covered.remove(&k);
                 continue;
             }
             let info = t.info.clone();
+            if clear {
+                OVERLAP_TRACE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                OVERLAP_TRACE[3].fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             OVERLAP_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             OVERLAP_TRACE[1].fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
-            self.host.evict_texture(k);
+            if self.covered_clear {
+                self.covered_history.record(by, k);
+                self.host.cover_texture(k);
+            } else {
+                self.host.evict_texture(k);
+            }
             self.texture_released(k);
             self.pending.insert(k, info);
         }
@@ -1570,7 +1669,7 @@ impl<B: PresentBackend> Title<B> {
         let until = budget.map(|budget| hot + budget);
         probe_round(&pools, &mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, None, &mut self.probe_buf, &mut dirty);
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
-            SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
+            SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log(self.shared.len());
         }
         let unloaded = std::mem::take(&mut self.unloaded);
         self.jobs(keys_to_sync(&unloaded, &dirty))
@@ -1730,7 +1829,7 @@ impl<B: PresentBackend> Title<B> {
         });
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             cost.upload = started.elapsed();
-            cost.log();
+            cost.log(self.shared.len());
         }
     }
 }
@@ -1906,7 +2005,7 @@ struct SyncCost {
 }
 
 impl SyncCost {
-    fn log(self) {
+    fn log(self, aliases: usize) {
         static SUM: std::sync::Mutex<Option<(std::time::Instant, [u64; 14])>> = std::sync::Mutex::new(None);
         let mut sum = SUM.lock().unwrap_or_else(|e| e.into_inner());
         let (since, s) = sum.get_or_insert_with(|| (std::time::Instant::now(), [0; 14]));
@@ -1923,13 +2022,61 @@ impl SyncCost {
         if since.elapsed().as_secs() >= 1 {
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
-                "texture sync in the last {:.1} s: {} batches, {} textures ({} for the first time, {} unchanged, {} blank, {} partly unreadable), {} MiB; under the lock: probes of {} hot textures {} ms ({} read whole, {} MiB), of blank ones {} ms, uploads {} ms; off it: {} ms (on its threads: read {} ms, hash {} ms, detile {} ms); placements replaced {} ({} by one that was there before)",
+                "texture sync in the last {:.1} s: {} batches, {} textures ({} for the first time, {} unchanged, {} blank, {} partly unreadable), {} MiB; under the lock: probes of {} hot textures {} ms ({} read whole, {} MiB), of blank ones {} ms, uploads {} ms; off it: {} ms (on its threads: read {} ms, hash {} ms, detile {} ms); placements replaced {} ({} by one that was there before), {} live aliases",
                 since.elapsed().as_secs_f32(), s[0], s[1], s[2], s[3], s[4], s[5], s[6] >> 20,
                 take(&HOT), s[7] / 1000, take(&WHOLE_PROBES[0]), take(&WHOLE_PROBES[1]) >> 20, s[8] / 1000, s[9] / 1000,
                 s[10] / 1000, s[11] / 1000, s[12] / 1000, s[13] / 1000,
-                take(&REPLACED[0]), take(&REPLACED[1])
+                take(&REPLACED[0]), take(&REPLACED[1]), aliases
             );
             *sum = None;
+        }
+    }
+}
+
+/// Bounded recent directed clearings, separate from permanent reverse-displacement exemptions.
+/// Guess: an explicit title placement covering its displacer means both views are live.
+/// If exemptions fill, retain existing exemptions but keep releasing all other pairs.
+#[derive(Default)]
+pub(super) struct CoveredHistory {
+    released: HashSet<(usize, usize)>,
+    order: std::collections::VecDeque<(usize, usize)>,
+    allowed: HashSet<(usize, usize)>,
+    saturated: bool,
+    pub(super) ping_pong: u64,
+}
+
+impl CoveredHistory {
+    const LIMIT: usize = 4096;
+
+    fn may_cover(&self, new: usize, old: usize) -> bool {
+        let pair = (new.min(old), new.max(old));
+        !self.allowed.contains(&pair)
+    }
+
+    fn placed_over(&mut self, new: usize, old: usize) -> bool {
+        let pair = (new.min(old), new.max(old));
+        if !self.may_cover(new, old) {
+            return false;
+        }
+        if self.released.remove(&(old, new)) {
+            self.order.retain(|&p| p != (old, new));
+            self.ping_pong += 1;
+            if self.allowed.len() == Self::LIMIT {
+                self.saturated = true;
+            } else {
+                self.allowed.insert(pair);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn record(&mut self, new: usize, old: usize) {
+        if self.released.insert((new, old)) {
+            self.order.push_back((new, old));
+            if self.order.len() > Self::LIMIT {
+                self.released.remove(&self.order.pop_front().expect("bounded history"));
+            }
         }
     }
 }
@@ -2015,8 +2162,8 @@ pub(super) fn distinct_bytes(mut ranges: Vec<(usize, usize)>) -> u64 {
 
 /// For the trace: textures given up under the budget, their bytes, and evicted ones made again.
 static BUDGET_TRACE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-/// For the trace: placed copies given up as another placement covered them, and their bytes.
-static OVERLAP_TRACE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// For the trace: covered copies and bytes given up, then the subset that needed entry clearing.
+static OVERLAP_TRACE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 /// For the trace: title textures that took an identical live copy's texture instead of their own.
 static SHARED_TRACE: [std::sync::atomic::AtomicU64; 1] = [const { std::sync::atomic::AtomicU64::new(0) }; 1];
 
@@ -2069,13 +2216,15 @@ impl<B: PresentBackend> Title<B> {
     /// [`Self::let_named_go`], once the submission is with its queue, so another submission's sync
     /// in between cannot give them up. Nothing is read under the budget with nothing given up
     /// (`glue::submit` runs one submission at a time, so none goes over budget in between), unless
-    /// the trace logs at this submission, so its figures match a run with the budget on.
+    /// the trace logs at this submission or covered entries may be cleared, so a named copy stays
+    /// protected even before the first eviction with the budget off.
     #[must_use = "the names stay kept until handed to `let_named_go`"]
     /// Whether [`Self::keep_named`] has anything to do: over budget, a texture given up, or the
-    /// trace due. Checked before the lists' snapshots are taken for it.
+    /// trace due, or covered entries that may be cleared. Checked before the lists' snapshots.
     pub(super) fn names_wanted(&self) -> bool {
         let over = self.budget.limit > 0 && self.budget.live > self.budget.limit;
         over || self.host.any_evicted() || self.budget.trace_due()
+            || (self.covered_clear && !self.covered.is_empty())
     }
 
     pub(super) fn keep_named<'a>(&mut self, lists: impl Iterator<Item = &'a NativeList<B>>) -> HashSet<usize>
@@ -2162,11 +2311,13 @@ impl<B: PresentBackend> Title<B> {
             let take = |a: &std::sync::atomic::AtomicU64| a.swap(0, std::sync::atomic::Ordering::Relaxed);
             let (distinct, outside) = self.memory_under_copies();
             tracing::info!(
-                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}; {} MiB of distinct title memory under the copies, {} MiB of copies outside the title's pools; in the last second {} textures shared an identical copy ({} share one now), {} placed copies another placement covered were given up ({} MiB), {} covered still in use",
+                "host texture copies: {} MiB, budget {} MiB; {} MiB shown by heap entries, named by the submission's tables or viewed for unordered access, {} MiB could be given up; given up in the last second {} ({} MiB), made again {}; {} MiB of distinct title memory under the copies, {} MiB of copies outside the title's pools; in the last second {} textures shared an identical copy ({} share one now), {} placed copies another placement covered were given up ({} MiB), {} covered still in use; {} covered copies given up by clearing entries ({} MiB), {} covered ping-pong pairs detected (exemptions full: {})",
                 self.budget.live >> 20, self.budget.limit >> 20, shown >> 20, evictable >> 20,
                 take(&BUDGET_TRACE[0]), take(&BUDGET_TRACE[1]) >> 20, take(&BUDGET_TRACE[2]),
                 distinct >> 20, outside >> 20,
                 take(&SHARED_TRACE[0]), self.copies_of.len(), take(&OVERLAP_TRACE[0]), take(&OVERLAP_TRACE[1]) >> 20, self.covered.len(),
+                take(&OVERLAP_TRACE[2]), take(&OVERLAP_TRACE[3]) >> 20,
+                self.covered_history.ping_pong, self.covered_history.saturated,
             );
         }
     }
@@ -2182,6 +2333,49 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn covered_clear_history_is_bounded_and_keeps_exemptions() {
+        let mut h = CoveredHistory::default();
+        assert!(h.may_cover(1, 2));
+        h.record(1, 2);
+        assert!(h.may_cover(2, 1), "a query is not a new title placement");
+        assert!(!h.placed_over(2, 1));
+        for i in 3..2 * CoveredHistory::LIMIT + 3 {
+            assert!(h.may_cover(i, 0));
+            h.record(i, 0);
+        }
+        assert_eq!(h.released.len(), CoveredHistory::LIMIT);
+        assert_eq!(h.order.len(), CoveredHistory::LIMIT);
+        assert!(!h.saturated, "streaming rotates recent history only");
+        assert!(!h.may_cover(1, 2) && !h.may_cover(2, 1));
+        assert_eq!(h.ping_pong, 1);
+        for i in 3..CoveredHistory::LIMIT + 3 {
+            h.record(i, 0);
+            assert_eq!(h.placed_over(0, i), i == CoveredHistory::LIMIT + 2);
+        }
+        assert_eq!(h.allowed.len(), CoveredHistory::LIMIT);
+        assert!(h.saturated);
+        assert!(h.may_cover(usize::MAX, 0), "full exemptions must not disable clearing");
+        assert!(h.placed_over(usize::MAX, 0));
+        assert!(!h.may_cover(1, 2) && !h.may_cover(2, 1), "existing exemptions survive");
+        let unprotected = CoveredHistory::LIMIT + 2;
+        assert!(h.may_cover(0, unprotected) && h.may_cover(unprotected, 0));
+
+        // The full history must still let the real clearing path release a shown copy.
+        let mut f = super::super::host::mirror_tests::CoveredCopies::new();
+        f.title.covered_history = h;
+        let old = f.place(0, 32);
+        let heap = f.show(old);
+        let weak = Rc::downgrade(&f.title.host.texture_at(old).unwrap());
+        f.place(0x800, 16);
+        assert!(f.title.covered.contains_key(&old));
+        f.title.sync_dirty();
+        assert!(weak.upgrade().is_none() && f.title.host.is_covered(old));
+        assert!(!heap.shows_texture(old));
+        assert_eq!(heap.heap.borrow()[&0], (0, 0));
+    }
 
     #[test]
     fn sync_keys_include_overlaps_once_and_keep_unloaded_first() {

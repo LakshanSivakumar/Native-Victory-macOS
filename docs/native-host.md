@@ -254,7 +254,7 @@ Goal: `victory-gpu`'s Metal backend wraps title memory pages as `MTLBuffer` obje
 2. **Stable addresses.** A mapping stays at its address until the title unmaps or remaps it. The title's virtual addresses are the CPU's virtual addresses (identity), so a GPU address the title holds is already a pointer. Remapping a range (`XMemMapPhysicalPages` over mapped pages) replaces the pages at that address, which is the moment a backend must drop and rebuild any `MTLBuffer` over it (`title_memory_remapped` in `victory-gpu`).
 3. **Alignment.** Map at and in multiples of 16 KiB (`vm_kernel_page_size`, also under Rosetta, where `getpagesize()` says 4 KiB). Note that Rosetta reports a 4 KiB page size, so two reported 4 KiB pages cannot hold the two 16 KiB buffers used by the descriptor-table test; that test sizes its arena as `(2 * 16 KiB).div_ceil(page_size())` pages, so it always holds 32 KiB. Checked on an M5 Pro with macOS 27 (a short Objective-C program, not in the repository, built for arm64 and for x86-64 under Rosetta): `newBufferWithBytesNoCopy` over a pool mapping returns a buffer whose `contents` is the same pointer, for the whole mapping, for a 4 KiB-aligned and a 16 KiB-aligned sub-range, and for a mapping of a sub-range of the pool at another address. A write through a buffer over mapping B is seen through mapping A at once (one VM object). Only the 16 KiB multiple is guaranteed to stay valid on other OS versions.
 4. **What the backend may assume.** Memory is `MTLStorageModeShared`. CPU and GPU see one copy, so the shadow copies and the copy-back disappear, and so does `victory-gpu/src/watch.rs` (write-guard tracking and its page-tracking lock). Ordering is by command buffers and fences only: a CPU write the title makes before it submits is visible to that submission, and the title's own fences order the rest. Create buffers with `hazardTrackingModeUntracked`; the title already tracks hazards.
-5. **Sizes.** `device.maxBufferLength` bounds one `MTLBuffer`; wrap each pool mapping (or each large allocation's mapping) separately and keep an address-to-buffer interval map keyed by the mapping's start. Pool mappings that are contiguous in address are still separate VM entries, so a buffer cannot span two mappings; the backend should ask for allocations large enough that they are one mapping (`XMemVirtualAlloc` of a range is). The native host does not wrap title mappings: it wraps each pool's own mapping once (`native/memory.rs`), so a title range may run over several title mappings when each follows the one before it both in title memory and in the same pool, which is how the 64 KiB pages of one allocation are reported. `PoolTable::resolve` follows such mappings and gives one pointer into the pool; a range over a gap, an empty mapping, two pools, or mappings that are not next to each other in the pool is refused.
+5. **Sizes.** `device.maxBufferLength` bounds one `MTLBuffer`; wrap each pool mapping (or each large allocation's mapping) separately and keep an address-to-buffer interval map keyed by the mapping's start. Pool mappings that are contiguous in address are still separate VM entries, so a buffer cannot span two mappings; the backend should ask for allocations large enough that they are one mapping (`XMemVirtualAlloc` of a range is). The native host does not wrap title mappings: it wraps each pool's own mapping once (`native/memory.rs`), so a title range may run over several title mappings when each follows the one before it both in title memory and in the same pool, which is how the 64 KiB pages of one allocation are reported. `PoolTable::resolve` follows such mappings and gives one pointer into the pool; a range over a gap, an empty mapping, two pools, or mappings that are not next to each other in the pool is refused. Such a range is not lost: `NativeHost::resolve` then shows it through a buffer of its own (`NativeHost::span`): the range's 64 KiB pages, as they are mapped now, side by side in an alias made with `mach_vm_remap` from the pools' own mappings (`victory_metal::mem::Stitch`, `ComputeBackend::wrap_title_span`), wrapped by one `MTLBuffer` whose deallocator unmaps the alias; pages the title has not mapped read as zeros, a view inside an existing span reuses it, and the alias is made again when the title maps the range differently (the old buffer is kept for the run: a heap entry may still name it). The title needs this: its culling shaders take the scene from one buffer view of 174 MiB over a whole arena whose pages are three runs of one pool that are not next to each other; with that view null they read an empty scene and the GPU-driven path drew nothing (shadow atlas 0.8% written, 97% with the view). Span buffers follow the title's memory (`NativeHost::refresh_spans`, at the start of every submission, one comparison when the pool table did not change): when it changed, each span's layout is compared with the range as it is mapped now; heap entries that show a span whose layout changed or whose buffer was replaced (`NativeHeap::spanned`: entry to span and buffer version) are mirrored again, which makes the span again; entries left with the null view because their memory was unmapped (`NativeHeap::unmapped`, at most 4,096 a heap) are tried again; a span no entry asked for again is dropped. This matters for entries no bound table covers (a shader loads them from the heap itself), which nothing else writes again. A replaced span buffer is kept for 64 more submissions (`SPAN_GRACE`) and then let go. shortcut: a count of submissions, not the completion of the work that may still read the old buffer. Test: `heap_tests::a_heap_entry_outside_every_table_shows_pages_mapped_after_the_view_was_made` (a view written while its range is unmapped reaches the first page, then a second page, a page mapped in place of it, and loses a page unmapped, with no write of the view in between).
 6. **Protection.** The CPU side can set a mapping `READ` while a buffer over it is live; `PagePool::map(.., Protect::READ)` makes a read-only alias (for CPU-side guards or for the GPU's read-only use) of pages another mapping writes.
 
 Provided (`victory_hle::modules::xmem_physical`, branch `native/host-mem`):
@@ -560,13 +560,20 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_COUNT_GREEN=1`: each presented frame has nine pixels copied out after it is drawn (`victory_metal::present`); a frame whose pixels are mostly pure green (zero YCbCr planes, a movie frame sampled blank) is counted. Once a second stderr gets `present pacing t=<s> presents=<n> longest_ms=<gap> green=<n> partly_green=<n> green_total=<n>`: presents in that second, the longest gap between two, and green frames. Costs one small blit a frame.
 - `VICTORY_TRACE_FAILS=1`: every title-to-host call of a bridged method table (the COM-style objects) whose result in `eax` is negative is logged with the object area, the slot offset, `this` and the title's calling address as an offset into the image (`from`). A method returning a pointer or a count shows up as noise. `=2` logs every such call.
 - `VICTORY_PROFILE=<secs>`: times every title-to-host call (imports and the methods of bridged objects: count, total and longest, by `rdtsc` in the bridge) and logs the 40 with the longest total every that many seconds. Time inside a call includes waiting for the host's locks and any title code it calls back, so methods that are long everywhere (all of `0x118`, `0x428`, `0xc0` at about 150 ms) point at a lock someone else holds (here the native host's `TITLE` lock, held by `sync_textures`).
+- `VICTORY_TRACE_FRAME_TIME=1`: on macOS, one warning starting `frame time:` at the end of every `glue::present`, with `key=value` fields since the previous present (the first interval starts at the switch's first check). Times are milliseconds with one decimal; counts are integers. `wall` is the interval length; `lock_held`, `lock_wait` (summed over all waiting threads), `lock_takes`, and `lock_max_hold` describe `TITLE`, with holds split into `hold_submit`, `hold_sync` (texture sync jobs/apply), `hold_timer`, `hold_list`, and `hold_other`. `submits`, `order_wait`, and `sync_prepare` describe submission ordering and texture preparation outside `TITLE`; `pump`/`pumps`, `execute`/`executes`, `prep`/`cmds` (all input commands, including drops), `mirror`/`mirrors`, `remirror`/`remirrors` (table checks, including their mirror calls), `refresh_spans`, `twin`, and `backend` locate host CPU work. `mirror_same` counts already current mirrors and `stamp_revalidated` counts successful key-version checks after an unrelated resource change. `mirror_buffer`, `mirror_typed`, `mirror_image`, `mirror_sampler`, and `mirror_null` count actual Metal heap entry writes by kind, including internal buffer tables and release clears; identical entries are excluded, a typed view that falls back to a raw buffer counts as a buffer, and zero-length buffers count as null. `view_made`/`view_cached` count creation/cache hits in `create_texture_view` and `texbuf_made`/`texbuf_cached` count texture-buffer views in `write_typed_buffer`; `entry_same` counts identical backend entries skipped. `set_commits`/`set_commit` count/time every heap residency-set commit, including creation, membership changes, the retirement limit and destruction (not the separate pool set); unchanged membership skips the commit. `set_adds`/`set_removes` count actual heap-set `addAllocation`/`removeAllocation` calls, including the heap buffer addition at creation but excluding destruction's `removeAllAllocations`. `safe_reads`/`safe_read` count/time table scans' safe reads, including per-record fallback reads. `device_mirrors`/`device_mirror` count/time `glue::mirror`, including its lock wait; `realize` times its `texture_placed`, `texture_created`, and `realize` calls inside the lock. `cbs` counts buffers committed by `submit_passes`, including split pieces; `passes_compute`, `passes_render`, `passes_blit`, and `passes_clear` count attempted passes by kind, with rectangular clears under clear and full attachment clears under render. `dispatches` and `draws` count Metal commands actually encoded, including indirect gate dispatches. `enc_compute`, `enc_render`, and `enc_blit` time pass encoding; rectangular clears, including their scratch render and copies, are charged to render. `commit` times command-buffer commit and `heap_sets` times `use_heap_cb`, including residency-set commits and attachment. `gpu`, `kernel`, `cbs_done`, `cb_latency`, and `cb_latency_max` cover buffers completed in the interval, with latency measured from commit to entry into the completion handler; `gpu_span` is latest GPU end minus earliest GPU start among valid completed-buffer timestamps, including gaps and overlaps, not a union or utilization. These buffer counters exclude the separate presentation buffer. `present` times the glue call, including its lock wait and any diagnostic delay; `drawable` times the worker's `nextDrawable`, which can finish in a later interval. `fence_wait`/`fence_waits` cover whole blocking fence-wait calls, including polls and sleeps; `fence_polls` counts explicit polls; `timer_ticks` counts timer refreshes. Timings are inclusive and overlap, so do not sum them to get `wall`; waits and holds crossing a present are charged when they finish, and relaxed atomic snapshot/reset boundaries are approximate across threads. The switch is read once; off, instrumentation does not read clocks, allocate, or update counters.
+- `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines). While work stays held (the `work held for a wait that does not hold` warning, when nothing is submitted any more) the same in-flight report is made, with a line giving how many command buffers are in flight, each queue whose order event is behind the command buffers encoded with it (`queue <title queue> at <reached> of <encoded>`), and the commands dropped so far at unmapped memory.
+- `VICTORY_TRACE_WRITES=1`: on macOS, a warning for every bottom-of-pipe value write a list records (value, address, whether a pool holds it, the list), every memory-value wait (address, comparison, reference, the list) and every `ExecuteCommandLists` (queue and lists): which list of which queue owes the word another queue waits for. About 100 lines a world frame. Without it, a value write the host has to drop (its address in no mapped pool, or not preparable) is still a warning, once per page (`native host drops a value write`): a queue may wait for that word for good.
+- `VICTORY_TRACE_TEXTURE_SYNC=1`: on macOS, once a second, what keeping the host's textures in step with title memory cost (`texture sync in the last ..`): the submissions that read textures (batches), the textures and MiB they read (those never uploaded before, those read and found unchanged, the blank ones, those with memory that could not be read at once), the time under the host's lock (probing the hot textures, with how many of them went to be read whole; probing the blank ones; uploading), the time the submitting thread spent reading without the lock and the reading threads' time by step (read, hash, detile), and the placements that replaced another at their address (with how many of those had been at that address before). See "Texture sync without the host's lock".
+- `VICTORY_TEXTURE_SCAN_MBPS=<n>`: on macOS, the texture scanner (the thread that hashes every watched texture's title memory to catch CPU writes no probe saw) reads at most `n` MiB a second; unset or 0 it runs as fast as it can. On a Mac near its memory limit the scanner keeps pulling the title's cold texture pages back out of the compressor (about 1 GiB a second each way on a 24 GB M4 Pro in the world); with a limit, a write to a texture that is neither hot nor blank is uploaded later (one round takes the watched bytes divided by the rate), so this is a speed switch that can show a stale texture for a while.
+- `VICTORY_TRACE_RECORD_WRITERS=1`: for indirect mesh draws that leave no pixels. At each present with indirect mesh executions it logs `mesh records` (the frame's records, and how many had a group count of 0 in title memory as the execution was recorded; a culling pass that ran fills them on the GPU later, one that was dropped never does), `mesh record buffer holder` for each compute program, `ran` or `dropped`, whose descriptor tables hold a record buffer for unordered access (with the records in those buffers and the textures it reads), and `texture read by a mesh record buffer holder` with the compute programs that hold that texture for unordered access. Tables are read 64 entries deep whatever their length, so a holder is a candidate writer, not a proven one; the texture keys are those of the `VICTORY_TRACE_TARGETS` frame line.
+- `VICTORY_TRACE_DISPATCH_FLAGS=1`: logs the first `DispatchX` with each flags value (`DispatchX: the first dispatch with these flags`, with its counts and the bits the host does not know: it knows 0x20 and 0x8000, see "`DispatchX` with thread counts"), and the first `ExecuteIndirect` of a type-105 dispatch, whose counts run as group counts.
 - `VICTORY_TRACE_COMMITS=1` (with `VICTORY_TRACE_GPU_FAILS=1`): on macOS, a line for each command buffer as it is committed (`cb commit #<serial> q<queue> t=<s>`, then its encoders: compute pipelines by shader hash with their group counts, render passes with their draw count and each pipeline's vertex and pixel hashes with its draws, blits with their fills) and one as it completes (`cb done #<serial>`, GPU time, failed or not). With `VICTORY_PASSES_PER_BUFFER=1` the command buffer the GPU never finishes, and so the pass, is the one committed and never done (#79).
 - `VICTORY_TRACE_RESIDENCY=1`: times the residency-set calls (`add_commit`, `remove_commit`, `request`, `end`, `made`, `drop_commit`, `pool_commit`) and command buffer commits (`cb_commit`): each call over 50 ms is logged at once ("residency: slow call"), and once a second a line gives count, total and longest per kind, with the bytes and allocations of the last set seen. Lines the host's residency work up with wired memory samples (#79).
 - `VICTORY_TRACE_HEAP_SET=<frames>`: every 64 frames, with the native-draws line, what the descriptor heaps' residency sets hold: textures and buffers apart, each allocation counted once over all heaps: all of them, those no table a draw or dispatch bound has named for that many frames (`idle_*`; each entry's last use is noted where tables are remirrored, `NativeHeap::used`), and those never named by one (`never_*`). Entries a shader reaches by indexing the heap itself are never seen, so `idle` and `never` are upper bounds. Measures what an eviction of idle allocations from the sets could save (#79).
 - `VICTORY_PASSES_PER_BUFFER=<n>`: on macOS, the most passes of a submission in one command buffer (default 0: no limit, the whole submission in one; 1 is the safest value to try). See "Command buffers of at most N passes".
 - `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines). While work stays held (the `work held for a wait that does not hold` warning, when nothing is submitted any more) the same in-flight report is made, with a line giving how many command buffers are in flight, each queue whose order event is behind the command buffers encoded with it (`queue <title queue> at <reached> of <encoded>`), and the commands dropped so far at unmapped memory. Each piece of a split submission (`VICTORY_PASSES_PER_BUFFER`) is traced as a whole command buffer is, under its own passes: `metal: slow piece` or `metal: failed piece` with its time, and it is in the in-flight report (a time-out carries no encoder states, so the labels are what names the pass). An indirect dispatch's label shows its record as title memory held it at encode time (`indirect[x, y, z]`), and every indirect draw goes through the gate so that the lines above can end with what the GPU read (`gpu read <compute shader, or "draw k" / "mesh draw k" by place in the pass> [counts]`, zeros for a gate that has not run yet); `metal: an indirect dispatch past the most groups ran nothing` names the first four records of each pipeline that asked for more than the gate runs (see "ExecuteIndirect on the native host").
 - `VICTORY_TRACE_WRITES=1`: on macOS, a warning for every bottom-of-pipe value write a list records (value, address, whether a pool holds it, the list), every memory-value wait (address, comparison, reference, the list) and every `ExecuteCommandLists` (queue and lists): which list of which queue owes the word another queue waits for. About 100 lines a world frame. Without it, a value write the host has to drop (its address in no mapped pool, or not preparable) is still a warning, once per page (`native host drops a value write`): a queue may wait for that word for good.
-- `VICTORY_TRACE_FREED=1`: names host and GPU uses of title memory the title's allocator has freed. `XMemAllocDefault` notes every range it hands out, `XMemFreeDefault` the ones it takes back (the block header holds the size), and `Host::resolve` — the way every host and GPU use of title memory begins — logs any range it is asked to map that overlaps a freed span, with both ranges and a serial. Part-reuse leaves the freed ends beside it. What it cannot see: the title can hook the allocator, and pools it sub-allocates inside a live block free and reuse memory without any call here; this names the `XMem`-granularity class only (#339: a host copy or a GPU write into freed memory, one candidate for the corrupted pool links).
+- `VICTORY_TRACE_FREED=1`: names host and GPU uses of title memory the title's allocator has freed. `XMemAllocDefault` notes every range it hands out, `XMemFreeDefault` the ones it takes back (the block header holds the size), and `Host::resolve` - the way every host and GPU use of title memory begins - logs any range it is asked to map that overlaps a freed span, with both ranges and a serial. Part-reuse leaves the freed ends beside it. What it cannot see: the title can hook the allocator, and pools it sub-allocates inside a live block free and reuse memory without any call here; this names the `XMem`-granularity class only (#339: a host copy or a GPU write into freed memory, one candidate for the corrupted pool links).
 - `VICTORY_TRACE_TEXTURE_SYNC=1`: on macOS, once a second, what keeping the host's textures in step with title memory cost (`texture sync in the last ..`): the submissions that read textures (batches), the textures and MiB they read (those never uploaded before, those read and found unchanged, the blank ones, those with memory that could not be read at once), the time under the host's lock (probing the hot textures, with how many of them went to be read whole; probing the blank ones; uploading), the time the submitting thread spent reading without the lock and the reading threads' time by step (read, hash, detile), and the placements that replaced another at their address (with how many of those had been at that address before). See "Texture sync without the host's lock". It also logs the texture budget once a second (`host texture copies: ..`; "A byte budget on host texture copies" below), whose size `VICTORY_METAL_TEXTURE_BUDGET_MB=<n>` sets (off unless set). The figures are logged with the budget off too.
 - `VICTORY_TRACE_RECORD_WRITERS=1`: for indirect mesh draws that leave no pixels. At each present with indirect mesh executions it logs `mesh records` (the frame's records, and how many had a group count of 0 in title memory as the execution was recorded; a culling pass that ran fills them on the GPU later, one that was dropped never does), `mesh record buffer holder` for each compute program, `ran` or `dropped`, whose descriptor tables hold a record buffer for unordered access (with the records in those buffers and the textures it reads), and `texture read by a mesh record buffer holder` with the compute programs that hold that texture for unordered access. Tables are read 64 entries deep whatever their length, so a holder is a candidate writer, not a proven one; the texture keys are those of the `VICTORY_TRACE_TARGETS` frame line. With compute shader hashes for a value (`VICTORY_TRACE_RECORD_WRITERS=<hash>[,<hash>...]`) the records watched are those of these shaders' indirect dispatches instead of the mesh records: the holders are then the candidate writers of their group counts.
 - `VICTORY_TRACE_PASSES=<dir>,<skip>,<presents>`: on macOS, an ordered trace of a few world frames, to find the first pass that writes nothing (`dive-lighting` research). It lets `<skip>` world presents go by (a present after 500 or more recorded draws; default 100), then for the next `<presents>` presents (default 4) writes to stderr, in the order each submission queues the work: `PASS exec=<submission> q=<queue> li=<list> ci=<command> kind=<draw|mesh|dispatch[..]|clear-rtv|copy-region|...> out=<"ran" or the drop reason> sh=[shaders] tg=[targets] rd=[shader-resource views] wr=[unordered-access views] none=<empty table entries> topo=<topology>` for every draw, dispatch, clear and copy recorded in the window; `PASSFAIL exec= li= ci= err=` for each of those the submission could not prepare (dropped then, e.g. "not in a mapped pool"); `PASSSUB exec= li= ci= changed=[entries]` when a noted draw's or dispatch's table entries read differently at submission than when it was recorded (the title rewrote them in between; D3D12 reads them at execution); `PASSUPLOAD` for each upload of title memory over a render-target or unordered-access texture; and, at the window's last present, `PASSTEX key= fmt= WxH at= nonzero=` (plus range, mean and non-finite counts for DXGI 2, 10, 24, 26) for every texture the window named, with a `.ppm` of each in `<dir>` (only formats the dump decodes; arrays skipped). A texture is written `<key>:f<DXGI format>:<W>x<H>@<title address>`, a shader-resource view of a buffer the host knows `<key>:buf`, of a null resource `null:f<format>:dim<view dimension>` (from its view description; it reads as zeros), and of anything else without a host texture `<key>:untracked`; a view of placed memory that is a buffer `placed:buf`, and of any other dimension that is not a texture `placed-dim<dimension>`; tables are read to the entries the shader's binding names (24 for a dropped draw or a dispatch, and never past the heap). Set `VICTORY_TRACE_PASSES_DUMP_EACH=1` to dump at every present of the window. The listing also writes a constant-buffer view as `cbv:<address>+<size>:<dwords>` and a placed buffer view as `placed:buf:<address>+<size>:desc[<first ten description words>]:<dwords>` (the first 512 bytes, in hex), and `<slot>.past-heap=<n>@<index>/<heap size>` when a table names entries past its heap; `PASSTEX` reads a 3D texture whole and adds `depth=`, `slices_nonzero=` and `distinct_texels=`, and for a DXGI 2 texture of 16 texels or fewer, `values=[...]`. Constant buffers and buffer contents are game data too. Off unless set: the switch is read once, at the first present; outside the window every hook is one relaxed load of a flag and nothing is formatted or kept, and the commands are prepared once either way (a failure is reported from the submission's own preparation). Images hold game content: keep `<dir>` outside the repository. Runs that end with exit code 134 a minute or two after the window were seen with and without the trace on the same build (the dive's runs and the untraced c2comb run), so that abort is not the trace's.
@@ -582,7 +589,7 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_DEBUG_PS=id`: every float export of every translated pixel program writes one colour, the low three bytes (red, green, blue) of the 32-bit FNV-1a hash of its console code (a container's `ACCC` code piece, as the `disasm` example takes it; alpha 1), so a target dump (`VICTORY_TRACE_PASSES`, `VICTORY_DUMP_TARGETS`) says which pixel program drew each pixel, and through the pass trace which draw and vertex program. Read a UNORM target (an sRGB one stores the encoded value). A translation switch (`VICTORY_DEBUG_PS` is in the cache key). Made for the world's G-buffer shards ("World geometry drawn as shards (open)"): the 40 pixel programs of the traced G-buffer draws have 40 different colours.
 - `VICTORY_TRACE_ROOT_SPAN[=<bytes>]`: root SRVs and UAVs whose title range stops being linear in its pool within `<bytes>` (default 1 MiB) of the root address (#15). A shader that does not read title memory reaches a root view through a view pair (`addr::root_view`): the pool from the mapping holding the address on, linearly, so past that mapping's end it reads and writes whatever the pool has next, not the title's next mapping. At each draw and dispatch a translated shader's root views are measured (`addr::linear_run`: following mappings that start where the last ended, in the same pool, at the next pool offset), and each one whose run is shorter is logged once per pipeline, root parameter and mapping (`a root view's range leaves its pool's linear run`, at most 2000): the pipeline's shader hashes, SRV or UAV, the dispatch's groups, the run, the first mapping, the mapping the title has where the run ends (`title_next`) and the title address of the pool bytes a pair view reaches there (`pool_next_is`). Root views of programs that read title memory (`through = "table"`) look each access up in the page table; they are logged too. Heap buffer views need no check: a range that is not linear in one pool wraps the title's own mapping instead (see "Heap buffer views not linear in one pool"). Off, the cost is one read of the switch per draw and dispatch. Run of 2026-11-26 (M5 Pro, Series S, crash at frame 2682): the 117 lines are all vertex shaders' root SRVs (root parameter 3, vertex fetch), and 30 of them do have a next title page elsewhere in pool 10 (pages mapped in descending pool order); no dispatch and no root UAV has a run under 1 MiB, so root views do not write the empty BVH nodes over other resources. Those vertex shaders read the wrong vertices past the first page, though: vertex and pixel programs now read root SRVs and UAVs through the page table (`root_memory` in `emit::lower`, with `zero_copy_memory`), one lookup per access, so they log as `through = "table"`; compute programs keep the views (no short run seen there). Tested by `a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool` (`addr_tests.rs`): a triangle whose first vertex ends one 64 KiB page and whose others start the next one, mapped elsewhere in the pool, was not drawn. Limit: the table has 64 KiB pages, so a page not wholly inside one mapping (mappings of 16 KiB) reads as zeros through it, where a view read it.
 - `VICTORY_TRACE_DESCRIPTORS=1`: how many descriptor records the title rewrites with plain stores, which no device call reports (#43). `NativeHost::remirror_tables` compares each bound table's records with those it last mirrored at every draw and dispatch; with the switch on, the frame log (`native draws so far`, every 64 frames) is followed by a `descriptor remirror` line with the records changed and checked since the previous one, per frame, per heap (by its first descriptor address, most changed first), and the most changed in one submission (`NativeHost::execute`). It counts only what that check sees: the first 16 entries of each bound table (more when the shader's metadata says so), at the draws that bind them; it does not say which code wrote the records. Off, the cost is one read of the switch per table and per submission. `VICTORY_TRACE_DESCRIPTORS=sites` also finds which title instructions store the records, for the choice between patching those store sites and remirroring: at each `ExecuteCommandLists` the pages of every descriptor heap's records (the title's own view, not the GPU's) are made read-only (`victory_platform::watch`). The loader's signal handler hands every write fault to the watch first, whoever wrote: a fault in a watched page makes that page writable again and the store runs again. It counts as a site (the instruction as an image offset) only when the instruction lies in the title image and the address in a heap's records, so the device's own view calls and title stores that only share the page go on unseen. The handler takes no lock and allocates nothing: a fixed table of 4096 sites (overflow counted), and the watched ranges (64 at most) in two tables behind sequence counts, so that a store faulting while a submission replaces the ranges is still the watch's: the handler reads the table in use and the one before it, and pages are opened only once neither holds them. Opened pages become read-write, which descriptor records' pages always are (the device's view calls write them). The frame log then adds a `descriptor store sites` line: the distinct sites so far and the 64 with the most stores, most first. Limit: a page stays writable until the next submission, so what is counted is the first store into each page per submission, not every store; a site that only stores after another one opened the page is seen less often, or not at all. A kernel write into a watched page (a `read` into it) would fail with `EFAULT` instead of faulting. Off, the handler's cost is one relaxed load per fault.
-- `VICTORY_WASAPI_WAV=<file>`: the audio device (`host_posix/wasapi.rs`) writes everything that reaches it as a float WAV — hearing exactly what the title's mixer produced, dry sound and (until #17 lands) silent reverb alike.
+- `VICTORY_WASAPI_WAV=<file>`: the audio device (`host_posix/wasapi.rs`) writes everything that reaches it as a float WAV - hearing exactly what the title's mixer produced, dry sound and (until #17 lands) silent reverb alike.
 - `VICTORY_SHADER_LOOP_LIMIT=<n>`: a translated loop stops after this many iterations per entry, and a lane that reaches the limit leaves the program as killed (a pixel discards; a genuine loop of more iterations is cut short too). The default is 2^14 (a lane doing 2^20 passes took 60 to 195 ms on an Apple M5 GPU, where 2^14 take 1 to 3 ms). A lower limit shows whether such a loop is what makes a frame slow, a higher one whether the limit cut a genuine loop short. The value is part of the translation, so the shader cache keys on it.
 - Diagnostics build only (`--features diagnostics`): `VICTORY_DUMP_REGISTRY=<dir>` writes the title's subsystem-registry state (the singleton, its tables and their raw memory) to files in that directory at the first title `int3`, so an assert that checks the registry can be read after the fact (#24), and `VICTORY_XMA_DUMP=<dir>` saves the context words (`<n>-<index>.ctx`) and input buffer 0 (`.xma`) of the first 32 XMA voices enabled, to test the decoder on a title's streams outside the title.
 
@@ -683,12 +690,12 @@ Measured offline (27 November) on the 1,765 compute containers the HDR and prolo
 
 ### If-conversion for groups of several console waves (#376, design note)
 
-Lockstep makes control flow uniform across the group because the group is one console wave: the wave's ballot is the same number in every thread, so a branch on it is taken by all or none. A group of W console waves has W different ballots, so one program counter cannot follow them; making the group's control flow uniform means removing the branches, not testing them differently. Proposed shape (a predication pass, not an extension of `structure::lockstep` — the single-wave ballot trick is what lockstep *is*, and multi-wave branches have no group-wide scalar to branch on):
+Lockstep makes control flow uniform across the group because the group is one console wave: the wave's ballot is the same number in every thread, so a branch on it is taken by all or none. A group of W console waves has W different ballots, so one program counter cannot follow them; making the group's control flow uniform means removing the branches, not testing them differently. Proposed shape (a predication pass, not an extension of `structure::lockstep` - the single-wave ballot trick is what lockstep *is*, and multi-wave branches have no group-wide scalar to branch on):
 
-* **Branches.** A divergent `if`/`else` becomes both arms executed straight-line, guarded per lane: stores, LDS writes, atomics and exports keep their EXEC guard; register writes are predicated selects at the join (`v_cndmask`-style), which the fast path already emits for EXEC-guarded writes. The branch's own condition must still be computed, but as a per-lane mask, never as an SCC branch. Loops: the loop runs while *any lane in the group* is active — a group-wide ballot (the OR of the waves' ballots, one `ds`/barrier reduction per iteration) instead of the wave's own — with per-lane continue masks; every thread executes the same number of iterations, so barriers inside the loop are reached by all.
+* **Branches.** A divergent `if`/`else` becomes both arms executed straight-line, guarded per lane: stores, LDS writes, atomics and exports keep their EXEC guard; register writes are predicated selects at the join (`v_cndmask`-style), which the fast path already emits for EXEC-guarded writes. The branch's own condition must still be computed, but as a per-lane mask, never as an SCC branch. Loops: the loop runs while *any lane in the group* is active - a group-wide ballot (the OR of the waves' ballots, one `ds`/barrier reduction per iteration) instead of the wave's own - with per-lane continue masks; every thread executes the same number of iterations, so barriers inside the loop are reached by all.
 * **Barriers and exchanges.** With no branches left, every group barrier is uniform, and the existing half-pair `xchg` exchange extends to W waves as a tree of pairwise exchanges (log2 W barriers) or W-1 sequential barriers; cross-wave LDS needs the same barrier discipline as `lockstep::lds_barriers`, but across all waves, not two halves.
 * **Where it runs.** Only after a refusal, as lockstep runs today, so nothing that translates now changes. The static check `lockstep::split_branch` generalises: a branch is convertible when its condition is a per-lane mask computable from uniform or per-lane data; a branch on a scalar a vector instruction writes per lane (waterfall first-lane reads) stays refused unless the value is wave-uniform.
-* **Cost bound (guess).** Groups of at most 4 console waves (256 threads on a 32-lane host): Metal threadgroups allow up to 1024 threads, but each predicated arm costs every thread, and the exchange tree grows with W; beyond the bound, refuse as today. Both arms running is the main cost for unbalanced branches — measure on the corpus before raising the bound.
+* **Cost bound (guess).** Groups of at most 4 console waves (256 threads on a 32-lane host): Metal threadgroups allow up to 1024 threads, but each predicated arm costs every thread, and the exchange tree grows with W; beyond the bound, refuse as today. Both arms running is the main cost for unbalanced branches - measure on the corpus before raising the bound.
 * **Open:** the current count of multi-wave refusals (the 74 was measured 27 November; a fresh `VICTORY_DUMP_REFUSED` corpus sweep answers it, #282), and whether any of them branch on per-lane scalars (those stay refused even under predication).
 
 ## Console pipeline descriptions (device slots 0x1c8 and 0x218)
@@ -718,7 +725,7 @@ Without ground truth for the 0x1c8 register image, `VICTORY_GUESS_GRAPHICS=1` bu
 * **Copy propagation that does not settle.** The tracer's copy propagation (`Tracer::propagate_copies`) is an optimistic fixpoint whose phi rule is not monotone, so phis that feed each other across nested loops can cycle instead of settling (a register saved and restored inside an inner loop). After `MAX_ROUNDS` sweeps a phi that still changes is kept as a join, standing for itself. That never names a wrong origin, but it can retain less copy information than an exact answer would: a descriptor or address traced through such a phi may then be refused later where an exact propagation would have resolved it. Programs that settle within `MAX_ROUNDS` are not affected.
 * **Vertex user data.** If a v2 vertex stage has a nonzero first user-data dword and a 0x41 register index below it, try those record indices relative to the header's start. Accept that layout only when it resolves an otherwise unbound address to a declared table or root view and agrees with existing root-address uses. The title's root slot and descriptor table offsets come from the record. Absolute indices remain the default until the register image is decoded.
 * **SCC of `s_add_i32`, `s_sub_i32` and `s_addk_i32`.** The signed overflow, from the sign bits (RDNA2 ISA, SOP2 2 and 3, SOPK 15): for the adds, both sources of one sign and the result of the other (`s_addk_i32` takes its constant sign-extended); for the subtraction, sources of different signs and a result whose sign differs from the first source's. A shader that read it was refused before ("the carry of a scalar operation").
-* **Undeclared SGPR addresses.** A load or store whose address base is a live-in SGPR pair no root parameter fills is taken as a title-memory address (as an address loaded from memory is), and lowers through the memory-space page table. The guessed layout declares such a pair as root constants so lowering can read it from the user-data block. Guesses: such a pair always holds a title address (the console's user data carries raw addresses), and its root-signature slot is the first free one — the register image does not yet say which root parameter holds the pair, so a draw whose title never set that slot fails loudly ("root parameter was never set"). A descriptor built around such an address is still refused, and a shader translated with a real (non-guessed) layout still refuses the undeclared read itself ("a hardware SGPR input").
+* **Undeclared SGPR addresses.** A load or store whose address base is a live-in SGPR pair no root parameter fills is taken as a title-memory address (as an address loaded from memory is), and lowers through the memory-space page table. The guessed layout declares such a pair as root constants so lowering can read it from the user-data block. Guesses: such a pair always holds a title address (the console's user data carries raw addresses), and its root-signature slot is the first free one - the register image does not yet say which root parameter holds the pair, so a draw whose title never set that slot fails loudly ("root parameter was never set"). A descriptor built around such an address is still refused, and a shader translated with a real (non-guessed) layout still refuses the undeclared read itself ("a hardware SGPR input").
 
 * **Pixel primitive mask.** Scalar masks, shifts and unsigned bit-field extraction (`s_bfe_u32`) may feed M0 for interpolation. When the resulting value and SCC have no other use, the inferred primitive-mask SGPR anchors the existing POPS collision-id mapping in the next SGPR. A hand-assembled regression covers extraction and rejects exports of either the original or extracted mask, as well as observable SCC. This extends the guessed-path heuristic; it has not been verified against the seven remaining title shaders in issue #4.
 * **Sample and gather variants.** Each `image_sample*` and `image_gather4*` suffix adds address VGPRs in the order of the RDNA2 ISA (section 8.2.5, "VGPR Usage"; LLVM's `AMDGPUSampleVariant` agrees): offset, bias, z-compare, derivatives, then the coordinates and the level or clamp. With `a16` the coordinates, level and clamp are f16 pairs and the derivatives stay 32-bit, one VGPR each: only the `_g16` opcodes (not translated) pack derivatives, each direction from a new VGPR. LLVM sizes the address so from gfx1010 to gfx1030; before #320 the derivatives were read as f16 pairs, and 1D and 3D gradient samples with `a16` were refused. The offset word holds three 6-bit signed offsets (x in bits 0-5, y 8-13, z 16-21). So `_o` is accepted on every sample the translator takes (`sampleLevel`, `sampleBias`, `sampleCmp`, `sampleCmpLevelZero`, `sampleGrad`): the offsets must be constant and within DXIL's -8..7, and a cube sample with offsets is refused. `image_gather4_c_lz` and `_c_lz_o` become `textureGatherCmp` (DXIL op 74). Guess: a comparison gather compares the channel its dmask picks, as a plain gather gathers it; DXIL compares red only, so any other channel is refused. Still refused: comparisons at an explicit level or with bias or gradients (`image_sample_c_l`, `_c_b`, `_c_d`: DXIL 1.7 and 1.8 operations), and comparison gathers at a computed level (`image_gather4_c`, `_c_l`, `_c_b`).
@@ -744,12 +751,47 @@ Without ground truth for the 0x1c8 register image, `VICTORY_GUESS_GRAPHICS=1` bu
   * `split_wave_tests::a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_with`
 
   Each test fails without its rule. The per-half copy has no test of its own; the vertex programs above need it.
+* **Missing vertex stage.** When both vertex piece pairs are empty, skip the slot. A vertex-only slot can still draw depth. The raw 0x1c8 mesh register layout still needs decoding; mesh pipelines supplied as native shader containers now use the path described below. Pixel shaders with opaque lane masks, system inputs the signature lacks, and vertex fetches with other formats are refused (see the frame log).
 * **A mask swapped by `s_xor_b64` in a 32-lane program is the mask it gives back.** The tile classifiers (`f1a0f42fc6c79ad7`, `3ade34337c5736e1`, two of the indirect dispatches that write the 80x45 tile texture the output draw reads) leave a waterfall loop by swapping SGPR pairs with three `s_xor_b64`, though they are 32-lane programs, then join the swapped loop masks with what the loop's EXEC-zero skip brings and AND them with EXEC. The structure modelled no 64-bit scalar operation of a 32-lane program, so the swapped value was an opaque lane function and the join was refused ("a lane-mask join of an untracked mask: data, at a join of several edges"). `Lanes::mask` now takes a swap's last XOR (`structure::xored_back`, of either width, each dword on its own) as the mask it gives back. Moves stay `Lanes::sop`'s: taking 64-bit moves of a 32-lane program as mask copies too made 8 pixel programs read such a copy as a host-lane mask number, which they cannot ("not written by a scalar ALU instruction"). Not a guess: the last XOR of a swap holds the other register's bits exactly, in every lane, so each lane's bit is the copied mask's (proof as for `xored_back` above); with console lanes or split host waves the bits are then lowered as for that mask itself. A third XOR with any other register is no swap and stays refused. In these two programs the copied masks are ORed in a waterfall loop only with bits of the pass's EXEC, and the loop leaves by `s_cbranch_scc1` of `s_andn2_wrexec`, a wave-wide branch, so every lane leaves on the same pass and reads the final mask (the #257 shape does not arise). Tests: `split_wave_tests::a_mask_swapped_into_a_pair_by_64_bit_xors_in_a_32_lane_wave_is_that_mask_at_a_join` (Metal values, and the look-alike refused).
 * **Missing vertex stage.** When both vertex piece pairs are empty, skip the slot. A vertex-only slot can still draw depth. Mesh pipelines still need their stage registers decoded. Pixel shaders with opaque lane masks, system inputs the signature lacks, and vertex fetches with other formats are refused (see the frame log).
 * **`v_cvt_pknorm_u16_f32`, `v_cvt_pknorm_i16_f32` and NaN.** Assumption: a NaN source packs as 0. No public source states what the hardware gives; this follows Direct3D's float-to-normalized conversion rule, and the code comment marks it as a guess. The rest is not a guess: src0 in the low half and src1 in the high half (RDNA2 ISA, Mesa ACO), clamped, scaled and rounded to nearest even (Mesa NIR `pack_unorm_1x16` / `pack_snorm_1x16`).
 * **`s_pack_{ll,lh,hh}_b32_b16`, `s_bfm_b64`, `s_bitreplicate_b64_b32`, `v_mad_u32_u16`.** Lowered from the RDNA2 ISA opcode tables (SOP2 50-52 and 37, SOP1 59, VOP3 883); none writes SCC. `s_bfm_b64` reads six bits of each count, as its opcode entry says (the summary table's `[4:0]` is the 32-bit form's). `v_mad_u32_u16` takes op_sel bits 0 and 1 (table 21) to pick the high halves of src0 and src1; op_sel bits 2 and 3 (the 32-bit addend and result) and source modifiers have no documented meaning and are refused rather than guessed.
 * **Refused shaders.** `VICTORY_DUMP_REFUSED=<dir>` writes the container of each shader the native host cannot translate as `<stage>_<hash>.bin` (the hash the refusal log line names); with `VICTORY_DUMP_ALL_SHADERS=1` every shader translated. A compute container carries the FSPX part (code, kind 6; metadata, kind 7); a guessed graphics one the `FSPG` part. Game data: keep the folder outside the repo.
 * **Debugging.** `cargo run -p victory-shader --example disasm` (`VICTORY_PIECE=<piece>`) disassembles a dumped code piece; `--example guess` (`VICTORY_STAGE=vs|ps VICTORY_CODE VICTORY_META`) runs the guessed translation on a pair; `--example sweep` translates a whole folder of dumped containers ("Sweeping a shader corpus").
+
+### Native present planes
+
+The measured title run presents two RGBA8 planes: plane 0 is the finished, tone-mapped
+1280x720 scene with alpha near zero; plane 1 is a 3840x2160 UI/HUD texture, transparent
+outside the UI. Showing only the largest plane therefore hides the scene. The native host
+now composites the first resources of two known texture planes in the drawable's existing
+full-screen render pass. Both inputs use linear scaling to the output size and their own
+format handling, including plain views of sRGB textures to preserve stored display values.
+The bottom picture still determines SDR/HDR presentation. Pipelines and sRGB views are
+cached; compositing needs no intermediate texture, per-frame resource allocation or readback.
+
+**Guess about console plane order:** plane 1 goes over plane 0, based on that measured run,
+not a decoded console ordering rule. Alpha is assumed straight by default:
+`out.rgb = bottom.rgb * (1 - top.a) + top.rgb * top.a`, with `out.a = 1` regardless of
+the scene's alpha. Diagnostic overrides (unset by default):
+
+- `VICTORY_PRESENT_TOP=0` swaps the planes; other values retain plane 1 on top.
+- `VICTORY_PRESENT_PREMULTIPLIED=1` instead uses
+  `out.rgb = bottom.rgb * (1 - top.a) + top.rgb`, still with opaque output alpha.
+- `VICTORY_PRESENT_PLANE=<n>` disables compositing and shows just that plane, counted from
+  zero, preserving its alpha as before. An out-of-range index keeps the old largest-plane
+  fallback. A single plane is unchanged; other plane counts or unknown texture formats
+  use the existing single-plane selection.
+
+The held queue action retains both textures, waits behind earlier work and fences, and keeps
+later signals behind drawable acquisition. `VICTORY_TRACE_PRESENT=<every>` still follows
+draws into the bottom picture. The `frame targets` line's `present=` and its address/format
+refer to that picture; `overlay=` and `overlay_alpha=` name the top texture and convention.
+`VICTORY_DUMP_TARGETS` still dumps the individual targets, not a composited CPU image.
+The synthetic GPU test `present_composites_two_planes_and_keeps_single_plane_overrides`
+covers zero scene alpha, opaque/transparent/half-alpha UI, scaling, unlike sRGB formats,
+both alpha conventions, single-plane overrides, and texture release during held presents.
+GPU pixel checks and a title run still need verification on a host with Metal.
 
 ### Why guessed draws leave the target black (findings)
 
@@ -834,6 +876,13 @@ Tools (all off by default): `VICTORY_TRACE_TARGETS=1` logs per present which tit
 #### First real frame: two causes of the zero constant buffers (resolved)
 
 * **Root layout.** Guessed render pipelines gave the converter the host's root layout (`Binding::layout`) only for stages that read title memory. Without it the converter makes the user-data block a root CBV, a pointer in the argument buffer, while `translated_args` writes the dwords inline; so every guessed vertex and pixel shader read its user data (descriptor table offsets, root constants) through the address formed by user-data dwords 0 and 1, here 0. Seen by converting the translated vertex shader both ways and reading the AIR (`llvm-dis` on the bitcode in the metallib): without a root signature it loads a pointer from the argument buffer, with one it reads dword 8 inline. Compute pipelines always had the layout. Now render stages get it too. A stage with immediate samplers needs them in the layout (the converter refuses it otherwise, "Resource SMP ... not referenced by the root signature"): `RootLayout::static_samplers` carries the decoded `StaticSampler`s (`s<n>`, space 0) and `msc.rs` passes them as the root signature's static samplers. With it the boot passes' pixel shader (`9406103f`, which samples the content target) runs, and the presented image shows the menus.
+* **Copied descriptor records.** The title copies view records into its shader-visible heap with plain stores, which no device call reports: at submission the host heap entry of a content table was all zero (read back from the Metal heap) while the title's record named the constant buffer. `NativeHost::remirror_tables` now checks, at each draw and dispatch, the first 16 entries of every bound table against the record each was last mirrored from (`NativeHeap::mirrored`) and skips an unchanged record after a successful mirror only while its dependencies still match. Every successful `MirrorStamp` keeps the exact 12 record bytes and the pool-mapping generation, including for image views: placed images are resolved through the pool table in `glue::mirror`. Resource SRVs and UAVs without counters (buffers or images) also keep the named key's version; placed images keep the version of `textures::placed_key(address, &res)`. Registering, replacing, forgetting or releasing that key invalidates the stamp; unrelated resource changes do not. Versions come from a monotonic global counter, with absent keys at version 0 and a fresh nonzero version on re-registration. Constant buffers, placed buffer views and samplers keep the global resource epoch because they have no single resource key. UAVs with a nonzero counter also keep it because either resource can invalidate the descriptor. The scan compares record bytes and pool generation first, then the saved global epoch; only when that epoch moved does it look up the stored key's version. An unchanged version refreshes the saved epoch without decoding the descriptor or writing the backend entry. `NativeHost::mirror` uses the same check for repeated device writes and returns success immediately for an already current entry. A buffer view whose address is still unmapped gets a zero-length null view, and any entry whose mirror attempt could not complete yet (`NativeHeap::pending_mirror`) is retried only once the record, the pool table's generation, or the registered-resource epoch changes (rather than re-encoding the null view at every draw). Root SRV/UAV lookups (`NativeHost::root_view`) likewise query `PoolTable::mapping_at` directly in `O(log n)` without rebuilding the full mapping snapshot when streaming updates the pool table between draws. The scan extends past 16 entries when shader metadata requires it. Views of resources the host has not realized yet are not made there.
+* **Views of memory in no pool.** A buffer view whose address the pool table cannot resolve now writes the null view (size 0) into its host heap entry, and `mirror` still returns the error; it used to leave the entry as it was, so a descriptor the title reused for such a buffer kept showing the buffer it named before, and shaders read and wrote that memory, possibly given to something else since (a cause of writes landing elsewhere, issue #15). The entry is not marked mirrored by `mirror`. Image and sampler views the host cannot make still leave the entry as it was: a buffer is not something to put in a texture or sampler entry.
+* Ruled out on the way: the pool view of the constant buffer equals the title's bytes (no aliasing problem for the low, sub-4 GiB linear allocator), no mirror errors for it, the table's heap is the heap bound, residency (`VICTORY_METAL_RESIDENCY_SETS=1` changes nothing there).
+
+Metal view reuse: each Rust `Buffer` caches up to 8192 texture-buffer views by byte offset, fitted element width, raw pixel format and writable usage. Each parent `Texture` caches up to 64 texture views by raw pixel format, texture type and the fitted mip/slice ranges. At the limit the cache clears before inserting the new view; heap entries retain their own references, so existing entries remain valid. These caches die with their Rust owner. Metal views retain the underlying buffer or parent texture, but those Metal objects do not retain the views, so there is no retain cycle. `Buffer::drop` clears its views before leaving its pool residency set. `Metal::heap_entry` skips both the descriptor write and residency bookkeeping when the resource pointer, optional texture-buffer view pointer and all three descriptor words already match.
+
+Residency itself: what a descriptor heap names is resident through its own `MTLResidencySet`, given to every command buffer that uses the heap; after deferred entry-level adds/removes preceded an IOGPUGroupMemory kernel panic ("Memory object not found in fMemoryCountedSet or fPendingMemorySet"), the set is now reconciled from `alloc_counts` against committed membership only at `use_heap_cb` or when more than 512 retired allocation/view objects accumulate, with the rule "one add or one remove per allocation per commit". Entry edits issue no Metal set calls, retired allocations and texture-buffer views keep addresses alive until reconciliation completes, and retirement followed by renaming costs no calls or commit if membership is unchanged (creation still commits the heap buffer). Destruction removes all allocations and commits once before releasing objects; without sets, removed entries release immediately. Before, every allocation was named to every encoder with `useResource`: the world's heap names about 37,000 allocations, the kernel took about 155 ms per drawing render pass for that list whatever the pass's shaders, and a world frame with 35 such passes in one submission took over 5 s with the GPU idle (0.07 fps on an M5 Pro; 0.47 with the sets). The sets are the default only on a Mac with 32 GiB or more (a guess: the world's heap set holds 17 to 18 GB and no smaller Mac has run it); a smaller Mac keeps the per-encoder naming unless `VICTORY_METAL_RESIDENCY_SETS=heap` asks for the sets, and the choice is logged once at start-up. `VICTORY_METAL_RESIDENCY_SETS=0` gives the per-encoder naming back on any Mac. `VICTORY_METAL_RESIDENCY_SETS=1` also keeps the title's pool buffers in a set on every queue, which holds all of title memory (about 6.7 GB on a Series S profile) resident for the whole process and on an 18 GB Mac ended in `kIOGPUCommandBufferCallbackErrorTimeout` after the world load; by default the encoders name the pool buffers they use. A texture the title releases for good (its object's last reference, or the pool it was placed in) has its heap entries cleared (`NativeHost::release_resource`, counted as `heap_cleared` on the frame line): left alone they kept the host texture alive and resident until the title happened to write another view there. A cleared entry reads as one never written. It is written again when the title writes another record there, or makes a texture at the released object's address again (`register_texture`: the record is then checked against the new texture, as the title's record for it may equal the old one's). The old record alone is not mirrored again: in a run it named the next object at that address, an RGBA8 texture under a stale R8 view, and Metal asserts on such a view (the backend now refuses a view format Metal cannot cast the texture to, `gfx::castable`). A texture only replaced by another description at its address keeps its entries (the title may still read them; that release is a guess). The frame line logs the heap set's size (`heap_set_mb`). Not checked on a 16 or 18 GB Mac. Details in `docs/metal-backend.md`, "Residency (what a heap needs)".
 * **Copied descriptor records.** The title copies view records into its shader-visible heap with plain stores, which no device call reports: at submission the host heap entry of a content table was all zero (read back from the Metal heap) while the title's record named the constant buffer. `NativeHost::remirror_tables` now checks, at each draw and dispatch, the first 16 entries of every bound table against the record each was last mirrored from (`NativeHeap::mirrored`) and skips unchanged records after a successful mirror. A buffer view whose address is still unmapped gets a zero-length null view, and any entry whose mirror attempt could not complete yet (`NativeHeap::pending_mirror`) is retried only once the record, the pool table's generation, or the registered-resource epoch changes (rather than re-encoding the null view at every draw). Root SRV/UAV lookups (`NativeHost::root_view`) likewise query `PoolTable::mapping_at` directly in `O(log n)` without rebuilding the full mapping snapshot when streaming updates the pool table between draws. The scan extends past 16 entries when shader metadata requires it. Views of resources the host has not realized yet are not made there.
 * **Views of memory in no pool.** A buffer view whose address the pool table cannot resolve now writes the null view (size 0) into its host heap entry, and `mirror` still returns the error; it used to leave the entry as it was, so a descriptor the title reused for such a buffer kept showing the buffer it named before, and shaders read and wrote that memory, possibly given to something else since (a cause of writes landing elsewhere, issue #15). The entry is not marked mirrored by `mirror`. Image and sampler views the host cannot make still leave the entry as it was: a buffer is not something to put in a texture or sampler entry. A buffer view of address 0, which is what D3D12 writes for a null view, is the null view for good, whatever its size, and is marked mirrored: nothing can be mapped at 0 in this process (`__PAGEZERO` keeps page 0) and no buffer object is at 0, so no pool or wrap can ever resolve it. As memory in no pool it was tried again after every change to the pool table, which streaming makes between almost every submission in the world. Measured on one Mac (M4 Pro), on a branch that also checks whole heaps for shaders that index them (main checks only the bound tables' entries): 21,000 to 23,000 such tries a frame in the world in two runs without it, none in two runs with it, and the world at about 2.0 fps instead of 0.9 to 1.1. The gain on main has not been measured and is likely smaller.
 * Ruled out on the way: the pool view of the constant buffer equals the title's bytes (no aliasing problem for the low, sub-4 GiB linear allocator), no mirror errors for it, the table's heap is the heap bound, residency (`VICTORY_METAL_RESIDENCY_SETS=1` changes nothing there).
@@ -899,8 +948,8 @@ Every kind of work the native host drops now logs one `warn!` the first time it
 happens ("native host drops work: ..."), and each drop still counts in the
 periodic "native draws so far" line. The kinds are: a draw or dispatch with no
 host pipeline (refused or not translated), a topology the host does not draw,
-an indexed rectangle list, a guessed mesh pipeline, mesh and indirect mesh
-dispatches, texture copies and resolves, and indirect executions (one warning
+an indexed rectangle list, an undecoded guessed mesh pipeline, refused mesh dispatches,
+texture copies and resolves, and unsupported indirect executions (one warning
 per signature). A texture in a format the host cannot realize warns once per
 format value, with its size and flags. No switch is needed; `RUST_LOG` filters
 them as usual.
@@ -919,6 +968,35 @@ kind as both its neighbours parts nothing, as before. These two are counted
 per host (`NativeHost::unset_roots`, `NativeHost::no_targets`). The unset-root
 drops are in the "native draws so far" line as `dropped_unset_root` (with
 `dropped_unmapped` and `dropped_failed` for the kinds below) and warn without
+a switch, once per root parameter. Unknown: what the console gives a shader in
+a root slot the title set nothing in.
+
+Root parameter 255 was not such a slot. It is the translator's own view-stride
+table (`victory_shader::emit::VIEW_STRIDES`, root SRV `t255`): a shader that
+takes a buffer view from the resource heap itself looks up the entry's stride
+there before it reads the entry, and reads the host's null buffer view where
+the table holds 0 (`emit`, "Buffer views at computed heap indices"). The
+native host bound no such table, so every draw and dispatch of such a shader
+was dropped at submission, counted only in `unset_roots` and warned about only
+with `VICTORY_TRACE_TARGETS=1`. Those shaders include the title's six culling
+shaders (first pass `fc5e66f8f873d3bb`, `0452fc2d2e2fc4c3`; later
+`3b471c122be79b3e`, `9f017d9011377efa`, `764ca63daec9c616`, `87bf9e3f2bf2f052`)
+and the per-frame record writer `4fb416369fc50b6e` (the `guess` example on
+their dumped containers prints `srvs [255]`), while the record reset
+`9146291b38ea9ce1` has no such read and ran. So the mesh records the cullers
+write stayed empty (every GPU-ordered snapshot of a persistent record page:
+`with_groups=0`) although the cullers counted as encoded when recorded. Now
+each resource heap has a stride table (`NativeHost::view_strides`: a dword per
+heap index up to `HEAP_VIEWS`, from `descriptors::stride_word`, made at first
+use from the title's records and kept current by `NativeHost::mirror`), bound
+where the shader's layout has `t255`. A resource heap is as long as the
+translator's index clamp (`HEAP_VIEWS` entries, 48 MiB of descriptors), with
+null buffer views at `NULL_BUFFER_VIEW` and below it. Limit: as for the view
+addresses, an entry the title copies as bytes outside a bound table keeps its
+old stride until it is mirrored. Tests:
+`heap_tests::a_heap_entry_outside_every_table_shows_pages_mapped_after_the_view_was_made`
+(a compute program stores through a buffer view it loads from the heap by
+index) and `descriptors::tests::stride_words_of_buffer_views`.
 a switch, the first time for each root parameter (at most 16); the no-target
 drops warn once with `VICTORY_TRACE_TARGETS=1`. Unknown: what the console
 gives a shader in a root slot the title set nothing in; the host draws nothing
@@ -958,6 +1036,23 @@ and value writes, so the title read their buffers stale (issue #15: 229 such
 refusals in one story load). These are counted per host
 (`NativeHost::unmapped`). The first one warns without any switch, as the
 refused piece did, and each one is logged at debug level with its address.
+With `VICTORY_TRACE_TARGETS=1` the frame log adds "commands dropped at
+unmapped title memory so far, by kind": the twelve most frequent of them by
+command kind and address (`NativeHost::unmapped_kinds`).
+
+Most of those commands (about 99,000 a run of Grand Theft Auto VI) named committed
+resources: their memory came from the host heap, which no pool backs. Committed
+resources ask the title's allocator (`XMemAlloc`, the title's hook) with the GPU's own
+allocator id (128), and the title's hook hands that on to `XMemAllocDefault`, which
+used the host heap for it; heaps from `CreateHeap` used the host heap directly
+(`resource::Memory::new`). On macOS both now take committed `XMemVirtualAlloc`
+graphics memory (`xmem::graphics_alloc`, a pool of its own below 2^40;
+`resource::use_graphics_memory` for the heaps), so the title's exposure read-back
+(texture-to-buffer copies of 0x10 and 0x50 bytes and value writes into four buffers
+in turn) and its three buffer-to-texture uploads a frame are encoded (`dropped_unmapped`
+went from about 99,000 a run to 0). "resource memory origin=..." logs the first 48
+allocations of each origin at debug level. Test:
+`xmem_posix::tests::the_gpu_allocators_memory_is_pool_backed`.
 
 Every other error the host meets preparing one command (root arguments that are not what the
 shader reads them as, a resource heap with no room for the view pairs, a buffer or page table
@@ -986,6 +1081,35 @@ texture is released (guess: the title is done with it once it places another the
 old description still in a heap would name a released texture). Every texture placed in a pool is
 released at the first submission after the pool is (`NativeHost::released_pools`).
 
+#### A placed view at a GPU-written texture's address
+
+A placed shader or unordered-access view can name the memory of a texture object the GPU
+writes. It now aliases that object's host texture instead of uploading a separate texture from
+title memory, which does not contain the GPU's writes. This covers the lighting carriers written
+through R32_UINT objects and read through R9G9B9E5 placed views at the same address.
+
+The owner must be a texture object with RENDER_TARGET or UNORDERED_ACCESS, without depth,
+at exactly the same memory address, with the same width, height, depth or layer count and
+dimension. Both host formats must be uncompressed colour formats of the same texel size;
+`Format::color_castable` is shared with Metal's view check. The most recently realized
+compatible object wins, otherwise a pending object is realized. Mip counts may differ: the
+existing Metal view path cuts the requested range to the owner's levels.
+
+`Title::realize` handles both orders. A new placement finds its owner before allocating storage.
+An object realized later replaces the placement's independent texture with an alias, removing
+its watch entry and sync work. Registering the owner's texture under the placed key advances
+the host's resource generation, so existing heap entries are mirrored again even if their title
+records are unchanged. The alias has no upload or write-back of its own. The owner's existing
+CPU write tracking stays in place; creating an alias schedules no additional owner uploads.
+
+Releasing the owner forgets its aliases and their address records. Replacing an alias or
+releasing its pool removes only the alias. The next placed view can find another owner or make
+an independent texture. The first 64 alias creations log the address, keys, formats, dimensions
+and creation order; the existing texture-sync trace also counts live aliases.
+
+This does not unify two texture objects of different formats at one address, block-compressed
+textures, depth textures, or mips beyond the owner's levels. Placements without a qualifying
+object, including static assets, retain their existing storage and uploads. Buffers are unchanged.
 #### A byte budget on host texture copies (#294)
 
 Every host texture copy of a title texture is made when a view first names it (`Title::realize`,
@@ -1130,6 +1254,27 @@ copies per new byte in the last 12 s, until macOS ran out of memory (#301). Two 
   title memory does not (render targets, depth, GPU-written, ever viewed for unordered access).
   Placements are the only trigger: an object created over placed copies does not cover them. The
   trace's "covered still in use" counts those waiting on an entry.
+  Default-on `VICTORY_COVERED_CLEAR` now also gives up a covered memory-only copy whose only
+  remaining use is stale heap entries, clearing those entries and their mirror/pending stamps
+  through the existing release path (Metal retires their allocations at `Heap::commit_set`),
+  while keeping copies named by a submission or retained by recorded/submitted lists; `=0`
+  restores the wait described above.
+  A covered copy is distinct from a budget eviction: its stale records stay null on table
+  checks and descriptor copies, and `realize` cannot recreate it. Only a new placed-view
+  creation call from the title can reclaim its memory. If that placement covers the copy
+  that displaced it, the pair is exempt from then on (4096 recent displacements and 4096
+  permanent exemptions). A full exemption set retains known pairs and keeps clearing all
+  other pairs; it never disables clearing globally. Keys hash the resource description and
+  address, not the view's mip/slice description, so another view of one resource adds no pair.
+  The existing texture-sync trace adds copies/MiB released by clearing entries and a
+  cumulative count of reverse displacements detected at title placement calls.
+  On the coordinator's 24 GB M4 Pro Series S run with the budget off, world entry reported
+  9856 MiB of copies, 9198 MiB retained, 658 MiB evictable and 2997 MiB of distinct title memory,
+  with only 402 covered copies (89 MiB) released and 10549 still held, followed by 19 GB GPU
+  memory and the first `kIOGPUCommandBufferCallbackErrorOutOfMemory` four minutes in.
+  The earlier clearing rule released 75,334 copies (19.3 GB) in ten minutes, kept placed copies
+  at 6.15 GB and preserved the picture without a GPU error; validation of this integration on
+  Metal and in the game remains with the coordinator.
 * What it cannot share: copies at other starts (separately placed mips or slices of one chain)
   and copies of one memory in other layouts or formats still hold it once each; the trace's
   distinct figure shows what is left.
@@ -1155,6 +1300,28 @@ views so Metal clamps it to the remaining levels. Previously the decoder returne
 the host bound the whole texture, so a shader reading level 0 saw the base mip even when
 the view started farther down the chain.
 
+#### Earlier eager typed-buffer implementation (historical)
+
+The following records the earlier implementation. The current lazy implementation follows it.
+
+`victory-shader` lowers MUBUF `buffer_load_format_*`, `buffer_store_format_*`, and their
+`getDimensions` size queries to DXIL `TypedBuffer` (`bufferLoad.f32` / `bufferStore.f32`), which the
+Metal Shader Converter compiles to `air.read_texture_buffer_1d.v4f32`,
+`air.write_texture_buffer_1d.v4f32`, and `air.get_width_texture_buffer_1d` reading `textureViewID`
+(word 1) of the 24-byte `IRDescriptorTableEntry`. `Metal::write_buffer` previously left word 1 at
+`0` (null `MTLResourceID`) for every buffer view, so formatted buffer stores wrote nothing and
+formatted buffer loads and size queries returned `0` (`#255`). `descriptors::decode` and
+`Metal::write_typed_buffer` now attach a zero-copy `MTLTextureTypeTextureBuffer` (`ShaderRead`, plus
+`ShaderWrite` for UAVs) in word 1 alongside `gpuVA` in word 0 and `size` in word 2 for typed buffer
+SRVs/UAVs and for 4-, 8-, and 16-byte structured buffer SRVs/UAVs (guess, marked in
+`descriptors.rs`: on RDNA2 a structured `V#` of 4-, 8-, or 16-byte elements carries a 1-, 2-, or
+4-dword 32-bit data format, so shaders may access the same descriptor with both
+`buffer_store_format_*` / `buffer_load_format_*` and `buffer_store_dword*` / `buffer_load_dword*`).
+The `MTLTexture` view is retained per heap entry while only the backing pool `MTLBuffer` is counted
+in `alloc_counts` and `MTLResidencySet`, so `heap_set_mb` and per-encoder `useResource` counts do
+not grow with buffer views. Tested on the GPU in
+`native::tests::heap_tests::formatted_buffer_stores_and_loads_through_structured_and_typed_uavs` and
+`victory-metal` `gfx::heap_set_tests::a_heaps_set_follows_its_entries`.
 #### Typed and structured buffer views lazily carry a Metal `texture_buffer`
 
 `victory-shader` lowers MUBUF `buffer_load_format_*`, `buffer_store_format_*`, and their
@@ -1291,7 +1458,7 @@ Texture uploads, the background scanner and submit-time probes first try one Mac
 #### Rectangle-list corners and the Brightness logo (open)
 
 * The right-angle corner is no longer assumed to be v1: the first two-channel-or-wider float fetch (the position) picks it as the corner opposite the longest side, and the strip is p, r, p + q - r, q (r the right angle). With the title's data (top-left, bottom-left, bottom-right) this is the old rule. A value two corners share is copied to the fourth exactly, not through float arithmetic (packed or NaN bits survive).
-* A rectangle-list draw whose pipeline is not guessed (a described pipeline) is drawn as a plain strip without its fourth corner, and now warns once.
+* At this point, described rectangle-list draws still lacked their fourth corner. They now replay the vertex program and complete its outputs; see "Described pipeline rectangle-list draws complete their outputs" below.
 * `VICTORY_TRACE_RECTS=1` logs the first three rectangle-list draws of each pipeline with the first three vertices as floats.
 * The Brightness logo (half a rectangle, the cut along one diagonal) is a guessed pipeline (`vertex 511484f3`: float3 position, unorm8x4 colour at 12, float2 uv at 16, 24-byte vertices) drawing one rectangle at (+-0.2, +-0.325) with corners top-left, bottom-left, bottom-right, which is the order the rule expects. Its matrices flip y, so the visible half is the strip's first triangle (which holds the computed corner), and the second triangle is lost. Both triangles wind alike, so culling does not explain it; the next suspects are the guessed depth state (less-equal with writes, `VICTORY_DEBUG_NO_DEPTH`) and the pixel shader on the second triangle. Not settled: the game runs needed were stopped.
 
@@ -1566,6 +1733,21 @@ console's `v_readlane` of a lane the group lacks reads whatever that lane's VGPR
 `split_wave_tests::a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks` (`victory-gpu`)
 runs a ballot and a whole-wave sum in a 96-lane group on Metal.
 
+`tile_wave_tests` (`victory-gpu`) runs the cross-lane forms of the title's tile classifier
+(`tiled_lighting`, 8 x 8 threads a group, 54 x 30 groups) as programs of our own in dispatches of
+4 x 3 groups with inputs that differ by group and by lane: `v_mbcnt` prefix counts and the first
+lane of a mask picked by `s_ff1_i32_b64` of EXEC, `v_readfirstlane_b32` and `v_readlane_b32`
+(lanes 0, 31, 32, 63) under part of EXEC, a whole-wave sum and an exclusive prefix sum in the
+console compiler's steps (DPP adds, `v_permlanex16_b32`, EXEC written a half at a time), LDS
+words gathered with `ds_or_b32`, `ds_add_u32`, `ds_max_u32` and `ds_min_u32` with no barrier, and
+a switch made by narrowing EXEC (`v_cmpx_ne_u32` and `s_cbranch_execz`) followed by a guarded
+rewrite. The programs store through a buffer view of a descriptor table: a program that reaches
+title memory by address and has LDS is left out of the console flow (`console::eligible`), so the
+tests of `split_wave_tests` that store with `global_store_dword` and use LDS run upstream's
+lowering, not the console flow. All pass with the console flow; with `VICTORY_NO_CONSOLE_FLOW=1`
+all but the first-lane read do (upstream's lowering gives each half its own first lane, whatever
+EXEC holds).
+
 ## ExecuteIndirect on the native host
 
 The prologue world load (frame ~2112) is the first place the title uses `ExecuteIndirect`. It creates five command signatures, each with one argument and no count buffer, and passes `max` 1 every time:
@@ -1576,7 +1758,7 @@ The prologue world load (frame ~2112) is the first place the title uses `Execute
 | 12 | 105, console single-pass dispatch | three group counts (guess, below) | as `DISPATCH` |
 | 16 | 0, `DRAW` | `D3D12_DRAW_ARGUMENTS` | `drawPrimitives:indirectBuffer:` |
 | 20 | 1, `DRAW_INDEXED` | `D3D12_DRAW_INDEXED_ARGUMENTS` | `drawIndexedPrimitives:...indirectBuffer:` |
-| 12 | 10, `DISPATCH_MESH` | `D3D12_DISPATCH_MESH_ARGUMENTS`: three group counts | `drawMeshThreadgroupsWithIndirectBuffer` (a guessed mesh pipeline) |
+| 12 | 10, `DISPATCH_MESH` | `D3D12_DISPATCH_MESH_ARGUMENTS`: three group counts | `drawMeshThreadgroupsWithIndirectBuffer` when its mesh pipeline is available (a described mesh stage of a stream pipeline, or a guessed mesh pipeline) |
 
 The words the log prints after a dispatch's type (`[2, 1, 0, 0]`, `[105, 0, 60000, 0]`) are not part of its argument description; only root-constant, view and vertex-buffer arguments use them.
 
@@ -1591,11 +1773,210 @@ The type-105 records are not the ones that held leftovers: the first three of ea
 Still dropped, logged once per signature ("indirect execution dropped"), except rectangle lists, logged once as "native host drops work: an indirect rectangle-list draw":
 
 - Signatures with more than one argument: root constants, root views, vertex or index buffers changed per record. Their values are per record in GPU memory, so they cannot be read on the CPU at submission time. None seen yet.
+- Mesh dispatches whose pipeline is undecoded, fails translation/conversion, or exceeds the output-storage limit (see below).
 - Mesh dispatches (type 10) under a pipeline that is not a mesh pipeline, and draws of a mesh pipeline ("a mesh dispatch of a vertex pipeline", "a draw of a mesh pipeline"). A guessed pipeline whose vertex program exports primitives is a mesh pipeline (see the guessed-pipelines list); its type-10 records run as `drawMeshThreadgroupsWithIndirectBuffer`, counted ones gated like the rest. Test: `victory-gpu` `a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count`.
-- Indirect draws of a rectangle list (topology 17): the host draws a rectangle list as instances of four vertices, which needs the record's counts rewritten first. The title's indexed signature (stride 20) is one (run 1 dropped it on this path, the only one an indexed record without a count buffer drops on); so are direct indexed rectangle lists, which the host also drops. First windowed run with this change (2026-11-27, Series S): the draw, dispatch and type-105 signatures ran, and only the mesh signature and the indexed rectangle-list draw dropped.
+- Indirect draws of guessed rectangle strips and indexed rectangle lists (topology 17) remain dropped. Described non-indexed rectangles now expand GPU records and shader outputs (see "Described pipeline rectangle-list draws complete their outputs"). The older guessed path draws instances of four vertices and still needs its own count mapping. The title's indexed signature (stride 20) is one (run 1 dropped it on this path, the only one an indexed record without a count buffer drops on); so are direct indexed rectangle lists, which the host also drops. First windowed run with this change (2026-11-27, Series S): the draw, dispatch and type-105 signatures ran, and only the mesh signature and the indexed rectangle-list draw dropped.
 
 Guess: type 105 is not a D3D12 argument type. It is taken to be the console's single-pass dispatch, with the same three-word record as `DISPATCH` (its flags live in the signature, the title passes none); its stride, 12, fits that.
 
+## Wine-route fixes ported to the native host (2026-11-26)
+
+The native `run` path applies title patches immediately after mapping, while the
+image is writable, before import finalization, TLS, DLL entry points or title
+code. The watchdog sites are selected by the original BLAKE3 build identity;
+all patches compare the original bytes and image bounds before writing. Output
+size and its back-buffer pool check are an atomic group: a mismatch leaves both
+unchanged. `NativeImage::finalize` supplies executable protections and flushes the
+instruction cache afterwards. These are the Wine build's known 1.0.2.1 sites,
+not a claim that the observed `+0x55e56f8` crash is conclusively diagnosed.
+
+| Variable | Native behavior |
+|---|---|
+| `VICTORY_NO_HANG_WATCHDOG` | Defaults to `1` in both native `run` and the launcher. `0` preserves the watchdog. Each patched RVA is logged; unknown builds and byte mismatches are left alone. |
+| `VICTORY_OUTPUT=WxH` | Optional: `1280x720`, `1664x936`, `1920x1080`, `2560x1440`, `3840x2160`. Changes title output, not window size. |
+| `VICTORY_RENDER_SCALE` | Optional `0.5` through `1.0`, for the title's own upscaler; FidelityFX's scale is unchanged. |
+| `VICTORY_UPSCALER` | Optional `6` (title's own) or `7` (FidelityFX). |
+| `VICTORY_STEP_OVER=pool` | Off unless requested. Before title exception handlers, resume only a mapped-image breakpoint whose bytes are `int3; xor r,r`, including matching REX register extensions. Advance only RIP; the xor produces the title's NULL return. Reports the first three and powers of two. A caller that cannot accept NULL may still fail. |
+| `VICTORY_REPORT_HDR=1` | Default off. Report enabled (`1`) and, for non-null info, write `[0.0,1600.0,1000.0]`. These are fixed Wine-route luminance values, not measured display capabilities. |
+| `VICTORY_MESH_OVER_LIMIT=1` | Default guard refuses declared mesh outputs above 32,768 bytes before conversion, warning and counting the refusal. Uses the larger of packed components and the Wine-measured aligned layout. `1` bypasses only this guard. |
+
+HDR presentation recognizes an `R10G10B10A2_UNORM` source only with the HDR switch
+on. The drawable worker selects `BGR10A2Unorm`, `itur_2100_PQ` and
+`wantsExtendedDynamicRangeContent`, preserving PQ values through the copy shader,
+as in [Apple's direct color-space presentation guidance](https://developer.apple.com/documentation/metal/using-color-spaces-to-display-hdr-content).
+Layer changes are serialized with drawable acquisition; stale SDR/HDR drawables
+are discarded if the source changes while acquisition is pending. SDR restores
+the layer's original settings. Other formats keep SDR behavior. There is no
+custom tone mapper or display-capability negotiation; the existing BGRA8 frame
+capture returns no image for HDR rather than treating packed 10-bit data as BGRA8.
+
+Native mesh-stage creation and mesh dispatch are still absent (`gfx.rs` uses a
+vertex/fragment pipeline descriptor; native glue requires a vertex stage). The
+new guard measures and rejects oversized translated mesh stages, but bypassing
+it does not make those pre-existing unsupported mesh pipelines render.
+
+`run-native.sh` inherits exported `VICTORY_*` variables directly. No game was run
+for this port; build and synthetic regressions cannot establish visual correctness
+or whether it prevents the three-minute crash.
+
+
+## Native mesh pipelines (known containers; raw 0x1c8 layout still open)
+
+The native host now accepts a mesh producer and its paired pixel shader from a pipeline
+stream (console subobject 24 = mesh, 2 = pixel). `native::ms_io` already decodes the
+container's FSSM stage registers: mesh slot 0x48, output semantics at stage-data +0xc8
+(count +0x188), clip/cull control +0x194, and the packed thread/vertex/primitive/topology
+fields at +0x448. This path is reused, not inferred from IA topology. Linked translation
+explicitly selects the mesh and pixel hardware stages. A synthetic FSSM pair tests the
+register decoding, pairing, channel pruning and depth-only output removal.
+
+Before conversion, mesh and pixel containers are translated together with the native
+wave32 and zero-copy options. Arbitrary outputs/channels the emitted pixel shader never
+reads are removed; system outputs remain. A depth-only pipeline removes all arbitrary
+outputs. This is the Wine route's `LINK_MESH_OUTPUTS=all` policy, always enabled for native
+mesh. The aligned Metal layout is measured **after** linking: distance scalars, position,
+then signature order, each field aligned to its own size, multiplied by declared maxima.
+An unknown footprint or one above 32,768 bytes is refused before creating a Metal pipeline.
+Exactly 32,768 bytes is accepted. There is no override for this queue-hang guard. Limit
+warnings occur once per source mesh shader, and each refused dispatch is counted.
+
+`victory-metal` creates `MTLMeshRenderPipelineDescriptor` with the same colour formats,
+blend/write masks, depth/stencil, raster, culling, viewport and scissor handling as vertex
+pipelines. Mesh and fragment arguments use their own top-level buffer at slot 2, resource
+and sampler heaps at slots 0/1, and dispatch arguments at slot 4. Page-table buffers are
+made resident for the mesh stage. Optional converted amplification DXIL creates an object
+function and may supply a separate root block. The converter's version-1 mesh and
+amplification reflection supplies the entry name, threadgroup dimensions, output maxima,
+topology and payload size; reflection is stored with the metallib in its own cache format.
+The ABI follows [Apple's reflection model](https://github.com/apple/game-porting-toolkit/blob/main/docs/metal-shader-converter/reflection.md).
+
+Direct `DispatchMesh(x,y,z)` preserves all three dimensions. `DispatchMeshX` uses `(x,1,1)`
+or the indirect title address when supplied; unknown flags and external console payloads
+are explicitly refused. `ExecuteIndirect` type 10 uses the same record-address path as
+other indirect operations. It resolves the complete 12-byte record at submission, then
+Metal reads it at execution, preserving preceding GPU writes. Mesh commands snapshot the
+graphics roots/targets and ignore stale IA vertex/index state. Resource lifetimes and pass
+ordering are the existing native command-list machinery.
+
+The periodic `native draws so far` line replaces `mesh`/`mesh_indirect` dropped counts with
+`mesh_drawn`, `mesh_refused_over_limit`, `mesh_refused_conversion`, and
+`mesh_refused_no_pipeline`. As with the existing `encoded` counter, `mesh_drawn` means
+handed to the native list; it does not certify successful GPU completion. Submission-time
+unmapped-memory/root/target failures retain their existing diagnostics.
+
+**Remaining gap:** the unlabelled 0x1c8 register image is not the FSSM stage-data record.
+The available source documents only its fixed-function offsets, not the mesh-stage map.
+Slots without a vertex producer still become `Pipe::Skipped`, and mesh dispatches using
+those slots count as `mesh_refused_no_pipeline`. No guessed threadgroup/output limits have
+been invented. Console amplification programs are not translated by `victory-shader` and
+are refused explicitly; optional object functions are supported for already-converted
+DXIL through the backend. Root-changing indirect signatures remain unsupported. Count buffers also gate type-10
+mesh records through the upstream GPU gate, using their three-word dispatch layout. This work does not establish that the game world renders.
+
+Tests: `cargo test -p victory-shader mesh` is CPU-only. `victory-metal --test mesh` exercises
+our HLSL mesh/fragment pair, direct and indirect draws, optional amplification payloads,
+root constants and both residency modes. `victory-gpu an_indirect_mesh` checks an aliased
+title-memory record written by a preceding GPU copy and graphics-state snapshotting.
+
+The initial mesh smoke tests accidentally inherited `Cull::Back` and clockwise front
+faces, while `tri_ms` emits a counterclockwise triangle. The vertex smoke tests explicitly
+disabled culling. Both mesh smoke tests now do the same. `mesh_culling_matches_winding`
+reproduces the old all-clear result with back/CW and checks all six culling/winding
+combinations. This is the leading explanation for the GPU's completed-but-empty draw;
+the corrected pixel tests still need a run outside the GPU-less agent sandbox.
+
+Independent diagnostics in `--test mesh` separate execution from rasterization:
+
+- `mesh_uav_proves_execution_without_rasterization`: a mesh with zero output primitives
+  writes 256 distinct words (32 lanes in each of 2x2x2 groups) through a root UAV. Tests
+  zero groups, direct dispatch and an indirect record populated by a preceding GPU copy.
+- `mesh_fullscreen_constant_fragment_without_stage_in`: a position-only full-screen
+  triangle and constant red fragment, no resources or user varyings, culling off; checks
+  an explicit viewport and the default viewport.
+- `mesh_triangle_direct_and_indirect_read_title_memory` and the separate
+  `mesh_triangle_amplified_direct_and_indirect_read_title_memory`: the original linked
+  color/roots and amplification payload checks. Each test covers both residency modes.
+
+Apple's MSC 4.0 beta 3 headers match our 32-byte mesh and 20-byte amplification reflection
+layouts, stage IDs 5/6, and reflection version 1. The release-info functions return `bool`;
+their FFI declarations now match. Native mesh grids go through Metal's mesh draw commands,
+with roots at slot 2 and resource/sampler heaps at 0/1 for each consuming stage. The draw
+arguments/uniforms at 4/5 in Apple's geometry/tessellation emulation helpers are not native
+mesh dispatch parameters; the redundant mesh/object slot-4 bindings have been removed.
+The converted fixture has a primitive count of 1, triangle indices 0/1/2, and matching
+`user(texcoord0)` mesh/fragment interfaces. Rasterization and sample-count descriptor
+defaults are enabled and 1. The depth-state guard is preserved.
+
+Use the unpacked **universal** library for both architectures (no Apple files are vendored):
+
+```sh
+export VICTORY_MSC_DYLIB=<folder>/MetalShaderConverter.pkg/Payload/usr/local/lib/libmetalirconverter.dylib
+export MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1
+cargo test -j6 --release --target aarch64-apple-darwin -p victory-metal --test mesh -- --nocapture --test-threads=1
+cargo test -j6 --release --target x86_64-apple-darwin -p victory-metal --test mesh -- --nocapture --test-threads=1
+cargo test -j6 --release --target aarch64-apple-darwin -p victory-gpu an_indirect_mesh -- --nocapture --test-threads=1
+```
+
+The tests honor `VICTORY_MSC_DYLIB` and otherwise use the installed default; without either,
+they skip. Use arm64 for `victory-gpu` (its broader test harness has a known Rosetta crash).
+The converter-only reflection/fixture test and ABI layout test run without a GPU on both
+architectures. These diagnostics use synthetic HLSL, compiled fixtures and test-only output;
+they add no runtime diagnostic switch. The game was not launched.
+
+## Native shader translation without a GPU
+
+On macOS, `victory translate --list --jobs 4 /path/to/shaders.rpf` now runs
+the translator directly with the native host's `wave32_host` and
+`zero_copy_memory` options. It reads containers and SGD5 records using the
+existing scanner, deduplicates complete containers by BLAKE3, and prints
+outcomes and totals by reason. It does not open Metal, validate DXIL, create
+pipelines, execute title code, or populate the runtime cache. `--validate`,
+`--pipelines`, and `--cache` still require the Windows path. Archive containers
+carry metadata that runtime-inferred graphics containers do not, so archive
+counts are not a measurement of the graphics refusals in a native run.
+
+The wave64 lowering now follows the console control flow for eligible compute
+groups of at most 64 threads on a 32-lane host. Both halves take the same
+wave-wide branches; EXEC guards vector effects, while scalar lane reads and
+writes still execute. This permits group-shared exchanges inside console
+branches and loops and orders LDS accesses between the halves. Mask phis retain
+their values even for lanes outside EXEC, and saveexec's SCC tests the new EXEC.
+Named lane accesses outside recognized whole-wave sections select this path
+before lowering; other unsupported mask/whole-wave patterns retry through it.
+Recognized reductions retain their existing optimized path. This ports the
+approach and conservative exclusions of Wine-route PR #439: it does not permit
+divergent group barriers across several console waves, forward permutes, or
+the excluded combinations of title-memory reads and LDS/whole-wave sections.
+Those exclusions need further evidence before expansion. RDNA2 backward
+permutes (`ds_bpermute_b32`) operate within each 32-lane half, without exchanges.
+General vertex/pixel cross-lane operations remain limited by the host's
+unproven lane correspondence beyond a pixel quad.
+
+Descriptor tracking folds scalar integer construction when its operands are
+proven constants and preserves loaded descriptors through exact bit identities
+(`and -1`, `or 0`, `xor 0`). A sampler constructed entirely this way uses the
+existing static-sampler path. A real edit to a loaded texture descriptor or a
+sampler word dependent on a runtime value remains refused; substituting the
+original host view or a fixed sampler would change its meaning.
+
+`s_absdiff_i32` uses wrapping 32-bit subtraction followed by signed absolute
+value, with SCC set for a nonzero result. `v_ldexp_f32` adjusts the float's
+exponent using integer operations, avoiding an overflowing intermediate
+`exp2`; it handles signed zeros, infinities, NaNs and extreme signed exponents.
+Like the surrounding f32 lowering, it assumes input/output denormals flush to
+zero. This is a mode assumption, not newly decoded title MODE state; other
+denormal modes remain unmodeled. The instruction rules and 32-lane backward
+permute scope follow the [AMD RDNA2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+Hand-assembled shader tests exercise translation only, without a GPU.
+
+Queue signals now always enter the existing held-action FIFO, even on an empty
+queue, and stay there if backend submission fails. A failed submission cannot
+discard the signal or allow later work on that queue to overtake it. The
+scheduler regression uses a fake executor and verifies retry, producer/consumer
+order and progress on independent queues. Fence diagnostics say "requested"
+rather than "queued": their timer starts at the title request, which may still
+be behind an unsatisfied CPU-side memory wait. This fixes a lost-signal error
+path; it does not establish that this error path caused the observed crash.
 ## `DispatchX` with thread counts
 
 `DispatchX(x, y, z, flags)` (list slot 0x270) is how the title's ray-tracing builder runs its node writers. The host ignored the flags and ran `x * y * z` groups. With flag 0x20 the counts are threads, not groups: a dispatch for 45 nodes of a 64-lane program ran 45 groups, 2,880 lanes, and wrote 2,835 empty nodes (child pointers -1, infinite boxes) past the acceleration structure, over whatever the title had mapped after it: texture chunks and the CPU structures of drawables. That was the crash on the way into the prologue (Series S, about 141 s in, frame ~1860: image+0x55ceb22, or the fatal-error path at image+0x55e56f8).
@@ -1849,11 +2230,17 @@ Refused fields:
 The message is "a view address field the table gives as 0: " and the field.
 
 The bits a program can see are followed through its readers:
-- `s_and_b32` with a constant keeps that constant's bits;
+- `s_and_b32` intersects the observable result with its constant mask, including a mask
+  held in an SGPR by up to four `s_mov_b32` definitions;
 - `s_pack_ll_b32_b16` keeps the low half;
-- `s_or_b32` with a constant and `s_lshr_b64` by a constant (of which the dword is the high half)
-  are followed into their results, four readers deep, as long as nothing reads their SCC;
-- any other reader, or a phi, sees every bit.
+- scalar moves, bitwise AND/OR, 32-bit logical shifts and unsigned bit-field extraction
+  propagate the result's observed bits back to the source, four readers deep;
+- a live SCC zero test observes all surviving result bits, even if later data masks discard
+  them; 64-bit right shifts of the high dword retain the existing SCC-unread restriction;
+- any other reader, or a phi, conservatively sees every bit.
+
+This includes size queries written as shifts and extractions, without treating the discarded
+address/format bits as reads. It does not authorize any additional table fields.
 
 Measured offline (27 November, the 4,921-container all-shaders boot set, main 465db23b + #304):
 - 44 translated programs read the table: 42 compute, 2 pixel, no vertex.
@@ -1889,6 +2276,100 @@ native Metal host serves view addresses (see "View addresses on the native host"
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
 compute programs refused with the old message.
 
+## Ray-tracing structure builder defaults off
+
+The native host suppresses the title's BVH builder unless `VICTORY_BVH_BUILDER=1`.
+The value must be exactly `1`; unset, empty, `0`, and other values leave it off.
+The policy is read once per process, shared by dispatch recording and translation.
+It logs once: `ray-tracing structure builder off (VICTORY_BVH_BUILDER=1 runs it)`.
+
+The detector ports the 7900XTX fork's `spill::is_spilled` rule: a compute program
+has at least two hardware user SGPRs, and the first nonempty root parameter past
+those registers starts at user-data index 16. This is a title-specific identification
+of the structure builder, not a general test for ray-tracing shaders. Both DXIL/XDAT
+containers and native ACCC/FSPX pieces go through the existing native-program parser.
+The shader is classified on registration, before prewarm workers can translate it
+and release its container; each single-compute-stage pipeline retains the flag.
+
+`Dispatch`, `DispatchX`, and single-command indirect compute dispatches (types 2 and
+105, with or without a count buffer) return before host pipeline creation or native
+command recording when their builder pipeline is off. The periodic `native draws
+so far` line adds `bvh_builder_skipped`: one per direct request, or the maximum
+record count for an indirect request. This is a count of suppressed requests, not
+GPU-executed work; the CPU does not read the indirect count buffer.
+
+While off, native translation sets `Options::bvh_no_hit`. Both BVH node-test
+instructions emit the console miss encoding without forming or reading a node
+address: `(+infinity, 1.0, 0, 0)` for triangle types and four `0xffffffff` children
+for other types. The option is included in the existing shader-cache settings key,
+so opting in cannot reuse a no-hit translation and opting out cannot reuse node
+reads. Generic/D3D12 translation keeps its existing full-intersection default.
+
+This mitigates the reported empty-AABB overwrite of title memory by preventing
+builder stores; the suspected relationship to the native pointer crash remains
+unverified without a game run. `VICTORY_BVH_BUILDER=1` restores the existing native
+builder/intersection path and its per-pipeline translation/conversion refusals.
+It does not port the Wine fork's separate whole-builder readiness/rest scheduler
+or establish that all builder stages can run safely on Metal.
+
+CPU regressions cover the detector's boundary cases, native pipeline tagging after
+prewarm releases the source, exact opt-in parsing, and both node-test instructions
+for all eight node types with and without no-hit lowering. The switch/translation
+agreement test runs in separate processes with the environment unset and set to `1`.
+No GPU or game was run for this change.
+
+
+#### November 26 story-load corruption investigation (offline)
+
+The n2/n3/n4 crashes are reads through corrupted pointer fields, with several
+workers failing together. The n4 fault obtains its pointer from an object field
+before attempting a vector byte read; the pointer contains plausible float
+words. This identifies the damaged field, not its writer. The logs do not map
+shader UAVs or DirectStorage page destinations to that field. No game or GPU
+execution was available for this investigation; crash resolution remains unverified.
+
+Two independently reproducible native memory bugs were fixed. Descriptor mirror
+receipts now include mapping and resource generations, and only successful mirrors
+are cached. Otherwise a UAV whose title record did not change could keep writing
+its previous physical pool slice after a remap. Page-table memory now belongs to
+the backend buffer, rather than a host allocation freed after eight replacements.
+Metal command buffers explicitly name these host buffers even when pool residency
+sets are enabled, retaining their allocations through completion. The CPU-only
+`native::host::mirror_tests` cover remap/retry and more than eight table replacements.
+Title pool mappings still use shared, no-copy Metal storage; no speculative flush
+or extra CPU/GPU memory copy was added.
+
+The reported constant-mask increase predates the console-flow changes: n3 already
+contains these refusals after mesh dispatch began reaching pipeline translation.
+The sampled programs have mesh allocation, barriers and LDS, while the native
+piece path guesses their stage as VS. Arbitrary mesh lane partitions remain
+refused until stage/register and mesh-output information is decoded. Enabling
+those masks in an ordinary vertex shader would hide the missing stage contract.
+
+Shader resource tracking now folds both words of constant `s_bfm_b64` sampler
+construction and cancels identical SSA terms in XOR-encoded descriptor spills.
+Real descriptor edits and runtime-built samplers remain refused. Graphics lowering
+can read any lane of a proven whole-wave reduction after EXEC restoration because
+the result is uniform; partial reductions remain refused. Synthetic GFX10 tests
+cover each boundary. The reference translator was compared, but its existing wave
+simulator does not itself solve the post-restore readlane case.
+
+`cargo run --release -p victory --example native_pack -- /outside/repo/shaders.rpf`
+reconstructs the native guessed graphics containers, with optional comma-separated
+container hashes as the second argument. It only translates on the CPU and prints
+identities/outcomes. The November 26 corpus went from 3,873 to 4,273 translated
+pieces out of 18,837; all previous successes still translated. Of the 475 n4
+graphics refusal records, 127 pairs now translate both stages independently.
+This is not proof that Metal accepts the linked pipeline or that its rendering is
+correct. The separate 25,889 archived-container scan was unchanged at 25,619
+successes. Runtime compute-piece containers have different hashes and root blobs;
+those archive counts must not be used to claim their runtime refusals disappeared.
+
+Next live evidence needs the writer of the corrupt object field: correlate GPU
+UAV/page-table pool offsets and DirectStorage destination pages at completion.
+The n4 tail also contains a 2.2-second held queue wait and a Metal texture row-pitch
+assertion. Neither is proof of which writer damaged the field. Detailed log times,
+reason counts and limitations are recorded in the external investigation report.
 Most pixel programs refused with these reasons (and with "a descriptor read only as data") read no
 descriptor word at all (27 November, offline corpus). The console compiler reuses a register that
 last held a descriptor dword (often a sampler's, loaded from the sampler heap) for a constant it
@@ -1915,7 +2396,7 @@ on a given Mac, because nobody has the numbers from a run that hits it on curren
 
 Rather than guess a threshold (an earlier version of this change tried a 90%-of-recommendation
 warning; worked out against this M2 Pro 16 GB's own real numbers it was silent exactly on the
-Series S default #12 steers 16 GB Macs to — `Metal` here reports `recommendedMaxWorkingSet: 12,124
+Series S default #12 steers 16 GB Macs to - `Metal` here reports `recommendedMaxWorkingSet: 12,124
 MiB`, and Series S's 7,776 MiB budget is 64% of that even before any host overhead, so a fixed
 10% margin never fires where it matters), `native::glue::with_title`
 (`crates/victory-gpu/src/native/glue.rs`), the one place the native Metal device is made (lazily,
@@ -1963,15 +2444,15 @@ land near `ir_seconds * 48000`, or something else) and replace this guess with t
 `VICTORY_DUMP_DSP=<dir>` goes further: at activation it writes a convolution stream's whole own
 `StreamDesc::ir` to `<dir>/stream<n>_ir.f32` (the title's bytes, not the synthetic tail; capped at
 16 Mi floats, logged as truncated if longer), and each `XDspSubmitCommand` appends the command's
-gains and input block to `<dir>/stream<n>_blocks.f32` and the block the stream wrote — silence, or
-the `VICTORY_GUESS_DSP` result — to `<dir>/stream<n>_out.f32`. A run with both set captures what
+gains and input block to `<dir>/stream<n>_blocks.f32` and the block the stream wrote - silence, or
+the `VICTORY_GUESS_DSP` result - to `<dir>/stream<n>_out.f32`. A run with both set captures what
 the title sends and hears, to validate the guess against the real effect once the hardware's
 partitioned IR layout is known.
 
 Tests (`modules::dsp::tests`): `convolve_merged_is_a_causal_fir_per_channel_scaled_by_gain` and
 `convolve_merged_reads_history_as_the_frames_before_the_block` (the convolution math against
 hand-computed values), `a_block_split_matches_one_convolution_over_the_whole_signal` (splitting one
-signal into two blocks and carrying history gives the same result as convolving it in one go — the
+signal into two blocks and carrying history gives the same result as convolving it in one go - the
 property that stops the tail from clicking at block boundaries), and
 `convolution_stream_as_the_title_drives_it` (the exported `XDspSubmitCommand` path, with
 `VICTORY_GUESS_DSP` set, no longer returns digital silence for a convolution stream with real
@@ -2043,16 +2524,104 @@ dispatches, blits, draws and non-positive viewports (tests: `victory-metal`
 `zero_sized_dispatch_and_blit_do_not_fail_validation` and `zero_count_draws_do_not_fail_validation`,
 `victory-gpu` `native::tests::zero_count_commands_are_not_recorded_and_still_check_pipeline`).
 
-## Described pipeline rectangle-list draws use `Triangles`
+## Described pipeline rectangle-list draws complete their outputs
 
-Only guessed console pipelines translate vertex shaders with `Options::rect_list` to generate the
-fourth corner from 4-vertex `TriangleStrip` instances. Previously, a rectangle-list draw
-(`topology = 17`) bound to a described `Pipe::Render` warned `"drawn without its fourth corner"`
-but still kept `rect = true`, emitting `Topology::TriangleStrip` with `draw_instanced(4, vertices / 3, 0, first / 3)`
-against per-vertex inputs. Described rectangle-list draws now reset `rect = false` and emit
-`Topology::Triangles` with `draw_instanced(vertices, instances, first, first_instance)` so each
-3-corner rectangle renders its supplied triangle and respects `first` (test: `victory-gpu`
-`native::tests::texture_tests::described_rectangle_list_draw_uses_supplied_triangles`).
+The earlier fallback drew each three-corner described rectangle as one `Triangles` primitive.
+It avoided the guessed pipeline's four-vertex strip convention, but covered only half of each
+lighting tile. `Options::rect_list` now has a described-vertex path: after lowering, it replays
+all control flow for console vertex IDs `3r`, `3r+1`, `3r+2`, with the original instance ID in
+each evaluation. Exports are collected as SSA values through branches and loops. Six host
+vertices select the original triangle and its completion. `emit::rect::complement` is shared
+with `rectangle_gs` and emits both triangles with matching winding. Described lists use the
+supplied p0 pivot, so the second triangle is `(p2, p1, p1 + p2 - p0)`, even after a transform
+makes the parallelogram non-orthogonal. The geometry path retains its right-angle inference.
+Every float output, including interpolants and all four position components, is completed;
+integer outputs retain a stored corner as in the geometry
+path. The export loop in `lower.rs` still computes values into `ready` before consecutive stores.
+
+`glue::pipe` caches rectangle variants separately, including target formats, and requests the
+vertex shader's existing `native_rect` cache only for described vertex stages. Ordinary draws
+and mesh dispatches retain their own variants. `Topology::Rectangles` carries console counts
+through `NativeList`. Metal expands direct records to `(count / 3 * 6, instances, first * 2,
+first_instance)`. Its existing counted-indirect `gate` compute pass applies the identical
+mapping to GPU-written records, with or without a count buffer, into private scratch buffers.
+It preserves instance counts/base instances, suppresses records past the GPU count, and never
+changes title records. Existing encoder fences and scratch-buffer hazard tracking order writers,
+expansion and drawing. An incomplete trailing rectangle is omitted. Overflowing arguments or a
+first vertex not divisible by three draw nothing; the vertex-ID tile convention starts at a
+three-vertex boundary.
+
+Vertex and instance IDs follow the existing ordinary-draw convention: `io::raise` maps console
+v0/v3 to `Input::VertexId`/`Input::InstanceId`, and `lower::input` loads `SV_VertexID`/`SV_InstanceID`
+directly, without adding either draw base. `gfx::encode_render` follows Apple's installed
+`metal_irconverter_runtime.h` helpers: direct arrays pass first vertex as `vertexStart`, first
+instance as `baseInstance`, and both in the converter's slot-4 draw arguments. Indirect draws
+bind the same record for both consumers; counted draws use the gated record for both.
+
+Offline conversion of the hand-assembled fixture with Metal Shader Converter 4.0b3 confirms
+that both ordinary and rectangle shaders begin with `SV_VertexID = air.vertex_id - air.base_vertex`
+and `SV_InstanceID = air.instance_id - air.base_instance`. Ordinary arrays starting at vertex 3
+therefore expose IDs starting at 0. For rectangles, native IDs `2*first + j` become `j` after
+subtracting `2*first`, and the replay uses `r = j / 6`, console IDs `3r..3r+2`. With first vertex 3,
+Metal IDs 6..11 become replay IDs 0..5 and complete tile 0, exactly as ordinary IDs 0..2 describe
+its first triangle. The original test's tile-1 expectation was wrong; no runtime change is
+needed. Indexed ordinary controls use indices 0..5 and a nonzero base vertex: Metal adds the base,
+then the converter removes it. Rectangle replay preserves the original instance input in all
+three evaluations, so one instance with `first_instance = 1` still reads v3 = 0. These are facts
+about the current host mapping, not claims about undocumented console draw-base registers.
+
+Every rectangle argument set has the following expectation, for direct, indirect and accepted
+counted-indirect draws alike. Ranges below are inclusive; complete tiles are the shader's `id / 3`.
+
+| Console arguments | Expanded Metal arguments | Replay SV_VertexID | Complete tiles | Instance rows |
+|---|---|---|---|---|
+| `[6,1,0,0]` | `[12,1,0,0]` | 0..11 | 0, 1 | 0 |
+| `[6,1,0,1]` | `[12,1,0,1]` | 0..11 | 0, 1 | 0 |
+| `[4,2,3,0]` | `[6,2,6,0]` | 0..5 | 0 | 0, 1 |
+| `[4,2,3,1]` | `[6,2,6,1]` | 0..5 | 0 | 0, 1 |
+| `[5,1,0,1]` | `[6,1,0,1]` | 0..5 | 0 | 0 |
+
+The last three cases discard their incomplete tail. The first two culling configurations retain
+both triangles; the reversed back-face configuration retains none. With GPU count 1, record 0
+uses the table above and record 1 (`[6,2,0,1]`) becomes all zeros. If that gate fails, its two tiles
+and two rows paint outside every accepted case when visible. Changing only base instance would
+redraw the same row and hide that failure. Both original argument records and the count stay
+unchanged in title memory.
+
+Guessed pipelines keep their fetched-attribute strip expansion. That mode reads three attributes
+before executing the program and is only correct for affine vertex operations; it cannot complete
+a vertex-ID-only shader. Described shader-pulled inputs are replayed with each console ID, but
+ordinary stage-in attributes cannot be fetched for another vertex by a DXIL vertex invocation,
+so those rectangle variants are explicitly refused. Indexed rectangles still need index fetching
+and remain dropped; guessed indirect rectangle strips also remain dropped.
+
+Tests use shared hand-assembled programs in `victory-shader/tests/programs/rect.rs`, never game
+instructions. `emit::rect_tests::vertex_id_rectangles_complete_position_and_interpolants` checks
+that live output expressions contain the fourth-corner sum and difference. The CPU module test
+`replay_keeps_loop_phis_conditional_exports_and_instance_ids` evaluates all six output vertices
+across two sheared parallelograms and two instance IDs, with a loop and separate return paths.
+`state_tests::vertex_id_rectangle_lists_cover_both_triangles_direct_and_indirect` checks every
+pixel's coverage and UVs, instancing/base instance, nonzero first vertex, incomplete tails,
+winding/culling, GPU-written arguments, counted suppression, and unchanged title records.
+`state_tests::ordinary_vertex_and_instance_ids_exclude_draw_bases` uses every argument set above
+with the same hand-assembled shader in ordinary direct, indexed, indirect and counted-indirect
+draws, including first vertex/base vertex 3. It checks the supplied and absent complementary
+halves of each tile against explicit expectations shared with the rectangle test.
+`texture_tests::described_rectangle_lists_select_the_expanded_pipeline_direct_and_indirect`
+checks described stream selection, separate cached variants, direct/indirect agreement, and
+switching back to ordinary triangles. The revised GPU tests and lighting appearance still
+need verification on a Metal device.
+
+### Dual-source conversion on every render entry path
+
+`RenderPipelineDesc::needs_dual_source` combines the explicit hint with `Blend::second_source`
+from the blend states. Both vertex and mesh pipeline conversion use it, including asynchronous
+compiles and diagnostic library dumps. This fixes direct backend callers such as
+`state_tests::a_second_source_colour_blends`, which set Src1 factors but leave the hint false.
+The converter's existing `IRCompilerSetDualSourceBlendingConfiguration` switch and distinct
+library-cache key are reused. No DXIL output rewriting is added. The test now covers synchronous
+and asynchronous creation, and the same pixel shader without Src1 factors remains an ordinary
+conversion. GPU verification remains pending.
 
 ## Texture copies on the native Metal host
 
@@ -2101,6 +2670,222 @@ Tests (`victory-gpu`, `native::texture_tests`, each failing before): `copy_resou
 `copy_texture_region_moves_plain_texels_into_compressed_blocks`,
 `resolve_subresource_copies_what_both_hold`, `depth_stencil_rows_go_in_and_out_as_the_depth_plane`.
 
+## Depth textures written through unordered access: the writable twin (native host)
+
+The title writes some depth textures from compute shaders and then uses them as depth: its
+material depth (`tiled_lighting:CS_GenerateMaterialMasks` stores `float(material) * 0x37800080`
+per texel into the depth plane of a 16-bit depth with stencil texture, console format 118, and
+the tiled lighting draws - `VS_TiledLighting` with one `TL_PS_PBR_MATERIAL_*` pixel shader per
+material - rasterise at that same depth with the test EQUAL and no depth write, into the HDR
+target), its shadow-map copies (`shadowSmartBlit:CS_DepthCopy`, 16-bit depth) and its upscaled
+depth (`postfx:CS_DepthUpscale`, 32-bit). Metal's depth textures take no shader writes, so on the
+native host those stores were lost: the material depth stayed as cleared, no lighting draw passed
+its depth test, and the HDR target held emissive pixels only (a black window with a full
+G-buffer). The D3D12 host has had the fix since decision 0007 (`crates/victory-gpu/src/twin.rs`);
+`native/twin.rs` is the same design on the native host:
+
+- `Textures::realize` tells the host which textures are depth (`NativeHost::register_depth`).
+- The first unordered access view of one (`NativeHost::mirror`, `twin_plane`) makes its twin: a
+  colour texture per plane (depth, then stencil), and the view's heap entry shows the plane the
+  view names (word 3 of a 2D view) instead of the depth texture.
+- At submission (`NativeHost::twin_copies_before`) each command's uses are found: the depth
+  side as its depth target, as a texture copy's source or destination, or through a shader
+  resource view in a table it binds; the twin side through an unordered access view in one.
+  Where the side a command needs is the stale one, a blit pass before it copies each plane
+  through a host buffer (`BlitOp::CopyDepthPlane` names the plane of a combined format).
+  `twin_copies` in the "native draws so far" line counts them.
+
+Differences from the D3D12 twin, and shortcuts, are listed at the top of `native/twin.rs`: the
+twin's depth plane is the host plane's own texel (32-bit floats for console format 118), so a
+value stored through a 16-bit view is not rounded to 16 bits; level 0 of slice 0 only; shaders
+that index the heap themselves move nothing. Test: `victory-gpu`
+`native::tests::state_tests::depth_a_compute_shader_writes_is_what_draws_test_equal_against`.
+
+The tiled lighting draws are rectangle lists (topology 17) of a described pipeline whose vertex
+shader takes everything from the vertex id, executed indirectly. These measurements preceded
+output expansion and showed only half of each tile. See "Described pipeline rectangle-list draws
+complete their outputs" for the implementation now awaiting Metal and game verification.
+
+`VICTORY_TRACE_FLOW_DRAWS=1` (with `VICTORY_TRACE_FLOW`) adds a "flow: draw" line for every
+captured draw into a set of targets with an HDR colour target (DXGI 10 or 26): shaders, the
+call (an indirect record's values as title memory has them), targets and views, and once per
+pipeline its depth, stencil, cull and colour state ("flow: draw pipeline state"); after the
+capture, "flow: late draw texture" gives level 0 of up to 400 distinct textures those draws
+named, including placed views (share of texels not zero, distinct texels, the OR of all texels,
+the largest value of an HDR format). Placed views include their host key in the trace:
+`sN.M placed tex 0x<key> at 0x<address> fmt F WxH mip m` (or `uN.M` for unordered access).
+Their late statistics follow texture aliases and use the placed format, with the view's
+level-0 extent when there is no resource object. The R32_FLOAT-only "flow: late texture" trace
+also accepts placed keys; extra mip statistics still require a resource description.
+
+### What the tiled lighting still lacks (state of 2026-11-27)
+
+Found with the flow trace, in order (runs n45 to n47 of the port's notes):
+
+1. The material depth: fixed by the twin above. Its plane then holds 1.0 where there is no
+   geometry and `material * 0x37800080` elsewhere, and the 7x4 tile masks
+   `tiled_lighting:CS_MaterialTiles` makes from it are filled.
+2. The sun: `VS_TiledLighting` draws a material's sunlit pipeline (`TL_PS_PBR_MATERIAL_*`) only
+   in tiles where its third mask (R8, 7x4, from `tiled_lighting:CS_ShadowRevealTiles`) is above
+   zero, and the `TL_PS_NoDir_*` pipeline where it is zero. That mask is reduced from the sun
+   shadow mask (R8, the size of the view), whose only writers seen are the tiled cascade shadow
+   shaders (`cascadeshadows_rendering:CS_ShadowRenderTiled*`, fed by
+   `cascadeshadows_classify:CS_ShadowUnifiedClearRaster`, `CS_CalcRasterClassificationListCounts`
+   and `CS_WriteRasterClassificationResults`). Their thread groups are 16x16 or larger, four or
+   more console waves, and the translator refuses them on a 32-lane host ("a cross-lane
+   operation between host waves in divergent code"; the D3D12 host's translator refuses the
+   same ones, "console wave64 lanes in a group of more than 64 threads"). So the mask stays
+   zero: no sunlit pipeline draws anywhere. The title makes no `ClearUnorderedAccessView*` call
+   in these frames (those calls are now run, see `glue::clear_unordered`, but were not the
+   cause). `VICTORY_DEBUG_FILL_INPUT=5741294cf872ffb9:0.95:255` fills the shadow mask with "lit"
+   before `CS_ShadowRevealTilesInitial` each frame, to stand in for the refused pass.
+3. The no-sun pipelines do draw, and add next to nothing (values around 1e-4 in 0.02% of the
+   HDR target): why the ambient and local light they should give is missing is not known.
+4. The half-tile coverage observed here now has an implementation fix, pending GPU validation:
+   described rectangle variants replay the vertex body for all three IDs, complete the outputs,
+   and expand direct and GPU-written indirect draw arguments. See "Described pipeline
+   rectangle-list draws complete their outputs". This does not address the missing lighting
+   contributions in the other items.
+
+`ClearUnorderedAccessViewUint` / `...Float` on the native host (`glue::clear_unordered`,
+`NativeHost::unordered_clear_target`): a texture view's level is cleared as a render pass's
+load action if the texture is a render target too, a depth texture's on its twin's plane, a
+buffer view is filled when the value is one byte repeated. A texture that is unordered access
+alone is not cleared (warned once). Test: `victory-gpu`
+`native::tests::state_tests::unordered_access_clears_write_the_view`.
+
+`list::tests::unordered_access_clears_have_the_same_slots_in_both_layouts` also checks the
+unchanged clear/discard slots in old and new list tables. Its release-build failure at
+DiscardResource was a function-address comparison, not a slot mismatch: the native test binary
+contained two codegen copies of the empty `ignored_state` function. The assertion now compares
+the stored discard entry with the same table's ignored root-signature entry, avoiding a fresh
+function-pointer coercion in the test's codegen unit. The runtime tables are unchanged.
+
+More trace switches (all with `VICTORY_TRACE_FLOW`): `VICTORY_TRACE_FLOW_SNAP=<hash>,...`
+copies the first colour target on the GPU after the 1st, 30th, 60th, 90th and 120th captured
+indirect draw of a pipeline with one of these stage hashes ("flow: target as the GPU had it";
+`VICTORY_TRACE_FLOW_SNAP_AT=<n>,<n>,...` names other draws, at most 16, and with pixel shader
+hashes the count is of those pipelines' draws alone). Compute hashes instead copy up to four
+distinct table UAV textures immediately before and after the first captured dispatch per hash,
+including direct, thread-count and indirect dispatches. An indirect execution snapshots its
+first recorded dispatch, with any count-buffer decision still made by the GPU. Copies use
+level 0 / slice 0, accept at most `1 << 21` texels per texture, and skip depth, block formats
+and textures that cannot be copied. Separate blit passes split compute batches in command
+order. The late "flow: target as the GPU had it" lines name `before compute <hash> uN.M` and
+`after compute <hash> uN.M`, with texel statistics, HDR maximum and grid. A dropped or refused
+first dispatch logs "flow: snapshot dispatch was not encoded" with its hash and state instead
+(a zero-sized direct dispatch is also reported this way). Compute dispatches do not advance
+the draw counter or use `_SNAP_AT`.
+`VICTORY_TRACE_FLOW_TEXTURES=<hash>,...` adds every texture those compute shaders name to the
+same late statistics, including placed views, sharing the 400-texture cap with draws;
+"flow: late twin plane" gives each twin plane (a material depth's most common
+values are its material numbers); `VICTORY_TRACE_TWIN=1` logs each twin copy and the kind of
+command it precedes.
+
+## Upstream integration at b998bb65
+
+The current host uses upstream's shared texture copies, covered-placement release and byte
+budget (`VICTORY_METAL_TEXTURE_BUDGET_MB`), including its R9G9B9E5 view over an R32_UINT object.
+The earlier `aliases`/`owns_placed` owner-selection mechanism, reverse-realization takeover,
+placed overlap rule A, `VICTORY_PLACED_OVERLAP`, `VICTORY_PLACED_IDLE` and the separate
+`texture memory:` line are retired. The historical notes below describe their experiments;
+upstream's budget trace describes current retention. `forget_resource` retains heap entries
+as upstream does; `release_resource` and budget eviction clear entries at their own boundary.
+
+The Metal heap keeps the complete deferred residency reconciliation: `alloc_counts` is desired
+membership, `in_set` is committed membership, and removed allocations and views are retained
+until `Heap::commit_set` commits their removal. There are no entry-level Metal adds or removes.
+This preserves the kernel-safety invariant across remove-then-readd and add-then-remove before
+one commit. Upstream's request-residency option and residency/commit traces wrap that ownership.
+A shared residency gate lets shutdown wait for active commits, empty the sets exclusively, and
+prevent subsequent heap or pool changes using their obsolete membership. Its CPU regression
+checks that shutdown waits for a pending commit and rejects later changes.
+`VICTORY_TRACE_FRAME_TIME` remains, including completion and commit accounting for split command
+buffers. Unchanged-entry skips, per-resource mirror versions, fitted texture views and typed
+buffer view caches remain; upstream's lazy typed-buffer promotion decides when a view is made.
+The mirror stamp also preserves upstream's permanent null-buffer rule: unrelated pool or resource
+changes do not rewrite an address-only null view. The existing CPU regression checks this.
+
+Upstream's `title_alias` handles a fully mapped range outside one pool run. Our `span`,
+`refresh_spans`, `NativeHeap::spanned`/`unmapped`, retired buffers and `Stitch` handle partly
+mapped ranges and pool-generation changes. Both refresh paths run before submission. The
+upstream stride table at root SRV 255 and view-address table remain; image entries retain only
+the component-kind bits needed by our integer image lowering, with zero buffer stride.
+
+Depth textures use one plane-aware `Twin` and one copy planner, `twin_copies_before`.
+`register_depth`, `twin_plane` and `BlitOp::CopyDepthPlane` retain depth and stencil transfers.
+Colour reads follow an existing twin as upstream does, resource aliases share that twin,
+and creating a twin invalidates earlier colour-read mirrors. The existing upstream
+`VICTORY_DEPTH_TWINS=0` switch also applies. This is a combined path awaiting Metal execution;
+the CPU recording-backend regression checks shared keys, colour reads and both plane copies.
+
+Presentation uses upstream's sequence of planes and straight-alpha overlay blend, including
+its resulting alpha. The local premultiplied compositor and forced-opaque result are retired.
+The composite lifetime test now uses the upstream plane interface and checks those alpha
+values; single-plane selection and queued presentation still keep their resource lifetimes.
+HDR reporting and drawable timing remain.
+
+Described mesh stages and guessed mesh programs still use `Compiler::mesh_pipeline` with
+`convert_mesh_with`/`reflect_mesh`, object stages and the 32 KiB limit. Upstream owns off-thread
+compilation, archive lookup/add, the writer thread, the 60-second compile deadline and remembered
+compiler failures. Described rectangle lists keep their replay and fourth-corner expansion;
+upstream's guessed vertex-ID rectangles use its own lowering. Mesh dispatches share one path
+and keep per-target refusals and both parents' counters. The console pipeline fallback,
+console flow, BVH-builder policy, flow/target diagnostics and earlier native title patches
+remain wired. Translation keys now include `VICTORY_NO_CONSOLE_FLOW` and
+`VICTORY_EXPORT_INTERLEAVED`; the console-flow trace changes no translation. A scalar mask
+instruction of the wrong wave width keeps upstream's precise refusal instead of being retried
+through console flow.
+
+Tests specific to the removed overlap/idle policy are retired with that policy. The two local
+alias tests for reverse-realization takeover and most-recent-owner selection are retired with
+that mechanism; upstream's sharing, lifetime and budget tests remain. Local sharing tests now
+read the upstream registry instead of expecting a separately owned placed texture. Their
+read-only R32_UINT exclusion is removed because upstream deliberately allows that sharing.
+The former forget-clears test now verifies upstream's retained-entry behavior and replacement
+invalidation. The mapping-list generation test uses the existing capture backend, since its
+assertions require no Metal device. No failing runtime test was removed to obtain a passing suite.
+
+## Earlier upstream integration at 2a3b03d1 (historical)
+
+Described stream mesh stages and guessed mesh producers share `Compiler::mesh_pipeline`.
+Their full mesh and amplification reflection, output linking, consecutive output stores and
+32 KiB refusal are retained. The owned compile descriptor and pending-job key include the
+mesh and amplification bytes and root layouts. Upstream's `metal::within`,
+`Archive::mesh` and `compile_mesh` now own off-frame compilation, archive lookup/add, the
+60-second compile deadline and remembered compiler crashes. The separate
+`mesh_pipeline_state` timeout, `VICTORY_PIPELINE_TIMEOUT_S` and per-run archive writer are
+retired. A timeout alone is refused for the run; upstream remembers a reported compiler crash,
+including one reported after the deadline. Existing per-run archive files are no longer read.
+
+Dual-source conversion uses upstream's pipeline-level decision and converter option. Its
+cache key replaces the port's separate dual-source key. Successful descriptor mirrors keep
+their mapping/resource stamps; pending mirrors use upstream's retry gating, sharing the
+registered-resource epoch. Span refresh, partially mapped spans, stride/address tables and
+depth twins remain active. The draw line includes both sets of counters, including separate
+refused direct/indirect mesh dispatches and recorded texture copies.
+
+The preferred console-flow lowering remains for named lane accesses that the fast path can
+translate without preserving the other half. Upstream's checked lockstep retry follows a
+refusal, including when `VICTORY_NO_CONSOLE_FLOW=1`; a lockstep retry cannot re-enter the
+preferred console-flow path. Both use the same wide first-lane helper. The half-float wave
+sum uses upstream's reduction helper with no prefix. Console-flow selection uses section
+boundaries without simulating their values, keeping upstream's single-simulation invariant.
+
+Both parents' regression cases remain. The local
+`lds_a_wave_shares_in_divergent_code_takes_console_flow` keeps its deliberate acceptance and
+barrier assertions in place of upstream's refusal test for the same program: console flow
+makes the exchange uniform. The known failing
+`a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves` is unchanged. The sampler-ID
+test uses upstream's independent `min` and `mag` fields, alongside upstream's expanded tests.
+Mesh compile ownership and cache identity cover both mesh and object stages. Early output-limit
+refusals now retain `MeshRefusal::OverLimit`, so dispatch counters keep the specific reason.
+
+3D compute image checks (2026-11-27): `native/volume_tests.rs` assembles synthetic GFX10 programs with 4 x 4 x 4 threads in wave64 and 3 x 2 x 3 groups, checking every texel of 12 x 8 x 12 title textures in DXGI 24, 26, 42 and 10. Stores use xyz-dependent values; SRV and UAV loads and point `image_sample_lz` at texel centres read CPU-uploaded volumes into a raw buffer, independently of image stores, including mip-1 views and preservation of mip 0. Code inspection found that object TEXTURE3D views bypassed mip decoding (now shared with placed views), while image loads/stores always annotated float components even for integer storage (now selected from the existing per-view format-kind bits, with integer DXIL operations for UINT/SINT and distinct cached handles for each component type). R32_UINT sampling is included as a diagnostic value test but still uses the existing float-typed sample lowering; its result needs the coordinator's GPU run. The 3D DXIL resource kind, xyz lowering, Metal type/depth, and whole-mip backend transfers already preserve depth; no MSC texture-type override was found. FirstWSlice/WSize are not array layers: W sub-ranges remain unsupported and expose the full selected 3D mip, covered by descriptor tests rather than a misleading sub-range GPU test. The flow tracer previously allocated one slice for a whole-volume backend read, which was rejected and left a zero-filled buffer; compute snapshots also copied only one slice into a 2D texture. Late statistics and snapshots now include every level-0 depth slice, print `depth N`, use the full-volume slice pitch/copy depth, and skip volumes exceeding `1 << 22` texels. GPU execution is pending; the diagnostic zero buffer alone does not establish that the volume store failed.
+
+Historical placed texture reclamation, retired at b998bb65 (2026-11-27): `texture memory:` beside the 64-frame draw counters reports tracked placed/object/target counts and `info.size` host-byte estimates, aliases, tracked placed title-range sum/union/overlap, pending descriptions, overlap/idle releases and bytes, idle re-realizations and bytes, and `ping_pong` (these estimates exclude Metal padding and in-flight retains).
+`VICTORY_PLACED_OVERLAP=0` disables the default overlap-reuse guess: a different-start placement retires intersecting placed copies through a sorted coverage index, preserving owners and same-owner aliases; reverse displacement exempts that pair, with 4096 recent displacements retained and up to 4096 persistent exemptions (only exhaustion of the exemption budget stops overlap eviction), and forgetting a resource now nulls its retained heap views and drops mirror stamps, including the old same-address path.
+`VICTORY_PLACED_IDLE=<frames>` optionally evicts non-target placed copies after more than that many presented frames without a bound draw/dispatch table reaching them (unset: off); cached per-resource frame cells avoid rehashing unchanged records, and queued bound tables restore evicted descriptions and upload their bytes before execution, including records copied without another device view call.
 ## Output stores follow their values (#181)
 
 The export lowering (`Lower::export`) makes every channel's value first and then emits the
@@ -2124,8 +2909,8 @@ input is read outside the ignored vertex-index operand of a `VERTEX_TABLE` stage
 (`Lower::rect_vertex_id`, `emit/lower/rect.rs`), the program has no fetched position from which
 `Lower::vertex_fetch` alone can extrapolate the fourth corner, and strip instances past the first
 would otherwise see `SV_VertexID = 0..3` again. `Lower::run_rect_by_id` lowers the program body
-three times in one invocation — with `v0 = 3 * SV_InstanceID + 0..2` and `v3` (`SV_InstanceID`)
-fixed at `0` as on the console's non-instanced rectangle list — finds the right-angle corner
+three times in one invocation - with `v0 = 3 * SV_InstanceID + 0..2` and `v3` (`SV_InstanceID`)
+fixed at `0` as on the console's non-instanced rectangle list - finds the right-angle corner
 opposite the longest `SV_Position.xy` side, extrapolates the missing fourth corner `p + q - r`
 across every exported float channel (keeping bitwise-equal shared corner values exact), and emits
 the `storeOutput` calls back to back after all values are computed. Programs with unordered-access
@@ -2190,3 +2975,184 @@ traced run of 3 world frames, `VICTORY_TRACE_PASSES`, Series S, M5 Pro):
   so an access's later dwords past a page boundary are read from the pool, not the title's next page.
 - Next run: `VICTORY_DEBUG_PS=id` with the pass trace names the pixel program, so the draws and the
   vertex program, of each shard.
+
+
+Merge verification follow-ups (2026-11-27, after `8fa0b15a`): the second follow-up restores
+`4f35fa7c`'s pool/span-first resolution, retaining upstream's own-buffer path and direct title
+wrap as a heap-view fallback. In this clone the parent has spans but no `title_alias` or the
+two wrapped-view tests; those came from `upstream-main`. Their different contracts matter:
+spans serve whole 64 KiB title pages, including sparse ranges, using the pools' own pointers;
+direct wraps require the entire aligned range to be mapped and become entirely null on a gap.
+`span` now enforces the whole-title-page contract (offsets and lengths, not the absolute pool
+base, which needs only host-page alignment). Smaller mapped fragments can use a direct wrap
+when fully mapped, but cannot turn into a partial span when one fragment is unmapped.
+
+The wrapped-view failure was a partial-span fallback, not a missing generation increment:
+`PoolTable::mapped` and `unmapped` both call `Inner::cut`, which advances the generation.
+The rejected direct wrap fell through to a span retaining the first mapped fragment, explaining
+the nonzero first 32 words after unmap. The two-pool crash path was different: the merge tried
+`wrap_title_memory` on the fixture's logical VA `0x23_4560_0000` (only recorded in the pool
+table, never mapped in the process), ahead of the parent's stitch of the real pool pointers.
+CPU regressions reproduce both mistakes before the fix and check nulling, recovery, pool
+pointer selection, remapping, sparse holes and retention of the replaced span afterward.
+Metal's span/deallocator implementation is unchanged from the parent: heap entries retain the
+MTLBuffer and the stitch is unmapped by its deallocator when Metal lets it go.
+
+The previous follow-up's generation-wide signature cache is removed. `follow_title_pages`
+again shares comparisons only within that pass, and mirroring keeps the signature returned by
+`title_alias` instead of walking again to infer whether resolution returned a wrap. The walk
+counter now also counts the fresh checks in `title_alias`: the three-copy test takes 1 walk
+on an unrelated mapping change, and 4 after remapping under the copies (one shared comparison
+and three wrap validations). Only that test's remap count changes; its exact data assertions
+and the unmap test's all-null assertion remain intact.
+
+Upstream `c4faf9c4478448c1fdf5b47195dee63701f9dbf2` introduced the descriptor-field refusal.
+It expects the existing `view_addresses` root SRV `t1`: buffer address dwords 0 and 1's low
+16 bits, image size/level/type fields, zeros elsewhere. Its commit records that all 44 table
+readers in its boot corpus still translate: 40 mask the buffer high word to 16 bits, and none
+reads image dwords through the table. Our host already supplies nonzero buffer high words;
+a CPU test checks `0x12` then `0x23`, the root binding, retained table and mirrored updates.
+There is no host-table or translator change to hide a missing buffer address.
+
+The synthetic `CS_VIEW_ADDRESSES` used by both heap tests previously moved all of image
+dwords 1-3 and buffer dword 1 to the output, including fields the table never supplied.
+Before the unchanged moves/stores, the fixture adds these instruction/literal pairs:
+`8711_FF11 C000_0000`, `8712_FF12 3FFF_FFFF`, `8713_FF13 F00F_FFFF`,
+`8719_FF19 0000_FFFF` (`s_and_b32` on s17, s18, s19, s25 respectively). No original
+instruction word is replaced. These keep image size fields and all 48 buffer address bits;
+the two GPU tests retain every output, canary and remap assertion. CPU translation checks
+also reconstruct the unmasked original and assert the exact image-dword-1 refusal, then
+check the buffer stride/swizzle refusal if the high-word mask is removed.
+
+The forgotten-texture test now pins upstream's retained-entry behavior: forget preserves the
+entry and stamp, registration invalidates the resource version, and final release clears the
+entry. CPU covered-placement and byte-budget tests check that shown copies survive and that
+eviction drops the host Rc after their last entry is replaced. The corresponding Metal tests
+also check host-copy lifetime. Metal's `heap_entry` replaces/removes the entry's retained resource
+and decrements its allocation count. With residency sets, the last removed reference is retired
+until `commit_set` reconciles residency (also bounded by `RETIRED_OBJECTS`); without a set it drops
+immediately. GPU work may still retain it until completion. The integer-target test now expects
+the specific mesh conversion refusal for float
+outputs, retaining its attachment diagnostic and exact integer pixel assertions. Sampled alias
+re-creation checks unloaded/unwatched first, then one upload and dirty watching after submission
+sync, matching upstream's deferred scanner registration.
+
+Second-follow-up verification: offline release x86_64 builds with four jobs; 14 CPU mirror
+tests, 6 pool-table tests, 9 address-contract tests, the shared address-program translation
+test and upstream's view-address-field refusal test pass (31 total). Asset policy passes.
+The named `a_wrapped_view` / `copies_of_a_wrapped_view` tests use `Host<Metal>` in this
+checkout, not `Capture`; attempting them reports `no Metal device` here. All GPU tests compile,
+but their GPU data assertions still need the coordinator's Mac. Logs are outside the repository
+in `/tmp/native-merge-second-followup`. The earlier follow-up's broader shader run and parent
+comparison are in `/tmp/native-merge-followup` (425 passes, 3 ignored, the known
+`a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves` failure on both trees).
+
+#### Third follow-up: opaque resource keys in the view-address table
+
+The two view-address GPU tests' `0x4EA9_0000` fault is a native-host bug, not a fixture
+that must create COM resources. `Heap::sized` still registers opaque texture keys;
+`textures::placed_key` likewise produces hashes with the top bit set. Parent `4f35fa7c`
+checked `resource::is_resource` before letting an object view reach `texture_words`.
+The merge removed that check when moving `NativeHost::address_words`.
+
+The caller chain is `NativeList::dispatch` / `dispatch_from` (records `Cmd::Dispatch`),
+the tests' `run`, `NativeHost::execute`, `prep`, `view_address_args`, `view_addresses`,
+`address_words`, `descriptor::texture_words`, `resource::texture_desc`, then
+`resource::texture_memory`. The last function reads `Resource::desc` at key + 16.
+The first address-table construction walks **every** heap entry, including entry 0's
+fake texture key; binding a root table at entry 2 does not exclude it. Once the table
+exists, `mirror` calls the same `address_words` when updating an entry.
+
+The masked fixture's descriptor reads request this table; they do not change key
+ownership. `stride_word`, descriptor decoding, typed-buffer materialization and ordinary
+texture mirroring use native resource registrations or the placed record's description.
+The tests call native lists directly, so `draw.rs`, the COM list copy path, `texture.rs`
+and Windows-only `descriptor::host::{prepare,is_texture}` are not on this chain.
+Optional diagnostic paths (`trace_args`, `table_views`) are separate from this table walk.
+
+Restore the parent's guard at the native boundary: registered buffers decode through
+`NativeHost::resources`, object texture words require the non-faulting `is_resource`
+check, and placed views continue to supply their inline description. Opaque texture
+keys have zero size words, as in the parent; real objects retain their title dimensions.
+Neither GPU fixture nor its assertions changes in this follow-up.
+
+The CPU recording-backend regression `view_addresses_never_dereference_native_resource_keys`
+reproduced SIGSEGV without the guard. It exercises dispatch preparation and mirrored
+updates for SRVs/UAVs with explicit and default descriptions, fake keys, placed hashes,
+stale records, registered buffer addresses with nonzero high words, inline placed
+descriptions and real texture objects. No Metal device or shader converter is used by
+this regression.
+
+Third-follow-up verification: pinned Rust 1.98.1, offline release builds with `-j4`,
+native arm64 test binary. `cargo test --offline --release -j4 -p victory-gpu` with filters
+`native::host::mirror_tests` (15), `native::descriptors::tests` (17) and
+`view_address_program_translates_without_a_gpu` (1) passes all 33 tests. Asset policy and
+`git diff --check` pass. Both named Metal tests compile as part of that test binary but
+were not run; their GPU assertions still need verification on the coordinator's Mac.
+Logs, including the CPU regression's pre-fix SIGSEGV, are in
+`/tmp/native-merge-third-followup`. The two earlier rounds of uncommitted changes remain.
+
+
+#### Merged-run regressions: descriptor reads and covered-copy revival
+
+The five cached containers named in the November 27 report were analyzed locally through
+SSA uses; no title instructions or bytes are recorded here. With `a7cac6c2`, both mesh
+containers already translate. The two pixel partners and the probe compute program fail
+because `c4faf9c4`'s reader analysis mistakes these field extractions for whole-word reads:
+
+| Program | Descriptor data actually observed | Native value and parent behavior |
+| --- | --- | --- |
+| Compute `f22a76fcb967ee59` | Buffer dword 0, dword 1 bits 0–15 (also a subset 0–7) | `address_words` supplies the view's full low address word and the high 16 bits. The parent lowered both words from root SRV `t1`; stride/swizzle bits were zero. One `0xffff` mask lives in an SGPR defined by a scalar move, which the upstream check did not resolve. |
+| Pixel `7d0f14ce44746d7e`, `6b6db9f1a526daeb` | Image dword 1 bits 30–31, dword 2 bits 0–29, dword 3 bits 12–15 | Width minus one is assembled from dword 1 shifted right 30 and dword 2 shifted left 2, then kept to 16 bits. Height minus one is a 16-bit extraction at bit 14; first mip is a four-bit extraction at bit 12. The existing `texture_words` already supplies all of these, as on `4f35fa7c`. |
+
+Neither pixel reads image dword 1's address, minimum-LOD or format bits. The probe's
+buffer dwords 2–3 are used as descriptors by resource instructions, not as numbers via
+`view_addresses`; its address reads need no record-count or format value. The parent
+marked numeric reads of those words missing too. The remaining field refusal,
+`ceb5eb68cd99cb07`, actually compares all of buffer dword 2 (record count); that value is
+not supplied and remains refused. The fix extends `Lower::seen_bits` to
+prove these uses, preserving the same table, 16-byte entries, root binding and field refusal
+masks. Unknown fields and observable SCC dependencies remain refused.
+
+The original `CS_VIEW_ADDRESSES` words are restored intact. Its five vector moves followed
+by raw stores expose **all** bits of image dwords 1–3 and buffer dword 1, including address,
+format, tiling and stride bits that neither native host supplied. This is not what the three
+affected programs do. Keeping its old zero-filled outputs would bless unsupported fields.
+The CPU test therefore preserves the whole-dword refusal; the two execution tests now
+perform synthetic width/height/first-mip extraction and the SGPR-held address mask, and
+check dimensions, nonzero high address bits, canaries and two-pool remapping. They do not
+pre-mask the image to make the refusal disappear. The refusal unit test covers these
+queries and adjacent unsupported bits, as well as live SCC uses.
+
+The covered-copy feedback loop was `give_up_covered` → `evict_texture` → an unchanged
+record requested by `remirror_tables`/`keep_named` → `realize` → `give_up_overlapped`.
+That last call treated internal revival as title activity and exempted the pair. At 4096
+exemptions `may_cover` returned false globally. Covered copies now have separate host
+state from budget evictions: internal realization is blocked and old or copied records
+mirror as null until an explicit title placement. Descriptor creation and descriptor copy
+carry distinct provenance into `placed_view`; only creation calls `texture_placed`, even
+when a copy is already resident. History detection happens only there, while eviction
+consults exemptions without mutating them. Saturation stops admitting pairs, not releases.
+`VICTORY_COVERED_CLEAR=0` preserves the previous shown-entry wait and budget-style revival.
+CPU recording-backend tests cover repeated remirroring/copying with no recreation or new
+exemption, explicit title revival, full-set clearing, in-flight/recorded-list protection,
+GPU-written/UAV protection, and the switch-off path.
+
+Verification uses the local pinned Rust 1.98.1 binaries and cached dependencies, offline
+with at most four jobs. The release `victory` build and x86_64 GPU test `--no-run` pass.
+Native arm64 CPU checks pass: 22 mirror/lifecycle tests, the bounded-history/full-set
+clearing test, and heap-query translation (24 tests); the switch-off and environment
+checks also pass with `VICTORY_COVERED_CLEAR=0`. The x86_64 shader suite reports 425 passed,
+3 ignored and the existing `a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves`
+failure, with the same `(6, true)` versus `(0, false)` assertion recorded for the parent
+in `/tmp/native-merge-followup/parent-wave32.log`. Asset policy passes. No Metal or game
+run was attempted in this sandbox. Logs and local corpus analysis are under
+`/tmp/victory-regressions-a7cac6c2`, outside the repository.
+
+The CPU-only `victory translate --list --jobs 4` runs before and after use identical native
+options and the same 19,104 container hashes. View-address-field refusals fall from **42 to 1**
+(6 buffer-address and 35 image-size queries restored); total refusals fall from **95 to 54**.
+There are **zero new refusals** and no changed outcomes or reasons outside those 41 restored
+programs. The reported compute and both pixel partners now translate; both mesh partners
+already did. The retained original unmasked fixture was checked word-for-word against
+`4f35fa7c`. `git diff --check` passes; changes remain uncommitted.

@@ -45,6 +45,13 @@ const EXCEPTIONS: &[(&str, &str)] = &[
     ("crates/victory-metal/tests/fixtures/tex_fill.dxil", "compiled from tex_fill.hlsl"),
     ("crates/victory-metal/tests/fixtures/tri_ps.dxil", "compiled from tri_ps.hlsl"),
     ("crates/victory-metal/tests/fixtures/tri_vs.dxil", "compiled from tri_vs.hlsl"),
+    ("crates/victory-metal/tests/fixtures/tri_ms.dxil", "compiled from tri_ms.hlsl"),
+    ("crates/victory-metal/tests/fixtures/tri_ms_payload.dxil", "compiled from tri_ms.hlsl with AMPLIFIED"),
+    ("crates/victory-metal/tests/fixtures/tri_as.dxil", "compiled from tri_as.hlsl"),
+    ("crates/victory-metal/tests/fixtures/mesh_ps.dxil", "compiled from mesh_ps.hlsl"),
+    ("crates/victory-metal/tests/fixtures/mesh_exec_ms.dxil", "compiled from mesh_exec_ms.hlsl"),
+    ("crates/victory-metal/tests/fixtures/mesh_fullscreen_ms.dxil", "compiled from mesh_fullscreen_ms.hlsl"),
+    ("crates/victory-metal/tests/fixtures/mesh_solid_ps.dxil", "compiled from mesh_solid_ps.hlsl"),
     ("crates/victory-metal/tests/fixtures/uint_fill.dxil", "compiled from uint_fill.hlsl"),
     // shortcut: one source file over the size limit, until it is split into modules.
     ("crates/victory-shader/src/emit/lower.rs", "hand-written translator source, over the size limit"),

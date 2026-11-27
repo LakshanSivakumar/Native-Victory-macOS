@@ -70,6 +70,7 @@ fn lowered(body: &[u32], lanes: u32, wave32_host: bool) -> Result<Lowered, crate
         zero_copy_memory: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
         view_marks: false,
     })
 }
@@ -432,12 +433,10 @@ fn what_has_no_form_is_refused_clearly() {
         ),
         "{r:?}"
     );
-    // A ballot in lanes below 10: the second host wave never gets there.
-    let r = lowered(DIV_BCNT, 64, true).err();
-    assert!(
-        matches!(r, Some(crate::ShaderError::Unsupported { .. })),
-        "{r:?}"
-    );
+    // Console flow brings both halves to a ballot in the lanes below 10.
+    let l = lowered(DIV_BCNT, 64, true).unwrap();
+    assert!(l.console_flow && l.exchanges);
+    assert!(l.barriers >= 4);
 }
 
 /// A wave64 lane mask joined with data at a uniform loop's header (the
@@ -594,6 +593,7 @@ fn pixel_and_other_width_mask_number_negatives_stay_refused() {
             prims: vec![],
             mesh_stride: 0,
             atomic_locks: false,
+        bvh_no_hit: false,
             bias_as_gradients: false,
             narrow_waves: false,
             wave32_host: true,
@@ -799,6 +799,7 @@ fn pixel_and_other_width_mask_number_negatives_stay_refused() {
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        bvh_no_hit: false,
         bias_as_gradients: false,
         narrow_waves: false,
         wave32_host: true,

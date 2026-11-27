@@ -218,6 +218,16 @@ pub(super) fn has_sections(p: &Program) -> bool {
     p.blocks.iter().any(|b| next_section(&b.insts, 0).is_some())
 }
 
+/// Section boundaries without simulating their values, for selecting the control-flow path.
+pub(super) fn section_ranges(p: &Program, block: usize) -> impl Iterator<Item = std::ops::RangeInclusive<usize>> + '_ {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        let (start, end, _) = next_section(&p.blocks[block].insts, from)?;
+        from = end + 1;
+        Some(start..=end)
+    })
+}
+
 /// The next save and restore indices and the saved EXEC value.
 fn next_section(insts: &[Inst], from: usize) -> Option<(usize, usize, Value)> {
     for (i, inst) in insts.iter().enumerate().skip(from) {
@@ -1346,6 +1356,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 atomic_locks: false,
+        bvh_no_hit: false,
                 bias_as_gradients: false,
                 narrow_waves: false,
                 wave32_host: true,

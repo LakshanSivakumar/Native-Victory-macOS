@@ -22,9 +22,6 @@ type MakeSignature = unsafe extern "C" fn(*const Descriptor, *mut *mut c_void) -
 type SetSignature = unsafe extern "C" fn(*mut c_void, *const c_void);
 type SetFlags = unsafe extern "C" fn(*mut c_void, u32);
 type SetDualSource = unsafe extern "C" fn(*mut c_void, u32);
-type GetReflection = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> bool;
-type CopyMeshInfo = unsafe extern "C" fn(*const c_void, u32, *mut MeshInfo) -> bool;
-type ReleaseMeshInfo = unsafe extern "C" fn(*mut MeshInfo) -> bool;
 
 /// `IRDualSourceBlendingConfigurationForceEnabled`: one target's two sources are shader outputs
 /// 0 and 1, both `[[color(0)]]` (`index(0)` and `index(1)`).
@@ -32,17 +29,35 @@ const DUAL_SOURCE_ON: u32 = 1;
 
 /// `IRShaderStageMesh`.
 pub const STAGE_MESH: i32 = 5;
+const STAGE_AMPLIFICATION: i32 = 6;
+const REFLECTION_VERSION_1_0: u32 = 1;
 
-/// `IRVersionedMSInfo` holding `IRMSInfo_1_0`.
+/// `IRVersionedMSInfo` (version followed by `IRMSInfo_1_0`). The single-member union
+/// is 4-aligned, so flattening it preserves the C layout: 32 bytes, threads at offset 20.
 #[repr(C)]
-#[derive(Default)]
-struct MeshInfo {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MeshInfo {
     version: u32,
-    max_vertices: u32,
-    max_primitives: u32,
-    topology: u32,
-    payload: u32,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub topology: u32,
+    pub payload_bytes: u32,
+    pub threads: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct AmplificationInfo {
+    version: u32,
     threads: [u32; 3],
+    payload_bytes: u32,
+}
+
+/// Reflected entry point and dispatch limits, kept together with the converted library.
+#[derive(Clone, Debug)]
+pub struct MeshStage {
+    pub entry: String,
+    pub info: MeshInfo,
 }
 
 /// `IRRootParameter1`: type, a 16-byte union (constants `{register, space, count}`, descriptor
@@ -88,7 +103,10 @@ impl Parameter {
         };
         Parameter {
             kind,
-            union: [u64::from(register) | u64::from(space) << 32, u64::from(extra)],
+            union: [
+                u64::from(register) | u64::from(space) << 32,
+                u64::from(extra),
+            ],
             visibility: 0,
         }
     }
@@ -98,7 +116,9 @@ impl Parameter {
 fn note(started: std::time::Instant, dxil: usize, hit: bool) {
     let ms = started.elapsed().as_millis();
     if ms >= 20 {
-        eprintln!("metal: library conversion {ms} ms (dxil {dxil} bytes, from the disk cache: {hit})");
+        eprintln!(
+            "metal: library conversion {ms} ms (dxil {dxil} bytes, from the disk cache: {hit})"
+        );
     }
 }
 
@@ -352,7 +372,7 @@ impl Msc {
         dual_source: bool,
     ) -> Result<(i32, Vec<u8>), ConvError> {
         let Some(dir) = crate::disk::dir() else {
-            return self.convert_uncached(dxil, entry, layout, dual_source);
+            return self.convert_uncached(dxil, entry, layout, dual_source, None);
         };
         let started = std::time::Instant::now();
         let layout_text = format!("{layout:?}");
@@ -376,49 +396,139 @@ impl Msc {
             note(started, dxil.len(), true);
             return Ok((stage, lib));
         }
-        let (stage, lib) = self.convert_uncached(dxil, entry, layout, dual_source)?;
+        let (stage, lib) = self.convert_uncached(dxil, entry, layout, dual_source, None)?;
         crate::disk::write(dir, &key, &[&stage.to_le_bytes()[..], &lib].concat());
         note(started, dxil.len(), false);
         Ok((stage, lib))
     }
 
-    /// The thread-group size of a mesh shader, from the converter's reflection of it (cached on
-    /// disk as conversions are).
-    pub fn mesh_threads(&self, dxil: &[u8], layout: Option<&RootLayout>) -> Result<[u32; 3], ConvError> {
-        let layout_text = format!("{layout:?}");
-        let dir = crate::disk::dir();
-        let key = crate::disk::key(&[b"mesh threads", dxil, layout_text.as_bytes(), self.id.as_bytes()]);
-        if let Some(t) = dir.and_then(|d| crate::disk::read(d, &key)).and_then(|b| {
-            let w = |k: usize| Some(u32::from_le_bytes(b.get(k * 4..k * 4 + 4)?.try_into().ok()?));
-            Some([w(0)?, w(1)?, w(2)?])
-        }) {
-            return Ok(t);
+    /// Converts a mesh (stage 5) or amplification (6) shader, preserving its reflection.
+    /// A separate cache record includes reflection, so an old library-only hit cannot lose it.
+    pub fn convert_mesh_with(
+        &self,
+        dxil: &[u8],
+        layout: Option<&RootLayout>,
+        amplification: bool,
+    ) -> Result<(Vec<u8>, MeshStage), ConvError> {
+        let wanted = if amplification {
+            STAGE_AMPLIFICATION
+        } else {
+            STAGE_MESH
+        };
+        let key = crate::disk::key(&[
+            b"mesh-reflection-v1",
+            dxil,
+            format!("{layout:?}").as_bytes(),
+            self.id.as_bytes(),
+        ]);
+        if let Some(b) = crate::disk::dir().and_then(|dir| crate::disk::read(dir, &key))
+            && let Some((stage, lib)) = decode_mesh_cache(&b, wanted)
+        {
+            return Ok((lib, stage));
         }
-        let h = self.h;
-        let threads = self.compiled(dxil, None, layout, false, |out| {
-            // SAFETY: the converter's documented C API (`IRShaderReflection*`, `IRObjectGetReflection`,
-            // `IRShaderReflectionCopyMeshInfo` with `IRReflectionVersion_1_0`); the reflection is
-            // destroyed before returning.
-            unsafe {
-                let r = sym::<Create>(h, "IRShaderReflectionCreate")();
-                let mut info = MeshInfo::default();
-                let ok = sym::<GetReflection>(h, "IRObjectGetReflection")(out, STAGE_MESH, r)
-                    && sym::<CopyMeshInfo>(h, "IRShaderReflectionCopyMeshInfo")(r, 1, &mut info);
-                if ok {
-                    sym::<ReleaseMeshInfo>(h, "IRShaderReflectionReleaseMeshInfo")(&mut info);
-                }
-                sym::<Destroy>(h, "IRShaderReflectionDestroy")(r);
-                if ok {
-                    Ok(info.threads)
-                } else {
-                    Err(ConvError { code: u32::MAX, msg: "no mesh reflection".into() })
-                }
-            }
+        let mut reflection = None;
+        let (stage, lib) = self.convert_uncached(dxil, None, layout, false, Some(&mut reflection))?;
+        if stage != wanted {
+            return Err(ConvError {
+                code: u32::MAX,
+                msg: format!("expected stage {wanted}, got {stage}"),
+            });
+        }
+        let reflected = reflection.ok_or_else(|| ConvError {
+            code: u32::MAX,
+            msg: "missing mesh reflection".into(),
         })?;
-        if let Some(d) = dir {
-            crate::disk::write(d, &key, &threads.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>());
+        if let Some(dir) = crate::disk::dir() {
+            let i = &reflected.info;
+            let words = [
+                stage as u32,
+                i.max_vertices,
+                i.max_primitives,
+                i.topology,
+                i.payload_bytes,
+                i.threads[0],
+                i.threads[1],
+                i.threads[2],
+                reflected.entry.len() as u32,
+            ];
+            let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            bytes.extend(reflected.entry.as_bytes());
+            bytes.extend(&lib);
+            crate::disk::write(dir, &key, &bytes);
         }
-        Ok(threads)
+        Ok((lib, reflected))
+    }
+
+    fn reflect_mesh(&self, object: *const c_void, stage: i32) -> Result<MeshStage, ConvError> {
+        type CopyMesh = unsafe extern "C" fn(*const c_void, u32, *mut MeshInfo) -> bool;
+        type CopyAs = unsafe extern "C" fn(*const c_void, u32, *mut AmplificationInfo) -> bool;
+        let fail = || ConvError {
+            code: u32::MAX,
+            msg: "missing or invalid mesh/amplification reflection".into(),
+        };
+        // SAFETY: the converter's versioned C ABI, with live objects and storage for version 1.
+        unsafe {
+            let r = sym::<Create>(self.h, "IRShaderReflectionCreate")();
+            if r.is_null() {
+                return Err(fail());
+            }
+            if !sym::<GetLib>(self.h, "IRObjectGetReflection")(object, stage, r) {
+                sym::<Destroy>(self.h, "IRShaderReflectionDestroy")(r);
+                return Err(fail());
+            }
+            let entry = sym::<unsafe extern "C" fn(*const c_void) -> *const c_char>(
+                self.h,
+                "IRShaderReflectionGetEntryPointFunctionName",
+            )(r);
+            let entry = if entry.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(entry).to_string_lossy().into_owned()
+            };
+            let mut info = MeshInfo::default();
+            let ok = match stage {
+                STAGE_MESH => {
+                    let mut raw = MeshInfo::default();
+                    let ok = sym::<CopyMesh>(self.h, "IRShaderReflectionCopyMeshInfo")(
+                        r,
+                        REFLECTION_VERSION_1_0,
+                        &mut raw,
+                    );
+                    info = raw;
+                    sym::<unsafe extern "C" fn(*mut MeshInfo) -> bool>(
+                        self.h,
+                        "IRShaderReflectionReleaseMeshInfo",
+                    )(&mut raw);
+                    ok
+                }
+                STAGE_AMPLIFICATION => {
+                    let mut a = AmplificationInfo::default();
+                    let ok = sym::<CopyAs>(self.h, "IRShaderReflectionCopyAmplificationInfo")(
+                        r,
+                        REFLECTION_VERSION_1_0,
+                        &mut a,
+                    );
+                    info.version = a.version;
+                    info.threads = a.threads;
+                    info.payload_bytes = a.payload_bytes;
+                    sym::<unsafe extern "C" fn(*mut AmplificationInfo) -> bool>(
+                        self.h,
+                        "IRShaderReflectionReleaseAmplificationInfo",
+                    )(&mut a);
+                    ok
+                }
+                _ => false,
+            };
+            sym::<Destroy>(self.h, "IRShaderReflectionDestroy")(r);
+            if !ok
+                || info.version != REFLECTION_VERSION_1_0
+                || entry.is_empty()
+                || info.threads.contains(&0)
+            {
+                return Err(fail());
+            }
+            Ok(MeshStage { entry, info })
+        }
     }
 
     fn convert_uncached(
@@ -427,6 +537,7 @@ impl Msc {
         entry: Option<&str>,
         layout: Option<&RootLayout>,
         dual_source: bool,
+        mut reflection: Option<&mut Option<MeshStage>>,
     ) -> Result<(i32, Vec<u8>), ConvError> {
         let h = self.h;
         self.compiled(dxil, entry, layout, dual_source, |out| {
@@ -438,7 +549,13 @@ impl Msc {
                     let n = sym::<LibSize>(h, "IRMetalLibGetBytecodeSize")(lib);
                     let mut v = vec![0u8; n];
                     sym::<LibBytes>(h, "IRMetalLibGetBytecode")(lib, v.as_mut_ptr());
-                    Ok((stage, v))
+                    match reflection.as_mut() {
+                        Some(reflected) => self.reflect_mesh(out, stage).map(|info| {
+                            **reflected = Some(info);
+                            (stage, v)
+                        }),
+                        None => Ok((stage, v)),
+                    }
                 } else {
                     Err(ConvError {
                         code: u32::MAX,
@@ -535,9 +652,59 @@ impl Msc {
     }
 }
 
+fn decode_mesh_cache(bytes: &[u8], wanted: i32) -> Option<(MeshStage, Vec<u8>)> {
+    let words: Vec<u32> = bytes
+        .get(..36)?
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    if words[0] != wanted as u32 || words[5..8].contains(&0) {
+        return None;
+    }
+    let end = 36usize.checked_add(words[8] as usize)?;
+    let entry = std::str::from_utf8(bytes.get(36..end)?).ok()?.to_owned();
+    let lib = bytes.get(end..)?;
+    if entry.is_empty() || lib.is_empty() {
+        return None;
+    }
+    Some((
+        MeshStage {
+            entry,
+            info: MeshInfo {
+                version: REFLECTION_VERSION_1_0,
+                max_vertices: words[1],
+                max_primitives: words[2],
+                topology: words[3],
+                payload_bytes: words[4],
+                threads: [words[5], words[6], words[7]],
+            },
+        },
+        lib.to_vec(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn mesh_reflection_matches_the_c_abi() {
+        // Verified against Apple's 4.0 beta 3 header with C static assertions on both ABIs.
+        assert_eq!(size_of::<MeshInfo>(), 32);
+        assert_eq!(align_of::<MeshInfo>(), 4);
+        assert_eq!(offset_of!(MeshInfo, version), 0);
+        assert_eq!(offset_of!(MeshInfo, max_vertices), 4);
+        assert_eq!(offset_of!(MeshInfo, max_primitives), 8);
+        assert_eq!(offset_of!(MeshInfo, topology), 12);
+        assert_eq!(offset_of!(MeshInfo, payload_bytes), 16);
+        assert_eq!(offset_of!(MeshInfo, threads), 20);
+        assert_eq!(size_of::<AmplificationInfo>(), 20);
+        assert_eq!(align_of::<AmplificationInfo>(), 4);
+        assert_eq!(offset_of!(AmplificationInfo, version), 0);
+        assert_eq!(offset_of!(AmplificationInfo, threads), 4);
+        assert_eq!(offset_of!(AmplificationInfo, payload_bytes), 16);
+    }
 
     #[test]
     fn the_converter_path_is_the_override_if_set_else_the_default() {

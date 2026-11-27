@@ -629,6 +629,28 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// Set when the memory came from the runtime's graphics memory
+    /// ([`use_graphics_memory`]; it goes back there).
+    graphics: bool,
+}
+
+/// `(size, alignment)` to zeroed memory the host GPU reaches at its own
+/// address, null if it cannot give that.
+pub type GraphicsAlloc = fn(usize, usize) -> *mut u8;
+pub type GraphicsFree = fn(*mut u8);
+static GRAPHICS_MEMORY: std::sync::OnceLock<(GraphicsAlloc, GraphicsFree)> =
+    std::sync::OnceLock::new();
+
+/// Where heaps, and committed resources of a title without an allocator,
+/// get their memory when the host GPU only reaches the runtime's graphics
+/// memory (the native host: a title address is a place in a physical-page
+/// pool). Without it they are in the host's heap, which that host cannot
+/// show the GPU: every copy from or into a buffer placed there, and every
+/// value write into one, was dropped ("is not in a mapped pool"; Grand
+/// Theft Auto VI reads its exposure back through such buffers and uploads
+/// three textures a frame from them).
+pub fn use_graphics_memory(alloc: GraphicsAlloc, free: GraphicsFree) {
+    let _ = GRAPHICS_MEMORY.set((alloc, free));
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -674,6 +696,20 @@ fn resource_attributes(info: AllocationInfo, heap_kind: u32) -> u64 {
     GRAPHICS_ALLOCATOR | pages << 14 | alignment << 24 | memory << 29
 }
 
+/// Logs at debug level where resource memory came from (the first 48 of each origin): the native host drops
+/// every command on memory its GPU does not reach, so the origin of a dropped address matters.
+fn note_origin(origin: &'static str, at: *const u8, size: usize) {
+    static SEEN: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+    let slot = match origin {
+        "graphics memory" => 0,
+        "the title's allocator" => 1,
+        _ => 2,
+    };
+    if SEEN[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 48 {
+        tracing::debug!(origin, at = format_args!("{at:p}"), size, "resource memory");
+    }
+}
+
 impl Memory {
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
@@ -688,10 +724,12 @@ impl Memory {
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        note_origin("the title's allocator", ptr.as_ptr(), layout.size());
         Ok(Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            graphics: false,
         })
     }
 
@@ -711,18 +749,37 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
+        if let Some(&(alloc, _)) = GRAPHICS_MEMORY.get()
+            && let Some(ptr) = NonNull::new(alloc(layout.size(), layout.align()))
+        {
+            note_origin("graphics memory", ptr.as_ptr(), layout.size());
+            return Ok(Memory {
+                ptr,
+                layout,
+                attributes: None,
+                graphics: true,
+            });
+        }
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        note_origin("the host heap", ptr.as_ptr(), layout.size());
         Ok(Memory {
             ptr,
             layout,
             attributes: None,
+            graphics: false,
         })
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        if self.graphics {
+            if let Some(&(_, free)) = GRAPHICS_MEMORY.get() {
+                free(self.ptr.as_ptr());
+            }
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -2401,11 +2458,34 @@ pub(crate) fn test_texture_array_at(address: u64, (width, height): (u64, u32), m
         layout: 0x100 | swizzle,
         flags,
     };
+    test_texture_desc_at(address, &desc)
+}
+
+/// A title 3D texture, using the same object creation path as the 2D fixtures.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_volume_at(address: u64, [width, height, depth]: [u32; 3], mips: u16, format: u32) -> This {
+    test_texture_desc_at(address, &ResourceDesc {
+        dimension: 4,
+        alignment: 0,
+        width: u64::from(width),
+        height,
+        depth_or_array_size: depth.try_into().unwrap(),
+        mip_levels: mips,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0x100 | victory_formats::texture::Swizzle::LINEAR.0,
+        flags: 4, // ALLOW_UNORDERED_ACCESS
+    })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn test_texture_desc_at(address: u64, desc: &ResourceDesc) -> This {
     let mut out = std::ptr::null();
     let hr = create_at_address(
         std::ptr::null(),
         address,
-        &desc,
+        desc,
         0,
         std::ptr::null(),
         &RESOURCE_IIDS[0],

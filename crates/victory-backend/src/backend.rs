@@ -109,6 +109,17 @@ pub trait ComputeBackend {
     fn create_fence(&self, initial: u64) -> Result<Self::Fence, String>;
     /// Wrap `ptr..ptr+len` (page-aligned) without copying; it stays mapped while the buffer lives.
     fn wrap_title_memory(&self, ptr: *mut u8, len: usize) -> Result<Self::Buffer, String>;
+    /// A buffer over `len` bytes (a multiple of 64 KiB) that no single mapping holds: zero-filled
+    /// memory in which each piece `(at, src, n)` (64 KiB multiples) shows the `n` bytes mapped at
+    /// `src`, the same physical pages and not a copy, at offset `at`. Returns the buffer and
+    /// where the host maps its bytes; that mapping lives as long as the GPU uses the buffer. The
+    /// pieces are the pages as they are mapped now: mapping something else at `src` later does
+    /// not change what the buffer shows. For title ranges whose pages come from several pools
+    /// (a title maps 64 KiB physical pages into its reservations in any order, and makes buffer
+    /// views across them).
+    fn wrap_title_span(&self, _len: usize, _pieces: &[(usize, *mut u8, usize)]) -> Result<(Self::Buffer, *mut u8), String> {
+        Err("this backend wraps single mappings only".into())
+    }
     /// The bytes of GPU memory the device holds for this process now, where the backend knows
     /// (Metal's `currentAllocatedSize`), for memory measurements.
     fn allocated_bytes(&self) -> u64 {

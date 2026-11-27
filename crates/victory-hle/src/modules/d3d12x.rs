@@ -22,6 +22,9 @@ extern "system" fn create_device(
         victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
         victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     }
+    // The native GPU reaches title memory through the physical-page pools.
+    #[cfg(target_os = "macos")]
+    victory_gpu::resource::use_graphics_memory(super::xmem::graphics_alloc, super::xmem::graphics_free);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     let hr = device::create(adapter, parameters, iid, out);

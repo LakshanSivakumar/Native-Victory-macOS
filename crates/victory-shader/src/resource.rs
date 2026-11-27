@@ -577,6 +577,45 @@ impl<'a> Tracer<'a> {
         self.p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1)
     }
 
+    /// XOR-encoded spills can decode to their original descriptor words.
+    /// Cancel equal SSA terms, including masks, only by bit-exact identities.
+    /// The bounded walk leaves genuine descriptor edits unmodified.
+    fn cancel_xor(&self, inst: &Inst, k: usize, origins: &[Option<Term>]) -> Option<Moved> {
+        let width = |i: &Inst| match i.name() { "s_xor_b32" => 1, "s_xor_b64" => 2, _ => 0 };
+        if k >= width(inst) || !matches!(inst.writes.get(k)?.0, Reg::S(0..=105)) { return None; }
+        let mut pending = vec![Term::Value(inst.writes[k].1)];
+        let mut leaves = Vec::new();
+        let mut constant = 0;
+        let mut visits = 0;
+        while let Some(t) = pending.pop() {
+            visits += 1;
+            if visits > 64 { return None; }
+            match t {
+                Term::Const(c) => constant ^= c,
+                Term::Value(v) => {
+                    if let Some(i) = self.def(v)
+                        && let Some(part) = i.writes.iter().position(|w| w.1 == v)
+                        && part < width(i)
+                        && let Fields::Sop { src, .. } = &i.fields
+                    {
+                        for op in src {
+                            pending.push(scalar_word(i, op, part, origins)?);
+                        }
+                    } else if let Some(index) = leaves.iter().position(|x| *x == v) {
+                        leaves.swap_remove(index);
+                    } else {
+                        leaves.push(v);
+                    }
+                }
+            }
+        }
+        match leaves.as_slice() {
+            [] => Some(Moved::Const(constant)),
+            [v] if constant == 0 => Some(Moved::Value(*v)),
+            _ => None,
+        }
+    }
+
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
     ///
@@ -634,6 +673,9 @@ impl<'a> Tracer<'a> {
                             .map(Moved::Value);
                         let new = match reload
                             .or_else(|| copy_source(inst, k))
+                            .or_else(|| self.cancel_xor(inst, k, &o))
+                            .or_else(|| fold_scalar_pair(inst, k, &o))
+                            .or_else(|| fold_scalar(inst, k, &o))
                             .or_else(|| self.restored(inst))
                         {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
@@ -2898,6 +2940,122 @@ pub(crate) fn lane_of(op: Operand) -> Option<u32> {
     }
 }
 
+/// Fold scalar descriptor construction using already-proven operands. SCC is
+/// deliberately left to instruction lowering; only the destination dword is
+/// replaced. In particular, no loaded descriptor field is guessed constant.
+fn fold_scalar(inst: &Inst, k: usize, origins: &[Option<Term>]) -> Option<Moved> {
+    let Fields::Sop { src, .. } = &inst.fields else { return None };
+    if k != 0 || !matches!(inst.writes.first()?.0, Reg::S(0..=105)) {
+        return None;
+    }
+    let term = |op: &Operand| match *op {
+        Operand::Const(c) => inline(c).map(Term::Const),
+        Operand::Literal(c) => Some(Term::Const(c)),
+        Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
+        Operand::Scalar { code, dwords: 1 } => origins[inst.read(Reg::S(code))?.0 as usize],
+        _ => None,
+    };
+    let a = term(src.first()?)?;
+    let b = src.get(1).and_then(term);
+    let moved = |t| match t { Term::Const(c) => Moved::Const(c), Term::Value(v) => Moved::Value(v) };
+    // These are identities for every bit pattern, including untracked data.
+    match (inst.name(), a, b) {
+        ("s_and_b32", _, Some(Term::Const(0)))
+        | ("s_and_b32", Term::Const(0), _) => return Some(Moved::Const(0)),
+        ("s_and_b32", x, Some(Term::Const(u32::MAX)))
+        | ("s_or_b32" | "s_xor_b32", x, Some(Term::Const(0))) => return Some(moved(x)),
+        ("s_and_b32", Term::Const(u32::MAX), Some(x))
+        | ("s_or_b32" | "s_xor_b32", Term::Const(0), Some(x)) => return Some(moved(x)),
+        _ => {}
+    }
+    let Term::Const(a) = a else { return None };
+    let b = match b { Some(Term::Const(b)) => Some(b), _ => None };
+    let value = match inst.name() {
+        "s_not_b32" => !a,
+        "s_brev_b32" => a.reverse_bits(),
+        "s_and_b32" => a & b?,
+        "s_or_b32" => a | b?,
+        "s_xor_b32" => a ^ b?,
+        "s_andn2_b32" => a & !b?,
+        "s_orn2_b32" => a | !b?,
+        "s_nand_b32" => !(a & b?),
+        "s_nor_b32" => !(a | b?),
+        "s_xnor_b32" => !(a ^ b?),
+        "s_lshl_b32" => a << (b? & 31),
+        "s_lshr_b32" => a >> (b? & 31),
+        "s_ashr_i32" => ((a as i32) >> (b? & 31)) as u32,
+        "s_add_u32" | "s_add_i32" => a.wrapping_add(b?),
+        "s_sub_u32" | "s_sub_i32" => a.wrapping_sub(b?),
+        "s_mul_i32" => a.wrapping_mul(b?),
+        "s_min_u32" => a.min(b?),
+        "s_max_u32" => a.max(b?),
+        "s_min_i32" => (a as i32).min(b? as i32) as u32,
+        "s_max_i32" => (a as i32).max(b? as i32) as u32,
+        "s_bfm_b32" => ((1u32 << (a & 31)) - 1) << (b? & 31),
+        "s_bfe_u32" => {
+            let b = b?;
+            let width = (b >> 16) & 0x7f;
+            if width == 0 { 0 } else { (a >> (b & 31)) & u32::MAX.checked_shr(32u32.saturating_sub(width)).unwrap_or(0) }
+        }
+        _ => return None,
+    };
+    Some(Moved::Const(value))
+}
+
+/// One scalar operand dword, respecting integer pair sign extension.
+fn scalar_word(inst: &Inst, op: &Operand, part: usize, origins: &[Option<Term>]) -> Option<Term> {
+    match *op {
+        Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
+        Operand::Scalar { code, dwords } if part < usize::from(dwords) => {
+            origins[inst.read(Reg::S(code + part as u8))?.0 as usize]
+        }
+        Operand::Const(c @ 128..=208) => {
+            let lo = inline(c)?;
+            Some(Term::Const(if part == 0 { lo } else { ((lo as i32) >> 31) as u32 }))
+        }
+        Operand::Literal(c) if part == 0 || c < 0x8000_0000 => Some(Term::Const(if part == 0 { c } else { 0 })),
+        _ => None,
+    }
+}
+
+/// Dword-wise identities of scalar pairs preserve loaded descriptors too.
+/// BFM's inputs are 32-bit counts even though its result is a pair; both
+/// counts use six bits (RDNA2 S_BFM_B64), including width 0 producing 0.
+fn fold_scalar_pair(inst: &Inst, k: usize, origins: &[Option<Term>]) -> Option<Moved> {
+    let Fields::Sop { src, .. } = &inst.fields else { return None };
+    if k >= 2 || !matches!(inst.writes.get(k)?.0, Reg::S(0..=105)) {
+        return None;
+    }
+    let word = |op, part| scalar_word(inst, op, part, origins);
+    if inst.name() == "s_bfm_b64" {
+        let (Term::Const(width), Term::Const(shift)) = (word(src.first()?, 0)?, word(src.get(1)?, 0)?) else { return None };
+        let mask = ((1u64 << (width & 63)) - 1) << (shift & 63);
+        return Some(Moved::Const((mask >> (32 * k)) as u32));
+    }
+    let name = match inst.name() {
+        "s_and_b64" => "and", "s_or_b64" => "or", "s_xor_b64" => "xor",
+        "s_andn2_b64" => "andn", "s_orn2_b64" => "orn",
+        _ => return None,
+    };
+    let (a, b) = (word(src.first()?, k)?, word(src.get(1)?, k)?);
+    let moved = |t| match t { Term::Const(c) => Moved::Const(c), Term::Value(v) => Moved::Value(v) };
+    match (name, a, b) {
+        ("and", _, Term::Const(0)) | ("and", Term::Const(0), _)
+        | ("andn", _, Term::Const(u32::MAX)) => Some(Moved::Const(0)),
+        ("and", x, Term::Const(u32::MAX)) | ("and", Term::Const(u32::MAX), x)
+        | ("or" | "xor" | "andn", x, Term::Const(0))
+        | ("or" | "xor", Term::Const(0), x)
+        | ("orn", x, Term::Const(u32::MAX)) => Some(moved(x)),
+        ("or", _, Term::Const(u32::MAX)) | ("or", Term::Const(u32::MAX), _)
+        | ("orn", _, Term::Const(0)) => Some(Moved::Const(u32::MAX)),
+        (_, Term::Const(a), Term::Const(b)) => Some(Moved::Const(match name {
+            "and" => a & b, "or" => a | b, "xor" => a ^ b,
+            "andn" => a & !b, "orn" => a | !b, _ => unreachable!(),
+        })),
+        _ => None,
+    }
+}
+
 /// What dword `k` of a move's result copies.
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
@@ -3523,6 +3681,34 @@ pub(crate) mod tests {
         // The title's samplers: bits 54 and 55, "a sampler built from computed words" before.
         assert_eq!(value(3, 0), Term::Const(0));
         assert_eq!(value(3, 1), Term::Const(0x00C0_0000));
+    }
+
+    #[test]
+    fn constant_scalar_descriptor_words_fold_without_guessing_loaded_bits() {
+        // SOP2 s2, s0, s1 after literal moves: expected exact 32-bit word.
+        let cases: &[(u32, u32, u32, u32)] = &[
+            (0x00, u32::MAX, 1, 0), (0x01, 0, 1, u32::MAX),
+            (0x06, 0xffff_fffe, 1, 0xffff_fffe), (0x09, 0xffff_fffe, 1, 0xffff_fffe),
+            (0x0e, 0xf0, 0x33, 0x30), (0x10, 0xf0, 0x33, 0xf3),
+            (0x12, 0xf0, 0x33, 0xc3), (0x14, 0xf0, 0x33, 0xc0),
+            (0x16, 0xf0, 0x33, 0xffff_fffc), (0x18, 0xf0, 0x33, 0xffff_ffcf),
+            (0x1a, 0xf0, 0x33, 0xffff_ff0c), (0x1c, 0xf0, 0x33, 0xffff_ff3c),
+            (0x1e, 1, 36, 16), (0x20, 0x8000_0000, 36, 0x0800_0000),
+            (0x22, 0x8000_0000, 36, 0xf800_0000),
+            (0x24, 12, 12, 0x00ff_f000), (0x26, u32::MAX, 3, 0xffff_fffd),
+            (0x27, 0x1234_5678, 0x0008_0008, 0x56),
+            (0x27, 0x1234_5678, 0x0000_0008, 0),
+            (0x27, 0x1234_5678, 0x0020_0008, 0x0012_3456),
+        ];
+        for &(op, a, b, expected) in cases {
+            let words = [0xBE80_03FF, a, 0xBE81_03FF, b,
+                0x8002_0100 | (op << 23), S_ENDPGM];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let t = Tracer::new(&p, &[], HwStage::Cs, None).unwrap();
+            let dst = p.blocks[0].insts[2].write(Reg::S(2)).unwrap();
+            assert_eq!(t.origin(dst), Term::Const(expected), "opcode {op:x}");
+        }
     }
 
     /// A register kept in a second one across an inner loop that restores

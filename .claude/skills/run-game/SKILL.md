@@ -29,6 +29,15 @@ VICTORY_GUESS_GRAPHICS=1 VICTORY_KEYS="$(seq 4 2 80 | sed 's/$/:Enter/' | paste 
 
 When several agents share a machine, wrap the run in `/usr/bin/lockf -k <dir>/game.lock ...` so only one game runs at a time.
 
+Native presentation composites two known texture planes, scaling both linearly to the window.
+Guess about console order: plane 1 (UI/HUD) goes over plane 0 (scene), based on the measured
+title run. The composite is opaque even when the scene's alpha is zero. For diagnostics,
+`VICTORY_PRESENT_TOP=0` swaps the planes, `VICTORY_PRESENT_PREMULTIPLIED=1` uses premultiplied
+instead of straight UI alpha, and `VICTORY_PRESENT_PLANE=<n>` shows only that plane without
+compositing (an out-of-range index falls back to the largest). Leave these unset normally.
+One plane retains its existing presentation behavior. See `docs/native-host.md`, "Native
+present planes", for the equations and trace fields.
+
 ## Scripted input (`VICTORY_KEYS`)
 
 A comma-separated list of `<seconds>:<key>` presses. Key names: a letter, a digit, `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down` and the other arrows. Enter every 2 s gets past "press A". Some setup screens need `Down` then `Enter` (the default choice isn't the one that goes forward), so build the script screen by screen and check each step with an image dump (see the debug-graphics skill).

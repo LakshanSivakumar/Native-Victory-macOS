@@ -128,6 +128,28 @@ impl PoolTable {
         ))
     }
 
+    /// The mappings over `[start, end)`, cut to it, in title order: `(title address, length,
+    /// pool id, the address of those bytes in the pool's own mapping)`. Mappings of pools the
+    /// table does not know are left out, as are empty ones.
+    pub fn covering(&self, start: usize, end: usize) -> Vec<(usize, usize, usize, usize)> {
+        let g = self.lock();
+        let first = g
+            .maps
+            .range(..start)
+            .next_back()
+            .filter(|&(&at, m)| at + m.len > start)
+            .map(|(&at, _)| at)
+            .unwrap_or(start);
+        g.maps
+            .range(first..end)
+            .filter_map(|(&at, m)| {
+                let pool = g.pools.get(&m.pool)?;
+                let (from, to) = (at.max(start), (at + m.len).min(end));
+                (from < to).then(|| (from, to - from, m.pool, pool.base + m.offset + (from - at)))
+            })
+            .collect()
+    }
+
     /// What the title maps at `[addr, addr + len)`, as a number that changes when any mapping in
     /// it does: a hash of the mappings it crosses (title address, length, pool, offset), which
     /// must follow one another in title addresses. `None` where part of it is not mapped.

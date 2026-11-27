@@ -1,6 +1,6 @@
 //! Hand-assembled GFX10 unit tests covering all 6 graphics shader refusal
-//! classes (both positive sequences that must lower — across `wave32_host`
-//! false/true where relevant — and genuinely unsupported variants that must
+//! classes (both positive sequences that must lower - across `wave32_host`
+//! false/true where relevant - and genuinely unsupported variants that must
 //! remain refused). Encodings assembled with `llvm-mc -mcpu=gfx1030` (plus
 //! `-mattr=+wavefrontsize64` for wave64).
 
@@ -260,7 +260,7 @@ pub(super) fn computed_subword_test_shader(op: u32, bounds: u32) -> super::HostS
         inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0,
         atomic_locks: false, bias_as_gradients: false, narrow_waves: false,
         wave32_host: false, zero_copy_memory: true, view_marks: false,
-        rect_list: false, copy_params: [0; 32],
+        rect_list: false, copy_params: [0; 32], bvh_no_hit: false,
     }).unwrap();
     super::HostShader {
         stage: HwStage::Cs, dxil: l.dxil, splits: l.splits, table_entries: l.table_entries,
@@ -350,6 +350,7 @@ fn lower_ps(
         view_marks: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
     })
 }
 
@@ -375,7 +376,7 @@ fn lower_vs(
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
-    lower::lower(&Parts {
+    lower::lower_graphics(&Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -393,7 +394,8 @@ fn lower_vs(
         view_marks: false,
         rect_list,
         copy_params: [0; 32],
-    })
+        bvh_no_hit: false,
+    }, true)
 }
 
 fn parsed_isg1(dxil: &[u8]) -> Vec<SigElement> {
@@ -909,13 +911,24 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
     let mov = |src: u32| vec![0xBE94_0300 | src]; // s_mov_b32 s20, s<src>
     // s_lshr_b64 s[20:21], s[12:13], 8, then s_and_b32 s20, s21, mask: dword 1 bits 8 on.
     let shifted = |mask: u32| vec![0x9094_880C, 0x8714_FF15, mask];
+    // The compiler can hoist an address mask into an SGPR. This is still exactly 16 bits.
+    let register_mask = |mask: u32| vec![0xBE95_03FF, mask, 0x8714_150D];
+    let extract = |src: u32, offset: u32, width: u32| vec![0x9394_FF00 | src, width << 16 | offset];
     let accepted = [
         (false, mov(12)),
         (false, and(13, 0xFFFF)),
         (false, shifted(0xFF)),
+        (false, register_mask(0xFFFF)),
         (true, and(13, 0xC000_0000)),
         (true, and(14, 0x3FFF_FFFF)),
         (true, and(15, 0xF00F_FFFF)),
+        (true, vec![0x9014_9E0D]), // width's low two bits: dword 1 >> 30
+        (true, extract(14, 14, 16)), // height - 1
+        (true, extract(15, 12, 4)), // first level
+        // Width: (dword 2 << 2 | dword 1 >> 30) & 0xffff. Neither OR operand is a literal.
+        (true, vec![0x8F15_820E, 0x9016_9E0D, 0x8814_1615, 0x8714_FF14, 0xFFFF]),
+        // A scalar move between the load and extraction does not expose additional bits.
+        (true, vec![0xBE95_030D, 0x9014_9E15]),
     ];
     for (image, read) in accepted {
         let shader = translate_with(&program(image, &read), Options::default());
@@ -931,12 +944,18 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
         (false, mov(13), "a buffer's stride or swizzle"),
         (false, and(13, 0x3FFF_0000), "a buffer's stride or swizzle"),
         (false, shifted(0xFFFF), "a buffer's stride or swizzle"),
+        (false, register_mask(0x1FFFF), "a buffer's stride or swizzle"),
         (false, mov(14), "a buffer's record count or format"),
         (true, mov(12), "an image's base address"),
         (true, and(13, 0xFF), dword_1),
         (true, and(13, 0x1FF0_0000), dword_1),
+        (true, vec![0x9014_9D0D], dword_1), // one bit beyond width
         (true, mov(14), "an image's dword 2"),
+        (true, extract(14, 14, 17), "an image's dword 2"),
         (true, and(15, 0x01F0_0000), "an image's tiling"),
+        (true, extract(15, 12, 9), "an image's tiling"),
+        // A narrowed data result does not hide the whole-word zero test consumed through SCC.
+        (true, vec![0x8815_800D, 0x8514_8081], dword_1),
         (true, mov(16), "an image's dwords 4-7"),
     ];
     for (image, read, why) in refused {
@@ -1925,6 +1944,7 @@ fn store_cs(dwords: u8, setup: &[u32], store: [u32; 2]) -> Result<Lowered, Shade
         view_marks: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
     })
 }
 
@@ -2190,6 +2210,49 @@ fn guessed_pixel_computed_samplers_and_short_images_remain_refused() {
     // The same sampler with dword 2 fixed is an immediate sampler.
     let fixed = [0xBE9A_0380, sample[0], sample[1]]; // s_mov_b32 s26, 0
     assert_eq!(run(&fixed).unwrap().samplers, [[0x0001_2345, 0x00FF_F000, 0, 0]]);
+    // Scalar construction is folded only when every contributing word is
+    // known. This shift used to hide the immediate sampler behind BuiltMemory.
+    let computed = [0xBE9C_0381, 0x8F1A_841C, sample[0], sample[1]];
+    assert_eq!(run(&computed).unwrap().samplers, [[0x0001_2345, 0x00FF_F000, 16, 0]]);
+    // Exact bit identities preserve the identity of a loaded texture view.
+    let identity = [0x8710_C110, fixed[0], sample[0], sample[1]]; // s_and_b32 s16, s16, -1
+    assert_eq!(run(&identity).unwrap().samplers, [[0x0001_2345, 0x00FF_F000, 0, 0]]);
+    // A 64-bit bit-field mask constructs both sampler words, including
+    // fields in the high dword. Counts use only their low six bits.
+    for (width, shift) in [(0u32, 54u32), (2, 54), (31, 31), (32, 0), (63, 1), (64, 0), (65, 65)] {
+        let mask = ((1u64 << (width & 63)) - 1) << (shift & 63);
+        let built = [
+            0xBE9C_03FF, width, // s_mov_b32 s28, width
+            0xBE9D_03FF, shift, // s_mov_b32 s29, shift
+            0x9298_1D1C, // s_bfm_b64 s[24:25], s28, s29
+            fixed[0], sample[0], sample[1],
+        ];
+        assert_eq!(run(&built).unwrap().samplers, [[mask as u32, (mask >> 32) as u32, 0, 0]]);
+    }
+    let dynamic = [0x9298_B600, fixed[0], sample[0], sample[1]]; // s_bfm_b64 s[24:25], s0, 54
+    assert!(run(&dynamic).is_err(), "a runtime mask is not an immediate sampler");
+    // Pair identities must preserve both words' load provenance.
+    let pair_identity = [0x8790_C110, fixed[0], sample[0], sample[1]]; // s_and_b64 s[16:17], s[16:17], -1
+    assert_eq!(run(&pair_identity).unwrap().samplers, [[0x0001_2345, 0x00FF_F000, 0, 0]]);
+    let pair_changed = [0x8790_FF10, 0xffff_fffe, fixed[0], sample[0], sample[1]];
+    assert!(run(&pair_changed).err().unwrap().to_string().contains("descriptor changed after loading"));
+    // Compilers XOR-encode spilled descriptor words with a live mask, then
+    // decode them with the same mask. Cancel both 32- and 64-bit identities.
+    for xor in [0x8910_0010, 0x8990_0010] { // s_xor_b32/b64 s16, s16, s0
+        let decoded = [xor, xor, fixed[0], sample[0], sample[1]];
+        assert!(run(&decoded).is_ok());
+        let edited = [xor, fixed[0], sample[0], sample[1]];
+        assert!(run(&edited).err().unwrap().to_string().contains("descriptor changed after loading"));
+    }
+    // Associative cancellation, through two distinct masks and reordered terms.
+    let decoded = [0x8910_0010, 0x8910_0110, 0x8910_0010, 0x8910_0110, fixed[0], sample[0], sample[1]];
+    assert!(run(&decoded).is_ok());
+    let different_masks = [0x8910_0010, 0x8910_0110, fixed[0], sample[0], sample[1]];
+    assert!(run(&different_masks).err().unwrap().to_string().contains("descriptor changed after loading"));
+    // A real descriptor edit still needs a corresponding host view. Do not
+    // silently sample the original texture when any descriptor bit changes.
+    let changed = [0x8710_FF10, 0xffff_fffe, fixed[0], sample[0], sample[1]];
+    assert!(run(&changed).err().unwrap().to_string().contains("descriptor changed after loading"));
     // A 128-bit image descriptor of loaded and built dwords.
     let short = [
         0xBE93_03FF,
@@ -2341,6 +2404,7 @@ fn computed_descriptor_cs(computed: bool) -> Result<Lowered, ShaderError> {
         view_marks: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
     })
 }
 
@@ -2433,6 +2497,7 @@ fn indexed_srv_cs(stride: u32) -> Result<Lowered, ShaderError> {
         view_marks: false,
         rect_list: false,
         copy_params: [0; 32],
+        bvh_no_hit: false,
     })
 }
 
@@ -2491,6 +2556,44 @@ fn compute_root_constants_reach_the_user_data() {
     }
     let err = translate_with(&container(None), Options::default()).unwrap_err();
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+}
+
+
+/// SOP2 ABS(DIFF) subtracts and takes the absolute value in signed 32 bits;
+/// SCC observes the result, including wrapped overflow and INT_MIN.
+#[test]
+fn absdiff_i32_and_its_scc_lower() {
+    for (a, b) in [(1, 7), (7, 1), (0, 0), (0x8000_0000, 0), (0x7fff_ffff, 0xffff_ffff)] {
+        let code = [
+            0xBE80_03FF, a, 0xBE81_03FF, b, // s0, s1
+            0x9602_0100, // s_absdiff_i32 s2, s0, s1
+            0x8503_8180, // s_cselect_b32 s3, 0, 1 (consume SCC)
+            0x7E00_0202, 0x7E02_0203, // v0 = result, v1 = SCC selection
+            0xF800_180F, 0x0100_0100, 0xBF81_0000,
+        ];
+        assert!(!lower_ps(&code, true, vec![], vec![], 0, 0, vec![], true).unwrap().dxil.is_empty());
+    }
+}
+
+#[test]
+fn ldexp_f32_lowers_integer_exponents_and_special_values() {
+    for (bits, exponent) in [
+        (0x3f80_0000, 3), (0xbf80_0000, -3), (0x0080_0000, -1),
+        (0x7f7f_ffff, 1), (0x8000_0000, i32::MAX), (1, i32::MAX),
+        (0x7f80_0000, i32::MIN), (0x7f80_0001, 1), (0x3f80_0000, i32::MIN),
+    ] {
+        let code = [
+            0xBE80_03FF, exponent as u32, // s0: signed integer exponent
+            0x7E02_02FF, bits, // v1: float significand
+            0xD762_0000, 0x0000_0101, // v_ldexp_f32 v0, v1, s0
+            0xF800_180F, 0, 0xBF81_0000,
+        ];
+        assert!(!lower_ps(&code, true, vec![], vec![], 0, 0, vec![], true).unwrap().dxil.is_empty());
+        let mut bad = code;
+        bad[4] |= 1 << 9; // abs on integer exponent has no defined float meaning
+        assert!(lower_ps(&bad, true, vec![], vec![], 0, 0, vec![], true)
+            .err().unwrap().to_string().contains("float modifiers on an integer exponent"));
+    }
 }
 
 fn whole_wave_minimum(
@@ -2629,6 +2732,55 @@ fn whole_wave_sections_name_the_step_they_do_not_follow() {
                 if what.strip_prefix(prefix) == Some(why)),
             "{err:?}"
         );
+    }
+}
+
+/// Restoring EXEC before the final readlane must not turn a proven full-wave
+/// reduction back into a hardware-lane shuffle in a graphics shader.
+#[test]
+fn pixel_readlane_of_a_completed_wave_reduction_is_uniform() {
+    let mut words = vec![
+        0x7E00_0200, // v_mov_b32 v0, s0
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD501_0001, 0x000A_0080, // v_cndmask_b32 v1, 0, v0, s2
+        0x4A02_02FA, 0xFF00_B101, // add, quad xor 1
+        0x4A02_02FA, 0xFF00_4E01, // add, quad xor 2
+        0x4A02_02FA, 0xFF01_4101, // add, row half mirror
+        0x4A02_02FA, 0xFF01_4001, // add, row mirror
+        0xD778_0002, 0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0xD760_0004, 0x0001_0101, // v_readlane_b32 s4, v1, 0
+        0x7E06_0204, // v_mov_b32 v3, s4
+        0xF800_180F, 0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+        0xBF81_0000,
+    ];
+    for host32 in [false, true] {
+        let lowered = lower_ps(&words, false, vec![root_const(0, 1)], vec![], 0, 0, vec![], host32).unwrap();
+        assert_eq!(lowered.barriers, 0);
+    }
+    // The row sum before combining both rows is not uniform over the wave.
+    words[17] = 0x0001_0102; // read v2 (the other row's sum), not v1
+    let err = lower_ps(&words, false, vec![root_const(0, 1)], vec![], 0, 0, vec![], true).err().unwrap();
+    assert!(err.to_string().contains("whole-wave section step"), "{err}");
+}
+
+#[test]
+fn guessed_vertex_mesh_lane_partition_still_requires_mesh_stage_information() {
+    let words = [
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0xBEFE_04FF, 0x0F00_0000, // s_mov_b64 exec, 0x0f000000
+        0xF800_08CF, 0, // exp pos0 v0, v0, v0, v0 done
+        0xBF81_0000,
+    ];
+    let mut meta = [0u8; 0x30];
+    meta[12..15].copy_from_slice(&[0x40, 0, 1]);
+    meta[0x10] = 0x41;
+    meta[0x14] = 2;
+    let c = graphics::container(HwStage::Vs, &bytes_of(&words), &meta).unwrap();
+    for host32 in [false, true] {
+        let err = translate_with(&c, Options { wave32_host: host32, ..Options::default() }).err().unwrap();
+        assert!(err.to_string().contains("constant lane mask"), "{err}");
     }
 }
 

@@ -2,8 +2,8 @@
 //!
 //! `cargo run --release -p victory-metal` runs the memory/latency probe.
 //! `victory-metal <file.dxil>...` converts DXIL through Apple's Metal Shader Converter
-//! (`VICTORY_MSC_DYLIB` names `libmetalirconverter.dylib`, which is x86_64-only in GPTK:
-//! build with `--target x86_64-apple-darwin` and run under Rosetta).
+//! (`VICTORY_MSC_DYLIB` names Apple's universal `libmetalirconverter.dylib`, supporting arm64
+//! and x86_64; only the older GPTK copy and the fixture-generation DXC require Rosetta).
 //! Does nothing on non-macOS targets.
 
 #[cfg(target_os = "macos")]

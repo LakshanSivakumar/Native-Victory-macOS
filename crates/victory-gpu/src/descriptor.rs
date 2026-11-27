@@ -564,7 +564,7 @@ pub(crate) fn record(handle: u64, view: View) {
     #[cfg(windows)]
     mirror(handle);
     #[cfg(target_os = "macos")]
-    crate::native::glue::mirror(handle);
+    crate::native::glue::mirror(handle, true);
 }
 
 /// A shader-visible heap's descriptor memory: its start, whether it holds samplers, and its
@@ -622,7 +622,16 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    let record = unsafe { (handle as *const [u8; 12]).read_unaligned() };
+    view_record(record)
+}
+
+/// Decode the exact record already read by a native table scan. Re-reading the title's slot
+/// here could pair a newer view with the older bytes saved in its mirror stamp.
+pub(crate) fn view_record(record: [u8; 12]) -> Option<View> {
+    let [tag, i, generation] = std::array::from_fn(|n| {
+        u32::from_le_bytes(record[n * 4..][..4].try_into().expect("a record word"))
+    });
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
@@ -718,7 +727,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         }
         #[cfg(target_os = "macos")]
         for i in 0..u64::from(count) {
-            crate::native::glue::mirror(dst + i * step);
+            crate::native::glue::mirror(dst + i * step, false);
         }
     }
 }

@@ -252,7 +252,6 @@ pub struct Pages<B: ComputeBackend> {
 }
 
 impl<B: ComputeBackend> Pages<B> {
-    /// `bytes` rounded up to 16 KiB (a page on Apple silicon; a multiple of every page size here).
     pub fn new(backend: &B, bytes: usize) -> Result<Pages<B>, String> {
         let len = bytes.max(1).next_multiple_of(1 << 14);
         let (buf, ptr) = backend.host_buffer(len)?;
@@ -263,10 +262,9 @@ impl<B: ComputeBackend> Pages<B> {
         })
     }
 
-    pub fn ptr(&self) -> *mut u8 {
-        self.ptr
-    }
+    pub fn ptr(&self) -> *mut u8 { self.ptr }
 
+    /// Writes `words` from dword `at` on. The GPU may be reading the buffer: a reader sees the old
     /// Writes `words` from dword `at` on. The GPU may be reading the buffer: a reader sees each
     /// dword old or new (one aligned store a dword), not the words all old or all new.
     pub fn write_at(&self, at: usize, words: &[u32]) {

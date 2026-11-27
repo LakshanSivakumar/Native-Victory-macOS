@@ -716,6 +716,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn accepts_section_with_zero_raw_size() {
+        let mut data = synthetic_image(&vec![0u8; 0x200]);
+
+        // Disable the export directory.
+        let opt = 0x58;
+        data[opt + 112..opt + 120].fill(0);
+
+        // Section header begins after the optional header.
+        let sec = opt + 240;
+
+        // A section may occupy virtual memory without having raw data.
+        data[sec + 16..sec + 20].copy_from_slice(&0u32.to_le_bytes());
+
+        let info = ImageInfo::parse(&data);
+
+        assert!(
+            info.is_ok(),
+            "section with zero raw size should be accepted"
+        );
+    }
+
     fn synthetic_bss(virtual_size: u32) -> Vec<u8> {
         let mut data = synthetic_image(&[]);
         let opt = 0x58;

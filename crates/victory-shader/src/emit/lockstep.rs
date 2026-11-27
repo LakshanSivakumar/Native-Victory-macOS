@@ -67,7 +67,7 @@ pub(super) fn retry(
     if let Some((offset, what)) = split_branch(&q, &st, &res.waterfall.reads) {
         return Err(ShaderError::Unsupported { offset, what });
     }
-    emit_fast(c, native, &q, &st, io, res, options)
+    emit_fast(c, native, &q, &st, io, res, options, None)
 }
 
 /// The offset of a branch whose condition is not a uniform (SCC) value alone.

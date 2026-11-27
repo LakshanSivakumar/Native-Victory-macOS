@@ -20,7 +20,9 @@ pub(super) enum Res<T> {
 /// What a heap entry holds, in backend terms.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decoded {
-    /// A raw buffer SRV, UAV or CBV: `size` bytes at title address `addr`.
+    /// A buffer SRV, UAV or CBV: `size` bytes at title address `addr`, plus an optional
+    /// `(format, writable)` `texture_buffer` view for `buffer_load_format_*` /
+    /// `buffer_store_format_*`.
     Buffer {
         addr: u64,
         size: u32,
@@ -46,6 +48,7 @@ const BUFFER: u32 = 1;
 /// SRV `ViewDimension` of `Texture2D`; UAV's numbering is the same up to 3D.
 const TEXTURE_2D: u32 = 4;
 const TEXTURE_2D_ARRAY: u32 = 5;
+const TEXTURE_3D: u32 = 8;
 const FLAG_RAW: u32 = 1;
 
 /// Bytes per element of a buffer view and the range it covers from `base`.
@@ -129,10 +132,24 @@ pub fn format(dxgi: u32) -> Option<Format> {
 /// heap indices"; what `descriptor::host::view_stride` and `view_kind` give the D3D12 host): a
 /// buffer view's element size in bytes (its structure stride, 4 for a raw view or a constant
 /// buffer, else its format's element size; at least 1), with `VIEW_INTEGER` (and `VIEW_SIGNED`)
-/// for a typed view of an integer format. 0 for anything [`decode`] makes no buffer of: a shader
-/// that takes a buffer at a heap index it computes reads the null view there.
+/// for an integer format. Images have a zero stride with their component-kind bits; anything
+/// else decoded without a buffer has 0. A computed buffer index with zero stride reads null.
 pub(super) fn stride_word<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> u32 {
     use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+    // Images carry only component-kind bits, never a buffer stride. Packed image stores
+    // use these bits to distinguish integer channels from floats and normalized channels.
+    let image_format = match view {
+        View::Shader(_, Some(d)) | View::Unordered(_, _, Some(d)) if d[1] != BUFFER => Some(d[0]),
+        View::Placed(_, res, d) if res[0] != BUFFER => Some(d[0]),
+        _ => None,
+    };
+    if let Some(format) = image_format {
+        return match crate::resource::pc_format(format) {
+            3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => VIEW_INTEGER,
+            4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => VIEW_INTEGER | VIEW_SIGNED,
+            _ => 0,
+        };
+    }
     let buffer = |r: &usize| matches!(resources.get(r), Some(Res::Buffer(..)));
     let (format, stride, flags) = match view {
         View::Constant(..) => return 4,
@@ -176,6 +193,9 @@ fn texture_view(resource: usize, unordered: bool, d: &[u32]) -> Option<Decoded> 
         }
         Some(layers)
     } else {
+        // TEXTURE3D UAV's d[3..5] are FirstWSlice/WSize, not array layers or a
+        // plane. Metal's 3D mip view keeps the full depth. W sub-ranges are not
+        // implemented: they currently expose the whole selected mip.
         None
     };
     Some(Decoded::Image {
@@ -195,6 +215,7 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
         View::Constant(addr, size) => Some(Decoded::Buffer {
             addr: *addr,
             size: *size,
+
         }),
         // SRV words: format, dimension, mapping, pad, then the union (buffer: first element (8
         // bytes), count, stride, flags; 2D: first mip, mip count).
@@ -234,6 +255,7 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
             Res::Buffer(addr, size) => Some(Decoded::Buffer {
                 addr,
                 size: size.min(u64::from(u32::MAX)) as u32,
+
             }),
             Res::Texture(_) if matches!(view, View::Shader(..)) => Some(Decoded::Image {
                 resource: *r,
@@ -243,10 +265,10 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
             }),
             Res::Texture(_) => None,
         },
-        View::Shader(r, Some(d)) if matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY) => {
+        View::Shader(r, Some(d)) if matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY | TEXTURE_3D) => {
             texture_view(*r, false, d)
         }
-        View::Unordered(r, _, Some(d)) if matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY) => {
+        View::Unordered(r, _, Some(d)) if matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY | TEXTURE_3D) => {
             texture_view(*r, true, d)
         }
         View::Shader(r, Some(d)) | View::Unordered(r, _, Some(d)) => Some(Decoded::Image {
@@ -467,6 +489,56 @@ mod tests {
     type Resources = HashMap<usize, Res<()>>;
 
     #[test]
+    fn volume_views_keep_mips_without_mistaking_w_slices_for_array_layers() {
+        let mut resource = [0; 14];
+        resource[0] = 4; // TEXTURE3D resource
+        for unordered in [false, true] {
+            // First W / W size are currently unsupported. Even a sub-range binds the
+            // full depth of the selected mip, never a 2D array or a single plane.
+            for (first_w, w_size) in [(0, 12), (4, 4), (0, u32::MAX)] {
+                let mut d = [0; 10];
+                d[..2].copy_from_slice(&[24, TEXTURE_3D]);
+                let object = if unordered {
+                    d[2..5].copy_from_slice(&[1, first_w, w_size]);
+                    View::Unordered(7, 0, Some(d))
+                } else {
+                    d[4..6].copy_from_slice(&[1, 2]);
+                    View::Shader(7, Some(d))
+                };
+                let mut placed = [0; 16];
+                placed[..10].copy_from_slice(&d);
+                for view in [object, View::Placed(unordered, resource, placed)] {
+                    let Some(Decoded::Image { mips, slices, format, .. }) = decode(&view, &Resources::new()) else { panic!("3D view") };
+                    assert_eq!(mips, Some((1, if unordered { 1 } else { 2 })));
+                    assert_eq!(slices, None);
+                    assert_eq!(format, Some(Format::Rgb10a2Unorm));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_component_kinds_do_not_make_images_look_like_buffers() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+        for (format, kind) in [(24, 0), (26, 0), (42, VIEW_INTEGER), (43, VIEW_INTEGER | VIEW_SIGNED), (10, 0)] {
+            for unordered in [false, true] {
+                let mut d = [0; 10];
+                d[..2].copy_from_slice(&[format, TEXTURE_3D]);
+                let object = if unordered { View::Unordered(7, 0, Some(d)) } else { View::Shader(7, Some(d)) };
+                let mut resource = [0; 14];
+                resource[0] = 4;
+                let mut placed = [0; 16];
+                placed[..10].copy_from_slice(&d);
+                for view in [object, View::Placed(unordered, resource, placed)] {
+                    let word = stride_word(&view, &HashMap::<usize, Res<()>>::new());
+                    assert_eq!(word, kind);
+                    assert_eq!(word & VIEW_STRIDE_BITS, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn texture_srvs_keep_all_remaining_mips_from_the_first_requested() {
         let mut srv = [0; 10];
         (srv[0], srv[1], srv[4], srv[5]) = (28, TEXTURE_2D, 2, u32::MAX);
@@ -590,7 +662,8 @@ mod tests {
             decode(&View::Shader(7, Some(srv)), &base),
             Some(Decoded::Buffer {
                 addr: 0x1000_0010,
-                size: 64
+                size: 64,
+
             })
         );
         // A structured UAV: 5 elements of 12 bytes.
@@ -602,10 +675,21 @@ mod tests {
             decode(&View::Unordered(7, 0, Some(uav)), &base),
             Some(Decoded::Buffer {
                 addr: 0x1000_0000,
-                size: 60
+                size: 60,
+
             })
         );
-        // A typed R32_FLOAT view: the format gives the element size.
+        // A 16-byte structured UAV also carries an Rgba32Float texture_buffer format.
+        uav[5] = 16;
+        assert_eq!(
+            decode(&View::Unordered(7, 0, Some(uav)), &base),
+            Some(Decoded::Buffer {
+                addr: 0x1000_0000,
+                size: 80,
+
+            })
+        );
+        // A typed R32_FLOAT view: the format gives the element size and texture_buffer format.
         srv[0] = 41;
         srv[4] = 0;
         srv[8] = 0;
@@ -613,7 +697,8 @@ mod tests {
             decode(&View::Shader(7, Some(srv)), &base),
             Some(Decoded::Buffer {
                 addr: 0x1000_0000,
-                size: 64
+                size: 64,
+
             })
         );
         assert_eq!(decode(&View::Shader(8, Some(srv)), &base), None);
@@ -621,7 +706,8 @@ mod tests {
             decode(&View::Constant(0x2000, 256), &base),
             Some(Decoded::Buffer {
                 addr: 0x2000,
-                size: 256
+                size: 256,
+
             })
         );
     }

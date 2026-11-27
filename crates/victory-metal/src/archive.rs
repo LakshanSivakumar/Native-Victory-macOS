@@ -182,6 +182,7 @@ impl Archive {
         }
         note(started, "pipeline archive written");
     }
+
 }
 
 impl Drop for Archive {

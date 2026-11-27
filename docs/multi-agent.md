@@ -39,7 +39,7 @@ cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnull
 cargo xtask policy
 ```
 
-Fill in the PR template's "How it was tested" and "Checklist" boxes — say which command you ran and how many iterations passed. The maintainer checks this before merging.
+Fill in the PR template's "How it was tested" and "Checklist" boxes - say which command you ran and how many iterations passed. The maintainer checks this before merging.
 
 ## Conflicts between agents
 

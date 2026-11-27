@@ -118,6 +118,12 @@ impl Format {
         matches!(self, D32Float | D32FloatS8 | D16Unorm)
     }
 
+    /// Uncompressed colour formats that can view the same texels without copying or conversion.
+    /// Depth and block formats are outside this rule, even when their element sizes match.
+    pub fn color_castable(self, to: Format) -> bool {
+        !self.is_depth() && !to.is_depth() && self.block().0 == 1 && self.block() == to.block()
+    }
+
     /// Bytes of one row of `width` texels (of blocks, for BC).
     pub fn row_bytes(self, width: usize) -> usize {
         let (b, n) = self.block();
@@ -533,6 +539,9 @@ impl Default for Raster {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Topology {
     Triangles,
+    /// Three console vertices per rectangle, expanded by the vertex shader to six host vertices.
+    /// Draw counts and first vertices are still in console units. Non-indexed draws only.
+    Rectangles,
     TriangleStrip,
     Lines,
     LineStrip,
@@ -542,6 +551,8 @@ pub enum Topology {
 #[derive(Default)]
 pub struct RenderPipelineDesc<'a> {
     pub vs: &'a [u8],
+    /// Mesh producer instead of the vertex stage (no vertex input layout).
+    pub mesh: Option<MeshPipelineDesc<'a>>,
     pub ps: Option<&'a [u8]>,
     /// Explicit root layouts when the converter needs the host's argument contract.
     pub vs_layout: Option<&'a RootLayout>,
@@ -561,6 +572,23 @@ pub struct RenderPipelineDesc<'a> {
     pub dual_source: bool,
     pub stencil: Option<StencilState>,
     pub raster: Raster,
+}
+
+impl RenderPipelineDesc<'_> {
+    /// Every pipeline entry path must request the converter's second colour output when its
+    /// blend state reads it, including callers that do not supply the explicit hint.
+    pub fn needs_dual_source(&self) -> bool {
+        self.dual_source || self.color_state.iter().any(|s| s.blend.is_some_and(|b| b.second_source()))
+    }
+}
+
+/// Converted mesh DXIL and an optional amplification stage. Each stage uses the same
+/// root-argument conventions as a vertex pipeline.
+pub struct MeshPipelineDesc<'a> {
+    pub mesh: &'a [u8],
+    pub layout: Option<&'a RootLayout>,
+    pub amplification: Option<&'a [u8]>,
+    pub amplification_layout: Option<&'a RootLayout>,
 }
 
 pub struct ColorTarget<'a, B: GraphicsBackend + ?Sized> {
@@ -629,6 +657,8 @@ pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     pub root: RootArgs,
     /// The pixel stage's own argument block, if it has one (else it reads `root`).
     pub fragment_root: Option<RootArgs>,
+    /// Amplification arguments (else it reads `root`); unused without an object stage.
+    pub object_root: Option<RootArgs>,
     pub heaps: Heaps<'a, B>,
     pub resources: Vec<&'a B::Buffer>,
     /// `(input slot, buffer, title address)` for each bound vertex stream.
@@ -703,6 +733,18 @@ pub enum BlitOp<'a, B: ResourceBackend + ?Sized> {
         len: usize,
         row_pitch: usize,
         slice_pitch: usize,
+    },
+    /// Level 0, slice 0 of one plane of a depth texture to (`to_texture`) or from a buffer, in
+    /// rows of `row_pitch` bytes: the depth plane as the texture has it (32-bit floats, or 16-bit
+    /// normalised values), or with `stencil` the 8-bit stencil plane of a format that has one.
+    /// How the native host moves a depth texture's contents to and from its writable twin.
+    CopyDepthPlane {
+        texture: &'a B::Texture,
+        stencil: bool,
+        to_texture: bool,
+        buffer: (&'a B::Buffer, *const u8),
+        size: [usize; 2],
+        row_pitch: usize,
     },
 }
 
@@ -788,7 +830,7 @@ pub trait GraphicsBackend: ResourceBackend {
     fn name_render_pipeline(&self, _p: &Self::RenderPipeline, _name: &str) {}
 }
 
-/// Showing a texture of the title in a window.
+/// Showing a texture of the title in a window, optionally with an overlay.
 pub trait PresentBackend: GraphicsBackend {
     /// Where frames go: a layer of the app's window.
     type Surface;
@@ -811,4 +853,30 @@ pub trait PresentBackend: GraphicsBackend {
         surface: &Self::Surface,
         sources: &[&Self::Texture],
     ) -> Result<(), String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Format;
+
+    #[test]
+    fn color_casts_require_uncompressed_non_depth_texels_of_the_same_size() {
+        use Format::*;
+        for (from, to, compatible) in [
+            (R32Uint, Rgb9e5Float, true),
+            (Rgba8Unorm, Rgba8UnormSrgb, true),
+            (R8Uint, R8Unorm, true),
+            (R32Uint, Rgba16Float, false),
+            (D32Float, R32Float, false),
+            (D16Unorm, R16Unorm, false),
+            (D32FloatS8, Rgba16Float, false),
+            (Bc1, Rgba16Float, false),
+            (Bc7, Rgba32Uint, false),
+            (Bc7, Bc7Srgb, false),
+            (D32Float, D32Float, false),
+        ] {
+            assert_eq!(from.color_castable(to), compatible, "{from:?} to {to:?}");
+            assert_eq!(to.color_castable(from), compatible, "{to:?} to {from:?}");
+        }
+    }
 }

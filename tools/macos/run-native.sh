@@ -60,6 +60,8 @@ log="$run_dir/victory.log"
   echo "# commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } > "$log"
 
+# Native loads can outlast the console watchdog; an explicit 0 keeps it enabled.
+export VICTORY_NO_HANG_WATCHDOG="${VICTORY_NO_HANG_WATCHDOG:-1}"
 export VICTORY_GUESS_GRAPHICS="${VICTORY_GUESS_GRAPHICS:-1}"
 # Press Enter (the pad's A) every 2 s from 4 s to 80 s unless VICTORY_KEYS is set.
 export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -sd, -)}"

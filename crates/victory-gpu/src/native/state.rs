@@ -500,6 +500,15 @@ impl Graphics {
             .collect()
     }
 
+    /// Debugging (`VICTORY_DEBUG_DEPTH_ALWAYS`): the depth test always passes, and writes the
+    /// fragments' depth if `write` (the depth target then shows where the draws rasterised and
+    /// the very depth they had).
+    pub fn debug_depth_always(&mut self, write: bool) {
+        self.depth_enable = true;
+        self.depth_func = 8;
+        self.depth_write = write;
+    }
+
     pub fn depth_test(&self) -> Option<(bool, Compare)> {
         // Debugging: no depth test at all.
         if self.guess.is_some() && env_set!("VICTORY_DEBUG_NO_DEPTH") {
@@ -1032,6 +1041,18 @@ mod tests {
             [(0, 24, false), (1, 32, true)]
         );
         assert!(g.vertex_layout(&[("NORMAL".to_owned(), 0)]).is_none());
+    }
+
+    /// `VICTORY_DEBUG_DEPTH_ALWAYS`: the test passes always, with or without the write, whatever
+    /// the pipeline said (here a test that is off).
+    #[test]
+    fn the_debug_depth_state_always_passes() {
+        let mut g = Graphics { depth_enable: false, depth_write: true, depth_func: 3, ..Graphics::default() };
+        assert_eq!(g.depth_test(), None);
+        g.debug_depth_always(false);
+        assert_eq!(g.depth_test(), Some((false, Compare::Always)));
+        g.debug_depth_always(true);
+        assert_eq!(g.depth_test(), Some((true, Compare::Always)));
     }
 
     #[test]

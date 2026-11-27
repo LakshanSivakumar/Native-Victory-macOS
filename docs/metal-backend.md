@@ -180,6 +180,17 @@ shader, so it is the one thing that runs under Rosetta; the test shader is now c
 The library's licence is Apple's: nothing of it, nor its headers, is vendored. Conversion could also run
 offline in `victory translate --cache`, caching `.metallib`s.
 
+For this workspace's native mesh tests, the unpacked MSC 4.0 beta 3 library is universal:
+
+```sh
+export VICTORY_MSC_DYLIB=<folder>/MetalShaderConverter.pkg/Payload/usr/local/lib/libmetalirconverter.dylib
+```
+
+Use it for both `--target aarch64-apple-darwin` and `--target x86_64-apple-darwin`.
+See [native mesh diagnostics](native-host.md#native-mesh-pipelines-known-containers-raw-0x1c8-layout-still-open) for the execution,
+rasterization, culling and amplification tests. Fixture compilation still uses the
+separate `VICTORY_DXC_DYLIB`; running committed fixtures does not require DXC.
+
 Facts read from the installed headers (`metal_irconverter.h`, `metal_irconverter_runtime.h`):
 
 - `IRErrorCode`: 0 NoError, 1 ShaderRequiresRootSignature, 2 UnrecognizedRootSignatureDescriptor,
@@ -393,11 +404,14 @@ unnamed resource work by luck).
 
 On a Mac with 32 GiB of memory or more (`hw.memsize`), and on any Mac with
 `VICTORY_METAL_RESIDENCY_SETS=heap`, a heap carries its own `MTLResidencySet`: the heap buffer and
-each allocation its entries name. An allocation is added when an entry first names it and removed (and the set committed) before
-the last entry naming it is overwritten or the heap is dropped; the set does not retain what it holds,
-the heap does. The set is committed when entries changed and given to each command buffer that uses
-the heap (`useResidencySet`), so what the heap names is resident while that command buffer runs:
-residency follows the frame, and nothing is rebuilt per command buffer. `clear_entry` empties an
+each allocation its entries name. After deferred entry-level adds/removes preceded an IOGPUGroupMemory
+kernel panic ("Memory object not found in fMemoryCountedSet or fPendingMemorySet"), entry edits now
+only update `alloc_counts` and retain retired allocations/views; at the next `use_heap_cb` (or above
+512 retired objects), reconciliation with committed membership enforces "one add or one remove per
+allocation per commit", skips unchanged membership, and releases retired objects afterwards.
+The heap buffer is added and committed at creation, each command buffer uses the set via
+`useResidencySet`, and destruction removes all allocations and commits once before releasing objects:
+residency follows the frame. `clear_entry` empties an
 entry (zero bytes, nothing kept): the host clears the entries of a texture the title released, so
 what the heap keeps alive and wired does not grow with play time.
 
@@ -520,8 +534,14 @@ hull/domain/geometry emulation, stream-out, indirect draws, UAV writes from pixe
 5: the translator's `ms_6_6` output for mesh-style console programs), `create_render_pipeline` makes an
 `MTLMeshRenderPipelineDescriptor` with that function and the pixel shader's, the same colour and depth
 formats, blend and write masks, and no vertex descriptor. Its thread-group size is the converter's
-reflection of the mesh shader (`IRShaderReflectionCopyMeshInfo`, `Msc::mesh_threads`, cached on disk
-as conversions are), kept on the pipeline (`RenderPipeline::mesh_threads`) for the draw.
+reflection of the mesh shader (`IRShaderReflectionCopyMeshInfo`, `Msc::convert_mesh_with`, cached on
+disk with the library), kept on the pipeline (`RenderPipeline::mesh_threads`) for the draw.
+One function makes every mesh pipeline (`Metal::mesh_pipeline`): a mesh stage in `vs` (above, the
+guessed path) and a described one (`RenderPipelineDesc::mesh`, a stream pipeline's mesh stage with an
+optional amplification stage) both go through it and through `mesh_pipeline_state` (asynchronous
+build with a limit, remembered compiler failures, the pipeline archive). On the host both are
+`Pipe::Render`, and `native::glue::dispatch_mesh_from` records direct and indirect mesh dispatches
+of either.
 Test: `victory-gpu` `native::tests::mesh_tests::a_mesh_style_vertex_program_makes_a_mesh_pipeline`.
 A mesh pipeline draws with `DrawCall::Mesh { groups }` (`NativeList::dispatch_mesh`):
 `drawMeshThreadgroups` with that thread-group size and no object stage, or, for an `ExecuteIndirect`
