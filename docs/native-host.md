@@ -666,6 +666,37 @@ now numbers: copies of an EXEC mask in `0ef1184e45342d20`, of a constant-buffer 
 vertex programs), and 137 compute programs move on to "a descriptor read only as data". Tests: `gfx_refusal_tests::a_join_of_swapped_copies_of_one_value_is_that_value`,
 `a_join_of_copies_of_two_values_stays_refused`.
 
+Three more forms of a per-lane join, ported from VIctory-macOS 6f8fe556 (the ray-traced shadow
+traces' BVH walks, `CS_RTShadowTrace32*`):
+- An edge that brings a join of masks (a loop's back edge carrying what an inner region left in
+  the register: that region's compare for the lanes that ran it, the header's mask for the
+  others), or a mask spilled to VGPR lanes and read back, is that join (`Lower::restored_mask`).
+- An edge whose lanes are in none of the masks the other edges bring, those masks being joins of
+  masks a region made, reads 0 (`no_mask_lane_through_joins`): `no_mask_lane_on_edge` through
+  joins, with the same reasoning (the compiler merges no value for those lanes, so where the
+  whole wave skips the region the data there is a reused register).
+- In compute, wave32, data written along the edge only (a region the other lanes skip reused
+  the register for a constant-buffer or descriptor-table dword) is no mask for that edge's lanes:
+  with the console's lanes, the lane's bit of the number, as at a uniform join, else 0. Only data
+  made from no mask counts (`made_without_masks`: loads, inputs, and scalar work on them); data
+  from before the region (it dominates the join, `dominates_join`) stays refused, and so does a
+  mask XORed with data (`split_wave_tests::a_mask_swapped_into_a_pair_by_64_bit_xors_in_a_32_lane_wave_is_that_mask_at_a_join`).
+Guesses: in the second form, where the whole wave skips the region, the data the skipping lanes
+bring is never read as a mask; in the third, the mask was dead where the compiler reused its
+register, so what the other edges' lanes read from it (their mask here; on the console, where the
+region's write is the whole wave's, the data's bits) changes no result. Neither was checked on the
+GPU against the console.
+On the r81 corpus (19,127 containers, Series S, the native host's options), 22 more compute
+programs translate (19,011 to 19,033): 19 by the first form (`0a5ecfee6b79e13b`,
+`17af15c4015cb4b6`, `a53a7977fe762268`, ...) and 3 of the 7 traces, which need all three
+(`534b3645dd344ab2`, `d50c03da6d935d87`, `ffd9788ba9fec033`); none regress and no output
+changes. Two other traces now stop at a later join. Tests (`emit::lower::tests`):
+`a_loops_mask_its_back_edge_brings_as_a_join_of_masks_lowers`,
+`a_join_of_masks_a_region_made_is_no_mask_for_the_lanes_that_skipped_it`,
+`a_mask_register_reused_for_data_a_region_loads_is_no_mask_for_its_lanes` (each fails without its
+arm), and `a_mask_joined_with_a_reused_registers_data_lowers` (data from before the region stays
+refused).
+
 In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
 vector compare result. At the join each mesh thread uses its group index modulo the console
 wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the same edge.
