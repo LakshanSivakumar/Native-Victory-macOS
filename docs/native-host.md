@@ -2179,6 +2179,30 @@ step it read the old page both times. Limits: work submitted before the change s
 pages; a range partly unmapped reads zeros as a whole, where a reserved resource reads zeros only
 at its unmapped tiles (marked shortcut in `title_alias`).
 
+A view one pool run holds is followed the same way (2026-11-28). Its heap entry points into the
+pool's buffer at the pages the title had under the view when the entry was written. The title frees
+memory and takes it again at the same addresses, with other pool pages under them, and writes the
+same record for its view (a view of memory without a resource object is its address and
+description, nothing else), so `remirror_tables` left the entry alone and `mirror` had dropped it
+from `title_views`: shaders read whatever the old pages held by then, and wrote into it. Measured in
+300 s world runs with the Series S profile: 2,048 such views moved in their pool under the same
+title address in one run (112-byte views at heap entries 28,000 to 36,000, about 1,000 of them at
+once); in another, a check of the bound tables' entries at each draw and dispatch found the host
+entry pointing away from its view's memory more than 1,000 times (a 1,872-byte view whose memory
+had gone from one pool address to another, for one), and 3 times with the views followed (an
+unordered view of 793,296 bytes whose own address had changed under the same record: not this, and
+not explained). Buffers that held foreign data were how it showed: the records of indirect
+dispatches read as millions of groups (`ExecuteIndirect on the native host`); none past the limits
+in three runs with the views followed, 0 to 43 a run in seven without. Cost: the title's tables
+advance through its heap and the entries behind them stay followed, 572,863 views after 300 s, and
+a look walks the pool table once for each distinct range: 4.7 ms a look on average over 1,000
+looks (1.6 % of the run; frames in 300 s 2,331 and 2,441, against 2,304 to 2,368 before).
+shortcut: every followed view's range is walked at each look; keep the title ranges the pool table
+changed since the last look and walk only the views over those if the looks get slow.
+Test: `tests::a_view_one_pool_run_holds_follows_title_pages_remapped_under_it` (a read through a
+view whose page the title mapped from another pool page, then a store: it went to the old pool page
+before).
+
 In game, the G-buffer's mesh records stayed zero after the GPU ran the frame with this change
 alone, as read from the CPU (a read the reset pass makes meaningless, #258). With #253 and the
 view-stride table (#264) as well, the G-buffer's targets are 11 to 15 % covered in a warm world

@@ -502,7 +502,8 @@ fn copied_wraps_follow_remaps_and_gaps_with_one_comparison_walk() {
     assert_eq!(walks(), 1);
     h.execute(&(), &[], &[], &[]).unwrap();
     assert!(heap.heap.borrow().values().all(|v| v.1 == 256), "all copies recover when the gap is mapped");
-    assert!(heap.title_views.borrow().is_empty(), "the recovered range is now one contiguous pool run");
+    // One contiguous pool run holds the recovered range: followed too, as a wrap is (PR 513).
+    assert!(heap.title_views.borrow().values().all(|v| v.2.is_some()), "the recovered range is now one contiguous pool run, still followed");
 }
 
 /// The title VA is a page-table key, not necessarily a pointer this process can dereference.

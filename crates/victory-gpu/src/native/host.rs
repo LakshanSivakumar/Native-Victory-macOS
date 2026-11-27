@@ -892,12 +892,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// Mirrors again, once per pool-table change and before the work that reads them, the heap
-    /// buffer views over title memory no pool run holds whose pages changed since they were
-    /// written: a wrap whose mappings the title changed or removed, and a null view whose gap the
-    /// title has mapped since. A shader can load such an entry from the heap itself (the
+    /// buffer views over title memory whose pages changed since they were written: a view one
+    /// pool run holds or a wrap whose mappings the title changed or removed, and a null view whose
+    /// gap the title has mapped since. A shader can load such an entry from the heap itself (the
     /// G-buffer culling programs' 174 MB view, #258), so no bound table brings it back to
     /// [`Self::remirror_tables`], and the title writes the entry once, early, while it keeps
     /// mapping pages into the range. Costs one comparison while the pool table is unchanged.
+    // shortcut: every followed view's range is walked at each look (4.7 ms a look with up to
+    // 570,000 views in a 300 s world run); walk only the views over the ranges the pool table
+    // changed since the last look if the looks get slow.
     fn follow_title_pages(&self) {
         let generation = self.memory.generation();
         if self.followed.replace(generation) == generation {
@@ -1489,13 +1492,26 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 let found = self.resolve_view(addr, u64::from(size)).map(|(b, p, span)| (b, p, span, None));
                 let (buf, ptr) = match found.map_or_else(|e| alias().ok_or(e), Ok) {
                     Ok((buf, ptr, span, wrapped)) => {
-                        if let Some(span) = span {
-                            heap.spanned.borrow_mut().insert(index, span);
-                        }
-                        if let Some(sig) = wrapped {
-                            heap.title_views.borrow_mut().insert(index, (addr, u64::from(size), Some(sig)));
-                        } else {
-                            heap.title_views.borrow_mut().remove(&index);
+                        // A view one pool run holds is followed as a wrap is: the title maps
+                        // other pool pages under the same addresses (memory it frees and takes
+                        // again) and writes the same record, so nothing else mirrors it again.
+                        // A span is followed by [`Self::refresh_spans`]; memory outside the pool
+                        // table (the host's own) has no signature.
+                        let sig = match span {
+                            Some(span) => {
+                                heap.spanned.borrow_mut().insert(index, span);
+                                None
+                            }
+                            None => wrapped.or_else(|| self.alias_signature(addr, u64::from(size))),
+                        };
+                        let mut views = heap.title_views.borrow_mut();
+                        match sig {
+                            Some(sig) => {
+                                views.insert(index, (addr, u64::from(size), Some(sig)));
+                            }
+                            None => {
+                                views.remove(&index);
+                            }
                         }
                         (buf, ptr)
                     }
