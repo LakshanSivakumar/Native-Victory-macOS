@@ -2296,3 +2296,51 @@ fn a_title_barrier_in_a_loop_the_waves_of_a_group_run_differently_is_refused() {
         .expect("refused");
     assert!(why.contains("unevenly"), "{why}");
 }
+
+#[test]
+fn a_whole_wave_prefix_sum_behind_a_branch_on_a_mask_anded_with_exec_in_four_waves() {
+    // The shape of `eee76bf6` (#258): `s_and_b64 s[16:17], vcc, exec` and a branch on its SCC, so a
+    // console wave enters with every lane when any of its lanes is in the mask, and a whole-wave
+    // section there needs all 64. Threads below 100 of a group of four: wave 0 has all its lanes in
+    // the mask, wave 1 its lanes 0..35, waves 2 and 3 none (they skip). Each wave sums its masked
+    // lanes' flat ids as a prefix over the whole wave, lanes outside the mask giving 0.
+    let mut w = vec![
+        V_LSHLREV_V1_2_V0,
+        0x7D88_00FF,
+        100,         // v_cmp_gt_u32 vcc, 100, v0
+        0x8790_7E6A, // s_and_b64 s[16:17], vcc, exec
+        0xBF84_0017, // s_cbranch_scc0 23
+        0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0003,
+        0x0042_0080, // v_cndmask_b32_e64 v3, 0, v0, s[16:17]
+    ];
+    for shr in [0xFF09_1103, 0xFF09_1203, 0xFF09_1403, 0xFF09_1803] {
+        w.extend([0x4A06_06FA, shr]); // v_add_nc_u32_dpp v3, v3, v3 row_shr:1, 2, 4, 8
+    }
+    w.extend([
+        0xD778_0002,
+        0x0305_8303, // v_permlanex16_b32 v2, v3, -1, -1
+        0x4A06_06FA,
+        0xAF00_E402, // v_add_nc_u32_dpp v3, v2, v3 row_mask:0xa
+        0xD760_000A,
+        0x0201_3F03, // v_readlane_b32 s10, v3, 31
+        0x7E04_020A, // v_mov_b32 v2, s10
+        0x4A06_06FA,
+        0xCF00_E402, // v_add_nc_u32_dpp v3, v2, v3 row_mask:0xc
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xDC70_8000,
+        0x0002_0301, // global_store_dword v1, v3, s[2:3]
+        S_ENDPGM,
+    ]);
+    assert!(refusal_of(&w, 256).is_some(), "refused on the fast path");
+    let got = run_group(&w, 0, 256, 256);
+    if got.is_empty() {
+        return;
+    }
+    let prefix = |base: u32, on: u32| -> Vec<u32> {
+        (0..64u32).map(|l| (0..=l).filter(|&j| j < on).map(|j| base + j).sum()).collect()
+    };
+    assert_eq!(got[..64], prefix(0, 64), "wave 0");
+    assert_eq!(got[64..128], prefix(64, 36), "wave 1");
+    assert_eq!(got[128..], [CANARY; 128], "waves 2 and 3 skip");
+}
