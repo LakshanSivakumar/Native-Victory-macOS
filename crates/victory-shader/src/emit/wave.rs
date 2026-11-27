@@ -129,6 +129,8 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    /// Complete reductions left in only some lanes, with the mask of lanes holding each result.
+    pub lane_reductions: HashMap<Value, Vec<(u64, Shape)>>,
     /// The first step the simulation does not model, if any: why a value
     /// the section leaves may have no shape.
     pub why: Option<&'static str>,
@@ -165,15 +167,23 @@ pub(super) fn register_only(inst: &Inst) -> bool {
     }
 }
 
+/// SALU independent of EXEC, with only ordinary scalar operands and destinations.
+pub(super) fn uniform_scalar_alu(inst: &Inst) -> bool {
+    let Fields::Sop { src, .. } = &inst.fields else { return false };
+    matches!(inst.name(), "s_lshl_b32" | "s_lshr_b32" | "s_sub_i32")
+        && src.iter().all(|operand| matches!(operand,
+            Operand::Scalar { code: 0..=105, dwords: 1 } | Operand::Const(_) | Operand::Literal(_)))
+        && inst.writes.iter().all(|(reg, _)| matches!(reg, Reg::S(0..=105) | Reg::Scc))
+}
+
 /// Every whole-wave section of `block`, by start index.
-pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
+pub(crate) fn sections(p: &Program, block: usize, pixel: bool) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
     let mut out = HashMap::new();
     let mut from = 0;
     while let Some((start, end, saved)) = next_section(insts, from) {
-        let (shapes, why) = simulate(&insts[start + 1..end], wave, saved);
-        out.insert(start, Section { end, shapes, why });
+        out.insert(start, simulate(&insts[start + 1..end], wave, saved, end, pixel));
         from = end + 1;
     }
     out
@@ -367,7 +377,9 @@ fn simulate(
     insts: &[Inst],
     wave: u32,
     saved: Value,
-) -> (HashMap<Value, Shape>, Option<&'static str>) {
+    end: usize,
+    pixel: bool,
+) -> Section {
     #[cfg(test)]
     SIMULATIONS.set(SIMULATIONS.get() + 1);
     let mut why = None;
@@ -391,7 +403,7 @@ fn simulate(
                 .then(|| constant(inst))
                 .flatten();
             let Some(k) = lo else {
-                return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
+                return shapes(end, vec, uni, wave, why.or(Some(EXEC_WRITE)), pixel);
             };
             exec = (if name == "s_mov_b64" {
                 k
@@ -406,7 +418,7 @@ fn simulate(
                 .then(|| constant(inst))
                 .flatten()
             else {
-                return (shapes(vec, uni, wave), why.or(Some(EXEC_WRITE)));
+                return shapes(end, vec, uni, wave, why.or(Some(EXEC_WRITE)), pixel);
             };
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
@@ -419,6 +431,20 @@ fn simulate(
             {
                 uni.insert(*dst, Sym::K(k as u32));
                 continue;
+            }
+            if pixel && uniform_scalar_alu(inst) {
+                let known = src.iter().all(|op| match *op {
+                    Operand::Scalar { code, .. } => inst.read(Reg::S(code)).is_some_and(|v| {
+                        !masked.contains(&v) && !matches!(uni.get(&v), Some(Sym::Unknown))
+                    }),
+                    Operand::Const(c) => crate::resource::inline(c).is_some(),
+                    Operand::Literal(_) => true,
+                    _ => false,
+                });
+                if known && let Some((_, dst)) = inst.writes.iter().find(|(reg, _)| matches!(reg, Reg::S(_))) {
+                    uni.insert(*dst, Sym::Uni(*dst));
+                    continue;
+                }
             }
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
@@ -674,7 +700,7 @@ fn simulate(
             .collect();
         vec.insert(dst, merged);
     }
-    (shapes(vec, uni, wave), why)
+    shapes(end, vec, uni, wave, why, pixel)
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -700,27 +726,47 @@ fn constant(inst: &Inst) -> Option<u64> {
 
 /// The shape of each value, where every lane agrees on one.
 fn shapes(
+    end: usize,
     vec: HashMap<Value, Vec<Sym>>,
     uni: HashMap<Value, Sym>,
     wave: u32,
-) -> HashMap<Value, Shape> {
+    why: Option<&'static str>,
+    pixel: bool,
+) -> Section {
     let all = if wave == 64 {
         u64::MAX
     } else {
         u64::from(u32::MAX)
     };
-    let mut out = HashMap::new();
+    let mut section = Section {
+        end,
+        shapes: HashMap::new(),
+        lane_reductions: HashMap::new(),
+        why,
+    };
     for (v, s) in uni {
         if let Some(sh) = uniform_shape(s, all) {
-            out.insert(v, sh);
+            section.shapes.insert(v, sh);
         }
     }
     for (v, lanes) in vec {
         if let Some(sh) = per_lane(&lanes, all) {
-            out.insert(v, sh);
+            section.shapes.insert(v, sh);
+        } else if pixel {
+            for (lane, sym) in lanes.into_iter().enumerate() {
+                let Some(sh @ Shape::Active(..)) = uniform_shape(sym, all) else {
+                    continue;
+                };
+                let reductions = section.lane_reductions.entry(v).or_default();
+                if let Some((mask, _)) = reductions.iter_mut().find(|(_, shape)| *shape == sh) {
+                    *mask |= 1 << lane;
+                } else {
+                    reductions.push((1 << lane, sh));
+                }
+            }
         }
     }
-    out
+    section
 }
 
 fn uniform_shape(s: Sym, all: u64) -> Option<Shape> {
@@ -1044,7 +1090,7 @@ mod tests {
                 .unwrap();
             let v2_val = insts[insts.len() - 4].write(Reg::V(2)).unwrap();
             let v4_val = insts[insts.len() - 3].write(Reg::V(4)).unwrap();
-            let sec = &sections(&p, 0)[&0];
+            let sec = &sections(&p, 0, false)[&0];
             assert_eq!(
                 sec.shapes.get(&v2_val),
                 Some(&Shape::Prefix(Op::AddU, v0_in, saved, 0, false))
@@ -1070,7 +1116,7 @@ mod tests {
         let insts = &p.blocks[0].insts;
         let v2_val = insts[3].write(Reg::V(2)).unwrap();
         let v3_val = insts[5].write(Reg::V(3)).unwrap();
-        let sec = &sections(&p, 0)[&0];
+        let sec = &sections(&p, 0, false)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
     }

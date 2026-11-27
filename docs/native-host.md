@@ -1097,6 +1097,11 @@ outside one. That read was refused as "v_readlane_b32 of a constant lane in a pi
 reduction or one lane's value is now that value at any lane (`Lower::section_uniform`).
 Test: `emit::gfx_refusal_tests::a_pixel_program_reads_a_lane_of_a_whole_wave_reduction_as_the_reduction`.
 
+The final step may write the complete reduction to only some lanes. The simulator keeps
+the lanes that hold it, and the emitter reuses the value for a later constant-lane read in
+the same block only when that lane is in the proven set. The Metal test
+`a_pixel_lane_reads_the_whole_wave_minimum_after_a_partial_write` checks the rendered values.
+
 A section of `v_mul_f32` steps is now followed: it is the product of the lanes
 (`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
 host waves of a console wave multiply their results (`split_wave_tests::

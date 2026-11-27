@@ -2672,7 +2672,29 @@ fn a_pixel_program_reads_a_lane_of_a_whole_wave_reduction_as_the_reduction() {
     // The same read outside a section, under the program's EXEC.
     let mut bare = code.clone();
     bare.retain(|&w| w != 0xBE83_3DC1 && w != 0xBEFE_0303);
-    for code in [code, bare] {
+    // Only the upper 16 lanes write the final minimum. Lane 31 still holds it, while lane 0
+    // keeps its row's minimum. The later section may reuse only the proven complete reduction.
+    let mut partial = code.clone();
+    let final_min = partial.iter().position(|&w| w == 0x2602_0501).unwrap();
+    partial.splice(final_min..final_min, [0xBEFE_03FF, 0xFFFF_0000]); // s_mov_b32 exec_lo, 0xffff0000
+    let mut unfinished = partial.clone();
+    let lane = unfinished.iter_mut().find(|w| **w == 0x0001_3F01).unwrap();
+    *lane = 0x0001_0101; // v_readlane_b32 s4, v1, 0
+    assert!(lower_ps(&unfinished, false, vec![], vec![], 0, 0, vec![], false).is_err());
+
+    let mut bare_partial = partial.clone();
+    bare_partial.retain(|&w| w != 0xBE83_3DC1 && w != 0xBEFE_0303);
+    let mut scalar = partial.clone();
+    scalar.insert(0, 0xBE85_03A0); // s_mov_b32 s5, 32
+    let restore = scalar.iter().position(|&w| w == 0xBEFE_0302).unwrap();
+    scalar.splice(restore..restore, [
+        0x8F06_8505, // s_lshl_b32 s6, s5, 5
+        0x9006_8406, // s_lshr_b32 s6, s6, 4
+        0x8186_0605, // s_sub_i32 s6, s5, s6
+    ]);
+    let output = scalar.iter().position(|&w| w == 0x7E02_0204).unwrap();
+    scalar.insert(output, 0x8004_0604); // s_add_u32 s4, s4, s6
+    for code in [code, bare, partial, bare_partial, scalar] {
         let l = lower_ps(&code, false, vec![], vec![], 0, 0, vec![], false).expect("lowers");
         assert!(!l.wave_active_calls.is_empty());
         assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);

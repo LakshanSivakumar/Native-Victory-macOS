@@ -112,6 +112,58 @@ fn a_mesh_draw_colours_the_target() {
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
+/// Each 16-lane row has a different minimum. Only the upper row writes the whole-wave
+/// minimum, and the later constant-lane read must return that minimum rather than its row's.
+#[test]
+fn a_pixel_lane_reads_the_whole_wave_minimum_after_a_partial_write() {
+    let Some(mut t) = title() else { return };
+    let ms = translate(HwStage::Vs, TRIANGLE);
+    let mut code = vec![
+        0xD765_0000, 0x0201_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+        0x4A00_00A0, // v_add_nc_u32 v0, 32, v0 (the two rows start at 32 and 48)
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD501_0001, 0x000A_00C1, // v_cndmask_b32 v1, -1, v0, s2
+    ];
+    for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+        code.extend([0x2602_02FA, 0xFF00_0001 | ctrl << 8]); // v_min_u32_dpp v1, v1, v1
+    }
+    code.extend([
+        0xD778_0002, 0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0xBEFE_03FF, 0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+        0x2602_0501, // v_min_u32 v1, v1, v2 (only the upper row writes)
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0xBE83_3DC1, // s_or_saveexec_b32 s3, -1
+        0xD760_0004, 0x0001_3F01, // v_readlane_b32 s4, v1, 31
+        0xBEFE_0303, // s_mov_b32 exec_lo, s3
+        0x7E02_0204, // v_mov_b32 v1, s4
+        0x7E02_0D01, // v_cvt_f32_u32 v1, v1
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000,
+    ]);
+    let ps = translate(HwStage::Ps, &code);
+    let format = Format::Rgba32Float;
+    let state = Graphics::guess_base().for_draw(vec![format], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "partial reduction") else {
+        panic!("{:?}", t.shaders);
+    };
+    let mut desc = TextureDesc::d2(format, 8, 8);
+    desc.render_target = true;
+    let target = t.host.texture(&desc).unwrap();
+    let mut list = NativeList::default();
+    list.set_render_targets(std::slice::from_ref(&target), None);
+    list.clear_render_target(&target, [-1.0; 4]);
+    list.set_graphics_pipeline(&pso, Topology::Triangles);
+    list.set_graphics_binding(binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+
+    let mut pixels = [0; 8 * 8 * 16];
+    t.host.backend.read_texture(&target, 0, 0, &mut pixels, 8 * 16, 0);
+    for (channel, &bytes) in pixels.as_chunks::<4>().0.iter().enumerate() {
+        assert_eq!(f32::from_le_bytes(bytes), 32.0, "channel {channel}");
+    }
+}
+
 /// The mesh stage gets its root arguments: the triangle program with its corners scaled by the
 /// root constant in user data dword 0 (s8 of a mesh program), 1.0. Without them it reads 0 and
 /// draws nothing.

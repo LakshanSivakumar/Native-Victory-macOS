@@ -52,6 +52,11 @@ enum Val {
     Missing(Why),
 }
 
+struct SectionLaneReduction {
+    shape: super::wave::Shape,
+    value: Option<Result<V, Why>>,
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Pixel inputs split off an input read two ways: (original, new) semantic indices.
@@ -406,6 +411,8 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: Set<Value>,
+    /// Complete reductions requested by a subsequent constant-lane read in the same block.
+    section_lane_reductions: HashMap<Value, BTreeMap<u32, SectionLaneReduction>>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -1132,6 +1139,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
+            section_lane_reductions: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1517,7 +1525,7 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
         for b in 0..p.blocks.len() {
-            let found = super::wave::sections(p, b);
+            let found = super::wave::sections(p, b, self.s.pixel);
             for (&start, sec) in &found {
                 for i in start + 1..sec.end {
                     for &(_, w) in &p.blocks[b].insts[i].writes {
@@ -1532,6 +1540,7 @@ impl<'a> Lower<'a> {
         if inside.is_empty() {
             return;
         }
+        let mut requested_lanes = BTreeSet::new();
         for (b, block) in p.blocks.iter().enumerate() {
             for phi in &block.phis {
                 self.section_out
@@ -1545,21 +1554,91 @@ impl<'a> Lower<'a> {
                         self.section_out.insert(r);
                     }
                 }
+                if self.s.pixel
+                    && inst.name() == "v_readlane_b32"
+                    && let Fields::Valu(v) = &inst.fields
+                    && let [Operand::Vector { reg, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(source) = inst.read(Reg::V(reg))
+                    && let Some(&(producer_block, _, producer_end)) = inside.get(&source)
+                    && producer_block == b
+                    && producer_end < i
+                    && !self.sections[&b].iter().any(|(&start, sec)| start < i && i < sec.end)
+                {
+                    requested_lanes.insert((source, lane));
+                }
             }
         }
+        if !self.s.pixel {
+            return;
+        }
+        for (block, sections) in &self.sections {
+            for (&start, consumer) in sections {
+                for (output, shape) in &consumer.shapes {
+                    let super::wave::Shape::ReadLane(source, lane) = *shape else {
+                        continue;
+                    };
+                    let Some(&(producer_block, _, producer_end)) = inside.get(&source)
+                    else {
+                        continue;
+                    };
+                    if producer_block != *block
+                        || producer_end >= start
+                        || !self.section_out.contains(output)
+                    {
+                        continue;
+                    }
+                    requested_lanes.insert((source, lane));
+                }
+            }
+        }
+        for (source, lane) in requested_lanes {
+            let Some(bit) = 1u64.checked_shl(lane) else {
+                continue;
+            };
+            let (block, start, _) = inside[&source];
+            let Some(reductions) = self.sections[&block][&start].lane_reductions.get(&source)
+            else {
+                continue;
+            };
+            if let Some(&(_, shape)) = reductions.iter().find(|&&(mask, _)| mask & bit != 0) {
+                self.section_lane_reductions
+                    .entry(source)
+                    .or_default()
+                    .insert(lane, SectionLaneReduction { shape, value: None });
+            }
+        }
+    }
+
+    fn section_lane_result(&self, source: Value, lane: u32) -> Option<Result<V, Why>> {
+        if self.def_block.get(&source) != Some(&self.cur_ir) {
+            return None;
+        }
+        self.section_lane_reductions.get(&source)?.get(&lane)?.value
     }
 
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
         let inst = &self.x.p.blocks[b].insts[i];
-        if !super::wave::register_only(inst) {
+        let uniform_scalar = self.s.pixel && super::wave::uniform_scalar_alu(inst);
+        if !super::wave::register_only(inst) && !uniform_scalar {
             return Err(unsupported(inst.machine.offset, inst.name()));
+        }
+        if uniform_scalar {
+            return self.sop(inst).map_err(|why| unsupported(inst.machine.offset, why));
         }
         // The first step the simulation does not model names the refusal.
         let sec = &self.sections[&b][&start];
         let unknown: Why = sec.why.unwrap_or(super::wave::NO_SHAPE);
         for &(_, w) in &inst.writes {
+            // Evaluate the reduction while its own section's host lanes are active.
+            if let Some(mut reductions) = self.section_lane_reductions.remove(&w) {
+                for reduction in reductions.values_mut() {
+                    reduction.value = Some(self.shape(reduction.shape));
+                }
+                self.section_lane_reductions.insert(w, reductions);
+            }
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
                 match shape.ok_or(unknown).and_then(|sh| self.shape(sh)) {
@@ -1585,6 +1664,9 @@ impl<'a> Lower<'a> {
             Shape::Value(v) => return self.i32_of(v),
             Shape::ReadLane(v, _) if self.section_uniform(v) => return self.i32_of(v),
             Shape::ReadLane(v, lane) => {
+                if let Some(result) = self.section_lane_result(v, lane) {
+                    return result;
+                }
                 self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
                 let x = self.i32_of(v)?;
                 let lane = self.s.m.i32(lane);
@@ -9046,6 +9128,13 @@ impl<'a> Lower<'a> {
                 int(self, a)
             }
             "v_readlane_b32" => {
+                if let [Operand::Vector { reg, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(source) = inst.read(Reg::V(reg))
+                    && let Some(result) = self.section_lane_result(source, lane)
+                {
+                    return int(self, result?);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
