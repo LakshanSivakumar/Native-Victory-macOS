@@ -1740,3 +1740,42 @@ fn a_lane_holding_half_a_wave_maximum_is_refused() {
     let why = refusal(&max_read_at_lane(0));
     assert!(why.as_deref().is_some_and(|w| w.contains("no reduction or prefix")), "{why:?}");
 }
+
+#[test]
+fn split_first_lane_reads_console_first_active_lane() {
+    // Two console waves (128 threads, so lockstep does not take the program; each console wave
+    // runs as two 32-lane host waves). `v3 = v0 + 100` gives every lane a distinct nonzero value
+    // so an empty EXEC reading lane 0 (100 / 164) is distinguishable from 0.
+    let cases: &[(u32, u32, u32, u32)] = &[
+        // Only lanes 8 and 9 active -> wave 0 reads lane 8 (108), wave 1 reads lane 72 (172).
+        (0x0000_0300, 0x0000_0000, 108, 172),
+        // Only upper half active (lanes 40 and 41) -> wave 0 reads 140, wave 1 reads 204.
+        (0x0000_0000, 0x0000_0300, 140, 204),
+        // Empty EXEC -> RDNA 2 reads lane 0 of each console wave (100 and 164).
+        (0x0000_0000, 0x0000_0000, 100, 164),
+    ];
+    for &(exec_lo, exec_hi, want_w0, want_w1) in cases {
+        let mut w = vec![
+            0x4A06_00FF,
+            100, // v_add_nc_u32 v3, 100, v0
+            0xBEFE_03FF,
+            exec_lo, // s_mov_b32 exec_lo, exec_lo
+            0xBEFF_03FF,
+            exec_hi,     // s_mov_b32 exec_hi, exec_hi
+            0x7E18_0503, // v_readfirstlane_b32 s12, v3
+            0xBEFE_04C1, // s_mov_b64 exec, -1
+            V_LSHLREV_V1_2_V0,
+            0x7E04_020C, // v_mov_b32 v2, s12
+        ];
+        w.extend(GLOBAL_STORE_V2_AT_V1);
+        w.push(S_ENDPGM);
+        // Always verify translation succeeds on the split-wave fast path even without converter.
+        assert_eq!(refusal(&w), None, "case ({exec_lo:#x}, {exec_hi:#x}) refused");
+        let got = run_io(&w, 0, 128, 0);
+        if got.is_empty() {
+            continue;
+        }
+        assert_eq!(got[..64], [want_w0; 64], "wave 0 for ({exec_lo:#x}, {exec_hi:#x})");
+        assert_eq!(got[64..], [want_w1; 64], "wave 1 for ({exec_lo:#x}, {exec_hi:#x})");
+    }
+}

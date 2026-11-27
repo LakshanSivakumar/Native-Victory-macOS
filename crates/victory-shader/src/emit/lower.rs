@@ -361,6 +361,9 @@ struct Lower<'a> {
     /// With `halves`, blocks where both halves of a console wave arrive
     /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
+    /// Values of `ds_read_b32`s proven identical across every lane of every
+    /// wave after a barrier ([`barrier_reads`]).
+    barrier_reads: Set<Value>,
     /// Why the program cannot run on a 32-lane host.
     refuse: Option<Why>,
     /// The group's lane in console order, made in the entry block.
@@ -915,7 +918,8 @@ impl<'a> Lower<'a> {
             // the title has it. Compute keeps the views: no case seen, and a lookup per access.
             || (x.zero_copy_memory && x.native.stage != HwStage::Cs);
         let mut console_lanes = console;
-        let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
+        let (mut host32, mut halves, mut once, mut alike_reads, mut refuse) =
+            (false, false, Vec::new(), Set::default(), None);
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -931,6 +935,14 @@ impl<'a> Lower<'a> {
                         || n.starts_with("v_permlane")
                         || n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        // The console wave's first lane, not each host wave's (#254), only when
+                        // a 32-lane host splits a wave64 program (and not a waterfall read or a
+                        // scalar/constant/covering-EXEC move).
+                        || (x.wave32_host
+                            && x.native.wave64
+                            && n == "v_readfirstlane_b32"
+                            && !i.writes.iter().any(|w| x.res.waterfall.reads.contains(&w.1))
+                            && !first_lane_of_a_scalar(p, x.st, i))
                         // One atomic per console wave; addresses by console lane.
                         || matches!(n, "ds_append" | "ds_consume")
                         || n.contains("addtid")
@@ -998,8 +1010,9 @@ impl<'a> Lower<'a> {
                     s.wave_size = Some(32);
                 }
                 if halves {
+                    alike_reads = barrier_reads(p, x.st);
                     once = if one_wave { wave_blocks(p, x.st) } else { once_blocks(p) };
-                    for (o, at_barrier) in once.iter_mut().zip(barrier_blocks(p, x.st)) {
+                    for (o, at_barrier) in once.iter_mut().zip(barrier_blocks(p, x.st, &alike_reads)) {
                         *o |= at_barrier;
                     }
                     s.xchg_dwords = lanes.next_multiple_of(64);
@@ -1107,6 +1120,7 @@ impl<'a> Lower<'a> {
             host32,
             halves,
             once,
+            barrier_reads: alike_reads,
             console_flat: None,
             refuse,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -9361,6 +9375,9 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
+                if let Some(r) = self.split_first_lane(inst, a)? {
+                    return int(self, r);
+                }
                 self.s.flags |= flags::WAVE_OPS;
                 let r = self.s.op(
                     c,
@@ -14651,8 +14668,7 @@ impl<'a> Lower<'a> {
                     }
                     // Data that is all lanes or none (`s_mov_b64 s, -1`) is that bit on any lanes.
                     (None, Some(&Val::I32(word)))
-                        if !self.console_lanes
-                            && let Some(all) = self.all_or_none(word, high.map(|h| h.args[n])) =>
+                        if let Some(all) = self.all_or_none(word, high.map(|h| h.args[n])) =>
                     {
                         self.s.m.bool(all)
                     }
@@ -14719,9 +14735,9 @@ pub(crate) fn once_blocks(p: &Program) -> Vec<bool> {
 /// the other waits at the exchange's group barrier. As in [`wave_blocks`], such an SCC in the
 /// block's reach condition excludes it, unless the first lane read is of an LDS word both halves
 /// read alike after a barrier ([`barrier_reads`]).
-pub(crate) fn barrier_blocks(p: &Program, st: &Structured) -> Vec<bool> {
+pub(crate) fn barrier_blocks(p: &Program, st: &Structured, alike: &Set<Value>) -> Vec<bool> {
     let n = p.blocks.len();
-    let split = split_scc(p, &barrier_reads(p, st));
+    let split = split_scc(p, alike);
     (0..n)
         .map(|b| {
             if !p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier") {
@@ -14877,6 +14893,51 @@ fn barrier_phases(p: &Program) -> Vec<Option<u64>> {
             return entry;
         }
     }
+}
+
+/// Whether `v_readfirstlane_b32` `i` reads a scalar, a constant, or a VGPR whose value a plain
+/// `v_mov_b32` moved from one under an EXEC that covers `i`'s active lanes: every active lane
+/// holds the same value, so each half's first lane reads it without turning on `console_lanes`.
+fn first_lane_of_a_scalar(p: &Program, st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    let reg = match v.src.first() {
+        Some(Operand::Vector { reg, .. }) => *reg,
+        Some(_) => return true,
+        None => return false,
+    };
+    let Some(value) = i.read(Reg::V(reg)) else {
+        return false;
+    };
+    let at_exec = i.read(Reg::S(EXEC));
+    let at_mask = at_exec.and_then(|e| st.masks.get(&e).or_else(|| st.other.get(&e)).copied());
+    p.blocks.iter().flat_map(|b| b.insts.iter()).any(|d| {
+        if !d.writes.iter().any(|w| w.1 == value) || d.name() != "v_mov_b32" {
+            return false;
+        }
+        let Fields::Valu(m) = &d.fields else {
+            return false;
+        };
+        if m.dpp.is_some()
+            || m.sdwa.is_some()
+            || !matches!(
+                m.src.first(),
+                Some(Operand::Scalar { .. } | Operand::Const(_) | Operand::Literal(_))
+            )
+        {
+            return false;
+        }
+        let def_exec = d.read(Reg::S(EXEC));
+        def_exec == at_exec
+            || matches!(
+                (
+                    at_mask,
+                    def_exec.and_then(|e| st.masks.get(&e).or_else(|| st.other.get(&e)).copied()),
+                ),
+                (Some(am), Some(dm)) if !st.bools.meet(&[(am, true), (dm, false)])
+            )
+    })
 }
 
 /// SCC values that can differ between the host waves of one console wave:
