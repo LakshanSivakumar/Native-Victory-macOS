@@ -3253,3 +3253,7 @@ view (`Lower::title_load_tail`). Test, on the GPU:
 the target stayed empty before, covered now; with the pages next to each other in the pool it passed
 either way). Global, scalar, typed-format and BVH loads and stores keep one lookup (marked shortcut
 in `Lower::memory`).
+Whether this was the bunk bed's shards is not proven: two headless runs with the change (28 November,
+pass trace at the 9th world present, one with `VICTORY_DEBUG_PS=id`) showed no shards in their
+G-buffer, and no "with a gap" view, but each run's camera showed another scene (a character close
+up, a garden wall), not the cell.
