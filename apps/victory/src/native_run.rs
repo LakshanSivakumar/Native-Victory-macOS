@@ -178,6 +178,7 @@ impl LoaderLock {
 /// by-name lookups of `LoadLibrary`.
 fn note(dll: &TitleDll) {
     println!("title dll      {} at {:#x}", dll.name, dll.image.base());
+    victory_gpu::pipeline::note_title_dll(&dll.name, dll.image.base(), dll.image.len());
     victory_hle::runtime::set_image_path(dll.image.base(), &dll.path);
 }
 

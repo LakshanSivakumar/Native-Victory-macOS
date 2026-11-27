@@ -950,12 +950,27 @@ pub(crate) fn set_pipeline(this: This, pipeline: This) {
 /// The host pipeline of title pipeline `key` for a draw into `targets`, made at first use. A
 /// console pipeline's state names no target formats, so it is made again for each set of targets.
 fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> {
+    if builder_held(key) {
+        return Pipe::Refused;
+    }
     if let Some(p) = t.pipelines.get(&key) {
         return p.clone();
     }
     let console_key = (key, targets.clone());
     if let Some(p) = t.console_pipes.get(&console_key) {
         return p.clone();
+    }
+    // The acceleration-structure builder's pipelines are never put off (`builder_made`).
+    if crate::pipeline::builder_pipeline(key as This) {
+        let wait = std::mem::replace(&mut t.compile_wait, BUILDER_WAIT);
+        let put_off = t.shaders.put_off;
+        let (made, _) = make_pipe(t, key, targets);
+        t.compile_wait = wait;
+        if t.shaders.put_off == put_off {
+            builder_made(key, &made, "");
+            t.pipelines.insert(key, made.clone());
+        }
+        return made;
     }
     // A cold first world frame binds ~1,300 pipelines; translating them all here holds the frame
     // past the title's watchdog. Once the frame has spent its budget, a pipeline whose shaders are
@@ -993,7 +1008,23 @@ fn pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> Pipe<Metal> 
 
 /// What the current frame has left of its budget for new pipelines (zero: spent).
 fn frame_left() -> std::time::Duration {
+    #[cfg(test)]
+    if NO_BUDGET.with(|n| n.get()) {
+        return std::time::Duration::ZERO;
+    }
     BUDGET.lock().unwrap_or_else(|e| e.into_inner()).left(crate::frame::current(), std::time::Instant::now(), crate::prewarm::FIRST_BIND_BUDGET)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The frame's budget seen as spent on this test thread only ([`test_no_budget`]).
+    static NO_BUDGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes [`frame_left`] zero on this thread (tests), without spending the budget other tests share.
+#[cfg(test)]
+pub(crate) fn test_no_budget(on: bool) {
+    NO_BUDGET.with(|n| n.set(on));
 }
 
 /// [`frame_left`] for tests, which read it to see whether a compile spent its frame.
@@ -1437,10 +1468,15 @@ fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<M
 /// The host pipeline of compute pipeline `key` for dispatches of thread counts, made at first
 /// use: its shader translated for them (`Options::thread_counts`).
 fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
+    if builder_held(key) {
+        return Pipe::Refused;
+    }
     if let Some(p) = t.thread_pipes.get(&key) {
         return p.clone();
     }
-    if frame_left().is_zero()
+    let builder = crate::pipeline::builder_pipeline(key as This);
+    if !builder
+        && frame_left().is_zero()
         && let Some(s) = crate::pipeline::compute_shader(key as This)
         && !s.threads_ready()
     {
@@ -1449,7 +1485,8 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
     }
     let (hash, shader) = crate::pipeline::native_threads(key as This);
     let name = format!("compute {hash} by thread counts");
-    t.compile_wait = compile_wait(t);
+    let wait = compile_wait(t);
+    t.compile_wait = if builder { BUILDER_WAIT } else { wait };
     let put_off = t.shaders.put_off;
     let made = match shader {
         Ok(cs) => t.compute_pipe(&cs, &name),
@@ -1458,10 +1495,66 @@ fn thread_pipe(t: &mut MetalTitle, key: usize) -> Pipe<Metal> {
             Pipe::Refused
         }
     };
+    t.compile_wait = wait;
     if t.shaders.put_off == put_off {
+        if builder {
+            builder_made(key, &made, " by thread counts");
+        }
         t.thread_pipes.insert(key, made.clone());
     }
     made
+}
+
+/// How long a pipeline of the acceleration-structure builder may take to compile: not put off.
+const BUILDER_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether a pipeline of the acceleration-structure builder failed: from then on none of its
+/// dispatches run ([`builder_held`]).
+static BUILDER_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The acceleration-structure builder (`XboxBvhBuilder.dll`, `crate::pipeline::note_title_dll`)
+/// runs whole or not at all (port of VIctory-macOS #481). It builds and refits the title's
+/// ray-tracing structures in title memory through some fifty compute programs, one dispatch
+/// after another, many of them only while a level streams in (the structures of what loads).
+/// Put off like other pipelines past the frame's budget, its dispatches were dropped for over a
+/// minute of the world load (r160: some 7,700 of them, 28 of its programs), so the structures
+/// stayed partly built for the run and the probes' and shadows' rays walk what the missing
+/// stages never wrote. So its pipelines are made at once, translated and compiled however long
+/// it takes (`BUILDER_WAIT`); and once one of them fails, every dispatch of the builder is dropped
+/// from then on (the structures keep what they held), so that no stage runs on what a missing
+/// one did not write. Called with what making pipeline `key` gave.
+fn builder_made(key: usize, made: &Pipe<Metal>, how: &str) {
+    static MADE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if matches!(made, Pipe::Compute(_)) {
+        let n = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            tracing::info!(made = n, "BVH builder pipelines made at once (never put off)");
+        }
+        return;
+    }
+    if !BUILDER_HELD.swap(true, Ordering::Relaxed) {
+        let hashes = stage_hashes(key);
+        tracing::warn!(pipeline = format_args!("{key:#x}"), ?hashes, how, "a BVH builder pipeline is not made: the builder's dispatches are held back from now on");
+    }
+}
+
+/// [`pipe`] and [`thread_pipe`] of a compute pipeline, for tests; and the builder's hold undone.
+#[cfg(test)]
+pub(crate) fn test_pipe(t: &mut MetalTitle, key: This, threads: bool) -> Pipe<Metal> {
+    if threads { thread_pipe(t, key as usize) } else { pipe(t, key as usize, &TargetFormats::default()) }
+}
+#[cfg(test)]
+pub(crate) fn test_builder_unheld() {
+    BUILDER_HELD.store(false, Ordering::Relaxed);
+}
+
+/// Whether title pipeline `key` is the acceleration-structure builder's and the builder is held
+/// back ([`builder_made`]).
+fn builder_held(key: usize) -> bool {
+    if !BUILDER_HELD.load(Ordering::Relaxed) || !crate::pipeline::builder_pipeline(key as This) {
+        return false;
+    }
+    true
 }
 
 fn make_host_pipe(

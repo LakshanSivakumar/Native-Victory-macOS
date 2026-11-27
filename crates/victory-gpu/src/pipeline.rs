@@ -631,6 +631,46 @@ pub(crate) fn compute_shader(this: This) -> Option<Arc<Shader>> {
     Some(shader.clone())
 }
 
+/// The title's acceleration-structure builder, `XboxBvhBuilder.dll`: its image `[start, end)`
+/// once mapped. Its compute programs (about fifty, all embedded in its image) build and refit the
+/// ray-tracing structures the probe and shadow rays walk (`native::glue::pipe`).
+#[cfg(target_os = "macos")]
+static BUILDER_IMAGE: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+/// A title DLL `file` was mapped at `base`, `len` bytes: noted if it is the acceleration-structure
+/// builder (port of VIctory-macOS #481, which knows its pipelines the same way).
+#[cfg(target_os = "macos")]
+pub fn note_title_dll(file: &str, base: usize, len: usize) {
+    if file.eq_ignore_ascii_case("XboxBvhBuilder.dll") {
+        tracing::info!(base = format_args!("{base:#x}"), len, "BVH builder mapped");
+        *BUILDER_IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((base, base + len));
+    }
+}
+
+/// Forgets the builder's image (tests).
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_forget_builder() {
+    *BUILDER_IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(target_os = "macos")]
+impl Shader {
+    /// Whether the title last held this container in the builder's image ([`note_title_dll`]).
+    pub(crate) fn is_builder(&self) -> bool {
+        let at = self.at.load(std::sync::atomic::Ordering::Relaxed);
+        BUILDER_IMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|(start, end)| (start..end).contains(&at))
+    }
+}
+
+/// Whether title pipeline `this` is a compute pipeline of the acceleration-structure builder.
+#[cfg(target_os = "macos")]
+pub(crate) fn builder_pipeline(this: This) -> bool {
+    compute_shader(this).is_some_and(|s| s.is_builder())
+}
+
 /// Compute pipeline `this`'s shader hash (as logged) and its translation for dispatches of thread
 /// counts (`Options::thread_counts`), made at the first one. The first translation let the
 /// container go, so it is read again where the title held it, and used only if it still hashes
