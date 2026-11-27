@@ -980,11 +980,7 @@ an existing pair changes; a heap whose pairs were written in another epoch write
 
 A texture the title places in its own memory (`CreateShaderResourceViewPlaced`) has no resource
 object, so nothing released it: its host texture and its entry in the scanner's watch list stayed
-for the whole run. The host now keeps the key it placed at each address
-(`Title::texture_placed`). When a view places another description at the same address, the old
-texture is released (guess: the title is done with it once it places another there; a view of the
-old description still in a heap would name a released texture). Every texture placed in a pool is
-released at the first submission after the pool is (`NativeHost::released_pools`).
+for the whole run. The host now keeps the key it placed at each address (`Title::texture_placed`) as well as physical pool chunks (`PoolTable::pool_ranges`, `Title::placed_pools`) so placements overlapping across virtual address aliases are also detected. When a view places another description at the same address, the old texture is released (guess: the title is done with it once it places another there; a view of the old description still in a heap would name a released texture). Placements overlapping another start (by VA or physical pool pages) mark the older copy `covered` at the current GPU epoch (`Title::give_up_overlapped`); under a texture budget (`VICTORY_METAL_TEXTURE_BUDGET_MB`), `Title::give_up_covered` also evicts heap-shown covered copies (clearing their stale heap entries) once all GPU work queued before they were covered has retired (`Title::retire_gpu_epochs`). If a descriptor mirror or table later re-realizes an evicted covered copy (`Title::covered_evicted`) while an overlapping placement is still live, it is marked covered again so it is evicted once that epoch retires. Sampled 2D textures whose leading fine mips above the tail have zero mapped pool pages (`unmapped_leading_mips`) also omit those unmapped levels at creation and upgrade in place (`NativeHost::upgrade_texture`) once `PoolTable` maps them. Every texture placed in a pool is released at the first submission after the pool is (`NativeHost::released_pools`).
 
 #### A byte budget on host texture copies (#294)
 

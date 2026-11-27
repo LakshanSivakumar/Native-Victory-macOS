@@ -96,13 +96,19 @@ impl TextureInfo {
     }
 
     /// [`Self::desc`] without the dropped top levels: what the host texture is made as.
-    pub fn host_desc(&self) -> Option<TextureDesc> {
+    /// Host texture description matching `self`, leaving `dropped` leading mips off (minimum 1
+    /// host mip).
+    pub fn host_desc_with(&self, dropped: usize) -> Option<TextureDesc> {
         let mut desc = self.desc()?;
-        let n = self.dropped_levels();
+        let n = dropped.min(desc.mips.saturating_sub(1));
         desc.width = (desc.width >> n).max(1);
         desc.height = (desc.height >> n).max(1);
         desc.mips -= n;
         Some(desc)
+    }
+
+    pub fn host_desc(&self) -> Option<TextureDesc> {
+        self.host_desc_with(self.dropped_levels())
     }
 
 }
@@ -125,6 +131,50 @@ pub fn drop_top_mip() -> bool {
 fn dropped_levels(enabled: bool, written_by_gpu: bool, volume: bool, mips: usize, largest_side: u32) -> usize {
     let eligible = enabled && !written_by_gpu && !volume && mips >= 2 && largest_side >= DROP_TOP_MIP_MIN_SIDE;
     usize::from(eligible)
+}
+
+/// Number of leading title mip levels (`dropped_levels()` or more) that should be left off `info`
+/// right now because leading fine mips above the tail have zero mapped pages in `pools`. Outside
+/// pools (`!pools.any_mapped(memory, size)`), falls back to `info.dropped_levels()`.
+pub(super) fn unmapped_leading_mips(info: &TextureInfo, pools: &PoolTable) -> usize {
+    let floor = info.dropped_levels();
+    let Some(desc) = info.desc() else {
+        return floor;
+    };
+    if info.render_target()
+        || desc.format.is_depth()
+        || info.flags & UNORDERED_ACCESS != 0
+        || info.dimension == Dimension::Tex3d
+        || !info.layout.addressable()
+        || desc.mips < 2
+        || !pools.any_mapped(info.memory as u64, info.size as u64)
+    {
+        return floor;
+    }
+    let slices = info.layout.slices.max(1) as usize;
+    let slice_size = info.layout.slice_size as usize;
+    let limit = info.layout.first_tail_mip.min(desc.mips as u32 - 1);
+    let mut unmapped = 0usize;
+    for mip in 0..limit {
+        let mip_start = info.layout.mips[mip as usize].offset as usize;
+        let mip_end = if mip > 0 {
+            info.layout.mips[mip as usize - 1].offset as usize
+        } else {
+            slice_size
+        };
+        if mip_start >= mip_end {
+            break;
+        }
+        let len = (mip_end - mip_start) as u64;
+        let mapped = (0..slices).any(|s| {
+            pools.any_mapped(info.memory as u64 + (s * slice_size + mip_start) as u64, len)
+        });
+        if mapped {
+            break;
+        }
+        unmapped += 1;
+    }
+    unmapped.max(floor).min(desc.mips - 1)
 }
 
 /// A view's title mip range `(first, count)` on a host texture made without its top `dropped`
@@ -671,6 +721,8 @@ pub struct Tracked<B: ResourceBackend> {
     /// The submission ([`Budget::serial`]) it was last named or shown at: the texture budget gives
     /// up the least recently used first.
     used: u64,
+    /// Leading title mip levels omitted from [`Self::texture`].
+    dropped: usize,
 }
 
 impl<B: ResourceBackend> Tracked<B> {
@@ -1120,7 +1172,8 @@ impl<B: PresentBackend> Title<B> {
         let Some(info) = self.pending.remove(&key) else {
             return false;
         };
-        let Some(desc) = info.host_desc() else {
+        let dropped = unmapped_leading_mips(&info, &self.host.memory());
+        let Some(desc) = info.host_desc_with(dropped) else {
             // Loud once per format: views of it get no texture and their draws sample nothing.
             static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -1135,6 +1188,9 @@ impl<B: PresentBackend> Title<B> {
         }
         if let Some(owner) = self.identical_copy(&info) {
             let tex = self.textures[&owner].texture.clone();
+            let owner_dropped = self.textures[&owner].dropped;
+            let owner_mips = info.desc().map_or(1, |d| d.mips.saturating_sub(owner_dropped).max(1));
+            self.host.set_dropped_levels(key, owner_dropped, owner_mips);
             self.host.register_texture(key, &tex);
             self.copies_of.insert(key, (owner, info));
             SHARED_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1148,8 +1204,8 @@ impl<B: PresentBackend> Title<B> {
             }
         };
         self.at_memory.entry(info.memory as usize).or_default().push(key);
+        self.host.set_dropped_levels(key, dropped, desc.mips);
         self.host.register_texture(key, &tex);
-        self.host.set_dropped_levels(key, info.dropped_levels(), desc.mips);
         self.budget.live += info.size as u64;
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1188,6 +1244,8 @@ impl<B: PresentBackend> Title<B> {
         } else {
             0
         };
+        let (placed_mem, placed_size) = (info.memory as u64, info.size as u64);
+        let floor_dropped = info.dropped_levels();
         self.textures.insert(
             key,
             Tracked {
@@ -1208,8 +1266,21 @@ impl<B: PresentBackend> Title<B> {
                 target_views: Vec::new(),
                 gpu_written: false,
                 used: self.budget.serial,
+                dropped,
             },
         );
+        if dropped > floor_dropped {
+            self.trimmed.insert(key);
+        }
+        if key >> 63 != 0 && !self.placed_chunks.contains_key(&key) {
+            let ranges = self.host.memory().pool_ranges(placed_mem, placed_size);
+            self.track_placed_pools(key, &ranges);
+        }
+        if self.covered_evicted.remove(&key) && self.has_live_placed_overlap(key) {
+            let epoch = self.gpu_epoch;
+            self.record_epoch(epoch);
+            self.covered.entry(key).or_insert(epoch);
+        }
         true
     }
 
@@ -1334,6 +1405,8 @@ impl<B: PresentBackend> Title<B> {
     pub fn texture_released(&mut self, key: usize) {
         self.copies_of.remove(&key);
         self.covered.remove(&key);
+        self.trimmed.remove(&key);
+        self.untrack_placed_pools(key);
         if let Some(t) = self.textures.remove(&key) {
             self.budget.live -= t.info.size as u64;
             let at = t.info.memory as usize;
@@ -1360,6 +1433,9 @@ impl<B: PresentBackend> Title<B> {
                 watch(|w| w.entries.insert(first, (at, info.size, false, t.serial)));
                 let mut t = t;
                 t.info = info;
+                if t.dropped > t.info.dropped_levels() {
+                    self.trimmed.insert(first);
+                }
                 self.textures.insert(first, t);
             }
         }
@@ -1377,6 +1453,45 @@ impl<B: PresentBackend> Title<B> {
         watch(|w| w.released(key));
     }
 
+    /// Indexes `ranges` (`(pool_id, offset, len)`) under `key` in [`Self::placed_pools`].
+    fn track_placed_pools(&mut self, key: usize, ranges: &[(usize, u64, u64)]) {
+        self.untrack_placed_pools(key);
+        if ranges.is_empty() {
+            return;
+        }
+        for &(pid, off, clen) in ranges {
+            self.placed_pool_reach = self.placed_pool_reach.max(clen);
+            self.placed_pools
+                .entry(pid)
+                .or_default()
+                .entry(off)
+                .or_default()
+                .push((key, clen));
+        }
+        self.placed_chunks.insert(key, ranges.to_vec());
+    }
+
+    /// Removes `key`'s physical pool entries from [`Self::placed_pools`].
+    fn untrack_placed_pools(&mut self, key: usize) {
+        let Some(chunks) = self.placed_chunks.remove(&key) else {
+            return;
+        };
+        for (pid, off, _) in chunks {
+            let Some(map) = self.placed_pools.get_mut(&pid) else {
+                continue;
+            };
+            if let Some(entries) = map.get_mut(&off) {
+                entries.retain(|&(k, _)| k != key);
+                if entries.is_empty() {
+                    map.remove(&off);
+                }
+            }
+            if map.is_empty() {
+                self.placed_pools.remove(&pid);
+            }
+        }
+    }
+
     /// A view placed texture `key` at title `address` (in pool `pool`). The title has no object to
     /// release for it, so the texture another description placed at that address before goes
     /// now (guess: the title is done with it once it places another there), and every texture
@@ -1384,7 +1499,9 @@ impl<B: PresentBackend> Title<B> {
     pub fn texture_placed(&mut self, address: u64, key: usize, pool: usize, size: usize) {
         // A view of a copy given up before comes back at its own address: not a new placement.
         if self.placed.get(&address).is_none_or(|&(k, _)| k != key) {
-            self.give_up_overlapped(address, key, size as u64);
+            let ranges = self.host.memory().pool_ranges(address, size as u64);
+            self.give_up_overlapped(address, key, size as u64, &ranges);
+            self.track_placed_pools(key, &ranges);
         }
         self.placed_reach = self.placed_reach.max(size as u64);
         if let Some((old, _)) = self.placed.insert(address, (key, pool))
@@ -1400,19 +1517,27 @@ impl<B: PresentBackend> Title<B> {
                 REPLACED[1].fetch_add(u64::from(were.contains(&(address, key))), std::sync::atomic::Ordering::Relaxed);
             }
             self.host.forget_resource(old);
+            self.covered_evicted.remove(&old);
             self.texture_released(old);
         }
     }
 
-    /// Placed copies over `[address, address + size)` that start elsewhere, which placed texture
-    /// `key` now covers, are marked covered: given up once nothing uses them
-    /// ([`Self::give_up_covered`]). Guess: the title is done with a placed view once it places
-    /// another over its memory (it does so when it streams something else in). Never marked:
-    /// copies that hold what title memory does not (render targets, depth, GPU-written, ever
-    /// viewed for unordered access).
-    fn give_up_overlapped(&mut self, address: u64, key: usize, size: u64) {
+    /// Placed copies over `[address, address + size)` (by title VA or by physical pool chunks
+    /// `ranges` across VA aliases) that start elsewhere, which placed texture `key` now covers,
+    /// are marked covered: given up once nothing uses them ([`Self::give_up_covered`]). Guess: the
+    /// title is done with a placed view once it places another over its memory (it does so when it
+    /// streams something else in). Never marked: copies that hold what title memory does not
+    /// (render targets, depth, GPU-written, ever viewed for unordered access).
+    fn give_up_overlapped(
+        &mut self,
+        address: u64,
+        key: usize,
+        size: u64,
+        ranges: &[(usize, u64, u64)],
+    ) {
         let end = address.saturating_add(size);
-        let over: Vec<usize> = self
+        let same_addr_old = self.placed.get(&address).map(|&(k, _)| k);
+        let mut over: Vec<usize> = self
             .placed
             .range(address.saturating_sub(self.placed_reach)..end)
             .filter(|&(&a, &(k, _))| a != address && k != key)
@@ -1426,28 +1551,149 @@ impl<B: PresentBackend> Title<B> {
                 })
             })
             .collect();
-        self.covered.extend(over);
+        for &(pid, off, clen) in ranges {
+            let Some(map) = self.placed_pools.get(&pid) else {
+                continue;
+            };
+            let pend = off.saturating_add(clen);
+            for (&p_off, entries) in map.range(off.saturating_sub(self.placed_pool_reach)..pend) {
+                if p_off >= pend {
+                    break;
+                }
+                for &(ok, ok_len) in entries {
+                    if ok != key
+                        && Some(ok) != same_addr_old
+                        && p_off.saturating_add(ok_len) > off
+                        && self
+                            .textures
+                            .get(&ok)
+                            .is_some_and(|t| self.holds_only_memory(ok, t))
+                    {
+                        over.push(ok);
+                    }
+                }
+            }
+        }
+        over.sort_unstable();
+        over.dedup();
+        if !over.is_empty() {
+            let epoch = self.gpu_epoch;
+            self.record_epoch(epoch);
+            for k in over {
+                self.covered.entry(k).or_insert(epoch);
+            }
+        }
+    }
+
+    fn record_epoch(&mut self, epoch: u64) {
+        if epoch > self.retired_epoch
+            && self.pending_epochs.back().is_none_or(|(e, _)| *e < epoch)
+            && !self.queue_fences.is_empty()
+        {
+            self.pending_epochs
+                .push_back((epoch, self.queue_fences.values().cloned().collect()));
+        }
+    }
+
+    /// Whether any other live texture covered by [`Self::holds_only_memory`] in `placed` or
+    /// `placed_pools` currently overlaps `key`'s range (used when re-realizing a covered copy).
+    fn has_live_placed_overlap(&self, key: usize) -> bool {
+        let Some(t) = self.textures.get(&key) else {
+            return false;
+        };
+        if !self.holds_only_memory(key, t) {
+            return false;
+        }
+        let address = t.info.memory as u64;
+        let end = address.saturating_add(t.info.size as u64);
+        if self
+            .placed
+            .range(address.saturating_sub(self.placed_reach)..end)
+            .filter(|&(_, &(k, _))| k != key)
+            .any(|(_, &(k, _))| {
+                self.textures.get(&k).is_some_and(|o| {
+                    let oa = o.info.memory as u64;
+                    oa < end
+                        && oa.saturating_add(o.info.size as u64) > address
+                        && self.holds_only_memory(k, o)
+                })
+            })
+        {
+            return true;
+        }
+        let Some(chunks) = self.placed_chunks.get(&key) else {
+            return false;
+        };
+        for &(pid, off, clen) in chunks {
+            let Some(map) = self.placed_pools.get(&pid) else {
+                continue;
+            };
+            let pend = off.saturating_add(clen);
+            for (&p_off, entries) in map.range(off.saturating_sub(self.placed_pool_reach)..pend) {
+                if p_off >= pend {
+                    break;
+                }
+                if entries.iter().any(|&(ok, ok_len)| {
+                    ok != key
+                        && p_off.saturating_add(ok_len) > off
+                        && self
+                            .textures
+                            .get(&ok)
+                            .is_some_and(|o| self.holds_only_memory(ok, o))
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Advances [`Self::retired_epoch`] across GPU epochs whose fences have all completed.
+    fn retire_gpu_epochs(&mut self) {
+        while let Some((_, fences)) = self.pending_epochs.front() {
+            if !fences
+                .iter()
+                .all(|(f, v)| self.host.backend.completed(f) >= *v)
+            {
+                break;
+            }
+            let (epoch, _) = self.pending_epochs.pop_front().expect("front exists");
+            self.retired_epoch = self.retired_epoch.max(epoch);
+        }
     }
 
     /// At each sync: covered copies ([`Self::give_up_overlapped`]) that nothing uses any more are
     /// given up as the budget gives one up ([`Self::evictable`]: no heap entry shows one, so no
     /// work in flight reads it through an entry, and no list holds one), and none a submission in
-    /// flight names. One still shown waits until the title writes another record over that entry.
+    /// flight names. Under a texture budget (`budget.limit > 0`), a covered copy whose heap
+    /// entries were not overwritten yet is also given up once all GPU work queued before it was
+    /// covered has finished, clearing its stale heap entries (`evict_texture`).
     /// One named again later is made again from title memory.
     fn give_up_covered(&mut self) {
-        let keys: Vec<usize> = self.covered.iter().copied().collect();
-        for k in keys {
+        self.retire_gpu_epochs();
+        let has_budget = self.budget.limit > 0;
+        let mut entries: Vec<(u64, usize)> = self.covered.iter().map(|(&k, &e)| (e, k)).collect();
+        entries.sort_unstable();
+        for (covered_epoch, k) in entries {
             let Some(t) = self.textures.get(&k) else {
                 self.covered.remove(&k);
                 continue;
             };
-            if self.budget.named.contains_key(&k) || !self.evictable(k, t) {
+            if self.budget.named.contains_key(&k)
+                || !self.holds_only_memory(k, t)
+                || Rc::strong_count(&t.texture) > 2
+            {
+                continue;
+            }
+            let evict_shown = has_budget && covered_epoch <= self.retired_epoch;
+            if self.host.texture_in_use(k) && !evict_shown {
                 continue;
             }
             let info = t.info.clone();
             OVERLAP_TRACE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             OVERLAP_TRACE[1].fetch_add(info.size as u64, std::sync::atomic::Ordering::Relaxed);
             self.host.evict_texture(k);
+            self.covered_evicted.insert(k);
             self.texture_released(k);
             self.pending.insert(k, info);
         }
@@ -1502,6 +1748,7 @@ impl<B: PresentBackend> Title<B> {
         for a in dead {
             let (key, _) = self.placed.remove(&a).expect("listed above");
             self.host.release_resource(key);
+            self.covered_evicted.remove(&key);
             self.texture_released(key);
         }
     }
@@ -1555,9 +1802,10 @@ impl<B: PresentBackend> Title<B> {
         for key in self.host.take_wanted() {
             self.realize(key);
         }
-        self.keep_to_budget();
         self.give_up_covered();
+        self.keep_to_budget();
         let pools = self.host.memory();
+        self.upgrade_trimmed_textures(&pools);
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
@@ -1596,7 +1844,7 @@ impl<B: PresentBackend> Title<B> {
                 last: t.last,
                 uploaded_mips: t.uploaded_mips,
                 partial: t.partial,
-                skip: t.info.dropped_levels(),
+                skip: t.dropped,
             })
         };
         let out: Vec<Job> = keys.into_iter().filter_map(job).collect();
@@ -1610,6 +1858,56 @@ impl<B: PresentBackend> Title<B> {
             });
         }
         out
+    }
+
+    /// Expands any live trimmed textures whose previously unmapped leading fine mips now have pool
+    /// mappings, re-mirroring heap entries and queueing them for fresh detile upload.
+    fn upgrade_trimmed_textures(&mut self, pools: &PoolTable) {
+        let pool_gen = pools.generation();
+        if self.trimmed.is_empty() || pool_gen == self.trimmed_pool_gen {
+            return;
+        }
+        self.trimmed_pool_gen = pool_gen;
+        let keys: Vec<usize> = self.trimmed.iter().copied().collect();
+        for key in keys {
+            let Some((new_dropped, floor, new_desc)) = self.textures.get(&key).and_then(|t| {
+                let d = unmapped_leading_mips(&t.info, pools);
+                (d < t.dropped)
+                    .then(|| t.info.host_desc_with(d).map(|desc| (d, t.info.dropped_levels(), desc)))
+                    .flatten()
+            }) else {
+                if !self.textures.contains_key(&key) {
+                    self.trimmed.remove(&key);
+                }
+                continue;
+            };
+            let Ok(new_tex) = self.host.texture(&new_desc) else {
+                continue;
+            };
+            if let Some(t) = self.textures.get_mut(&key) {
+                t.texture = new_tex.clone();
+                t.dropped = new_dropped;
+                t.uploaded_mips = 0;
+                t.last = None;
+                t.partial = new_dropped > floor;
+                #[cfg(target_os = "macos")]
+                t.target_views.clear();
+            }
+            self.host.upgrade_texture(key, &new_tex, new_dropped, new_desc.mips);
+            let sharers: Vec<usize> = self
+                .copies_of
+                .iter()
+                .filter(|(_, (o, _))| *o == key)
+                .map(|(&s, _)| s)
+                .collect();
+            for sharer in sharers {
+                self.host.upgrade_texture(sharer, &new_tex, new_dropped, new_desc.mips);
+            }
+            self.unloaded.insert(key);
+            if new_dropped <= floor {
+                self.trimmed.remove(&key);
+            }
+        }
     }
 
     /// Uploads what [`prepare`] detiled, into the textures that are still the ones it read.
@@ -2713,6 +3011,7 @@ mod tests {
             blank: false,
             target_views: Vec::new(),
             gpu_written: false,
+            dropped: 0,
         };
 
         // 1. Explicit trace removing entries after wraparound (`cursor = 4` on 6 entries `[0..6]`,
@@ -2866,6 +3165,7 @@ mod tests {
                         blank: false,
                         target_views: Vec::new(),
                         gpu_written: false,
+                        dropped: 0,
                     },
                 )
             })

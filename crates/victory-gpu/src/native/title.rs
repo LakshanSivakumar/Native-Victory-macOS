@@ -16,7 +16,7 @@ use super::host::NativeHost;
 use super::list::{Binding, ComputePso, NativeList};
 use super::memory::PoolTable;
 use crate::hold::{Held, Item, ValueWait, World};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::resources::{Format, GraphicsBackend, PresentBackend};
@@ -191,6 +191,8 @@ enum QueuedAction<B: PresentBackend> {
     Present(Rc<B::Queue>, Rc<B::Surface>, Vec<Rc<B::Texture>>),
 }
 
+type PendingEpochs<F> = VecDeque<(u64, Vec<(Rc<F>, u64)>)>;
+
 pub struct Title<B: PresentBackend> {
     pub host: NativeHost<B>,
     /// Host pipelines by title pipeline object, made at first use.
@@ -235,14 +237,36 @@ pub struct Title<B: PresentBackend> {
     /// The largest placed texture's size: how far before an address a placed texture over it can
     /// start ([`Self::texture_placed`]).
     pub(super) placed_reach: u64,
+    /// Placed textures indexed by physical `(pool_id, pool_offset)`: `(key, chunk_len)` entries,
+    /// so VA aliases over the same pool pages detect overlaps across addresses too.
+    pub(super) placed_pools: HashMap<usize, std::collections::BTreeMap<u64, Vec<(usize, u64)>>>,
+    /// Physical pool chunks indexed in [`Self::placed_pools`] per texture key, for O(1) removal.
+    pub(super) placed_chunks: HashMap<usize, Vec<(usize, u64, u64)>>,
+    /// The largest physical chunk length in [`Self::placed_pools`].
+    pub(super) placed_pool_reach: u64,
     /// Title textures whose host texture is another's, laid out identically over the same memory
     /// ([`Self::realize`]): that other key (in `textures`), and their own description.
     pub(super) copies_of: HashMap<usize, (usize, super::textures::TextureInfo)>,
     /// Keys in `textures` by the title memory they start at.
     pub(super) at_memory: HashMap<usize, Vec<usize>>,
-    /// Placed copies another placement covered, given up once nothing uses them
+    /// Placed copies another placement covered, mapped to the `gpu_epoch` when covered, given up
+    /// once nothing uses them (or under budget once all work from that epoch has finished on the GPU)
     /// ([`Self::give_up_covered`]).
-    pub(super) covered: std::collections::HashSet<usize>,
+    pub(super) covered: HashMap<usize, u64>,
+    /// Covered placed copies evicted under a budget (`give_up_covered`), so if a descriptor
+    /// mirror or table scan realizes one again while a newer overlapping placement is still live,
+    /// it is marked covered again instead of pinning duplicate memory permanently.
+    pub(super) covered_evicted: std::collections::HashSet<usize>,
+    /// Live sampled textures whose leading unmapped fine mips were trimmed on creation, plus the
+    /// [`PoolTable::generation`] last checked for newly mapped fine mips (`upgrade_trimmed_textures`).
+    pub(super) trimmed: std::collections::HashSet<usize>,
+    pub(super) trimmed_pool_gen: u64,
+    /// Monotonic GPU submission epoch advanced on each executed piece, and the highest epoch whose
+    /// in-flight work has completed across all queues.
+    pub(super) gpu_epoch: u64,
+    pub(super) retired_epoch: u64,
+    pub(super) queue_fences: HashMap<usize, (Rc<B::Fence>, u64)>,
+    pub(super) pending_epochs: PendingEpochs<B::Fence>,
     /// Resource objects whose host texture a placed view names too: its address and key.
     pub(super) shared: HashMap<usize, (u64, usize)>,
     queues: HashMap<usize, Rc<B::Queue>>,
@@ -285,9 +309,19 @@ impl<B: PresentBackend> Title<B> {
             placed: Default::default(),
             shared: HashMap::new(),
             placed_reach: 0,
+            placed_pools: HashMap::new(),
+            placed_chunks: HashMap::new(),
+            placed_pool_reach: 0,
             copies_of: HashMap::new(),
             at_memory: HashMap::new(),
             covered: Default::default(),
+            covered_evicted: Default::default(),
+            trimmed: Default::default(),
+            trimmed_pool_gen: 0,
+            gpu_epoch: 0,
+            retired_epoch: 0,
+            queue_fences: HashMap::new(),
+            pending_epochs: VecDeque::new(),
             queues: HashMap::new(),
             fences: HashMap::new(),
             requested: HashMap::new(),
@@ -441,6 +475,9 @@ impl<B: PresentBackend> Title<B> {
             actions,
             stats,
             back,
+            budget,
+            gpu_epoch,
+            queue_fences,
             ..
         } = self;
         let memory = host.memory();
@@ -457,11 +494,32 @@ impl<B: PresentBackend> Title<B> {
             };
             let refs: Vec<&NativeList<B>> = lists.iter().map(|l| &**l).collect();
             let ours = back.next(host, queue);
-            let signals: Vec<(&B::Fence, u64)> = ours.iter().map(|(f, v)| (&**f, *v)).collect();
+            let epoch_sig = if budget.limit > 0 {
+                let entry = match queue_fences.entry(queue) {
+                    std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        host.backend.create_fence(0).ok().map(|f| e.insert((Rc::new(f), 0)))
+                    }
+                };
+                entry.map(|(f, v)| {
+                    *v += 1;
+                    (f.clone(), *v)
+                })
+            } else {
+                None
+            };
+            let mut signals: Vec<(&B::Fence, u64)> = ours.iter().map(|(f, v)| (&**f, *v)).collect();
+            if let Some((f, v)) = &epoch_sig {
+                signals.push((&**f, *v));
+            }
             if let Err(e) = host.execute(&q, &refs, &[], &signals) {
                 stats.refused += 1;
                 tracing::warn!(error = %e, "a piece of title work was refused");
+                if let Some((f, v)) = &epoch_sig {
+                    host.backend.signal(f, *v);
+                }
             }
+            *gpu_epoch += 1;
             back.submitted(host, ours);
         };
         let mut signal = |n: usize, _: u64| {
