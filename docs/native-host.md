@@ -2404,6 +2404,25 @@ read as null before). Corpus (tmi-agent, 21,600): 0 newly translated, 0 regresse
 changed (94 compute, 589 pixel, 2,056 vertex), each a program whose rebuilt dword 1 is tested
 against 0.
 
+**A size-only waterfall loop over a shifted heap index.** Many world compute programs (light and
+volume passes) size a 1D image in one waterfall loop and read it in a second: each loop reads the
+first lane's heap index (`v_readfirstlane_b32`), shifts it left by 5 to the byte offset of whole
+descriptors (`s_lshl_b32 s, s, 5`) and loads the descriptor at that offset, the sizing loop only
+its first four dwords. A load read only as data takes its view kind from another load of the
+same descriptor; the two were the same only when the offset was the first-lane read itself, so
+the sizing load fell to the view-address table, which holds no dword 2 or 3 for a four-dword
+load, and the program was refused ("a descriptor read only as data", 705 compute programs). Two
+offsets are now the same also when each is the first-lane read of one VGPR value shifted left by
+one constant: every lane of both loops then names the same heap entry. Test:
+`lower::tests::a_waterfall_loop_that_sizes_by_a_shifted_index_takes_the_kind_of_the_sampled_one`.
+Corpus against the null-test commit: 358 newly translated (355 compute, 3 pixel), 0 regressed, 6
+compute outputs changed (sizes now from the view itself, not the view-address table), 350 refused
+for another reason (153 "a lane-mask join of an untracked mask: data, at a join of several
+edges", 93 "a lane mask holding lanes elsewhere read as data: a program input", 74 "an image's
+dwords N to N", 28 "a value the translation could not make", 2 others). Of the windowed world
+run's 677 dropped compute dispatches a frame (20261127-235056), the 85 programs now translated
+made 181.
+
 ## The device's own memory ceiling, logged at native host startup (issue #8)
 
 16 GB Macs still run the title out of GPU memory past the menus (`kIOGPUCommandBufferCallbackErrorOutOfMemory`),

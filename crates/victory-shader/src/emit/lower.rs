@@ -6699,12 +6699,25 @@ impl<'a> Lower<'a> {
                 _ => None,
             }
         };
+        // A heap index a waterfall loop reads from the first lane, as is or shifted left by a
+        // constant (the byte offset of whole descriptors): each lane's VGPR and the shift.
+        let lane_index = |v: Value| {
+            if let Some(s) = lane_source(v) {
+                return Some((s, 0));
+            }
+            let i = self.def_inst(v)?;
+            let Fields::Sop { src, .. } = &i.fields else { return None };
+            match src[..] {
+                [x, k] if i.name() == "s_lshl_b32" => Some((lane_source(sgpr_operand(i, x)?)?, scalar_constant(k)?)),
+                _ => None,
+            }
+        };
         let same = |a: &Address, b: &Address| {
             a.param == b.param
                 && a.offset == b.offset
                 && (a.dynamic == b.dynamic
-                    || a.dynamic.and_then(lane_source).is_some()
-                        && a.dynamic.and_then(lane_source) == b.dynamic.and_then(lane_source))
+                    || a.dynamic.and_then(lane_index).is_some()
+                        && a.dynamic.and_then(lane_index) == b.dynamic.and_then(lane_index))
         };
         let address = self.scalar.get(&site);
         let use_at = use_of(site).or_else(|| {
@@ -16175,6 +16188,60 @@ mod tests {
             0xBF8C_3F70, // s_waitcnt vmcnt(0)
             0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
             0xBF89_FFF6, // s_cbranch_execnz L2
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_1000,
+            0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_and_uav_tables();
+        lower_wave(&words, layout, used, false).unwrap();
+    }
+
+    #[test]
+    fn a_waterfall_loop_that_sizes_by_a_shifted_index_takes_the_kind_of_the_sampled_one() {
+        // As above, but v7 holds the entry's index and each loop shifts the first lane's index
+        // left by 5 to the byte offset (`s_lshl_b32`, the title's form), and the sizing loop
+        // loads only four dwords, of which dword 2 has no view address: the two loads are of
+        // the same descriptor only through the shift.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x360E_0081, // v_and_b32 v7, 1, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E28_0507, // L1: v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0x8F14_8514, // s_lshl_b32 s20, s20, 5
+            0xF408_0302,
+            0x2800_0000, // s_load_dwordx4 s[12:15], s[4:5], s20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xD54E_0008,
+            0x0278_1A0E, // v_alignbit_b32 v8, s14, s13, 30
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF6, // s_cbranch_execnz L1
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E28_0507, // L2: v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0x8F14_8514, // s_lshl_b32 s20, s20, 5
+            0xF40C_0302,
+            0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF5, // s_cbranch_execnz L2
             0xBEFE_0317, // s_mov_b32 exec_lo, s23
             0xE070_1000,
             0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen
