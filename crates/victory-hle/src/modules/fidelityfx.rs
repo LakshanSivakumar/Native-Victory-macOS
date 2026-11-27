@@ -19,6 +19,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{CStr, c_char, c_void};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
@@ -100,6 +102,7 @@ const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
 const _: () = assert!(size_of::<Resource>() == 0x30);
 const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
 
+
 /// The versions a backend offers: count in and out, ids, names.
 #[repr(C)]
 struct GetVersions {
@@ -144,6 +147,140 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::$level!($($arg)*));
     }};
+}
+
+/// The title's upscaler context under `VICTORY_METALFX=1`: what the create
+/// description carries, before the scaler itself exists (M2 builds it from
+/// the first dispatch, where the formats show up).
+struct UpscalerConfig {
+    render: [u32; 2],
+    output: [u32; 2],
+    flags: u32,
+}
+
+impl UpscalerConfig {
+    /// What MetalFX requires before a scaler can be built at all. The
+    /// device's own scale bounds are checked at creation (M2).
+    fn validate(&self) -> Result<(), String> {
+        let [rw, rh] = self.render;
+        let [ow, oh] = self.output;
+        if rw == 0 || rh == 0 || ow == 0 || oh == 0 {
+            return Err("a size is zero".into());
+        }
+        if ow < rw {
+            return Err("output smaller than render: MetalFX upscales".into());
+        }
+        let scale = ow as f64 / rw.max(1) as f64;
+        if scale > 4.0 {
+            return Err(format!("scale {scale:.2}x is beyond MetalFX's range"));
+        }
+        Ok(())
+    }
+}
+
+/// The MetalFX contexts we handed the title, by address. The handles are
+/// `Box<UpscalerConfig>` until M2 turns them into scalers.
+static METALFX_CONTEXTS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+
+/// Whether the title's upscaler is served with MetalFX (`VICTORY_METALFX=1`).
+fn metalfx_enabled() -> bool {
+    std::env::var_os("VICTORY_METALFX").is_some_and(|v| v != "0")
+}
+
+fn metalfx_holds(context: *mut *mut c_void) -> bool {
+    if context.is_null() {
+        return false;
+    }
+    // SAFETY: the caller's context points at our handle.
+    let handle = unsafe { *context } as usize;
+    METALFX_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&handle)
+}
+
+/// Creates the MetalFX context from the title's upscaler description.
+///
+/// # Safety
+/// `desc` names an upscaler description; `context` is the title's out-slot.
+unsafe extern "C" fn metalfx_create(
+    context: *mut *mut c_void,
+    desc: *mut Header,
+) -> u32 {
+    // SAFETY: an upscaler description, by its type.
+    let upscale = unsafe { desc.cast::<CreateUpscale>().read() };
+    let config = UpscalerConfig {
+        render: upscale.max_render,
+        output: upscale.max_output,
+        flags: upscale.flags,
+    };
+    if let Err(why) = config.validate() {
+        tracing::error!("FidelityFX MetalFX: refused the upscaler: {why}");
+        return PARAMETER;
+    }
+    let handle = Box::into_raw(Box::new(config));
+    // SAFETY: the title's out-slot.
+    unsafe { context.write(handle.cast()) };
+    METALFX_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle as usize);
+    let (render, output, flags) = unsafe {
+        // SAFETY: the handle was just boxed from a valid config.
+        let c = handle.as_ref().unwrap();
+        (c.render, c.output, c.flags)
+    };
+    tracing::info!(
+        render = ?render,
+        output = ?output,
+        flags = format_args!("{flags:#x}"),
+        "FidelityFX: MetalFX upscaler context created (the scaler itself lands at the first dispatch, M2)"
+    );
+    OK
+}
+
+/// Destroys a MetalFX context; `None` when the handle is not ours.
+///
+/// # Safety
+/// `context` points at a handle this module handed out or the title's own.
+unsafe extern "C" fn metalfx_destroy(context: *mut *mut c_void) -> Option<u32> {
+    if context.is_null() {
+        return None;
+    }
+    // SAFETY: as above.
+    let handle = unsafe { *context } as usize;
+    let removed = METALFX_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle);
+    if removed {
+        // SAFETY: the handle came from `metalfx_create`.
+        unsafe { drop(Box::from_raw(handle as *mut UpscalerConfig)) };
+        Some(OK)
+    } else {
+        None
+    }
+}
+
+/// The M1 dispatch path: a MetalFX context's upscaling is refused until the
+/// scaler itself is built (M2). `None` when the dispatch is not ours.
+///
+/// # Safety
+/// `context` and `desc` are the title's pointers; `desc` names a dispatch.
+unsafe extern "C" fn metalfx_dispatch_refusal(
+    context: *mut *mut c_void,
+    desc: *mut Header,
+) -> Option<u32> {
+    // SAFETY: the title passes a description.
+    let kind = unsafe { (*desc).kind };
+    if kind == DISPATCH_UPSCALE && metalfx_holds(context) {
+        once!(
+            warn,
+            "FidelityFX MetalFX: the scaler build lands at the first dispatch (M2); the upscaling did not run"
+        );
+        return Some(PARAMETER);
+    }
+    None
 }
 
 /// Serves the title's FidelityFX calls with the PC upscaler in `dir`
@@ -291,14 +428,18 @@ extern "C" fn ffxCreateContext(
     desc: *mut Header,
     memory: *const c_void,
 ) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if context.is_null() || desc.is_null() {
         return PARAMETER;
     }
     // SAFETY: the title passes a chain of descriptions.
     let kind = unsafe { (*desc).kind };
+    if metalfx_enabled() && kind == CREATE_UPSCALE {
+        // SAFETY: the kind was just read from `desc`.
+        return unsafe { metalfx_create(context, desc) };
+    }
+    let Some(host) = HOST.get() else {
+        return NO_PROVIDER;
+    };
     if kind != CREATE_UPSCALE {
         once!(
             warn,
@@ -348,6 +489,12 @@ extern "C" fn ffxCreateContext(
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    if metalfx_enabled() {
+        // SAFETY: the title passes its context.
+        if let Some(code) = unsafe { metalfx_destroy(context) } {
+            return code;
+        }
+    }
     // SAFETY: the title passes its context.
     HOST.get()
         .map_or(NO_PROVIDER, |h| unsafe { (h.destroy)(context, memory) })
@@ -391,6 +538,12 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
+    if metalfx_enabled() {
+        // SAFETY: the title's pointers; the kind was just read.
+        if let Some(code) = unsafe { metalfx_dispatch_refusal(context, desc) } {
+            return code;
+        }
+    }
     if kind != DISPATCH_UPSCALE {
         once!(
             warn,
@@ -515,5 +668,72 @@ mod tests {
         assert_eq!(host_state(0x2), Some(0x8));
         assert_eq!(host_state(0x200), Some(0x10));
         assert_eq!(host_state(0x14), None);
+    }
+}
+
+#[cfg(test)]
+mod metalfx_tests {
+    use super::*;
+
+    #[test]
+    fn context_roundtrip_and_dispatch_refusal() {
+        let mut ctx: *mut c_void = null_mut();
+        let mut upscale = CreateUpscale {
+            header: Header {
+                kind: CREATE_UPSCALE,
+                next: null_mut(),
+            },
+            flags: 1,
+            max_render: [1280, 720],
+            max_output: [2560, 1440],
+            message: 0,
+        };
+        // SAFETY: a fabricated description and our own out-slot.
+        assert_eq!(unsafe { metalfx_create(&mut ctx, &mut upscale.header) }, OK);
+        let handle = ctx as usize;
+        assert!(METALFX_CONTEXTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&handle));
+
+        let mut dispatch = DispatchUpscale {
+            header: Header {
+                kind: DISPATCH_UPSCALE,
+                next: null_mut(),
+            },
+            list: null_mut(),
+            resources: [Resource {
+                resource: null_mut(),
+                description: [0; 8],
+                state: 0,
+            }; 7],
+            rest: [0; 18],
+        };
+        let mut dc: *mut c_void = ctx;
+        // SAFETY: our own context and description.
+        assert_eq!(unsafe { metalfx_dispatch_refusal(&mut dc, &mut dispatch.header) }.unwrap(), PARAMETER);
+
+        // SAFETY: our own context.
+        assert_eq!(unsafe { metalfx_destroy(&mut ctx) }, Some(OK));
+        assert!(!METALFX_CONTEXTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&handle));
+    }
+
+    #[test]
+    fn zero_sizes_are_refused() {
+        let cfg = UpscalerConfig {
+            render: [0, 0],
+            output: [0, 0],
+            flags: 0,
+        };
+        assert!(cfg.validate().is_err());
+        let cfg = UpscalerConfig {
+            render: [1280, 720],
+            output: [640, 360],
+            flags: 0,
+        };
+        assert!(cfg.validate().is_err());
     }
 }
