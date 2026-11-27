@@ -1698,17 +1698,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// The four dwords of a heap entry in the view addresses: a buffer view's title address
-    /// (dword 0, and dword 1 bits 0-15), a texture view's size fields
+    /// (dword 0, and dword 1 bits 0-15), stride (dword 1 bits 16-29) and record count (dword 2)
+    /// ([`super::descriptors::buffer_words`]), a texture view's size fields
     /// ([`crate::descriptor::texture_words`]), zeros for anything else.
     fn address_words(&self, view: Option<&crate::descriptor::View>) -> [u32; 4] {
         let Some(view) = view else { return [0; 4] };
         if let Some(words) = crate::descriptor::texture_words(view) {
             return words;
         }
-        match decode(view, &self.resources.borrow()) {
-            Some(Decoded::Buffer { addr, .. }) => [addr as u32, (addr >> 32) as u32 & 0xFFFF, 0, 0],
-            _ => [0; 4],
-        }
+        super::descriptors::buffer_words(view, &self.resources.borrow()).unwrap_or([0; 4])
     }
 
     /// The view addresses of `heap` (the translator's root SRV `t1` of the memory space,
