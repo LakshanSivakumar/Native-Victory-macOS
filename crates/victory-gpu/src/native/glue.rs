@@ -1411,6 +1411,11 @@ pub(crate) fn log_draw_counts(frame: u64) {
         tracing::info!(frame, typed_views, typed_views_live, "native typed buffer views");
     }
     super::descriptor_trace::log(frame);
+    // What copying GPU-written textures back costs (all of it under the title lock).
+    if let Some(s) = with_title(|t| t.host.collecting_written().then(|| t.stats.clone())).flatten() {
+        let (kib, us) = (s.copied_back_bytes >> 10, s.copy_back_time.as_micros() as u64);
+        tracing::info!(frame, textures = s.copied_back, checks = s.copy_back_checks, kib, us, "textures copied back so far");
+    }
 }
 
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.

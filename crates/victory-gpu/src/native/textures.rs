@@ -439,7 +439,12 @@ fn download<B: ResourceBackend>(
         let depth = layout.subresource_depth(mip).max(1) as usize;
         let mut linear = vec![0u8; slice_pitch * depth];
         for slice in 0..slices {
-            backend.read_texture(tex, mip as usize, slice as usize, &mut linear, row, slice_pitch);
+            let read = |out: &mut [u8]| {
+                backend.read_texture(tex, mip as usize, slice as usize, out, row, slice_pitch)
+            };
+            if !read_checked(&mut linear, read) {
+                return Err(format!("the host refused to read mip {mip} slice {slice}"));
+            }
             from_host(info.format, &mut linear);
             layout
                 .tile(tiled, mip, slice, &linear, row, slice_pitch)
@@ -449,8 +454,25 @@ fn download<B: ResourceBackend>(
     Ok(())
 }
 
-/// The largest texture copied back (the ocean maps are small; a guess until a world run's
-/// "copied back" lines show what is written).
+/// Runs `read` into `out` and says whether it wrote there. `read_texture` gives no error: a
+/// transfer the host texture cannot take (its texel size is not the layout's) is logged and
+/// skipped, and `out` keeps what it held, which would then be written into title memory as the
+/// GPU's result. So `out` is filled with one byte first, and with another if the read left only
+/// that byte (a texture can hold it everywhere).
+fn read_checked(out: &mut [u8], mut read: impl FnMut(&mut [u8])) -> bool {
+    for fill in [0xA5, 0x5A] {
+        out.fill(fill);
+        read(out);
+        if out.iter().any(|&b| b != fill) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The largest texture copied back. A world run on an M5 Pro copied back 22 textures, none
+/// larger than this (the largest a 256x256x16 3D texture of 4 MiB, #151). A larger one is
+/// logged once and left alone.
 const BACK_LIMIT: usize = 4 << 20;
 
 /// Textures compute work wrote, to be copied back into title memory once it completes
@@ -497,6 +519,11 @@ impl<B: PresentBackend> Back<B> {
         };
         *value += 1;
         Some((fence.clone(), *value))
+    }
+
+    /// The title released queue `key`: its fence goes (work still pending keeps its own).
+    pub(super) fn forget_queue(&mut self, key: usize) {
+        self.fences.remove(&key);
     }
 
     /// That work went to the GPU: if it wrote textures, they are copied back once `signal` is
@@ -1052,11 +1079,16 @@ impl<B: PresentBackend> Title<B> {
             }
             !reached
         });
+        if done.is_empty() {
+            return;
+        }
         done.sort_unstable();
         done.dedup();
+        let start = std::time::Instant::now();
         for key in done {
             self.write_back(key);
         }
+        self.stats.copy_back_time += start.elapsed();
     }
 
     /// Retiles the host texture of `key` into its title memory.
@@ -1072,10 +1104,11 @@ impl<B: PresentBackend> Title<B> {
         let described = (info.format, info.width, info.height, info.depth_or_layers, info.size);
         if info.size > BACK_LIMIT {
             if self.back.logged.insert(key) {
-                tracing::info!(texture = key, ?described, "a GPU-written texture is too large to copy back");
+                tracing::info!(texture = key, ?described, layout = ?info.layout.desc, "a GPU-written texture is too large to copy back");
             }
             return;
         }
+        self.stats.copy_back_checks += 1;
         let mut tiled = vec![0u8; info.size];
         let _ = read_into(Some(&pools), info.memory as usize, &mut tiled, t.partial);
         // The title wrote the memory since the host texture was filled from it: its bytes stay,
@@ -1085,7 +1118,7 @@ impl<B: PresentBackend> Title<B> {
         }
         if let Err(error) = download(&self.host.backend, &t.texture, info, &mut tiled) {
             if self.back.logged.insert(key) {
-                tracing::warn!(texture = key, ?described, %error, "a GPU-written texture was not copied back");
+                tracing::warn!(texture = key, ?described, layout = ?info.layout.desc, %error, "a GPU-written texture was not copied back");
             }
             return;
         }
@@ -1099,6 +1132,8 @@ impl<B: PresentBackend> Title<B> {
         unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), at.cast_mut(), tiled.len()) };
         // What the host texture holds, so the scanner's sighting of this write uploads nothing.
         t.last = Some(hash);
+        self.stats.copied_back += 1;
+        self.stats.copied_back_bytes += tiled.len() as u64;
         if self.back.logged.insert(key) {
             tracing::info!(texture = key, ?described, layout = ?info.layout.desc, "a GPU-written texture is copied back into title memory");
         }
@@ -2350,6 +2385,19 @@ mod tests {
             from_host(format, &mut texels);
             assert_eq!(texels, title, "{format}");
         }
+    }
+
+    /// A read the host refused leaves the buffer as it was: that is not taken for texels, which
+    /// can be any bytes.
+    #[test]
+    fn a_refused_read_is_not_taken_for_texels() {
+        let mut out = vec![0u8; 64];
+        assert!(!read_checked(&mut out, |_| {}), "refused");
+        for fill in [0, 0xA5, 0x5A] {
+            assert!(read_checked(&mut out, |o| o.fill(fill)), "texels that are all {fill:#x}");
+            assert!(out.iter().all(|&b| b == fill), "{fill:#x}");
+        }
+        assert!(read_checked(&mut out, |o| o[63] = 1), "one byte written");
     }
 
     #[test]
