@@ -27,7 +27,6 @@ use std::sync::Mutex;
 use super::fidelityfx_common::{host_state, link};
 use super::fidelityfx_common::*;
 
-#[cfg(windows)]
 use std::ffi::CStr;
 #[cfg(windows)]
 use std::sync::OnceLock;
@@ -197,6 +196,67 @@ unsafe fn metalfx_dispatch_refusal(
         return Some(PARAMETER);
     }
     None
+}
+
+/// The provider the MetalFX path reports in version queries. Our own id:
+/// create ignores the requested provider, and the real DLL's values should
+/// be dumped on Windows (the PC `versions()` helper logs them) if the title
+/// ever cross-checks.
+const METALFX_PROVIDER_ID: u64 = 0x6d65_7461; // "meta"
+const METALFX_PROVIDER_NAME: &CStr = c"MetalFX (victory)";
+
+/// Answers the version negotiation the PC build answers on Windows. Without
+/// this the title concludes there is no provider and never creates a
+/// context. `None` when the query is not one of the version kinds.
+///
+/// # Safety
+/// `desc` names a GetVersions or ProviderVersion description whose buffers
+/// the title owns.
+unsafe fn metalfx_query(desc: *mut Header) -> Option<u32> {
+    // SAFETY: the title passes a description.
+    let kind = unsafe { (*desc).kind };
+    match kind {
+        GET_VERSIONS => {
+            // SAFETY: a GetVersions description, by its type.
+            let gv = unsafe { desc.cast::<GetVersions>().read() };
+            if gv.create_kind != CREATE_UPSCALE || gv.count.is_null() {
+                return Some(PARAMETER);
+            }
+            // SAFETY: the title owns the count slot.
+            unsafe { *gv.count = 1 };
+            if !gv.ids.is_null() {
+                // SAFETY: the title owns the ids array.
+                unsafe { *gv.ids = METALFX_PROVIDER_ID };
+            }
+            if !gv.names.is_null() {
+                // SAFETY: the title owns the names array.
+                unsafe { *gv.names = METALFX_PROVIDER_NAME.as_ptr().cast() };
+            }
+            once!(
+                info,
+                id = format_args!("{METALFX_PROVIDER_ID:#x}"),
+                "FidelityFX MetalFX: version query answered with one provider"
+            );
+            Some(OK)
+        }
+        GET_PROVIDER_VERSION => {
+            // SAFETY: a ProviderVersion description, by its type.
+            unsafe {
+                (*desc.cast::<ProviderVersion>()).id = METALFX_PROVIDER_ID;
+                (*desc.cast::<ProviderVersion>()).name = METALFX_PROVIDER_NAME.as_ptr().cast();
+            }
+            once!(info, "FidelityFX MetalFX: provider version answered");
+            Some(OK)
+        }
+        _ => None,
+    }
+}
+
+/// MetalFX path's configure: settings and debug callbacks are accepted and
+/// ignored (the PC build forwards them to the DLL, which only logs).
+fn metalfx_configure() -> u32 {
+    once!(info, "FidelityFX MetalFX: configure accepted and ignored");
+    OK
 }
 
 /// Serves the title's FidelityFX calls with the PC upscaler in `dir`
@@ -438,6 +498,9 @@ unsafe fn pc_destroy(context: *mut *mut c_void, memory: *const c_void) -> Option
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if metalfx_enabled() {
+        return metalfx_configure();
+    }
     #[cfg(windows)]
     {
         // SAFETY: the title passes its context and descriptions.
@@ -464,6 +527,12 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
+    if metalfx_enabled() {
+        // SAFETY: the title's pointers.
+        if let Some(code) = unsafe { metalfx_query(desc) } {
+            return code;
+        }
+    }
     // These carry the console device.
     if kind == GET_VERSIONS || kind == MEMORY_USAGE_WITH_DEVICE {
         once!(
@@ -720,3 +789,40 @@ mod metalfx_tests {
         assert!(cfg.validate().is_err());
     }
 }
+
+    #[test]
+    fn metalfx_query_negotiates_one_provider() {
+        let mut count = 0u64;
+        let mut id = 0u64;
+        let mut names: [*const c_char; 1] = [null_mut()];
+        let mut gv = GetVersions {
+            header: Header {
+                kind: GET_VERSIONS,
+                next: null_mut(),
+            },
+            create_kind: CREATE_UPSCALE,
+            device: null_mut(),
+            count: &raw mut count,
+            ids: &raw mut id,
+            names: names.as_mut_ptr(),
+        };
+        // SAFETY: our own description and buffers.
+        assert_eq!(unsafe { metalfx_query(&raw mut gv.header) }.unwrap(), OK);
+        assert_eq!(count, 1);
+        assert_eq!(id, METALFX_PROVIDER_ID);
+        assert!(!names[0].is_null());
+
+        // A provider-version query gets the same id back.
+        let mut pv = ProviderVersion {
+            header: Header {
+                kind: GET_PROVIDER_VERSION,
+                next: null_mut(),
+            },
+            id: 0,
+            name: null(),
+        };
+        // SAFETY: our own description.
+        assert_eq!(unsafe { metalfx_query(&raw mut pv.header) }.unwrap(), OK);
+        assert_eq!(pv.id, METALFX_PROVIDER_ID);
+        assert!(!pv.name.is_null());
+    }
