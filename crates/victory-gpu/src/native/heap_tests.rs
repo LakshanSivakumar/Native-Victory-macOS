@@ -1669,3 +1669,162 @@ fn a_compute_shader_reads_both_the_view_strides_and_the_view_addresses() {
     assert_eq!((t.host.unset_roots(), t.host.failed()), (0, 0));
     drop(records);
 }
+
+/// Lane 0 stores `[v1..v4]` (read from byte 2048 of the raw entry 1) to element 1 of entry 0 with
+/// `buffer_store_format_xyzw ... idxen`, loads element 1 back and element 0 (what was there
+/// before) with `buffer_load_format_xyzw ... idxen`, and writes them to entry 1 at bytes 0 and 32.
+const CS_FMT_STORE_THEN_LOAD_BOTH: &[u32] = &[
+    0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E00_0281, // v_mov_b32 v0, 1 (element 1)
+    0xE038_0800, 0x8004_0100, // buffer_load_dwordx4 v[1:4], off, s[16:19], 0 offset:2048
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE01C_2000, 0x8003_0100, // buffer_store_format_xyzw v[1:4], v0, s[12:15], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE00C_2000, 0x8003_0600, // buffer_load_format_xyzw v[6:9], v0, s[12:15], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE078_0000, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0
+    0x7E00_0280, // v_mov_b32 v0, 0 (element 0)
+    0xE00C_2000, 0x8003_0600, // buffer_load_format_xyzw v[6:9], v0, s[12:15], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE078_0020, 0x8004_0600, // buffer_store_dwordx4 v[6:9], off, s[16:19], 0 offset:32
+    0xBF81_0000, // s_endpgm
+];
+
+/// Lane 0 adds 5 to element 1 of entry 0 (`buffer_atomic_add ... idxen glc`, which returns the old
+/// value), then loads element 1 typed (`buffer_load_format_x ... idxen`), and writes the old value
+/// and the loaded one to entry 1 at bytes 0 and 4.
+const CS_TYPED_ATOMIC_ADD: &[u32] = &[
+    0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF408_0405, 0xFA00_0020, // s_load_dwordx4 s[16:19], s[10:11], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x7E00_0281, // v_mov_b32 v0, 1 (element 1)
+    0x7E04_0285, // v_mov_b32 v2, 5
+    0xE0C8_6000, 0x8003_0200, // buffer_atomic_add v2, v0, s[12:15], 0 idxen glc
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE000_2000, 0x8003_0300, // buffer_load_format_x v3, v0, s[12:15], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8004_0200, // buffer_store_dword v2, off, s[16:19], 0
+    0xE070_0004, 0x8004_0300, // buffer_store_dword v3, off, s[16:19], 0 offset:4
+    0xBF81_0000, // s_endpgm
+];
+
+/// Typed buffer views that start inside a 16-byte unit (Metal's texture-buffer alignment): an
+/// `R16_UINT` view whose first element is at byte 2, an `R32G32_FLOAT` view at byte 8 and an
+/// `R32_UINT` view at byte 4 (all `FirstElement = 1`). The irradiance cache's ray records and
+/// probe lists are views like these (r190 `Rg32Float` at `0x83aee88`, r195 `R16Uint` at
+/// `0x84c1dd2`). Typed loads must read the title's elements and typed stores must land in its
+/// memory, at the view's elements, not the 16-byte unit's; the R32 view's atomics too. Before the
+/// fix `write_typed_buffer` gave such views a raw entry with no texture:
+/// loads read 0 and stores went nowhere.
+#[test]
+fn typed_views_that_start_inside_a_16_byte_unit_read_and_write_the_titles_elements() {
+    let mut uav0 = [0u8; 32];
+    uav0[0] = 0x41;
+    uav0[4..6].copy_from_slice(&[3, 3]);
+    uav0[16] = 1;
+    uav0[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut uav1 = uav0;
+    uav1[8] = 8; // +8 dwords = +32 bytes (entry 1)
+    let c_fmt = crate::pipeline::test_compute_container(CS_FMT_STORE_THEN_LOAD_BOTH, &[uav0, uav1], 7);
+    let cs_fmt = shaders::translate(&c_fmt).unwrap();
+    let c_atomic = crate::pipeline::test_compute_container(CS_TYPED_ATOMIC_ADD, &[uav0, uav1], 7);
+    let cs_atomic = shaders::translate(&c_atomic).unwrap();
+    assert!(crate::native::list::Binding::of(&cs_fmt).typed_buffers);
+    assert!(crate::native::list::Binding::of(&cs_atomic).typed_buffers);
+
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 4];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 4).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // BUFFER
+    // Entry 1: a raw UAV of 1024 dwords at `VA_A + 0x1000` (pool offset 0x2_1000).
+    let mut raw_out = [0u32; 16];
+    (raw_out[1], raw_out[4], raw_out[8]) = (1, 1024, 1);
+    [raw_out[10], raw_out[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x1000);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &raw_out, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    // Entry 0: a typed UAV of `format` over `VA_A` (pool offset 0x2_0000), first element 1.
+    let typed_view = |t: &Title<Metal>, format: u32| {
+        let mut view = [0u32; 16];
+        (view[0], view[1], view[2], view[4]) = (format, 1, 1, 8);
+        [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+        crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+        assert!(t.host.mirror(start).unwrap());
+    };
+    let run = |t: &mut Title<Metal>, cs: &HostShader, label: &str| {
+        let Pipe::Compute(pso) = t.compute_pipe(cs, label) else { panic!("{:?}", t.shaders) };
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        assert_eq!(t.shaders.refusals(), 0, "{label}: {:?}", t.shaders.refused);
+    };
+    let mut failures = Vec::new();
+    let mut check = |what: &str, got: Vec<u32>, want: Vec<u32>| {
+        if got != want {
+            failures.push(format!("{what}: {got:08x?}, want {want:08x?}"));
+        }
+    };
+
+    // R16_UINT (57): elements are the halves after byte 0x2_0000's first; element 0 of the view is
+    // 0x2222 (bytes 2-3), element 1 is 0x3333 (bytes 4-5).
+    f.put(0x2_0000, &[0x2222_1111u32, 0x4444_3333, 0x6666_5555, 0x8888_7777]);
+    f.put(0x2_1000, &[0u32; 16]);
+    f.put(0x2_1800, &[0x0000_ABCDu32, 0, 0, 1]);
+    typed_view(&t, 57);
+    run(&mut t, &cs_fmt, "R16_UINT at byte 2");
+    check("R16_UINT at byte 2: memory", f.get(0x2_0000, 4), vec![0x2222_1111, 0x4444_ABCD, 0x6666_5555, 0x8888_7777]);
+    check("R16_UINT at byte 2: element 1 loaded", f.get(0x2_1000, 1), vec![0xABCD]);
+    check("R16_UINT at byte 2: element 0 loaded", f.get(0x2_1020, 1), vec![0x2222]);
+
+    // R32G32_FLOAT (16): element 0 of the view is bytes 8-15, element 1 bytes 16-23.
+    let (e0, e1) = ([0.25f32, 4.0].map(f32::to_bits), [1.5f32, -2.0].map(f32::to_bits));
+    f.put(0x2_0000, &[0x1111_1111u32, 0x2222_2222, e0[0], e0[1], 0, 0, 0x7777_7777, 0x8888_8888]);
+    f.put(0x2_1000, &[0u32; 16]);
+    f.put(0x2_1800, &[e1[0], e1[1], 0, 0]);
+    typed_view(&t, 16);
+    run(&mut t, &cs_fmt, "R32G32_FLOAT at byte 8");
+    check(
+        "R32G32_FLOAT at byte 8: memory",
+        f.get(0x2_0000, 8),
+        vec![0x1111_1111, 0x2222_2222, e0[0], e0[1], e1[0], e1[1], 0x7777_7777, 0x8888_8888],
+    );
+    check("R32G32_FLOAT at byte 8: element 1 loaded", f.get(0x2_1000, 2), e1.to_vec());
+    check("R32G32_FLOAT at byte 8: element 0 loaded", f.get(0x2_1020, 2), e0.to_vec());
+
+    // R32_UINT (42): element 0 of the view is bytes 4-7 (10), element 1 bytes 8-11 (100).
+    f.put(0x2_0000, &[7u32, 10, 100, 1000]);
+    f.put(0x2_1000, &[0u32; 16]);
+    typed_view(&t, 42);
+    run(&mut t, &cs_atomic, "R32_UINT at byte 4");
+    check("R32_UINT at byte 4: memory after the add", f.get(0x2_0000, 4), vec![7, 10, 105, 1000]);
+    check("R32_UINT at byte 4: old value and element 1 loaded", f.get(0x2_1000, 2), vec![100, 105]);
+
+    // The same atomic through an aligned R32_UINT view (first element 0 at byte 0): the add and
+    // the typed load of the same element agree.
+    f.put(0x2_0000, &[7u32, 10, 100, 1000]);
+    f.put(0x2_1000, &[0u32; 16]);
+    let mut view = [0u32; 16];
+    (view[0], view[1], view[4]) = (42, 1, 8);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+    assert!(t.host.mirror(start).unwrap());
+    run(&mut t, &cs_atomic, "R32_UINT at byte 0");
+    check("R32_UINT at byte 0: memory after the add", f.get(0x2_0000, 4), vec![7, 15, 100, 1000]);
+    check("R32_UINT at byte 0: old value and element 1 loaded", f.get(0x2_1000, 2), vec![10, 15]);
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    drop(records);
+}
