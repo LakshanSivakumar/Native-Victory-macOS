@@ -874,9 +874,10 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
                 .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
         }
     };
-    // The pixel program's input enables, from the register image (pair 0).
+    // The pixel program's input enables and user SGPR count, from the register image (pair 0).
     let ps_input = piece(0).and_then(victory_shader::emit::graphics::ps_input_ena);
-    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input) {
+    let ps_user_sgprs = piece(0).and_then(victory_shader::emit::graphics::ps_user_sgprs);
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input, ps_user_sgprs) {
         Ok(c) => Ok(shader(name, &c)),
         Err(e) => {
             tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");

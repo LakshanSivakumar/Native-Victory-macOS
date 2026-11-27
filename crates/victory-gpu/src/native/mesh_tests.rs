@@ -832,7 +832,7 @@ fn exported_input(ena: u32, v: u32) -> Option<Vec<u32>> {
     let bytes: Vec<_> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
     let mut meta = [0; 0x10];
     meta[12] = 0x40;
-    let c = victory_shader::emit::graphics::container_with_inputs(HwStage::Ps, &bytes, &meta, Some(ena)).unwrap();
+    let c = victory_shader::emit::graphics::container_with_inputs(HwStage::Ps, &bytes, &meta, Some(ena), None).unwrap();
     let ms = translate(HwStage::Vs, TRIANGLE);
     let mut t = title()?;
     let state = Graphics::guess_base().for_draw(vec![Format::R32Uint], None, vec![], &[], false);
