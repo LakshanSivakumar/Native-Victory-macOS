@@ -3268,3 +3268,172 @@ fn a_saved_exec_mask_joined_with_data_names_the_host_lanes_case() {
         "{what}"
     );
 }
+
+#[test]
+fn host_lanes_waterfall_and_bfe_mask_joins_translate_while_divergent_jump_arms_stay_refused() {
+    // Wave32 pixel waterfall loop: `s6` starts as `v_cmp_gt_f32`, is read as a lane mask by
+    // `v_cndmask_b32`, and is peeled on the uniform back edge by `s_bitset0_b32(s6, s_ff1(s6))`.
+    let ps32_waterfall = [
+        0xD404_0006, 0x0002_0300, // v_cmp_gt_f32 s6, v0, v1
+        0x7E04_0280,              // v_mov_b32 v2, 0
+        // loop:
+        0x4A06_0481,              // v_add_nc_u32 v3, 1, v2
+        0xD501_0002, 0x001A_0702, // v_cndmask_b32 v2, v2, v3, s6
+        0xBE84_1306,              // s_ff1_i32_b32 s4, s6
+        0xBE86_1B04,              // s_bitset0_b32 s6, s4
+        0xBF07_8006,              // s_cmp_lg_u32 s6, 0
+        0xBF85_FFF9,              // s_cbranch_scc1 loop
+        0xF800_180F, 0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+        0xBF81_0000,              // s_endpgm
+    ];
+    lower_ps(&ps32_waterfall, false, vec![], vec![], 0, 0, vec![], false)
+        .unwrap_or_else(|e| panic!("ps32 waterfall: {e}"));
+
+    // Wave64 pixel waterfall loop (`s_ff1_i32_b64` + `s_bitset0_b64` + `s_cmp_lg_u64`).
+    let ps64_waterfall = [
+        0xD404_0006, 0x0002_0300, // v_cmp_gt_f32 s[6:7], v0, v1
+        0x7E04_0280,              // v_mov_b32 v2, 0
+        // loop:
+        0x4A06_0481,              // v_add_nc_u32 v3, 1, v2
+        0xD501_0002, 0x001A_0702, // v_cndmask_b32 v2, v2, v3, s[6:7]
+        0xBE84_1406,              // s_ff1_i32_b64 s4, s[6:7]
+        0xBE86_1C04,              // s_bitset0_b64 s[6:7], s4
+        0xBF13_8006,              // s_cmp_lg_u64 s[6:7], 0
+        0xBF85_FFF9,              // s_cbranch_scc1 loop
+        0xF800_180F, 0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+        0xBF81_0000,              // s_endpgm
+    ];
+    lower_ps(&ps64_waterfall, true, vec![], vec![], 0, 0, vec![], false)
+        .unwrap_or_else(|e| panic!("ps64 waterfall: {e}"));
+
+    // Uniform branch joining a `v_cmp` mask with 1-bit `s_bfe_i32` / `s_mul_i32` (wave32) and
+    // 1-bit `s_bfe_i64` / `s_bitreplicate_b64_b32` (wave64).
+    let ps32_bfe = [
+        0x7E08_0500,              // v_readfirstlane_b32 s4, v0
+        0xBF06_8004,              // s_cmp_eq_u32 s4, 0
+        0xBF84_0003,              // s_cbranch_scc0 else
+        0x9406_FF04, 0x0001_0002, // s_bfe_i32 s6, s4, 0x00010002 (offset 2, width 1)
+        0xBF82_0002,              // s_branch join
+        // else:
+        0xD404_0006, 0x0002_0300, // v_cmp_gt_f32 s6, v0, v1
+        // join:
+        0xD501_0001, 0x001A_0300, // v_cndmask_b32 v1, v0, v1, s6
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000,              // s_endpgm
+    ];
+    lower_ps(&ps32_bfe, false, vec![], vec![], 0, 0, vec![], false)
+        .unwrap_or_else(|e| panic!("ps32 s_bfe_i32: {e}"));
+
+    let ps64_bfe_and_replicate = |use_replicate: bool| {
+        let arm: [u32; 2] = if use_replicate {
+            [0xBE86_3BFF, 0x5555_5555] // s_bitreplicate_b64_b32 s[6:7], 0x55555555
+        } else {
+            [0x9506_FF04, 0x0001_0002] // s_bfe_i64 s[6:7], s[4:5], 0x00010002
+        };
+        [
+            0x7E08_0500,              // v_readfirstlane_b32 s4, v0
+            0xBE85_0380,              // s_mov_b32 s5, 0
+            0xBF06_8004,              // s_cmp_eq_u32 s4, 0
+            0xBF84_0003,              // s_cbranch_scc0 else
+            arm[0], arm[1],
+            0xBF82_0002,              // s_branch join
+            // else:
+            0xD404_0006, 0x0002_0300, // v_cmp_gt_f32 s[6:7], v0, v1
+            // join:
+            0xD501_0001, 0x001A_0300, // v_cndmask_b32 v1, v0, v1, s[6:7]
+            0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000,              // s_endpgm
+        ]
+    };
+    lower_ps(&ps64_bfe_and_replicate(false), true, vec![], vec![], 0, 0, vec![], false)
+        .unwrap_or_else(|e| panic!("ps64 s_bfe_i64: {e}"));
+    lower_ps(&ps64_bfe_and_replicate(true), true, vec![], vec![], 0, 0, vec![], false)
+        .unwrap_or_else(|e| panic!("ps64 s_bitreplicate_b64_b32: {e}"));
+
+    // Negative: two per-lane arms that both enter `join` by unconditional jumps (`s_branch` and
+    // fallthrough) are NOT host-wave-uniform and must stay refused on the host's lanes.
+    let divergent_jump_arms = [
+        0xD404_0001, 0x0002_0300, // v_cmp_gt_f32 s1, v0, v1
+        0xBE82_3C01,              // s_and_saveexec_b32 s2, s1
+        0xBF88_0003,              // s_cbranch_execz else
+        0xD401_0006, 0x0002_0300, // v_cmp_lt_f32 s6, v0, v1
+        0xBF82_0004,              // s_branch join
+        // else:
+        0x8A7E_7E02,              // s_andn2_b32 exec_lo, s2, exec_lo
+        0xBE84_137E,              // s_ff1_i32_b32 s4, exec_lo
+        0x8E06_0481,              // s_lshl_b32 s6, 1, s4
+        0xBF80_0000,              // s_nop 0
+        // join:
+        0xBEFE_0302,              // s_mov_b32 exec_lo, s2
+        0xD501_0001, 0x001A_0300, // v_cndmask_b32 v1, v0, v1, s6
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000,              // s_endpgm
+    ];
+    let err = lower_ps(&divergent_jump_arms, false, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("divergent jump arms must stay refused")
+        .to_string();
+    assert!(err.contains("data, on the host's lanes"), "{err}");
+}
+
+#[test]
+fn exec_skip_joins_read_only_by_v_cndmask_or_saveexec_translate_while_restored_exec_stays_refused() {
+    let ps_cndmask = |restore_before_read: bool| {
+        let mut w = vec![
+            0x7E0C_0500,              // v_readfirstlane_b32 s6, v0 (stale data on skip edge)
+            0xD404_0001, 0x0002_0300, // v_cmp_gt_f32 s1, v0, v1
+            0xD401_0003, 0x0002_0500, // v_cmp_lt_f32 s3, v0, v2 (overlaps ~s1)
+            0xBE82_3C01,              // s_and_saveexec_b32 s2, s1
+            0xBF88_0001,              // s_cbranch_execz join
+            0x8806_0301,              // s_or_b32 s6, s1, s3
+        ];
+        // join:
+        if restore_before_read {
+            w.push(0xBEFE_0302); // s_mov_b32 exec_lo, s2
+            w.extend([0xD501_0001, 0x001A_0300]); // v_cndmask_b32 v1, v0, v1, s6
+        } else {
+            w.extend([0xD501_0001, 0x001A_0300]); // v_cndmask_b32 v1, v0, v1, s6 (under EXEC = s1)
+            w.push(0xBEFE_0302); // s_mov_b32 exec_lo, s2
+        }
+        w.extend([0xF800_180F, 0x0101_0101, 0xBF81_0000]);
+        w
+    };
+    lower_ps(&ps_cndmask(false), false, vec![], vec![], 0, 0, vec![], false)
+        .unwrap_or_else(|e| panic!("v_cndmask under narrowed EXEC: {e}"));
+    let err = lower_ps(&ps_cndmask(true), false, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("restored EXEC exposes skip-edge data")
+        .to_string();
+    assert!(err.contains("data, on the host's lanes"), "{err}");
+
+    let ps_saveexec = |restore_before_read: bool| {
+        let mut w = vec![
+            0x7E0C_0500,              // v_readfirstlane_b32 s6, v0
+            0xD404_0001, 0x0002_0300, // v_cmp_gt_f32 s1, v0, v1
+            0xD401_0003, 0x0002_0500, // v_cmp_lt_f32 s3, v0, v2
+            0xBE82_3C01,              // s_and_saveexec_b32 s2, s1
+            0xBF88_0001,              // s_cbranch_execz join
+            0x8806_0301,              // s_or_b32 s6, s1, s3
+        ];
+        // join:
+        if restore_before_read {
+            w.push(0xBEFE_0302); // s_mov_b32 exec_lo, s2
+            w.push(0xBE84_3C06); // s_and_saveexec_b32 s4, s6 (exposes skip-edge s6!)
+            w.push(0x7E02_0302); // v_mov_b32 v1, v2
+            w.push(0xBEFE_0304); // s_mov_b32 exec_lo, s4
+        } else {
+            w.push(0xBE84_3C06); // s_and_saveexec_b32 s4, s6 (under EXEC = s1)
+            w.push(0x7E02_0302); // v_mov_b32 v1, v2
+            w.push(0xBEFE_0302); // s_mov_b32 exec_lo, s2
+        }
+        w.extend([0xF800_180F, 0x0101_0101, 0xBF81_0000]);
+        w
+    };
+    lower_ps(&ps_saveexec(false), false, vec![], vec![], 0, 0, vec![], false)
+        .unwrap_or_else(|e| panic!("s_and_saveexec under narrowed EXEC: {e}"));
+    let err = lower_ps(&ps_saveexec(true), false, vec![], vec![], 0, 0, vec![], false)
+        .err()
+        .expect("restored EXEC before s_and_saveexec exposes skip-edge data")
+        .to_string();
+    assert!(err.contains("data, on the host's lanes"), "{err}");
+}

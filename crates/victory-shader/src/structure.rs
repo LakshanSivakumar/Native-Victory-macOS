@@ -174,6 +174,11 @@ impl Bools {
         (v != TERMINAL).then(|| (self.atoms[v as usize], lo, hi))
     }
 
+    /// The positive literal of `atom`, if interned in this table.
+    pub fn literal(&self, atom: Atom) -> Option<Bool> {
+        Some(*self.unique.get(&(*self.ids.get(&atom)?, Bool::FALSE, Bool::TRUE))?)
+    }
+
     /// The atoms `b` depends on, in variable order.
     pub fn support(&self, b: Bool) -> Vec<Atom> {
         let mut vars = self.vars(b);

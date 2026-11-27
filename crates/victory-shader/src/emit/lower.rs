@@ -3574,6 +3574,38 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, keep, r, t)
     }
 
+    /// 64-bit signed bit-field extract (`s_bfe_i64`): `off` is masked to 6 bits, `width` >= 64
+    /// keeps all remaining bits.
+    fn bfe64(&mut self, a: V, off: V, width: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let (k63, k64, zero, one, ones) = (
+            self.s.m.int_const(i64t, 63),
+            self.s.m.int_const(i64t, 64),
+            self.s.m.int_const(i64t, 0),
+            self.s.m.int_const(i64t, 1),
+            self.s.m.int_const(i64t, -1),
+        );
+        let off = self.s.m.cast(c, Cast::ZExt, off, i64t);
+        let width = self.s.m.cast(c, Cast::ZExt, width, i64t);
+        let off = self.s.m.bin(c, Bin::And, off, k63);
+        let shifted = self.s.m.bin(c, Bin::AShr, a, off);
+        let full = self.s.m.cmp(c, pred::IUGE, width, k64);
+        let w = self.s.m.bin(c, Bin::And, width, k63);
+        let mask = self.s.m.bin(c, Bin::Shl, one, w);
+        let mask = self.s.m.bin(c, Bin::Sub, mask, one);
+        let mask = self.s.m.select(c, full, ones, mask);
+        let r = self.s.m.bin(c, Bin::And, shifted, mask);
+        let left = self.s.m.bin(c, Bin::Sub, k64, w);
+        let left = self.s.m.bin(c, Bin::And, left, k63);
+        let t = self.s.m.bin(c, Bin::Shl, r, left);
+        let t = self.s.m.bin(c, Bin::AShr, t, left);
+        let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
+        let keep = self.s.m.bin(c, Bin::Or, full, is0);
+        self.s.m.select(c, keep, r, t)
+    }
+
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
@@ -4061,6 +4093,17 @@ impl<'a> Lower<'a> {
                 src_ok && old_ok
             }
             "s_ashr_i32" => src.get(1).and_then(|&s| scalar_constant(s)) == Some(31),
+            "s_bfe_i32" => src
+                .get(1)
+                .and_then(|&s| scalar_constant(s))
+                .is_some_and(|imm| (imm >> 16 & 0x7F) == 1),
+            "s_mul_i32" => {
+                src.len() == 2
+                    && ((scalar_constant(src[0]) == Some(u32::MAX)
+                        && self.is_scalar_flag(def, src[1], depth - 1))
+                        || (scalar_constant(src[1]) == Some(u32::MAX)
+                            && self.is_scalar_flag(def, src[0], depth - 1)))
+            }
             "s_sub_i32" | "s_sub_u32" => {
                 src.first().and_then(|&s| scalar_constant(s)) == Some(0)
                     && src
@@ -4307,6 +4350,21 @@ impl<'a> Lower<'a> {
                 let want = if wave64 { 63 } else { 31 };
                 return src.get(1).and_then(|&s| scalar_constant(s)) == Some(want);
             }
+            if name == (if wave64 { "s_bfe_i64" } else { "s_bfe_i32" }) {
+                return src
+                    .get(1)
+                    .and_then(|&s| scalar_constant(s))
+                    .is_some_and(|imm| (imm >> 16 & 0x7F) == 1);
+            }
+            if wave64 && name == "s_bitreplicate_b64_b32" {
+                return match src.first().copied() {
+                    Some(op) if scalar_constant(op).is_some_and(|c| c.rotate_left(2) == c) => true,
+                    Some(Operand::Scalar { code, .. }) if code != NULL => lo_inst
+                        .read(Reg::S(code))
+                        .is_some_and(|v| self.is_uniform_bitmask32(v, 8)),
+                    _ => false,
+                };
+            }
             if !wave64 {
                 match name {
                     "s_movk_i32" => {
@@ -4320,6 +4378,13 @@ impl<'a> Lower<'a> {
                             imm.map(|x| i32::from(x as i16) as u32),
                             Some(0 | u32::MAX)
                         ) && dst.is_some_and(|d| op_mask(lo_inst, d, visited));
+                    }
+                    "s_mul_i32" => {
+                        return src.len() == 2
+                            && ((scalar_constant(src[0]) == Some(u32::MAX)
+                                && self.is_scalar_flag(lo_inst, src[1], 8))
+                                || (scalar_constant(src[1]) == Some(u32::MAX)
+                                    && self.is_scalar_flag(lo_inst, src[0], 8)));
                     }
                     "s_sub_u32" | "s_sub_i32" => {
                         // `0 - mask`, `0 - flag`, or `mask - 1`.
@@ -6045,6 +6110,26 @@ impl<'a> Lower<'a> {
                     };
                     self.set(lo, Val::I32(rlo));
                     self.set(hi, Val::I32(rhi));
+                    Ok(())
+                }
+                "s_bfe_i64" => {
+                    let (a, ah, b) = (half(self, 0, 0)?, half(self, 0, 1)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let ah = self.s.m.cast(c, Cast::ZExt, ah, i64t);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let ah = self.s.m.bin(c, Bin::Shl, ah, k32);
+                    let a = self.s.m.bin(c, Bin::Or, a, ah);
+                    let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
+                    let w = self.s.m.bin(c, Bin::LShr, b, k16);
+                    let w = self.s.m.bin(c, Bin::And, w, k127);
+                    let r = self.bfe64(a, b, w);
+                    let (rl, rh) = self.split64(r);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    let s = nonzero(self, rl, rh);
+                    self.set(scc, Val::Bit(s));
                     Ok(())
                 }
                 _ => Err(name),
@@ -11533,15 +11618,62 @@ impl<'a> Lower<'a> {
             let mut on_cycle = |x: usize| -> bool {
                 *cycle_cache[x].get_or_insert_with(|| self.on_cycle(x))
             };
-            // What reading a joined mask keeps: `Some(true)` the lanes of EXEC (an AND, a NAND, or
-            // `s_orn2` by EXEC), `Some(false)` the others (`s_andn2` by EXEC), `None` anything else.
-            let keeps_exec_read = |inst: &Inst| -> Option<bool> {
-                let by_exec = matches!(&inst.fields, Fields::Sop { src, .. }
-                    if matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })));
+            // What reading a joined mask keeps: `Some(true)` the lanes of EXEC (an AND, a NAND,
+            // `s_orn2` by EXEC, `s_{and,nand,andn1,orn2}_{saveexec,wrexec}`, or `v_cndmask_b32`),
+            // `Some(false)` the others (`s_andn2` by EXEC, `s_nor` with EXEC, or
+            // `s_{andn2,nor,orn1}_{saveexec,wrexec}`), `None` anything else.
+            let keeps_exec_read = |inst: &Inst, reg: Reg| -> Option<bool> {
+                if matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                    return None;
+                }
+                if let Fields::Valu(v) = &inst.fields {
+                    return (inst.name() == "v_cndmask_b32" && v.dpp.is_none() && v.sdwa.is_none())
+                        .then_some(true);
+                }
+                let is_exec = |op: Option<&Operand>| {
+                    matches!(op, Some(Operand::Scalar { code: EXEC, .. }))
+                };
+                let (s0, s1) = match &inst.fields {
+                    Fields::Sop { src, .. } => (is_exec(src.first()), is_exec(src.get(1))),
+                    _ => (false, false),
+                };
                 match inst.name() {
-                    "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" => Some(true),
-                    "s_orn2_b32" | "s_orn2_b64" if by_exec => Some(true),
-                    "s_andn2_b32" | "s_andn2_b64" if by_exec => Some(false),
+                    "s_and_b32" | "s_and_b64" | "s_nand_b32" | "s_nand_b64" if s0 || s1 => {
+                        Some(true)
+                    }
+                    "s_nor_b32" | "s_nor_b64" if s0 || s1 => Some(false),
+                    "s_orn2_b32" | "s_orn2_b64" if s1 => Some(true),
+                    "s_orn2_b32" | "s_orn2_b64" if s0 => Some(false),
+                    "s_andn2_b32" | "s_andn2_b64" if s1 => Some(false),
+                    "s_andn2_b32" | "s_andn2_b64" if s0 => Some(true),
+                    "s_and_saveexec_b32"
+                    | "s_and_saveexec_b64"
+                    | "s_and_wrexec_b32"
+                    | "s_and_wrexec_b64"
+                    | "s_nand_saveexec_b32"
+                    | "s_nand_saveexec_b64"
+                    | "s_nand_wrexec_b32"
+                    | "s_nand_wrexec_b64"
+                    | "s_andn1_saveexec_b32"
+                    | "s_andn1_saveexec_b64"
+                    | "s_andn1_wrexec_b32"
+                    | "s_andn1_wrexec_b64"
+                    | "s_orn2_saveexec_b32"
+                    | "s_orn2_saveexec_b64"
+                    | "s_orn2_wrexec_b32"
+                    | "s_orn2_wrexec_b64" => Some(true),
+                    "s_andn2_saveexec_b32"
+                    | "s_andn2_saveexec_b64"
+                    | "s_andn2_wrexec_b32"
+                    | "s_andn2_wrexec_b64"
+                    | "s_nor_saveexec_b32"
+                    | "s_nor_saveexec_b64"
+                    | "s_nor_wrexec_b32"
+                    | "s_nor_wrexec_b64"
+                    | "s_orn1_saveexec_b32"
+                    | "s_orn1_saveexec_b64"
+                    | "s_orn1_wrexec_b32"
+                    | "s_orn1_wrexec_b64" => Some(false),
                     _ => None,
                 }
             };
@@ -11577,7 +11709,9 @@ impl<'a> Lower<'a> {
                         let inst = &p.blocks[bb].insts[i];
                         // The lanes whose bits of the join the result keeps: EXEC's, or
                         // (`s_andn2` by EXEC) the others.
-                        let Some(keeps_exec) = keeps_exec_read(inst) else { return false };
+                        let Some(keeps_exec) = keeps_exec_read(inst, phi.reg) else {
+                            return false;
+                        };
                         // In another block the edge's lanes are the same lanes only where
                         // neither block runs again (the else part of an if, further down).
                         let Some(exec) = inst
@@ -11648,7 +11782,7 @@ impl<'a> Lower<'a> {
                     && rd.iter().all(|&(bb, ii)| {
                         let inst = &p.blocks[bb].insts[ii];
                         bb == e
-                            && keeps_exec_read(inst) == Some(true)
+                            && keeps_exec_read(inst, p.blocks[e].phis[i].reg) == Some(true)
                             && inst.read(Reg::S(EXEC)).is_some_and(|x| {
                                 let y = self
                                     .phi_at
@@ -11731,6 +11865,63 @@ impl<'a> Lower<'a> {
                     .all(|a| matches!(a, Atom::Uniform(v) if uniform_scc(*v))),
                 _ => true,
             })
+    }
+
+    /// Whether every lane that reaches IR block `b` enters it along the same
+    /// incoming edge as the rest of its host wave: every branch on an incoming
+    /// predecessor is uniform (`uniform_join`), and under every assignment to
+    /// the host-wave-uniform SCC atoms (`uniform_scc`), no reachable incoming
+    /// edge can be taken by some lanes at `b` while skipped by others.
+    fn host_uniform_join(&self, b: usize, uniform_scc: impl Fn(Value) -> bool) -> bool {
+        if !self.uniform_join(b, &uniform_scc) {
+            return false;
+        }
+        let st = self.x.st;
+        let reach_b = st.reach[b];
+        for &q in &self.x.p.blocks[b].preds {
+            if self.block[q].is_none() || self.never_taken(q, b) {
+                continue;
+            }
+            let edge = self.lane_edge(q, b);
+            let mut uniforms = Vec::new();
+            for &(f, _) in std::iter::once(&(reach_b, true)).chain(&edge) {
+                for a in st.bools.support(f) {
+                    if let Atom::Uniform(v) = a {
+                        if !uniform_scc(v) {
+                            return false;
+                        }
+                        if let Some(u) = st.bools.literal(a)
+                            && !uniforms.contains(&u)
+                        {
+                            uniforms.push(u);
+                        }
+                    }
+                }
+            }
+            if uniforms.len() > 6 {
+                return false;
+            }
+            for bits in 0..(1u32 << uniforms.len()) {
+                let mut base = Vec::with_capacity(1 + uniforms.len() + edge.len());
+                base.push((reach_b, true));
+                for (k, &u) in uniforms.iter().enumerate() {
+                    base.push((u, bits >> k & 1 != 0));
+                }
+                let mut taken = base.clone();
+                taken.extend_from_slice(&edge);
+                if !st.bools.meet(&taken) {
+                    continue;
+                }
+                for &(ef, es) in &edge {
+                    let mut missed = base.clone();
+                    missed.push((ef, !es));
+                    if st.bools.meet(&missed) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Whether no lane goes from IR block `q` to `b`.
@@ -15436,19 +15627,29 @@ impl<'a> Lower<'a> {
             // single block, the whole wave brings either its mask or the scalar
             // data. Two unconditional jumps from separate arms prove no such thing.
             let preds = &p.blocks[b].preds;
+            let has_mask_pair = phi.args.iter().enumerate().any(|(n, &lo)| {
+                self.x.st.mask_bits(lo, high.map(|h| h.args[n])).is_some()
+            });
             let mesh_branch = self.s.mesh.is_some()
                 && matches!(preds.as_slice(), &[a, c] if a != b && c != b
                     && (p.blocks[a].preds == [c] || p.blocks[c].preds == [a]))
-                && phi.args.iter().enumerate().any(|(n, &lo)| {
-                    self.x.st.mask_bits(lo, high.map(|h| h.args[n])).is_some()
-                });
+                && has_mask_pair;
             let uniform = self.uniform_join(b, |_| true);
-            let mesh_number = uniform && mesh_branch && {
+            let mesh_number = uniform && self.s.mesh.is_some() && has_mask_pair && {
                 // Each host half can read a different first lane.
                 let split = mesh_split.get_or_insert_with(|| split_scc(p, &Set::default()));
                 !split.contains(&phi.value)
                     && high.is_none_or(|h| !split.contains(&h.value))
-                    && self.uniform_join(b, |scc| !split.contains(&scc))
+                    && ((mesh_branch && self.uniform_join(b, |scc| !split.contains(&scc)))
+                        || self.host_uniform_join(b, |scc| !split.contains(&scc)))
+            };
+            let host_uniform = self.mask_data == MaskData::Host && {
+                let split_wave = self.x.native.wave64 && self.x.wave32_host;
+                let split = mesh_split.get_or_insert_with(|| split_scc(p, &Set::default()));
+                (!split_wave
+                    || (!split.contains(&phi.value)
+                        && high.is_none_or(|h| !split.contains(&h.value))))
+                    && self.host_uniform_join(b, |scc| !split_wave || !split.contains(&scc))
             };
             let number = self.console_lanes && uniform || mesh_number;
             let mut incoming = Vec::new();
@@ -15478,6 +15679,13 @@ impl<'a> Lower<'a> {
                 } else {
                     self.x.st.masks.get(&arg).copied()
                 };
+                let host_number = !number
+                    && host_uniform
+                    && self.is_host_wave_mask(
+                        arg,
+                        high.map(|h| h.args[n]),
+                        &mut Set::default(),
+                    );
                 let x = match (mask, self.vals.get(&arg)) {
                     (Some(m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
                     // Read only ANDed with an EXEC those lanes are not in, or not read at all
@@ -15486,7 +15694,7 @@ impl<'a> Lower<'a> {
                     (None, _) if self.unneeded_edges().contains(&(phi.value, n)) => {
                         self.s.m.bool(false)
                     }
-                    (None, Some(&Val::I32(word))) if number => {
+                    (None, Some(&Val::I32(word))) if number || host_number => {
                         let hi = if self.x.native.wave64 {
                             match high.and_then(|h| self.vals.get(&h.args[n])) {
                                 Some(&Val::I32(hi)) => Some(hi),
@@ -15494,6 +15702,11 @@ impl<'a> Lower<'a> {
                             }
                         } else {
                             None
+                        };
+                        let hi = if host_number && self.x.wave32_host {
+                            None
+                        } else {
+                            hi
                         };
                         self.lane_bit(qb, word, hi)
                     }
