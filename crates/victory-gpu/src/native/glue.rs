@@ -1358,6 +1358,36 @@ pub(crate) fn log_draw_counts(frame: u64) {
     super::descriptor_trace::log(frame);
 }
 
+/// The frame log's line of pipeline counters, at every present whose counters moved
+/// (`VICTORY_TRACE_PIPELINES=1`): pipelines made, put off for their compiles, and served from the
+/// library cache, each cumulative. The 64-frame `native draws so far` line has no pipeline
+/// counters, and a crash storm puts pipelines off frame by frame, so counting them needs this
+/// resolution. Off, it costs one read of the switch: the title lock is taken only when it is on,
+/// and the present's thread holds nothing else by then, so the read is a lock that is almost never
+/// contended and copies no data. A frame whose counters did not move writes nothing.
+#[inline(never)]
+pub(crate) fn log_pipeline_counts(frame: u64) {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*TRACE.get_or_init(|| {
+        std::env::var_os("VICTORY_TRACE_PIPELINES").is_some_and(|v| !v.is_empty() && v != "0")
+    }) {
+        return;
+    }
+    let Some((made, put_off, cached)) =
+        with_title(|t| (t.shaders.pipelines, t.shaders.put_off, t.shaders.cached))
+    else {
+        return;
+    };
+    /// The counters as last logged.
+    static LAST: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if (made, put_off, cached) == *last {
+        return;
+    }
+    *last = (made, put_off, cached);
+    tracing::info!(frame, made, put_off, cached, "native pipelines so far");
+}
+
 /// A title pipeline object's host pipeline: its shaders translated for the host, then converted.
 /// The second result says the pipeline depends on the draw's targets.
 fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<Metal>, bool) {
