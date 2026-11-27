@@ -298,6 +298,8 @@ struct Lower<'a> {
     lane_bits: Map<Value, V>,
     /// IR phi location by value.
     phi_at: Map<Value, (usize, usize)>,
+    /// Lazy map of scalar copy destinations (`s_mov_b32`/`s_mov_b64` and `restored`) to source values.
+    scalar_copies: std::cell::OnceCell<Map<Value, Value>>,
     mask_phis: Map<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     /// [`Lower::unneeded_edges`], made at the first join that asks.
@@ -1130,6 +1132,7 @@ impl<'a> Lower<'a> {
             bools: Map::default(),
             lane_bits: Map::default(),
             phi_at,
+            scalar_copies: std::cell::OnceCell::new(),
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
             unneeded: std::cell::OnceCell::new(),
@@ -2531,7 +2534,7 @@ impl<'a> Lower<'a> {
             return;
         };
         let inst = &self.x.p.blocks[b].insts[i];
-        let kind = self.read_kind(inst);
+        let kind = self.read_kind(b, i, inst);
         let facts = match kind {
             ReadKind::Lane => {
                 let mut f = vec![(reach, true)];
@@ -2552,7 +2555,7 @@ impl<'a> Lower<'a> {
         });
     }
 
-    fn read_kind(&self, inst: &Inst) -> ReadKind {
+    fn read_kind(&self, b: usize, i: usize, inst: &Inst) -> ReadKind {
         let name = inst.name();
         if let Fields::Valu(v) = &inst.fields {
             if let Some(dpp) = v.dpp {
@@ -2563,10 +2566,23 @@ impl<'a> Lower<'a> {
                     ReadKind::Wave
                 };
             }
-            if name.starts_with("v_readfirstlane")
-                || name.starts_with("v_readlane")
-                || name.starts_with("v_permlane")
-            {
+            if name == "v_readfirstlane_b32" {
+                if inst
+                    .writes
+                    .first()
+                    .is_some_and(|w| self.waterfall_reads.contains(&w.1))
+                {
+                    return ReadKind::Lane;
+                }
+                // Guess: `v_readfirstlane_b32` reads lane 0 on RDNA when EXEC == 0,
+                // so outside pixel shaders a proved-nonzero EXEC guarantees an
+                // active lane (matching its console source lane) is read.
+                if !self.s.pixel && self.exec_nonzero_at(b, i, inst) {
+                    return ReadKind::Lane;
+                }
+                return ReadKind::Wave;
+            }
+            if name.starts_with("v_readlane") || name.starts_with("v_permlane") {
                 return ReadKind::Wave;
             }
         }
@@ -2594,6 +2610,201 @@ impl<'a> Lower<'a> {
             return ReadKind::Quad;
         }
         ReadKind::Lane
+    }
+
+    fn scalar_copy_map(&self) -> &Map<Value, Value> {
+        self.scalar_copies.get_or_init(|| {
+            let mut m = self.x.st.restored.clone();
+            for block in &self.x.p.blocks {
+                for inst in &block.insts {
+                    let Fields::Sop {
+                        dst: Some(Operand::Scalar { code: dcode, .. }),
+                        src,
+                        ..
+                    } = &inst.fields
+                    else {
+                        continue;
+                    };
+                    let Some(&Operand::Scalar { code: scode, .. }) = src.first() else {
+                        continue;
+                    };
+                    let halves: &[u8] = match inst.name() {
+                        "s_mov_b32" => &[0],
+                        "s_mov_b64" => &[0, 1],
+                        _ => continue,
+                    };
+                    for &h in halves {
+                        if let (Some(d), Some(s)) = (
+                            inst.write(Reg::S(*dcode + h)),
+                            inst.read(Reg::S(scode + h)),
+                        ) {
+                            m.insert(d, s);
+                        }
+                    }
+                }
+            }
+            m
+        })
+    }
+
+    fn unwrap_scalar_copy(&self, mut v: Value) -> Value {
+        let copies = self.scalar_copy_map();
+        for _ in 0..16 {
+            let Some(&src) = copies.get(&v) else {
+                break;
+            };
+            if src == v {
+                break;
+            }
+            v = src;
+        }
+        v
+    }
+
+    /// Whether EXEC at `(b, i)` is guaranteed nonzero by a dominating `execz`/`execnz`
+    /// check of the same lane mask (or identical scalar EXEC value, including loop-invariant EXEC phis).
+    fn exec_nonzero_at(&self, b: usize, i: usize, inst: &Inst) -> bool {
+        let p = self.x.p;
+        let Some(exec_lo) = inst.read(Reg::S(EXEC)) else {
+            return false;
+        };
+        let exec_hi = if p.wave64 {
+            let Some(hi) = inst.read(Reg::S(EXEC + 1)) else {
+                return false;
+            };
+            Some(hi)
+        } else {
+            None
+        };
+        let target = self.x.st.guards[b][i].unwrap_or(self.x.st.reach[b]);
+        let tracked_exec = self.x.st.mask_bits(exec_lo, exec_hi);
+        let mask_matches = |blo: Value, bhi: Option<Value>| {
+            (self.x.st.guards[b][i].is_some() || tracked_exec.is_some())
+                && self
+                    .x
+                    .st
+                    .mask_bits(blo, bhi)
+                    .is_some_and(|m| m == target || tracked_exec == Some(m))
+        };
+
+        let mut cur = b;
+        let mut cur_lo = self.unwrap_scalar_copy(exec_lo);
+        let mut cur_hi = exec_hi.map(|h| self.unwrap_scalar_copy(h));
+        for _ in 0..16 {
+            let (q, next_lo, next_hi) = match &p.blocks[cur].preds[..] {
+                &[q] => (q, cur_lo, cur_hi),
+                preds => {
+                    let Some(&(pb_lo, pi_lo)) = self.phi_at.get(&cur_lo) else {
+                        break;
+                    };
+                    if pb_lo != cur {
+                        break;
+                    }
+                    let phi_lo = &p.blocks[cur].phis[pi_lo];
+                    let phi_hi = match cur_hi {
+                        Some(hi) => {
+                            let Some(&(pb_hi, pi_hi)) = self.phi_at.get(&hi) else {
+                                break;
+                            };
+                            if pb_hi != cur {
+                                break;
+                            }
+                            Some((hi, &p.blocks[cur].phis[pi_hi]))
+                        }
+                        None => None,
+                    };
+                    let mut entry: Option<(usize, usize)> = None;
+                    let mut valid = true;
+                    for (k, &pred) in preds.iter().enumerate() {
+                        if self.rpo[pred] == usize::MAX {
+                            continue;
+                        }
+                        if self.rpo[pred] < self.rpo[cur] && self.tail[pred].is_some() {
+                            if entry.is_some() {
+                                valid = false;
+                                break;
+                            }
+                            entry = Some((k, pred));
+                        } else {
+                            let same_lo = self.unwrap_scalar_copy(phi_lo.args[k]) == cur_lo;
+                            let same_hi = phi_hi.is_none_or(|(hi, ph)| {
+                                self.unwrap_scalar_copy(ph.args[k]) == hi
+                            });
+                            if !(same_lo && same_hi) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some((fk, fq)) = entry.filter(|_| valid) else {
+                        break;
+                    };
+                    let nlo = self.unwrap_scalar_copy(phi_lo.args[fk]);
+                    let nhi = phi_hi.map(|(_, ph)| self.unwrap_scalar_copy(ph.args[fk]));
+                    (fq, nlo, nhi)
+                }
+            };
+            if self.tail[q].is_none() || self.rpo[q] >= self.rpo[cur] {
+                break;
+            }
+            if let Exit::Branch { taken, not_taken } = p.blocks[q].exit
+                && taken != not_taken
+            {
+                let insts = &p.blocks[q].insts;
+                let branch_read = |ins: &Inst| -> Option<(Value, Option<Value>)> {
+                    let lo = ins.read(Reg::S(EXEC))?;
+                    let hi = if p.wave64 {
+                        Some(ins.read(Reg::S(EXEC + 1))?)
+                    } else {
+                        None
+                    };
+                    Some((lo, hi))
+                };
+                let exec_of_branch = match &insts[..] {
+                    [.., last] if last.name() == "s_cbranch_execz" && not_taken == cur => {
+                        branch_read(last)
+                    }
+                    [.., last] if last.name() == "s_cbranch_execnz" && taken == cur => {
+                        branch_read(last)
+                    }
+                    [.., cmp, branch]
+                        if branch.write(Reg::Scc).is_none()
+                            && cmp.write(Reg::Scc).is_some()
+                            && branch.read(Reg::Scc) == cmp.write(Reg::Scc)
+                            && matches!(&cmp.fields, Fields::Sop { src, .. }
+                                if src.get(1).copied().and_then(scalar_constant) == Some(0))
+                            && matches!(
+                                (cmp.name(), p.wave64, branch.name(), taken == cur, not_taken == cur),
+                                ("s_cmp_eq_u64", _, "s_cbranch_scc1", false, true)
+                                    | ("s_cmp_eq_u32", false, "s_cbranch_scc1", false, true)
+                                    | ("s_cmp_lg_u64", _, "s_cbranch_scc0", false, true)
+                                    | ("s_cmp_lg_u32", false, "s_cbranch_scc0", false, true)
+                                    | ("s_cmp_lg_u64", _, "s_cbranch_scc1", true, false)
+                                    | ("s_cmp_lg_u32", false, "s_cbranch_scc1", true, false)
+                                    | ("s_cmp_eq_u64", _, "s_cbranch_scc0", true, false)
+                                    | ("s_cmp_eq_u32", false, "s_cbranch_scc0", true, false)
+                            ) =>
+                    {
+                        branch_read(cmp)
+                    }
+                    _ => None,
+                };
+                if let Some((blo, bhi)) = exec_of_branch {
+                    let ublo = self.unwrap_scalar_copy(blo);
+                    let ubhi = bhi.map(|h| self.unwrap_scalar_copy(h));
+                    if (ublo, ubhi) == (next_lo, next_hi)
+                        || mask_matches(blo, bhi)
+                        || mask_matches(ublo, ubhi)
+                    {
+                        return true;
+                    }
+                }
+            }
+            cur = q;
+            cur_lo = next_lo;
+            cur_hi = next_hi;
+        }
+        false
     }
 
     fn quad_facts(&self, b: usize, i: usize) -> Vec<(Bool, bool)> {
@@ -2625,10 +2836,11 @@ impl<'a> Lower<'a> {
 
     fn get_val(&mut self, v: Value, genuine: bool) -> Result<Val, Why> {
         if genuine {
-            if self.phi_at.contains_key(&v) {
+            let is_phi = self.phi_at.contains_key(&v);
+            if is_phi {
                 self.read_phis.insert(v);
             }
-            if self.kept_writes.contains_key(&v) {
+            if is_phi || self.kept_writes.contains_key(&v) {
                 self.record_kept_read(v);
             }
         }
@@ -14867,90 +15079,18 @@ impl<'a> Lower<'a> {
         // phi, each compared with all before it, and never finished.
         const MAX_PATHS: usize = 64;
         let (p, st) = (self.x.p, &self.x.st);
-        let uses = (!self.kept_reads.is_empty() && self.s.pixel).then(|| self.build_uses());
-
-        let mut phi_seeds: Vec<(Value, Vec<(Bool, bool)>)> =
-            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
-        for read in &self.kept_reads {
-            let mut seen_kept: Map<Value, Vec<Vec<(Bool, bool)>>> = Map::default();
-            let mut kept_work = vec![(read.val, read.facts.clone())];
-            let helper_site = (!read.cross_lane && self.s.pixel)
-                .then(|| read.inst.map(|i| (read.block, i)))
-                .flatten();
-            while let Some((v, known)) = kept_work.pop() {
-                if let Some(kw) = self.kept_writes.get(&v) {
-                    let mut combined = known.clone();
-                    if kw.reach != Bool::TRUE {
-                        combined.push((kw.reach, true));
-                    }
-                    if let Some(g) = kw.guard {
-                        combined.push((g, false));
-                    }
-                    combined.drain(..combined.len().saturating_sub(MAX_KNOWN));
-                    if !st.bools.meet(&combined) {
-                        continue;
-                    }
-                    if let (Some(site), Some(u)) = (helper_site, uses.as_ref())
-                        && self.safe_wqm_helper_read(site, &combined, u)
-                    {
-                        continue;
-                    }
-                    let done = seen_kept.entry(v).or_default();
-                    if done.iter().any(|d| d.iter().all(|c| combined.contains(c))) {
-                        continue;
-                    }
-                    let next = if done.len() < MAX_PATHS {
-                        combined
-                    } else {
-                        Vec::new()
-                    };
-                    done.push(next.clone());
-                    if let Some((offset, why)) = kw.missing {
-                        return Err(unsupported(offset, why));
-                    }
-                    kept_work.push((kw.old, next));
-                } else if self.phi_at.contains_key(&v) {
-                    phi_seeds.push((v, known));
-                }
-            }
-        }
-
-        let mut work = phi_seeds;
         let mut live = Set::default();
-        let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
-        while let Some((v, known)) = work.pop() {
-            if let Some(kw) = self.kept_writes.get(&v) {
-                let mut combined = known;
-                if kw.reach != Bool::TRUE {
-                    combined.push((kw.reach, true));
-                }
-                if let Some(g) = kw.guard {
-                    combined.push((g, false));
-                }
-                combined.drain(..combined.len().saturating_sub(MAX_KNOWN));
-                if !st.bools.meet(&combined) {
-                    continue;
-                }
-                let done = seen.entry(v).or_default();
-                if done.iter().any(|d| d.iter().all(|c| combined.contains(c))) {
-                    continue;
-                }
-                let next = if done.len() < MAX_PATHS {
-                    combined
-                } else {
-                    Vec::new()
-                };
-                done.push(next.clone());
-                if let Some((offset, why)) = kw.missing {
-                    return Err(unsupported(offset, why));
-                }
-                work.push((kw.old, next));
-                continue;
-            }
+
+        // Keep `main`'s exact `live_edges` over `read_phis` so programs without
+        // reached `kept_writes` lower identically.
+        let mut phi_work: Vec<(Value, Vec<(Bool, bool)>)> =
+            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        let mut phi_seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
+        while let Some((v, known)) = phi_work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
-            let done = seen.entry(v).or_default();
+            let done = phi_seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
             if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
                 continue;
@@ -14985,8 +15125,173 @@ impl<'a> Lower<'a> {
                 }
                 live.insert((v, n));
                 let arg = p.blocks[b].phis[i].args[n];
+                if self.phi_at.contains_key(&arg) {
+                    phi_work.push((arg, k));
+                }
+            }
+        }
+
+        if self.kept_writes.is_empty() || self.kept_reads.is_empty() {
+            return Ok(live);
+        }
+
+        // Only `kept_reads` whose value can backward-reach a `kept_writes` entry
+        // through `kept_writes` / `phi` chains need checking.
+        let mut reaches_kept: Set<Value> = self.kept_writes.keys().copied().collect();
+        let mut rev_kw: Map<Value, Vec<Value>> = Map::default();
+        for (&new, kw) in &self.kept_writes {
+            rev_kw.entry(kw.old).or_default().push(new);
+        }
+        let mut rev_phi: Map<Value, Vec<Value>> = Map::default();
+        for block in &p.blocks {
+            for phi in &block.phis {
+                for &arg in &phi.args {
+                    if arg != phi.value {
+                        rev_phi.entry(arg).or_default().push(phi.value);
+                    }
+                }
+            }
+        }
+        let mut fwd: Vec<Value> = reaches_kept.iter().copied().collect();
+        while let Some(v) = fwd.pop() {
+            for next in rev_kw.get(&v).into_iter().flatten().chain(rev_phi.get(&v).into_iter().flatten()) {
+                if reaches_kept.insert(*next) {
+                    fwd.push(*next);
+                }
+            }
+        }
+
+        let uses = self.s.pixel.then(|| self.build_uses());
+        let push_fact = |facts: &mut Vec<(Bool, bool)>, pair: (Bool, bool)| {
+            if !facts.contains(&pair) {
+                facts.push(pair);
+            }
+        };
+
+        struct KeptWork {
+            v: Value,
+            known: Vec<(Bool, bool)>,
+            helper_site: Option<(usize, usize)>,
+            through_kept: bool,
+        }
+
+        let mut work = Vec::new();
+        for read in &self.kept_reads {
+            if !reaches_kept.contains(&read.val) {
+                continue;
+            }
+            let helper_site = (!read.cross_lane && self.s.pixel)
+                .then(|| read.inst.map(|i| (read.block, i)))
+                .flatten();
+            work.push(KeptWork {
+                v: read.val,
+                known: read.facts.clone(),
+                helper_site,
+                through_kept: false,
+            });
+        }
+
+        type KeptKey = (Value, bool, Option<(usize, usize)>);
+        type FactSet = Vec<(Bool, bool)>;
+        let mut seen: Map<KeptKey, Vec<FactSet>> = Map::default();
+        while let Some(item) = work.pop() {
+            let KeptWork {
+                v,
+                known,
+                helper_site,
+                through_kept,
+            } = item;
+            if let Some(kw) = self.kept_writes.get(&v) {
+                let mut combined = known;
+                if kw.reach != Bool::TRUE {
+                    push_fact(&mut combined, (kw.reach, true));
+                }
+                if let Some(g) = kw.guard {
+                    push_fact(&mut combined, (g, false));
+                }
+                combined.drain(..combined.len().saturating_sub(MAX_KNOWN));
+                if !st.bools.meet(&combined) {
+                    continue;
+                }
+                if let (Some(site), Some(u)) = (helper_site, uses.as_ref())
+                    && self.safe_wqm_helper_read(site, &combined, u)
+                {
+                    continue;
+                }
+                let done = seen.entry((v, through_kept, helper_site)).or_default();
+                if done.iter().any(|d| d.iter().all(|c| combined.contains(c))) {
+                    continue;
+                }
+                let next = if done.len() < MAX_PATHS {
+                    combined
+                } else {
+                    Vec::new()
+                };
+                done.push(next.clone());
+                if let Some((offset, why)) = kw.missing {
+                    return Err(unsupported(offset, why));
+                }
+                work.push(KeptWork {
+                    v: kw.old,
+                    known: next,
+                    helper_site,
+                    through_kept: true,
+                });
+                continue;
+            }
+            let Some(&(b, i)) = self.phi_at.get(&v) else {
+                continue;
+            };
+            let done = seen.entry((v, through_kept, helper_site)).or_default();
+            if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
+                continue;
+            }
+            let known = if done.len() < MAX_PATHS { known } else { Vec::new() };
+            done.push(known.clone());
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.tail[q].is_none() {
+                    continue;
+                }
+                let mut k = Vec::new();
+                if let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = st.exits[q]
+                    && taken != not_taken
+                    && self.rpo[taken] > self.rpo[q]
+                    && self.rpo[not_taken] > self.rpo[q]
+                {
+                    k.clone_from(&known);
+                    push_fact(&mut k, (when, taken == b));
+                    if st.reach[q] != Bool::TRUE {
+                        push_fact(&mut k, (st.reach[q], true));
+                    }
+                    k.drain(..k.len().saturating_sub(MAX_KNOWN));
+                    if !st.bools.meet(&k) {
+                        continue;
+                    }
+                } else if self.rpo[q] < self.rpo[b] {
+                    k.clone_from(&known);
+                    if st.reach[q] != Bool::TRUE {
+                        push_fact(&mut k, (st.reach[q], true));
+                        k.drain(..k.len().saturating_sub(MAX_KNOWN));
+                        if !st.bools.meet(&k) {
+                            continue;
+                        }
+                    }
+                }
+                if through_kept {
+                    live.insert((v, n));
+                }
+                let arg = p.blocks[b].phis[i].args[n];
                 if self.phi_at.contains_key(&arg) || self.kept_writes.contains_key(&arg) {
-                    work.push((arg, k));
+                    work.push(KeptWork {
+                        v: arg,
+                        known: k,
+                        helper_site,
+                        through_kept,
+                    });
                 }
             }
         }
@@ -15028,7 +15333,7 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         let st = &self.x.st;
         let start = &p.blocks[site.0].insts[site.1];
-        if start.writes.is_empty() || self.read_kind(start) != ReadKind::Lane {
+        if start.writes.is_empty() || self.read_kind(site.0, site.1, start) != ReadKind::Lane {
             return false;
         }
         if st.discards.contains_key(&site)
@@ -15054,7 +15359,9 @@ impl<'a> Lower<'a> {
                     continue;
                 };
                 let uinst = &p.blocks[bb].insts[ii];
-                if self.read_kind(uinst) != ReadKind::Lane || st.discards.contains_key(&(bb, ii)) {
+                if self.read_kind(bb, ii, uinst) != ReadKind::Lane
+                    || st.discards.contains_key(&(bb, ii))
+                {
                     return false;
                 }
                 let mut sink_facts = facts.to_vec();
@@ -17618,5 +17925,191 @@ mod tests {
             "deep SGPR phi chain took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_compute_readfirstlane_under_proved_nonzero_exec_reads_its_lane() {
+        // v1 starts as s_memtime (Missing), then guarded write under v0 >= 8 sets v1 = 7
+        // (keeping Missing in lanes < 8). Inside v0 >= 8, `v_readfirstlane_b32 s6, v1`
+        // copies into v2 (cleanly initialized to 0).
+        let mk = |branch_or_nop: &[u32], mut_hi: bool, wave64: bool| {
+            let save_exec = if wave64 { 0xBE88_246A } else { 0xBE88_3C6A };
+            let restore_exec = if wave64 { 0xBEFE_0408 } else { 0xBEFE_0308 };
+            let mut w = vec![
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xF490_0180,
+                0x0000_0000, // s_memtime s[6:7]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E02_0206, // v_mov_b32 v1, s6 (v1 = Missing in all lanes)
+                0x7D86_0088, // v_cmp_le_u32 vcc_lo, 8, v0 (v0 >= 8)
+                save_exec,   // s_and_saveexec_*
+                0x7E02_0287, // v_mov_b32 v1, 7 (clean in lanes >= 8; < 8 keeps Missing)
+                restore_exec,
+                save_exec,   // s_and_saveexec_* reuses same vcc mask
+            ];
+            w.extend_from_slice(branch_or_nop);
+            if mut_hi {
+                w.push(0xBEFF_0380); // s_mov_b32 exec_hi, 0
+            }
+            w.extend([
+                0x7E0C_0501, // v_readfirstlane_b32 s6, v1
+                0x7E04_0206, // v_mov_b32 v2, s6
+                restore_exec,
+                0xD834_0000,
+                0x0000_0200, // ds_write_b32 v0, v2
+                S_ENDPGM,
+            ]);
+            w
+        };
+        // Proved nonzero via s_cbranch_execz -> ReadKind::Lane -> translates.
+        lower_wave(&mk(&[0xBF88_0002], false, false), vec![], vec![], false).unwrap();
+        // No execz branch (guards == Some) -> ReadKind::Wave -> refused.
+        assert!(lower_wave(&mk(&[0xBF80_0000], false, false), vec![], vec![], false).is_err());
+        // Divergent if with s_cbranch_vccz (guards == None, no execz) -> ReadKind::Wave -> refused.
+        assert!(lower_wave(&mk(&[0xBF86_0002], false, false), vec![], vec![], false).is_err());
+        // Wave64 with s_cbranch_execz translates, unless exec_hi is mutated before readfirstlane.
+        lower_wave(&mk(&[0xBF88_0002], false, true), vec![], vec![], true).unwrap();
+        assert!(lower_wave(&mk(&[0xBF88_0003], true, true), vec![], vec![], true).is_err());
+    }
+
+    #[test]
+    fn a_waterfall_loop_overwrite_feeds_reads_after_exit_but_not_inside_loop() {
+        // v7 and v12 start as s_memtime (Missing). Guarded writes under v0 >= 8 set v7
+        // (leaving < 8 Missing), then `s_cbranch_vccz` (no execz) skips lanes < 8 so
+        // st.reach[L] is v0 >= 8. Inside waterfall loop L, `v_readfirstlane_b32 s20, v7`
+        // stays `ReadKind::Lane` via `waterfall_reads`, while `image_sample_lz` overwrites
+        // v12 under `v_cmpx_eq_u32`. Reading v12 after exit translates; reading v12 before
+        // overwrite inside L refuses.
+        let (layout, used) = texture_and_uav_tables();
+        let build = |read_in_loop: bool| {
+            let mut w = vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF490_0180,
+                0x0000_0000, // s_memtime s[6:7]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E0E_0206, // v_mov_b32 v7, s6 (v7 = Missing in all lanes)
+                0x7E18_0206, // v_mov_b32 v12, s6 (v12 = Missing before L)
+                0x7E10_0280, // v_mov_b32 v8, 0
+                0xBE86_0301, // s_mov_b32 s6, s1
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+                0x7E06_0302, // v_mov_b32 v3, v2
+                0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7D86_0088, // v_cmp_le_u32 vcc_lo, 8, v0 (v0 >= 8)
+                0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+                0x360E_0081, // v_and_b32 v7, 1, v0 (clean in lanes >= 8; < 8 keeps Missing)
+                0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+                0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            ];
+            let branch_pos = w.len();
+            w.push(0xBF86_0000); // s_cbranch_vccz end (patched below; no execz)
+            w.extend([
+                0xBE97_037E, // s_mov_b32 s23, exec_lo
+                0xBE95_037E, // s_mov_b32 s21, exec_lo
+            ]);
+            let loop_top = w.len();
+            if read_in_loop {
+                w.push(0x4A10_1881); // v_add_nc_u32 v8, 1, v12 (reads v12 before overwrite)
+            }
+            w.extend([
+                0x7E28_0507, // L: v_readfirstlane_b32 s20, v7
+                0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+                0xF40C_0302,
+                0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF09C_0F08,
+                0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0x8A15_7E15, // s_andn2_b32 s21, s21, exec_lo
+                0xBEFE_0315, // s_mov_b32 exec_lo, s21
+            ]);
+            let back_off = ((loop_top as isize - (w.len() as isize + 1)) as i16) as u16 as u32;
+            w.push(0xBF89_0000 | back_off); // s_cbranch_execnz L
+            w.push(0xBEFE_0317); // s_mov_b32 exec_lo, s23
+            let store_src = if read_in_loop { 0x800A_0810 } else { 0x800A_0C10 };
+            w.extend([0xE070_1000, store_src]);
+            let end_off = (w.len() - branch_pos - 1) as u32;
+            w[branch_pos] = 0xBF86_0000 | end_off;
+            w.push(S_ENDPGM);
+            w
+        };
+        lower_wave(&build(false), layout.clone(), used.clone(), false).unwrap();
+        assert!(lower_wave(&build(true), layout, used, false).is_err());
+    }
+
+    #[test]
+    fn a_guarded_write_through_a_phi_and_forward_edge_reach_translates() {
+        // v1 starts as s_memtime (Missing), overwritten with 7 under v0 >= 8. A branch
+        // on v0 >= 8 goes through two Jump blocks (testing st.reach[q] on non-branch
+        // forward edges into join's phi), while the else block overwrites v1 cleanly
+        // with 0. Broadening the branch to v0 >= 4 lets lanes < 8 reach join and refuses.
+        let mk = |cmp_vcc: u32| {
+            [
+                0xF490_0180,
+                0x0000_0000, // s_memtime s[6:7]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E02_0206, // v_mov_b32 v1, s6 (v1 = Missing in all lanes)
+                0x7D86_0088, // v_cmp_le_u32 vcc_lo, 8, v0 (v0 >= 8)
+                0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+                0x7E02_0287, // v_mov_b32 v1, 7 (clean in lanes >= 8; < 8 keeps Missing)
+                0xBEFE_0308, // s_mov_b32 exec_lo, s8
+                cmp_vcc,     // s_nop 0 reuses exact vcc (v0 >= 8); v_cmp_le_u32 v0 >= 4 broadens
+                0xBF86_0004, // s_cbranch_vccz else_lbl
+                0xBF80_0000, // then_a: s_nop 0
+                0xBF82_0000, // s_branch then_b
+                0xBF80_0000, // then_b: s_nop 0
+                0xBF82_0001, // s_branch join
+                0x7E02_0280, // else_lbl: v_mov_b32 v1, 0
+                0x4A02_0281, // join: v_add_nc_u32 v1, 1, v1
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        lower_wave(&mk(0xBF80_0000), vec![], vec![], false).unwrap();
+        assert!(lower_wave(&mk(0x7D86_0084), vec![], vec![], false).is_err());
+    }
+
+    #[test]
+    fn a_phi_read_of_a_guarded_write_uses_the_readers_guard() {
+        // v1 starts as s_memtime (Missing), overwritten with 7 under v0 >= 8, then
+        // joined via a uniform s0 == 0 diamond (`else` sets v1 = 0) so st.reach at the
+        // join imposes no lane constraint. Reading phi(v1) under the same guard (v0 >= 8)
+        // translates via `get_val` recording phi reads with the reader's (reach, guard);
+        // reading it outside the guard refuses.
+        let build = |guarded_reader: bool| {
+            let enter = if guarded_reader { 0xBE88_3C6A } else { 0xBF80_0000 };
+            let leave = if guarded_reader { 0xBEFE_0308 } else { 0xBF80_0000 };
+            [
+                0xF490_0180,
+                0x0000_0000, // s_memtime s[6:7]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E02_0206, // v_mov_b32 v1, s6 (v1 = Missing in all lanes)
+                0x7D86_0088, // v_cmp_le_u32 vcc_lo, 8, v0 (v0 >= 8)
+                0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+                0x7E02_0287, // v_mov_b32 v1, 7 (clean in >= 8; < 8 keeps Missing)
+                0xBEFE_0308, // s_mov_b32 exec_lo, s8
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0 (uniform branch for non-trivial phi)
+                0xBF84_0002, // s_cbranch_scc0 else_lbl
+                0xBF80_0000, // then_lbl: s_nop 0
+                0xBF82_0001, // s_branch join
+                0x7E02_0280, // else_lbl: v_mov_b32 v1, 0
+                enter,       // join: guard v0 >= 8 (s_and_saveexec) or unguarded (s_nop)
+                0x4A02_0281, // v_add_nc_u32 v1, 1, v1 (reads phi(v1))
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                leave,       // restore exec (s_mov) or s_nop
+                S_ENDPGM,
+            ]
+        };
+        let layout = vec![root(RootType::Constants, 0, 0)];
+        lower_wave(&build(true), layout.clone(), vec![], false).unwrap();
+        assert!(lower_wave(&build(false), layout, vec![], false).is_err());
     }
 }
