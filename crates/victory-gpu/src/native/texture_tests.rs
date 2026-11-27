@@ -2476,7 +2476,7 @@ fn textures_over_one_memory_each_hold_a_copy_of_their_own() {
     let id = crate::resource::texture_info(d).unwrap();
     t.texture_created(d as usize, id.clone());
     assert!(t.realize(d as usize));
-    assert_eq!(t.budget.live, counted + id.size as u64);
+    assert_eq!(t.budget.live, counted, "VA alias over same pool offset shares one host texture");
     assert_eq!(t.memory_under_copies(), (under, 0), "one memory at two addresses");
 }
 
@@ -2749,4 +2749,64 @@ fn unmapped_leading_mips_are_trimmed_until_mapped() {
     assert!(!std::rc::Rc::ptr_eq(&small, &full), "texture upgraded after fine mips mapped");
     assert_eq!(t.host.dropped_count(key), info.dropped_levels());
     assert!(!t.trimmed.contains(&key));
+    let expected_live = if info.dropped_levels() > 0 {
+        crate::native::textures::host_texture_bytes(&info.host_desc().unwrap())
+    } else {
+        info.size as u64
+    };
+    assert_eq!(t.budget.live, expected_live);
+}
+
+#[test]
+fn identical_textures_across_va_aliases_share_one_host_texture() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let key1 = budget_texture(&mut t, &pool, 0, 0, 0x31);
+    let info1 = t.textures[&key1].info.clone();
+    let va1 = pool.va(0) as usize;
+    let (pool_info, _) = t.host.memory().resolve(va1 as u64, 1).unwrap();
+    let va2 = 0x2_0000_0000usize;
+    t.host.memory().mapped(va2, pool.mem.len, &pool_info, 0);
+
+    let mut info2 = info1.clone();
+    info2.memory = va2 as *const u8;
+    let key2 = 0xDEAD_BEEFusize;
+    t.texture_created(key2, info2);
+    assert!(t.realize(key2));
+
+    let tex1 = t.texture_of(key1).unwrap();
+    let tex2 = t.texture_of(key2).unwrap();
+    assert!(std::rc::Rc::ptr_eq(&tex1, &tex2), "VA alias over same pool offset shares host texture");
+    assert_eq!(t.copies_of.len(), 1);
+    assert_eq!(t.budget.live, t.textures[&key1].host_bytes);
+}
+
+#[test]
+fn cold_retired_heap_shown_texture_is_evicted_under_budget_and_realized_again() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let cold = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let active = budget_texture(&mut t, &pool, 0x4000, 0, 0x22);
+    t.sync_textures();
+
+    let records = [0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let _heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), cold as _, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    crate::descriptor::create_srv(std::ptr::null(), active as _, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+
+    // Advance retired_epoch past `cold`, while `active` is stamped at the newer epoch.
+    t.gpu_epoch = 2;
+    t.retired_epoch = 2;
+    t.textures.get_mut(&active).unwrap().last_named_epoch = 2;
+    t.textures.get_mut(&cold).unwrap().last_named_epoch = 1;
+
+    t.set_texture_budget(t.textures[&active].host_bytes);
+    t.keep_to_budget();
+    assert!(!t.host.knows(cold), "cold retired heap-shown texture is evicted");
+    assert!(t.host.knows(active), "active heap-shown texture stays resident");
+
+    assert!(t.realize(cold), "evicted cold texture can be realized again");
 }

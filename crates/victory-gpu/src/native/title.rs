@@ -249,6 +249,8 @@ pub struct Title<B: PresentBackend> {
     pub(super) copies_of: HashMap<usize, (usize, super::textures::TextureInfo)>,
     /// Keys in `textures` by the title memory they start at.
     pub(super) at_memory: HashMap<usize, Vec<usize>>,
+    /// Keys in `textures` by their contiguous physical `(pool_id, pool_offset)` start.
+    pub(super) at_pool: HashMap<(usize, u64), Vec<usize>>,
     /// Placed copies another placement covered, mapped to the `gpu_epoch` when covered, given up
     /// once nothing uses them (or under budget once all work from that epoch has finished on the GPU)
     /// ([`Self::give_up_covered`]).
@@ -314,6 +316,7 @@ impl<B: PresentBackend> Title<B> {
             placed_pool_reach: 0,
             copies_of: HashMap::new(),
             at_memory: HashMap::new(),
+            at_pool: HashMap::new(),
             covered: Default::default(),
             covered_evicted: Default::default(),
             trimmed: Default::default(),

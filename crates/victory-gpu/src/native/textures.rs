@@ -113,6 +113,73 @@ impl TextureInfo {
 
 }
 
+/// Approximate Metal allocation size in bytes for `desc` across all mip levels and slices.
+pub(super) fn host_texture_bytes(desc: &TextureDesc) -> u64 {
+    let (block_w, block_h, block_bytes) = match desc.format {
+        Format::Bc1 | Format::Bc1Srgb | Format::Bc4 => (4usize, 4usize, 8u64),
+        Format::Bc2
+        | Format::Bc3
+        | Format::Bc3Srgb
+        | Format::Bc5
+        | Format::Bc6h
+        | Format::Bc6hSigned
+        | Format::Bc7
+        | Format::Bc7Srgb => (4, 4, 16),
+        Format::R8Unorm | Format::A8Unorm | Format::R8Uint | Format::R8Snorm => (1, 1, 1),
+        Format::R16Unorm
+        | Format::D16Unorm
+        | Format::Rg8Unorm
+        | Format::Rg8Uint
+        | Format::Rg8Snorm
+        | Format::R16Float
+        | Format::R16Uint
+        | Format::R16Snorm
+        | Format::Bgr5a1Unorm
+        | Format::Abgr4Unorm => (1, 1, 2),
+        Format::Rgba8Unorm
+        | Format::Rgba8UnormSrgb
+        | Format::Bgra8Unorm
+        | Format::Bgra8UnormSrgb
+        | Format::R32Float
+        | Format::D32Float
+        | Format::Rgb10a2Unorm
+        | Format::Rgb10a2Uint
+        | Format::Rg11b10Float
+        | Format::Rgba8Uint
+        | Format::Rgba8Snorm
+        | Format::Rg16Float
+        | Format::Rg16Unorm
+        | Format::Rg16Uint
+        | Format::Rg16Snorm
+        | Format::R32Uint
+        | Format::Rgb9e5Float => (1, 1, 4),
+        Format::D32FloatS8 => (1, 1, 5),
+        Format::Rgba16Float
+        | Format::Rg32Float
+        | Format::Rg32Uint
+        | Format::Rgba16Unorm
+        | Format::Rgba16Snorm
+        | Format::Rgba16Uint => (1, 1, 8),
+        Format::Rgba32Float | Format::Rgba32Uint => (1, 1, 16),
+    };
+    let mips = desc.mips.max(1);
+    let (slices, depth_base) = match desc.dim {
+        TexDim::D3 => (1usize, desc.depth_or_layers.max(1)),
+        TexDim::D2Array => (desc.depth_or_layers.max(1), 1usize),
+        TexDim::D2 => (1usize, 1usize),
+    };
+    let mut per_slice = 0u64;
+    for mip in 0..mips {
+        let w = (desc.width >> mip).max(1);
+        let h = (desc.height >> mip).max(1);
+        let d = (depth_base >> mip).max(1) as u64;
+        let bw = w.div_ceil(block_w) as u64;
+        let bh = h.div_ceil(block_h) as u64;
+        per_slice = per_slice.saturating_add(bw * bh * block_bytes * d);
+    }
+    per_slice.saturating_mul(slices as u64)
+}
+
 /// Largest side (texels) from which a sampled texture loses its top level under [`drop_top_mip`].
 const DROP_TOP_MIP_MIN_SIDE: u32 = 1024;
 
@@ -683,7 +750,7 @@ fn start_scanner() {
 /// A texture the host keeps for a title texture.
 pub struct Tracked<B: ResourceBackend> {
     pub texture: Rc<B::Texture>,
-    info: TextureInfo,
+    pub(super) info: TextureInfo,
     /// Which texture this is: its key (an object's address, a placement) names another one later.
     serial: u64,
     /// The hash of the memory last uploaded; `None` for targets and before the first upload.
@@ -723,6 +790,12 @@ pub struct Tracked<B: ResourceBackend> {
     used: u64,
     /// Leading title mip levels omitted from [`Self::texture`].
     dropped: usize,
+    /// Approximate host Metal allocation size in bytes (accounts for dropped/trimmed mips).
+    pub(super) host_bytes: u64,
+    /// Contiguous physical `(pool_id, pool_offset)` start if the texture lies in one pool chunk.
+    pool_origin: Option<(usize, u64)>,
+    /// Last `gpu_epoch` at which this texture was named by a submission or `texture_of`.
+    pub(super) last_named_epoch: u64,
 }
 
 impl<B: ResourceBackend> Tracked<B> {
@@ -1186,7 +1259,11 @@ impl<B: PresentBackend> Title<B> {
         if self.host.is_evicted(key) {
             BUDGET_TRACE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if let Some(owner) = self.identical_copy(&info) {
+        let pools = self.host.memory();
+        let pool_ranges = pools.pool_ranges(info.memory as u64, info.size as u64);
+        let pool_origin = (pool_ranges.len() == 1 && pool_ranges[0].2 >= info.size as u64)
+            .then(|| (pool_ranges[0].0, pool_ranges[0].1));
+        if let Some(owner) = self.identical_copy(&info, pool_origin) {
             let tex = self.textures[&owner].texture.clone();
             let owner_dropped = self.textures[&owner].dropped;
             let owner_mips = info.desc().map_or(1, |d| d.mips.saturating_sub(owner_dropped).max(1));
@@ -1203,10 +1280,18 @@ impl<B: PresentBackend> Title<B> {
                 return false;
             }
         };
+        let host_bytes = if dropped > 0 {
+            host_texture_bytes(&desc)
+        } else {
+            info.size as u64
+        };
         self.at_memory.entry(info.memory as usize).or_default().push(key);
+        if let Some(origin) = pool_origin {
+            self.at_pool.entry(origin).or_default().push(key);
+        }
         self.host.set_dropped_levels(key, dropped, desc.mips);
         self.host.register_texture(key, &tex);
-        self.budget.live += info.size as u64;
+        self.budget.live += host_bytes;
         static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Depth-stencil textures are GPU-written depth targets whose CPU tile layout (e.g.
@@ -1267,6 +1352,9 @@ impl<B: PresentBackend> Title<B> {
                 gpu_written: false,
                 used: self.budget.serial,
                 dropped,
+                host_bytes,
+                pool_origin,
+                last_named_epoch: self.gpu_epoch,
             },
         );
         if dropped > floor_dropped {
@@ -1288,12 +1376,12 @@ impl<B: PresentBackend> Title<B> {
     /// same layout, dimensions and host format, filled from that memory the same way (B4G4R4A4 is
     /// converted on upload), not a render target or depth (the GPU's, not memory's) and not
     /// GPU-written. Views of either then sample the same texels from one texture.
-    fn identical_copy(&self, info: &TextureInfo) -> Option<usize> {
+    fn identical_copy(&self, info: &TextureInfo, pool_origin: Option<(usize, u64)>) -> Option<usize> {
         let desc = info.desc()?;
         if info.render_target() || desc.format.is_depth() {
             return None;
         }
-        self.at_memory.get(&(info.memory as usize))?.iter().copied().find(|k| {
+        let matches = |k: &usize| {
             let o = &self.textures[k].info;
             !self.textures[k].gpu_written
                 && !o.render_target()
@@ -1304,7 +1392,17 @@ impl<B: PresentBackend> Title<B> {
                 && o.flags & UNORDERED_ACCESS == info.flags & UNORDERED_ACCESS
                 && (o.format == 115) == (info.format == 115)
                 && o.desc().is_some_and(|d| d.format == desc.format)
-        })
+        };
+        self.at_memory
+            .get(&(info.memory as usize))
+            .and_then(|keys| keys.iter().copied().find(matches))
+            .or_else(|| {
+                pool_origin.and_then(|origin| {
+                    self.at_pool
+                        .get(&origin)
+                        .and_then(|keys| keys.iter().copied().find(matches))
+                })
+            })
     }
 
     /// The key whose copy title texture `key` uses: its own, or the identical copy it shares.
@@ -1323,8 +1421,10 @@ impl<B: PresentBackend> Title<B> {
         self.realize(key);
         let key = self.owner_of(key);
         let serial = self.budget.serial;
+        let epoch = self.gpu_epoch;
         self.textures.get_mut(&key).map(|t| {
             t.used = serial;
+            t.last_named_epoch = epoch;
             t.texture.clone()
         })
     }
@@ -1408,12 +1508,20 @@ impl<B: PresentBackend> Title<B> {
         self.trimmed.remove(&key);
         self.untrack_placed_pools(key);
         if let Some(t) = self.textures.remove(&key) {
-            self.budget.live -= t.info.size as u64;
+            self.budget.live -= t.host_bytes;
             let at = t.info.memory as usize;
             if let Some(keys) = self.at_memory.get_mut(&at) {
                 keys.retain(|&k| k != key);
                 if keys.is_empty() {
                     self.at_memory.remove(&at);
+                }
+            }
+            if let Some(origin) = t.pool_origin
+                && let Some(keys) = self.at_pool.get_mut(&origin)
+            {
+                keys.retain(|&k| k != key);
+                if keys.is_empty() {
+                    self.at_pool.remove(&origin);
                 }
             }
             // The copy stays with those that shared it: the first takes it over (their entries
@@ -1428,9 +1536,13 @@ impl<B: PresentBackend> Title<B> {
                 if self.unloaded.contains(&key) {
                     self.unloaded.insert(first);
                 }
-                self.budget.live += info.size as u64;
-                self.at_memory.entry(at).or_default().push(first);
-                watch(|w| w.entries.insert(first, (at, info.size, false, t.serial)));
+                self.budget.live += t.host_bytes;
+                let first_at = info.memory as usize;
+                self.at_memory.entry(first_at).or_default().push(first);
+                if let Some(origin) = t.pool_origin {
+                    self.at_pool.entry(origin).or_default().push(first);
+                }
+                watch(|w| w.entries.insert(first, (first_at, info.size, false, t.serial)));
                 let mut t = t;
                 t.info = info;
                 if t.dropped > t.info.dropped_levels() {
@@ -1885,6 +1997,14 @@ impl<B: PresentBackend> Title<B> {
                 continue;
             };
             if let Some(t) = self.textures.get_mut(&key) {
+                let new_bytes = if new_dropped > 0 {
+                    host_texture_bytes(&new_desc)
+                } else {
+                    t.info.size as u64
+                };
+                let old_bytes = t.host_bytes;
+                self.budget.live = self.budget.live.saturating_sub(old_bytes) + new_bytes;
+                t.host_bytes = new_bytes;
                 t.texture = new_tex.clone();
                 t.dropped = new_dropped;
                 t.uploaded_mips = 0;
@@ -2394,8 +2514,18 @@ impl<B: PresentBackend> Title<B> {
                 self.realize(key);
             }
         }
+        let serial = self.budget.serial;
+        let epoch = self.gpu_epoch;
+        if !named.is_empty() {
+            self.record_epoch(epoch);
+        }
         for &key in &named {
             *self.budget.named.entry(key).or_default() += 1;
+            let owner = self.owner_of(key);
+            if let Some(t) = self.textures.get_mut(&owner) {
+                t.used = serial;
+                t.last_named_epoch = epoch;
+            }
         }
         named
     }
@@ -2426,23 +2556,44 @@ impl<B: PresentBackend> Title<B> {
         if !check && !trace {
             return;
         }
-        let (mut candidates, mut shown) = (Vec::new(), 0);
+        if check {
+            self.retire_gpu_epochs();
+        }
+        let (mut candidates, mut cold_heap, mut shown) = (Vec::new(), Vec::new(), 0);
         let keys: Vec<usize> = self.textures.keys().copied().collect();
         for key in keys {
             let t = &self.textures[&key];
             let named = self.budget.named.contains_key(&key);
-            if !named && self.evictable(key, t) {
-                candidates.push((key, t.info.size as u64, t.used));
-            } else if named || self.host.texture_in_use(key) {
-                shown += t.info.size as u64;
+            if named {
+                shown += t.host_bytes;
                 self.textures.get_mut(&key).expect("listed").used = serial;
+            } else if self.evictable(key, t) {
+                candidates.push((key, t.host_bytes, t.used));
+            } else if self.host.texture_in_use(key) {
+                shown += t.host_bytes;
+                if self.holds_only_memory(key, t)
+                    && Rc::strong_count(&t.texture) <= 2
+                    && self.retired_epoch > 0
+                    && t.last_named_epoch < self.retired_epoch
+                {
+                    cold_heap.push((key, t.host_bytes, t.used));
+                }
             }
         }
         let evictable: u64 = candidates.iter().map(|c| c.1).sum();
         if check {
-            for key in choose_evictions(candidates, over) {
+            let mut to_evict = choose_evictions(candidates, over);
+            let remaining = self.budget.live.saturating_sub(self.budget.limit);
+            let freed_unshown: u64 = to_evict
+                .iter()
+                .filter_map(|k| self.textures.get(k).map(|t| t.host_bytes))
+                .sum();
+            if freed_unshown < remaining && !cold_heap.is_empty() {
+                to_evict.extend(choose_evictions(cold_heap, remaining - freed_unshown));
+            }
+            for key in to_evict {
                 let t = self.textures.get(&key).expect("a candidate");
-                let bytes = t.info.size as u64;
+                let bytes = t.host_bytes;
                 let info = t.info.clone();
                 self.host.evict_texture(key);
                 self.texture_released(key);
@@ -3012,6 +3163,9 @@ mod tests {
             target_views: Vec::new(),
             gpu_written: false,
             dropped: 0,
+            host_bytes: 0,
+            pool_origin: None,
+            last_named_epoch: 0,
         };
 
         // 1. Explicit trace removing entries after wraparound (`cursor = 4` on 6 entries `[0..6]`,
@@ -3166,6 +3320,9 @@ mod tests {
                         target_views: Vec::new(),
                         gpu_written: false,
                         dropped: 0,
+                        host_bytes: 0,
+                        pool_origin: None,
+                        last_named_epoch: 0,
                     },
                 )
             })

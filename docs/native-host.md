@@ -995,20 +995,18 @@ and Metal then failed ordinary command buffers with `kIOGPUCommandBufferCallback
   `texture_budget_mib` on the `native host: Metal` startup line). The figure to try is logged next
   to it as `suggested_texture_budget_mib`: Metal's `recommendedMaxWorkingSetSize` less the title's
   memory, at least 1536 MiB (`MIN_TEXTURE_BUDGET`; guess: about what a world frame samples). 4348
-  MiB on that M4 with Series S; Series X on 16 GB gets the floor. A copy counts its size in title
-  memory.
+  MiB on that M4 with Series S; Series X on 16 GB gets the floor. A copy counts its host
+  Metal allocation size (`host_texture_bytes`, accounting for dropped/trimmed mips), and
+  identical sampled textures mapped across distinct virtual addresses over the same physical
+  pool offset (`Title::at_pool`) share one host texture.
 * **What may go.** At each submission over the budget (`Title::keep_to_budget`), before its
   textures are synced, the least recently used copies that may go are given up until under it.
-  A copy may go when it is a sampled texture filled only from title memory (not a render target,
-  depth or GPU-copied texture, nor one ever shown through an unordered access view, whose host
-  texture may hold what title memory does not), no heap entry shows it, and no recorded or
-  submitted list holds it (the host's own two references are all there are). Shaders index the
-  heaps themselves (#79), so a copy an entry shows counts as used however long no bound table
-  named it; D3D12 forbids rewriting an entry that submitted work still reads, so a copy no entry
-  shows is not reached by work in flight, and Metal retains what a committed command buffer names
-  directly. A check that cannot get under the budget waits 64 submissions before the next
-  (`RECHECK`). "Least recently used" is the last submission a view, a copy or a check saw it
-  shown at.
+  Unshown copies go first (sampled, filled only from title memory, no heap entry, no recorded
+  or submitted list). If that is still over budget, cold heap-shown copies whose last named
+  submission epoch (`last_named_epoch`) has retired (`retired_epoch > 0 && last_named_epoch < retired_epoch`)
+  are evicted as a fallback and their stale heap entries are cleared. A check that cannot get
+  under the budget waits 64 submissions before the next (`RECHECK`). "Least recently used" is
+  the last submission a view, a copy or a table scan saw it named at.
 * **Coming back.** A given-up copy goes the way a released one does (`NativeHost::evict_texture`,
   through `release_resource`), so it leaves the heap residency sets with its last reference and
   does not work against `VICTORY_METAL_RESIDENCY_SETS=heap`. Its description goes back to
