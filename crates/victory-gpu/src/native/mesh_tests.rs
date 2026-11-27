@@ -431,6 +431,48 @@ fn halves_of_many_parameters_stay_within_the_mesh_size() {
     };
 }
 
+/// Halves a pixel program reads that the mesh program's guess left out for room (those of the
+/// last of ten parameters) link once the mesh program exports what the pixel program reads
+/// (`Options::pixel_reads`, as the guessed pipeline asks): before, the converter refused the
+/// pair, the fragment inputs mismatching the mesh outputs.
+#[test]
+fn halves_left_out_for_room_are_exported_for_the_pixel_program_that_reads_them() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0x7E10_02FF, 0x3C00_3800]); // v_mov_b32 v8, 0x3c003800 (0.5 low, 1.0 high)
+    let at = at + 2;
+    // exp param<n> v8, v8, v8, v8
+    words.splice(at..at, (0..10u32).flat_map(|n| [0xF800_020F | n << 4, 0x0808_0808]));
+    let ps_words = [
+        0xD742_0002, 0x0202_0009, // v_interp_p1ll_f16 v2, v0, attr9.x
+        0xD75A_0003, 0x040A_0209, // v_interp_p2_f16 v3, v1, attr9.x, v2
+        0x7E06_1703, // v_cvt_f32_f16 v3, v3
+        0xF800_180F, 0x0303_0303, // exp mrt0 v3, v3, v3, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let ps = translate(HwStage::Ps, &ps_words);
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let c = victory_shader::emit::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
+    let ms = shaders::translate(&c).unwrap();
+    let halves = crate::native::state::halves(&ps.dxil, victory_shader::FourCC::ISG1);
+    assert_eq!(halves, 1 << 18); // HALF18: the low half of param 9
+    assert_eq!(halves & crate::native::state::halves(&ms.dxil, victory_shader::FourCC::OSG1), 0, "the guess has room for them now");
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    assert!(matches!(t.render_pipe(&ms, Some(&ps), &state, "guess"), Pipe::MeshRefused(crate::native::title::MeshRefusal::ConversionFailed)), "the guess alone links");
+    let reads = (crate::native::state::texcoords(&ps.dxil, victory_shader::FourCC::ISG1), halves);
+    let ms = shaders::translate_extra(&c, false, 0, [0; 32], Some(reads)).unwrap();
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [128; 4]), "{:?}", pixels(&t, &color));
+}
+
 /// A parameter only a packing instruction makes (`v_cvt_pkrtz_f16_f32`: 0.5 low, 1.0 high) is
 /// exported as its halves alone, and the pixel program's f16 interpolations of both halves of
 /// x read them.
@@ -790,7 +832,7 @@ fn exported_input(ena: u32, v: u32) -> Option<Vec<u32>> {
     let bytes: Vec<_> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
     let mut meta = [0; 0x10];
     meta[12] = 0x40;
-    let c = victory_shader::emit::graphics::container_with_inputs(HwStage::Ps, &bytes, &meta, Some(ena)).unwrap();
+    let c = victory_shader::emit::graphics::container_with_inputs(HwStage::Ps, &bytes, &meta, Some(ena), None).unwrap();
     let ms = translate(HwStage::Vs, TRIANGLE);
     let mut t = title()?;
     let state = Graphics::guess_base().for_draw(vec![Format::R32Uint], None, vec![], &[], false);
@@ -871,5 +913,44 @@ fn a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric() {
         super::run(&t.host, &[&list]);
         let got = pixels(&t, &color);
         assert!(got.iter().all(|p| *p == [255, 128, 255, 255]), "{order}: {got:?}");
+    }
+}
+
+/// A pixel program that exports its barycentrics as data: `exp mrt0 v0, v1, 0, 1.0`, after an
+/// interpolation that makes v0 and v1 the perspective-centre pair. `i` and `j` weigh the second
+/// and third corners of the triangle program's triangle, (3, -1) and (-1, 3), from (-1, -1): at a
+/// pixel centre `i = (x + 1) / 4` and `j = (y + 1) / 4` in normalized coordinates (w is 1). They
+/// were refused as "barycentrics read directly" and come from `SV_Barycentrics` now.
+#[test]
+fn barycentrics_read_as_data_weigh_the_second_and_third_corners() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0xF800_0201, 0x0000_0006]); // exp param0 v6 (1.0)
+    let ps_words = [
+        0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+        0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_02F2, // v_mov_b32 v3, 1.0
+        0xF800_180F, 0x0302_0100, // exp mrt0 v0, v1, v2, v3 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, &words), translate(HwStage::Ps, &ps_words));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "barycentrics") else {
+        panic!("{:?}", t.shaders);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    let got = pixels(&t, &color);
+    for (n, p) in got.iter().enumerate() {
+        let (px, py) = ((n % 8) as f32 + 0.5, (n / 8) as f32 + 0.5);
+        let (x, y) = (px / 4.0 - 1.0, 1.0 - py / 4.0);
+        let want = [((x + 1.0) / 4.0 * 255.0).round(), ((y + 1.0) / 4.0 * 255.0).round()];
+        for c in 0..2 {
+            assert!((f32::from(p[c]) - want[c]).abs() <= 1.0, "texel {n}: {p:?}, want {want:?}");
+        }
+        assert_eq!(&p[2..], &[0, 255], "texel {n}");
     }
 }

@@ -117,12 +117,12 @@ fn shaders_the_host_cannot_run_are_refused_and_counted() {
     assert_eq!(refused.len(), 2, "{refused:?}");
     assert!(refused.iter().any(|(why, _)| why.contains("marks the pages")));
     assert!(refused.iter().any(|(why, _)| why.contains("thread group") || why.contains("conversion")));
-    // Compute shaders get the page table; a graphics pipeline does not yet.
+    // A graphics pipeline needing write marks is refused (the page table it gets, as compute).
     let mut vs = host_shader(HwStage::Vs, read("tests/fixtures/tri_vs.dxil"));
-    vs.memory = true;
+    vs.view_marks = true;
     let g = Graphics::default();
     assert!(matches!(t.render_pipe(&vs, None, &g, "vs"), Pipe::Refused));
-    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("graphics pipeline")));
+    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("write marks")));
     t.refused_translation("y", "no DXIL part".into());
     assert_eq!(t.shaders.refusals(), 5, "{:?}", t.shaders.refused);
 }

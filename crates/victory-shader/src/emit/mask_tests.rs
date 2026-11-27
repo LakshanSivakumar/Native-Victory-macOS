@@ -896,3 +896,132 @@ fn a_loop_register_that_is_not_exec_on_one_edge_is_not_exec_at_the_head() {
     assert!(!joins.is_empty());
     assert!(joins.iter().all(|ph| !st.active.contains(&ph.value)), "s4 taken as EXEC at its loop's head");
 }
+
+/// A loop carrying a boolean in a lane mask as the console compiler merges one under an EXEC
+/// (`s_andn2_b64 s[64:65], s[100:101], exec` then `s_or_b64 s[64:65], s[64:65], vcc`, with
+/// `s[100:101]` a copy of the mask where the if runs, stale where a uniform branch skips the
+/// if), in an if its lanes skip with `s_cbranch_scc0` of the skipped lanes. The lanes that skip keep their bit of the old mask, which is what their edge
+/// brings to the join: a mesh program of the world G-buffer was refused there as "a lane-mask
+/// join of an untracked mask: a value the translation could not make".
+const MERGE: &[u32] = &[
+    0xBE9D_0380, // s_mov_b32 s29, 0
+    0xBEC0_0480, // s_mov_b64 s[64:65], 0
+    0xBEE4_0480, // s_mov_b64 s[100:101], 0
+    0xBE96_047E, // loop: s_mov_b64 s[22:23], exec
+    0xBF0D_801D, // s_bitcmp1_b32 s29, 0
+    0xBF84_0005, // s_cbranch_scc0 merge
+    0x7DA8_0088, // v_cmpx_gt_u32 8, v0
+    0x8AC6_7E16, // s_andn2_b64 s[70:71], s[22:23], exec
+    0xBF84_0005, // s_cbranch_scc0 join
+    0xBEE4_0440, // s_mov_b64 s[100:101], s[64:65]
+    0xBEFE_0446, // s_mov_b64 exec, s[70:71]
+    0x7D82_0094, // merge: v_cmp_lt_u32 vcc, 20, v0
+    0x8AC0_7E64, // s_andn2_b64 s[64:65], s[100:101], exec
+    0x88C0_6A40, // s_or_b64 s[64:65], s[64:65], vcc
+    0xBEFE_0416, // join: s_mov_b64 exec, s[22:23]
+    0x801D_811D, // s_add_u32 s29, s29, 1
+    0xBF06_841D, // s_cmp_eq_u32 s29, 4
+    0xBF84_FFF1, // s_cbranch_scc0 loop
+    0xD501_0001, // v_cndmask_b32 v1, 0, 1, s[64:65]
+    0x0101_0280,
+];
+
+/// Lowers `body`, then exports of `v1` (parameter 0 and the position) and a triangle, as a
+/// wave64 mesh program of 64 lanes, whose lane masks are no numbers.
+fn mesh(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
+    use super::container::SigElement;
+    use crate::native::{MeshIo, Usage, VsOutput};
+    const EXPORTS: &[u32] = &[
+        0xF800_020F, 0x0101_0101, // exp param0 v1, v1, v1, v1
+        0x7E12_02FF, 0x0020_0400, // v_mov_b32 v9, 0x200400 (corners 0, 1, 2)
+        0xF800_0941, 0x0000_0009, // exp prim v9, off, off, off done
+        0xF800_08CF, 0x0101_0101, // exp pos0 v1, v1, v1, v1 done
+        0xBF81_0000, // s_endpgm
+    ];
+    let words: Vec<u32> = [body, EXPORTS].concat();
+    let element = |name: &str, kind, row| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp: 0,
+        row: Some(row),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Ms,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ms(MeshIo {
+            outputs: vec![VsOutput { usage: Usage::Generic, row: 1, param: 0, fp16: false, pack2: false }],
+            clip_cntl: 0,
+            threads: 64,
+            max_vertices: 64,
+            max_primitives: 64,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, true, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    lower::lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![element("SV_Position", 3, 0), element("TEXCOORD", 0, 1)],
+        prims: vec![],
+        mesh_stride: 32,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: false,
+        zero_copy_memory: false,
+        view_marks: false,
+        rect_list: false,
+        copy_params: [0; 32],
+        bvh_no_hit: false,
+    })
+}
+
+#[test]
+fn a_mask_merged_under_exec_keeps_the_old_bits_of_the_lanes_that_skip() {
+    let r = mesh(MERGE);
+    assert!(r.is_ok(), "{:?}", r.err());
+}
+
+/// The same loop with the merge's `s_andn2_b64` reading `s[22:23]` (the loop's EXEC, not the
+/// old mask): the lanes that skip then keep no bit of what their edge brings, and the join
+/// stays refused.
+#[test]
+fn a_merge_of_another_mask_is_no_merge_of_the_old_one() {
+    let body: Vec<u32> = MERGE.iter().map(|&w| if w == 0x8AC0_7E64 { 0x8AC0_7E16 } else { w }).collect();
+    assert_ne!(body, MERGE);
+    let err = mesh(&body).err().expect("refused");
+    assert!(err.to_string().contains("a lane-mask join of an untracked mask"), "{err}");
+}
+
+
+/// A mesh program (the NGG stage) gets eight system SGPRs and at most 32 user SGPRs from s8,
+/// so an SGPR from s40 up that it reads before writing holds what the last wave left: zero, as
+/// in compute. The world's mesh programs read such registers on paths only an empty EXEC
+/// takes (`3a0627643418e45d` exports `s49` and `s50` after an EXEC skip over their load); they
+/// were refused as "a hardware SGPR input". An SGPR below s40 may be user data the layout does
+/// not name, and stays refused.
+#[test]
+fn a_mesh_program_reads_sgprs_past_its_user_data_as_zero() {
+    let read = |sgpr: u32| mesh(&[0x7E02_0200 | sgpr]); // v_mov_b32 v1, s<sgpr>
+    assert!(read(49).is_ok(), "{:?}", read(49).err());
+    let err = read(39).err().expect("refused");
+    assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
+}

@@ -514,6 +514,11 @@ pub struct Options {
     /// are declared uint and store the exported dwords' bits as they are. D3D12 wants a target's
     /// output type to match its format, and the console exports integer bits in float registers.
     pub integer_targets: u8,
+    /// A guessed vertex or mesh program's pixel shader's parameter inputs (`TEXCOORD` n bits,
+    /// [`graphics::HALF`] i bits), when it reads halves the program's own guess left out for
+    /// room: the program exports those halves and no others, and no `TEXCOORD` the pixel shader
+    /// does not read (but those [`Self::copy_params`] copy), so they fit.
+    pub pixel_reads: Option<(u32, u64)>,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -661,6 +666,30 @@ fn emit_fast(
             e.kind == 16 && e.comp == 9 && e.index < 8 && options.integer_targets >> e.index & 1 != 0
         }) {
             e.comp = 5;
+        }
+    }
+    if let (false, Some((texcoords, halves))) = (pixel, options.pixel_reads) {
+        let copied = |n: u32| options.copy_params.iter().any(|&from| u32::from(from) == n + 1);
+        // Past every row the program had: an export finds its parameter's element by row.
+        let first = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
+        outputs.retain(|e| match e.name.as_str() {
+            graphics::HALF => false,
+            "TEXCOORD" if e.kind == 0 => (e.index < 32 && texcoords >> e.index & 1 != 0) || copied(e.index),
+            _ => true,
+        });
+        for (row, i) in (first..).zip((0..64u32).filter(|&i| halves >> i & 1 != 0)) {
+            outputs.push(container::SigElement {
+                name: graphics::HALF.into(),
+                index: i,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(row),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            });
         }
     }
     if !pixel && options.extra_params != 0 {
@@ -1240,8 +1269,12 @@ mod tests {
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let shader = emit(&c, &native, &p, &st, &io, &res);
+            // A raw barycentric read (the input not initialized first) is declared as
+            // `SV_Barycentrics`: the program then reads the input, not the value moved in.
+            let raw = |s: &super::HostShader| s.dxil.windows(15).any(|w| w == b"SV_Barycentrics");
             if matches!(case, Complete | NonzeroBase) {
                 let shader = shader.unwrap();
+                assert!(!raw(&shader), "{case:?}: reads the raw barycentric");
                 assert!(
                     Container::parse(&shader.dxil)
                         .unwrap()
@@ -1259,14 +1292,15 @@ mod tests {
             } else {
                 eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
                 assert!(
-                    matches!(
-                        shader,
-                        Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
-                            ..
-                        })
-                    ),
-                    "{case:?}"
+                    match &shader {
+                        Ok(s) => raw(s),
+                        Err(e) => matches!(
+                            e,
+                            ShaderError::Unsupported { what: "barycentrics read directly", .. }
+                        ),
+                    },
+                    "{case:?}: {:?}",
+                    shader.as_ref().err()
                 );
             }
         }

@@ -754,6 +754,16 @@ pub fn vertex_inputs(dxil: &[u8]) -> Option<Vec<(String, u32)>> {
 
 /// The `TEXCOORD` indices of a translated shader's `ISG1` (inputs) or `OSG1` (outputs) as a mask.
 pub fn texcoords(dxil: &[u8], fourcc: victory_shader::FourCC) -> u32 {
+    named(dxil, fourcc, b"TEXCOORD") as u32 // indices past 31 are not parameters
+}
+
+/// The `HALF` indices (`victory_shader::emit::Options::pixel_reads`) of a translated shader's
+/// `ISG1` or `OSG1` as a mask.
+pub fn halves(dxil: &[u8], fourcc: victory_shader::FourCC) -> u64 {
+    named(dxil, fourcc, b"HALF")
+}
+
+fn named(dxil: &[u8], fourcc: victory_shader::FourCC, want: &[u8]) -> u64 {
     use victory_shader::Container;
     let Some(part) = Container::parse(dxil).ok().and_then(|c| c.part(fourcc).map(|p| p.data.to_vec())) else {
         return 0;
@@ -763,8 +773,8 @@ pub fn texcoords(dxil: &[u8], fourcc: victory_shader::FourCC) -> u32 {
     for i in 0..word(0) as usize {
         let at = 8 + 32 * i;
         let name = part.get(word(at + 4) as usize..).and_then(|t| t.split(|&b| b == 0).next()).unwrap_or(&[]);
-        if name == b"TEXCOORD" && word(at + 12) == 0 && word(at + 8) < 32 {
-            mask |= 1 << word(at + 8);
+        if name == want && word(at + 12) == 0 && word(at + 8) < 64 {
+            mask |= 1u64 << word(at + 8);
         }
     }
     mask

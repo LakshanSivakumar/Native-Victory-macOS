@@ -101,19 +101,20 @@ pub fn translate_rect(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// A guessed vertex shader's container translated for rectangle lists or not, writing the
-/// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write.
-pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> Result<HostShader, String> {
-    translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, ..options() })
+/// `TEXCOORD` parameters in `extra` (bit n) too: those its pixel shader reads and it does not write;
+/// with `pixel_reads`, exporting what its pixel shader reads (`Options::pixel_reads`).
+pub fn translate_extra(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32], pixel_reads: Option<(u32, u64)>) -> Result<HostShader, String> {
+    translate_cached(container, Options { rect_list: rect, extra_params: extra, copy_params, pixel_reads, ..options() })
 }
 
 /// Whether [`translate_extra`]'s translation is in the disk cache already.
-pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32]) -> bool {
-    let o = Options { rect_list: rect, extra_params: extra, copy_params, ..options() };
+pub fn extra_cached(container: &[u8], rect: bool, extra: u32, copy_params: [u8; 32], pixel_reads: Option<(u32, u64)>) -> bool {
+    let o = Options { rect_list: rect, extra_params: extra, copy_params, pixel_reads, ..options() };
     #[cfg(any(windows, target_os = "macos"))]
     return crate::shader_cache::native_present(container, &format!("{o:?}"));
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (container, rect, extra, copy_params, o);
+        let _ = (container, rect, extra, copy_params, pixel_reads, o);
         false
     }
 }
@@ -141,7 +142,7 @@ pub fn integer_targets(color: &[Format]) -> u8 {
 }
 
 /// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
-/// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
+/// give the page table (compute and graphics shaders, guessed or described). A shader that indexes the resource
 /// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
 /// stage (`bind_root_render`, `bind_root` in `victory-metal`).
 pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
@@ -395,7 +396,8 @@ impl<B: PresentBackend> Title<B> {
         if self.refuse_mesh(vs, name) {
             return Pipe::MeshRefused(MeshRefusal::OverLimit);
         }
-        if let Some(why) = refusal(vs, ps, graphics.is_guessed() || vs.stage == victory_shader::HwStage::Ms) {
+        // The draw binds the page table for any render pipeline whose binding asks (`memory`).
+        if let Some(why) = refusal(vs, ps, true) {
             self.shaders.refuse(name, why.into());
             return if vs.stage == victory_shader::HwStage::Ms { Pipe::MeshRefused(MeshRefusal::NoPipeline) } else { Pipe::Refused };
         }

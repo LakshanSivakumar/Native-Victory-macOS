@@ -255,10 +255,15 @@ fn lower_program(parts: &Parts, guessed: bool, console_cf: bool, keep: Option<&K
     // (built from scalars, shifted) only with the console's lanes: asked
     // for when the first try finds one used.
     let mut console = false;
+    // Pixel programs read their barycentric inputs as data from `SV_Barycentrics`: asked for
+    // when the first try is refused for one.
+    let mut barycentrics = false;
     loop {
         #[cfg(test)]
         PASSES.set(PASSES.get() + 1);
-        match Lower::new(parts, &bad, console, guessed, keep, console_cf).run() {
+        let mut lower = Lower::new(parts, &bad, console, guessed, keep, console_cf);
+        lower.barycentrics = barycentrics;
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(phis)) => {
                 for (v, why) in phis {
@@ -274,6 +279,13 @@ fn lower_program(parts: &Parts, guessed: bool, console_cf: bool, keep: Option<&K
                 what: "an opaque lane mask" | "a constant lane mask",
                 ..
             })) if !console && parts.native.stage == HwStage::Cs => console = true,
+            Err(Stop::Fail(ShaderError::Unsupported { what: BARYCENTRICS_READ, .. }))
+                if !barycentrics && parts.native.stage == HwStage::Ps =>
+            {
+                barycentrics = true;
+                // Joins the first try gave up on for a barycentric have one now.
+                bad.retain(|_, why| *why != BARYCENTRICS_READ);
+            }
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
@@ -430,6 +442,8 @@ struct Lower<'a> {
     /// All lanes follow console control flow; EXEC guards vector instructions.
     console_cf: bool,
     opaque_open: HashSet<Value>,
+    /// Barycentric inputs read as data come from `SV_Barycentrics` (`lower_graphics`).
+    barycentrics: bool,
     /// Console wave64 code on 32-lane host waves ([`Options::wave32_host`]).
     host32: bool,
     /// The same, where a console wave is two host waves and the program has
@@ -717,6 +731,9 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
         .map(|o| (o.row, o.pack2))
         .collect()
 }
+
+/// Why a barycentric input has no value until a program reads it as data (`Lower::get`).
+const BARYCENTRICS_READ: Why = "barycentrics read directly";
 
 /// `buffer_atomic_sub` among the buffer atomics' DXIL operation numbers: no DXIL operation of its
 /// own, it is lowered as an add (0) of the negated data.
@@ -1210,6 +1227,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             console_cf,
             opaque_open: HashSet::new(),
+            barycentrics: false,
             host32,
             halves,
             once,
@@ -2287,7 +2305,13 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            // From `SV_Barycentrics` only in a second pass, for a program the first refused for
+            // reading one as data (`lower_graphics`): the many that only interpolate with them
+            // keep their translation and declare no `SV_Barycentrics`.
+            Input::Barycentric { kind, index } if self.barycentrics => {
+                return self.barycentric(kind, index);
+            }
+            Input::Barycentric { .. } => return Val::Missing(BARYCENTRICS_READ),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -2494,6 +2518,49 @@ impl<'a> Lower<'a> {
         };
         self.loaded_inputs.insert((id, col), out);
         out
+    }
+
+    /// A barycentric the pixel program reads as data, not only through `v_interp_*`: `i` (index 0)
+    /// and `j` (1) weigh the triangle's second and third vertices (RDNA2 ISA, "Parameter
+    /// interpolation": P0 + i * P10 + j * P20). They are channels y and z of `SV_Barycentrics`,
+    /// declared with the interpolation of the console's pair (DXIL modes 2 to 7), one element per
+    /// mode as the program first reads it (D3D allows two). The pull model stays refused.
+    fn barycentric(&mut self, kind: crate::io::Barycentric, index: u8) -> Val {
+        use crate::io::Barycentric as B;
+        let interp = match kind {
+            B::PerspectiveCenter => 2,
+            B::PerspectiveCentroid => 3,
+            B::LinearCenter => 4,
+            B::LinearCentroid => 5,
+            B::PerspectiveSample => 6,
+            B::LinearSample => 7,
+            B::PerspectivePullModel => return Val::Missing(BARYCENTRICS_READ),
+        };
+        let id = match self.s.inputs.iter().position(|e| e.kind == 28 && e.interp == interp) {
+            Some(id) => id,
+            None => {
+                let n = self.s.inputs.iter().filter(|e| e.kind == 28).count() as u32;
+                if n == 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                let row = self.s.inputs.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+                self.s.inputs.push(super::container::SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: n,
+                    kind: 28,
+                    comp: 9,
+                    interp,
+                    row: Some(row),
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_input(id, index + 1)
     }
 
     /// The vertex id input (debugging).
@@ -11716,6 +11783,7 @@ impl<'a> Lower<'a> {
                 // `n` have gone on. An arm inside a loop's body is no back edge.
                 k != n
                     && !self.dominates(b, preds[k])
+                    && !self.merge_keeps_edge(b, args, n, k)
                     && st.masks.get(arg).is_some_and(|&m| {
                         [true, false].into_iter().any(|set| {
                             let mut lanes = on_n.clone();
@@ -11739,6 +11807,79 @@ impl<'a> Lower<'a> {
                         differs(&self.lane_edge(from, q), known)
                     })
             })
+    }
+
+    /// Whether edge `k` into the join `b` brings the console compiler's merge of a boolean
+    /// into a lane mask, `s_andn2 t, old, exec` then `s_or d, t, vcc` with `vcc` a compare
+    /// under that EXEC, whose `old` is what edge `n` brings, as the wave runs from edge `n`'s
+    /// block to the merge. The lanes of edge `n` are outside that EXEC (they skip the merge's
+    /// block), where a compare writes 0, so `d` holds their bit of `old`: what edge `n` brings.
+    fn merge_keeps_edge(&self, b: usize, args: &[Value], n: usize, k: usize) -> bool {
+        let p = self.x.p;
+        let w = if self.x.native.wave64 { "_b64" } else { "_b32" };
+        let dwords = if self.x.native.wave64 { 2 } else { 1 };
+        let start = p.blocks[b].preds[n];
+        // Blocks the wave can run after edge `n`'s block before it reaches the join.
+        let mut after = vec![false; p.blocks.len()];
+        let mut stack = p.blocks[start].exit.successors();
+        while let Some(x) = stack.pop() {
+            if x != b && !std::mem::replace(&mut after[x], true) {
+                stack.extend(p.blocks[x].exit.successors());
+            }
+        }
+        let def = |v: Value| self.def_inst(v);
+        let scalar = |i: &Inst, s: usize| match i.fields {
+            Fields::Sop { ref src, .. } => match src.get(s) {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => Some(code),
+                _ => None,
+            },
+            _ => None,
+        };
+        // The one instruction writing every dword of the pair at `code` that `i` reads.
+        let pair_def = |i: &Inst, code: u8| -> Option<&Inst> {
+            let d = def(i.read(Reg::S(code))?)?;
+            (1..dwords)
+                .all(|h| i.read(Reg::S(code + h)).and_then(def).is_some_and(|x| std::ptr::eq(x, d)))
+                .then_some(d)
+        };
+        let exec = |i: &Inst| (0..dwords).map(|h| i.read(Reg::S(EXEC + h))).collect::<Vec<_>>();
+        // What `v` is, through copies and the joins the wave enters from edge `n`'s block on:
+        // at those, the one edge such a block brings it.
+        let resolve = |mut v: Value| {
+            for _ in 0..64 {
+                if let Some(c) = def(v).and_then(|i| crate::structure::copied(i, v, def)) {
+                    v = c;
+                    continue;
+                }
+                let Some(&(q, i)) = self.phi_at.get(&v).filter(|&&(q, _)| after[q]) else { break };
+                let mut from = p.blocks[q].preds.iter().enumerate().filter(|&(_, &x)| x == start || after[x]);
+                match (from.next(), from.next()) {
+                    (Some((e, _)), None) => v = p.blocks[q].phis[i].args[e],
+                    _ => break,
+                }
+            }
+            v
+        };
+        let Some(or) = def(args[k]).filter(|i| i.name() == format!("s_or{w}")) else { return false };
+        if !self.def_block.get(&args[k]).is_some_and(|&d| after[d]) || after[start] {
+            return false;
+        }
+        (0..2).any(|s| {
+            let (Some(t), Some(c)) = (scalar(or, s), scalar(or, 1 - s)) else { return false };
+            let (Some(t), Some(cmp)) = (pair_def(or, t), pair_def(or, c)) else { return false };
+            let Some(old) = scalar(t, 0) else { return false };
+            t.name() == format!("s_andn2{w}")
+                && scalar(t, 1) == Some(EXEC)
+                && cmp.name().starts_with("v_cmp_")
+                && matches!(cmp.fields, Fields::Valu(_))
+                && exec(cmp) == exec(t)
+                && (0..dwords).all(|h| {
+                    let want = if h == 0 { Some(args[n]) } else { self.pair_high(args[n]) };
+                    // A value made again on the way to the merge is another value there.
+                    want.is_some_and(|x| !self.def_block.get(&x).is_some_and(|&d| after[d]))
+                        && t.read(Reg::S(old + h)).map(resolve) == want
+                })
+        })
     }
 
     /// Whether IR block `b` dominates `q`: no path from the entry gets to `q` but through `b`.

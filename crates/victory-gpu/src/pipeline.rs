@@ -318,15 +318,15 @@ impl Shader {
     }
 
     /// Whether [`Self::translate_extra`] would find its translation on disk.
-    pub(crate) fn extra_cached(&self, rect: bool, extra: u32, copy: [u8; 32]) -> bool {
+    pub(crate) fn extra_cached(&self, rect: bool, extra: u32, copy: [u8; 32], reads: Option<(u32, u64)>) -> bool {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
-        crate::native::shaders::extra_cached(&container, rect, extra, copy)
+        crate::native::shaders::extra_cached(&container, rect, extra, copy, reads)
     }
 
     /// A translation that also writes the `TEXCOORD` parameters in `extra` (not cached).
-    pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32]) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+    pub(crate) fn translate_extra(&self, rect: bool, extra: u32, copy: [u8; 32], reads: Option<(u32, u64)>) -> Result<Arc<victory_shader::emit::HostShader>, String> {
         let container = self.container.lock().unwrap_or_else(|e| e.into_inner());
-        crate::native::shaders::translate_extra(&container, rect, extra, copy).map(Arc::new)
+        crate::native::shaders::translate_extra(&container, rect, extra, copy, reads).map(Arc::new)
     }
 
     /// The translation for rectangle-list draws, made on first use.
@@ -874,9 +874,10 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
                 .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
         }
     };
-    // The pixel program's input enables, from the register image (pair 0).
+    // The pixel program's input enables and user SGPR count, from the register image (pair 0).
     let ps_input = piece(0).and_then(victory_shader::emit::graphics::ps_input_ena);
-    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input) {
+    let ps_user_sgprs = piece(0).and_then(victory_shader::emit::graphics::ps_user_sgprs);
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input, ps_user_sgprs) {
         Ok(c) => Ok(shader(name, &c)),
         Err(e) => {
             tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
