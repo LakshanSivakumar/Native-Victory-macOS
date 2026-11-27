@@ -7351,55 +7351,212 @@ impl<'a> Lower<'a> {
         seen
     }
 
-    /// `buffer_load_dword*` through a descriptor the program builds around its constant table
-    /// (`s_getpc_b64` plus an offset, `records` bytes in dword 2, no stride): the table's
-    /// dwords, and 0 for a dword past `records`, as the console's range check gives. `off` is the
-    /// byte from the descriptor's base, `in_view` the part of it the range check covers (all but
-    /// SOFFSET).
-    // shortcut: every OOB_SELECT mode is taken as a check of each dword's end (mode 3, the one
-    // the console compiler's tables use, RDNA2 ISA table 35); an index (`idxen`) is refused.
+    /// `buffer_load_{dword*,ubyte,sbyte,ushort,sshort}` through a descriptor the program builds
+    /// around its constant table (`s_getpc_b64` plus an offset, stride in dword 1 bits 16-29,
+    /// `records` in dword 2, `OOB_SELECT` in dword 3 bits 28-29): reads the table's elements and
+    /// returns 0 for any element failing the RDNA2 ISA table 35 range check (`SOFFSET` moves the
+    /// base without changing the bounds, matching [`Self::computed_buffer`]).
+    #[allow(clippy::too_many_arguments)]
     fn code_buffer_load(
         &mut self,
         inst: &Inst,
         address: &Address,
-        (off, in_view): (V, V),
-        records: u32,
-        indexed: bool,
+        bits: u32,
+        (records, control): (u32, u32),
+        index: Option<V>,
+        (voffset, immediate): (Option<V>, u32),
+        soffset: Option<V>,
         guard: Option<V>,
     ) -> Result<(), Why> {
-        let count = match inst.name().strip_prefix("buffer_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x3") => 3,
-            Some("x4") => 4,
-            _ => return Err("an access other than a dword load through a descriptor built around a table in the code"),
+        let (count, bytes, signed) = match inst.name() {
+            "buffer_load_dword" => (1u32, 4u32, false),
+            "buffer_load_dwordx2" => (2, 4, false),
+            "buffer_load_dwordx3" => (3, 4, false),
+            "buffer_load_dwordx4" => (4, 4, false),
+            "buffer_load_ubyte" => (1, 1, false),
+            "buffer_load_sbyte" => (1, 1, true),
+            "buffer_load_ushort" => (1, 2, false),
+            "buffer_load_sshort" => (1, 2, true),
+            _ => {
+                return Err(
+                    "an access other than a load through a descriptor built around a table in the code",
+                );
+            }
         };
-        if indexed {
-            return Err("an indexed load through a descriptor built around a table in the code");
+        if bits >> 30 != 0 || control & 0xC080_0000 != 0 {
+            return Err(
+                "a descriptor built around a table in the code with swizzling, ADD_TID or a non-buffer type",
+            );
         }
-        let Fields::Buffer { data: Some(Operand::Vector { reg, .. }), .. } = &inst.fields else {
+        let Fields::Buffer {
+            data: Some(Operand::Vector { reg, .. }),
+            ..
+        } = &inst.fields
+        else {
             return Err("a buffer result");
         };
+        let stride = (bits >> 16) & 0x3FFF;
+        let bounds = (control >> 28) & 3;
         let c = self.cur;
-        let mut at = self.s.m.i32(address.offset);
+        let mut at = self.s.m.i32(address.offset.wrapping_add(immediate));
         if let Some(d) = address.dynamic {
             let d = self.i32_of(d)?;
             at = self.s.m.bin(c, Bin::Add, at, d);
         }
-        let at = self.s.m.bin(c, Bin::Add, at, off);
-        let (zero, limit) = (self.s.m.i32(0), self.s.m.i32(records));
+        if let Some(vo) = voffset {
+            at = self.s.m.bin(c, Bin::Add, at, vo);
+        }
+        if let Some(ix) = index
+            && stride != 0
+        {
+            let st = self.s.m.i32(stride);
+            let row = self.s.m.bin(c, Bin::Mul, ix, st);
+            at = self.s.m.bin(c, Bin::Add, at, row);
+        }
+        if let Some(so) = soffset {
+            at = self.s.m.bin(c, Bin::Add, at, so);
+        }
+        let zero = self.s.m.i32(0);
+        // Bounds check helpers (RDNA2 ISA table 35): `None` = statically out of bounds,
+        // `Some(None)` = statically in bounds, `Some(Some(cond))` = runtime i1 predicate.
+        let index_ok = if records == 0 {
+            None
+        } else if let Some(ix) = index {
+            let lim = self.s.m.i32(records);
+            Some(Some(self.s.m.cmp(c, pred::IULT, ix, lim)))
+        } else {
+            Some(None)
+        };
+        // Widen to 64-bit for mode 3 only when `index * stride` is present, could overflow u32,
+        // and at least the first component can fit within `records`.
+        let byte64 = if bounds == 3
+            && u64::from(records) >= u64::from(immediate) + u64::from(bytes)
+            && let Some(ix) = index
+            && stride != 0
+        {
+            let i64t = self.s.m.int(64);
+            self.s.flags |= flags::INT64;
+            let ix64 = self.s.m.cast(c, Cast::ZExt, ix, i64t);
+            let st64 = self.s.m.int_const(i64t, i64::from(stride));
+            let row64 = self.s.m.bin(c, Bin::Mul, ix64, st64);
+            let b64 = if let Some(vo) = voffset {
+                let vo64 = self.s.m.cast(c, Cast::ZExt, vo, i64t);
+                self.s.m.bin(c, Bin::Add, row64, vo64)
+            } else {
+                row64
+            };
+            Some((i64t, b64))
+        } else {
+            None
+        };
         for k in 0..count {
             let c = self.cur;
-            let four = self.s.m.i32(4 * k);
-            let byte = self.s.m.bin(c, Bin::Add, at, four);
-            let x = self.code_dword(byte)?;
-            let end = self.s.m.i32(4 * k + 4);
-            let end = self.s.m.bin(c, Bin::Add, in_view, end);
-            let fits = self.s.m.cmp(c, pred::IULE, end, limit);
-            let x = self.s.m.select(c, fits, x, zero);
+            let fits: Option<Option<V>> = match bounds {
+                0 => {
+                    // Mode 0 checks the component's starting offset against stride and index < records.
+                    let const_delta = u64::from(immediate) + u64::from(bytes * k);
+                    if u64::from(stride) <= const_delta {
+                        None
+                    } else {
+                        let off_ok = voffset.map(|vo| {
+                            let lim = self.s.m.i32((u64::from(stride) - const_delta) as u32);
+                            self.s.m.cmp(c, pred::IULT, vo, lim)
+                        });
+                        match (index_ok, off_ok) {
+                            (None, _) => None,
+                            (Some(None), o) => Some(o),
+                            (Some(Some(i_ok)), None) => Some(Some(i_ok)),
+                            (Some(Some(i_ok)), Some(o_ok)) => {
+                                Some(Some(self.s.m.bin(c, Bin::And, i_ok, o_ok)))
+                            }
+                        }
+                    }
+                }
+                1 => index_ok,
+                // OOB_SELECT=2 disables range checks, except an empty descriptor returns 0.
+                2 => (records != 0).then_some(None),
+                _ => {
+                    // Mode 3 checks the component's payload end against `records` without u32 overflow.
+                    let const_end = u64::from(immediate) + u64::from(bytes * (k + 1));
+                    if u64::from(records) < const_end {
+                        None
+                    } else {
+                        let rem = u64::from(records) - const_end;
+                        if let Some((i64t, b64)) = byte64 {
+                            let lim = self.s.m.int_const(i64t, rem as i64);
+                            Some(Some(self.s.m.cmp(c, pred::IULE, b64, lim)))
+                        } else if let Some(vo) = voffset {
+                            let lim = self.s.m.i32(rem as u32);
+                            Some(Some(self.s.m.cmp(c, pred::IULE, vo, lim)))
+                        } else {
+                            Some(None)
+                        }
+                    }
+                }
+            };
+            let x = match fits {
+                None => zero,
+                Some(cond) => {
+                    let byte = if k == 0 {
+                        at
+                    } else {
+                        let delta = self.s.m.i32(bytes * k);
+                        self.s.m.bin(c, Bin::Add, at, delta)
+                    };
+                    let val = if bytes == 4 {
+                        self.code_dword(byte)?
+                    } else {
+                        self.code_subword(byte, bytes, signed)?
+                    };
+                    match cond {
+                        Some(fits) => self.s.m.select(self.cur, fits, val, zero),
+                        None => val,
+                    }
+                }
+            };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// A 1- or 2-byte load from the program's constant table at `byte` (including a halfword
+    /// straddling two dwords), zero- or sign-extended to 32 bits.
+    fn code_subword(&mut self, byte: V, bytes: u32, signed: bool) -> Result<V, Why> {
+        let mut value = self.s.m.i32(0);
+        for b in 0..bytes {
+            let c = self.cur;
+            let at = if b == 0 {
+                byte
+            } else {
+                let delta = self.s.m.i32(b);
+                self.s.m.bin(c, Bin::Add, byte, delta)
+            };
+            let word = self.code_dword(at)?;
+            let c = self.cur;
+            let three = self.s.m.i32(3);
+            let lane = self.s.m.bin(c, Bin::And, at, three);
+            let shift = self.s.m.bin(c, Bin::Shl, lane, three);
+            let part = self.s.m.bin(c, Bin::LShr, word, shift);
+            let mask = self.s.m.i32(0xFF);
+            let part = self.s.m.bin(c, Bin::And, part, mask);
+            let part = if b == 0 {
+                part
+            } else {
+                let shift = self.s.m.i32(8 * b);
+                self.s.m.bin(c, Bin::Shl, part, shift)
+            };
+            value = if b == 0 {
+                part
+            } else {
+                self.s.m.bin(c, Bin::Or, value, part)
+            };
+        }
+        if signed {
+            let shift = self.s.m.i32(32 - bytes * 8);
+            value = self.s.m.bin(self.cur, Bin::Shl, value, shift);
+            value = self.s.m.bin(self.cur, Bin::AShr, value, shift);
+        }
+        Ok(value)
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -13121,19 +13278,30 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        if let Source::Built {
+            address,
+            bits,
+            words: [records, control],
+        } = src
+            && address.param == CODE
+        {
+            return self.code_buffer_load(
+                inst,
+                address,
+                *bits,
+                (*records, *control),
+                index,
+                (voffset, u32::from(*offset)),
+                so,
+                guard,
+            );
+        }
         let mut off = self.s.m.i32(u32::from(*offset));
         if let Some(vo) = voffset {
             off = self.s.m.bin(c, Bin::Add, off, vo);
         }
-        // SOFFSET moves the base, not the bounds (as `computed_buffer`).
-        let in_view = off;
         if let Some(so) = so {
             off = self.s.m.bin(c, Bin::Add, off, so);
-        }
-        if let Source::Built { address, words: [records, _], .. } = src
-            && address.param == CODE
-        {
-            return self.code_buffer_load(inst, address, (off, in_view), *records, index.is_some(), guard);
         }
         if let Some(slot) = self.vertex_table_slot(src) {
             return self.vertex_fetch(inst, slot, typed, count, *format, *offset, index.is_some() && !*offen, guard);
