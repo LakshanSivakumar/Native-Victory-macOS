@@ -156,7 +156,8 @@
 //!   0), a texture view's width and height - 1 (dword 1 bits 30-31, dword 2
 //!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
 //!   and type (bits 28-31) with an identity swizzle; zeros for anything
-//!   else.
+//!   else. A program that can see a bit of a field the table gives as 0
+//!   is refused (`Lower::seen_bits`).
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -470,8 +471,10 @@ pub struct Options {
     pub zero_copy_memory: bool,
     /// A guessed graphics vertex shader ([`graphics`]) drawn as a rectangle list: each fetched
     /// attribute is read for the rectangle's three corners (instance-stepped, so one instance is a
-    /// rectangle) and the vertex id 0 to 3 picks a corner, the fourth being the sum of two corners
-    /// less the right-angle one, found from the first two-channel float fetch (the position).
+    /// rectangle), or when the program reads `SV_VertexID` directly its body runs for console
+    /// vertex ids `3 * instance + 0..2`, and the strip vertex id 0 to 3 picks a corner, the fourth
+    /// being the sum of two corners less the right-angle one (`SV_Position.xy` or the first
+    /// two-channel float fetch).
     pub rect_list: bool,
     /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
     /// n, undefined values) because its pixel shader reads them.

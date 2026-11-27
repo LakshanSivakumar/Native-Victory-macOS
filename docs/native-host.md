@@ -428,13 +428,13 @@ A lane mask read as a number is the ballot of its lanes' bits where it is writte
 
 "A program input" was also what a loop's join gave, as the join has no defining instruction: a structurized loop keeps the lanes still looping in an SGPR beside EXEC (a copy of EXEC before the loop, `s_andn2_b64 s, s, exec` and its SCC for "does any lane loop on?" at the head, `s_andn2_wrexec_b64 s, s` at the back edge, which writes the same result to both). Where the structuriser could not prove that every lane arriving at the head has its bit set (an outer loop with lanes that broke out makes the arrivals unprovable), the head's SCC was a number of that join and was refused. That join is EXEC at the head: on every edge it takes EXEC's own incoming value (a copy, or the same `_wrexec` result), so it now counts as the head's EXEC mask and a ballot there gives it (`structure::Lanes::exec_copies_at_joins`). Found on the world's lighting compute `9e5a12054881a74d` (#258), the only writer of a 1280x720 R11G11B10 target the host otherwise never wrote; that program then stops at the next refusal, the lanes that broke out of a loop read back through copies ("a lane-mask join of an untracked mask: data whose high dword is not known"). Of 4,129 refused containers dumped at boot (27 November, Series S), the 15 refused as "a program input" are all such joins; only that compute one changes. Test: `mask_tests::a_loop_register_that_is_exec_on_every_edge_is_exec_at_the_head` (two nested loops of this shape; the inner loop's register was not the head's EXEC mask before).
 
-That program's next refusal was a join, not the lanes that broke out: after a loop that an EXEC skip (`s_cbranch_execz`, `s_cmp_eq_u64 exec, 0` and `s_cbranch_scc1` once lockstep rewrites it) can jump over, an SGPR that holds the loop's mask on one edge and leftover data on the skip's (descriptor dwords, the high one with no value) is read only ANDed with EXEC. On the skip's edge that EXEC is the one the skip found empty, so the AND keeps no lane whatever the SGPR holds: the edge is not needed (`Lower::unneeded_edges` now knows that edge, where the lane algebra could not prove it), and a join that lockstep takes as a number no longer asks for that edge's dwords first. Measured offline (27 November) on the 4,129 refused containers of a boot run: with both changes 28 compute programs translate (`9e5a12054881a74d`, `2fcb1ef0e54c7df4`, an HDR writer, and `113a4779d954d6d2`, `a81f1b5bb0d7ba01`, `dd1d8e07445421e6` among them), 2 more stop at a later refusal, nothing else changes; Metal made the compute pipelines of 21 of the 28 (not run) and the host refused the other 7 as "needs view addresses or write marks". Test: `gfx_refusal_tests::a_join_read_only_with_exec_needs_nothing_from_an_exec_skip` (refused before as "data whose high dword is not known").
+That program's next refusal was a join, not the lanes that broke out: after a loop that an EXEC skip (`s_cbranch_execz`, `s_cmp_eq_u64 exec, 0` and `s_cbranch_scc1` once lockstep rewrites it) can jump over, an SGPR that holds the loop's mask on one edge and leftover data on the skip's (descriptor dwords, the high one with no value) is read only ANDed with EXEC. On the skip's edge that EXEC is the one the skip found empty, so the AND keeps no lane whatever the SGPR holds: the edge is not needed (`Lower::unneeded_edges` now knows that edge, where the lane algebra could not prove it), and a join that lockstep takes as a number no longer asks for that edge's dwords first. Measured offline (27 November) on the 4,129 refused containers of a boot run: with both changes 28 compute programs translate (`9e5a12054881a74d`, `2fcb1ef0e54c7df4`, an HDR writer, and `113a4779d954d6d2`, `a81f1b5bb0d7ba01`, `dd1d8e07445421e6` among them), 2 more stop at a later refusal, nothing else changes; Metal made the compute pipelines of 21 of the 28 (not run) and the host refused the other 7 as "needs view addresses or write marks". Test: `gfx_refusal_tests::a_join_read_only_with_exec_needs_nothing_from_an_exec_skip` (refused before as "data whose high dword is not known"). The rule also follows the value through one unconditional relay: a join that is not read in its own block but passed unchanged by a single jump into the next block's phi, and read there only ANDed with an EXEC that the skip found empty (a compute program, `d3ff71633430b06d`, was refused as "a lane-mask join of an untracked mask" for want of that). Only one hop and only reads in the relayed-to block count. Tests: `gfx_refusal_tests::a_join_relayed_by_a_jump_and_read_only_with_exec_needs_nothing_from_an_exec_skip` (refused before), the two that stay refused, `a_relay_block_that_rewrites_exec_still_needs_the_data` and `a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded`, and on Metal `split_wave_tests::a_mask_relayed_by_a_jump_and_read_only_with_exec_is_its_lanes_in_lockstep`.
 
 ## Shader and pipeline cache on disk (native path)
 
 On by default; `VICTORY_NO_SHADER_CACHE=1` turns it off (an empty value or `0` leaves it on). Everything lives under the cache folder (`cache_subdir("native-shaders")`, for example `~/.cache/victory/native-shaders/<translator>/`), never in the repo, and is never sent anywhere. Three layers, each written to a temporary name and renamed:
 
-- **Translations** (`translated/`, `victory_gpu::shader_cache::native_shader`): the `HostShader` of a console container, including `table_entries` and `splits`, keyed by the container's bytes, the translation `Options` (rectangle lists, extra and copied parameters), and the build key (`victory_shader::SOURCE_HASH`, the text of `shader_cache.rs` which defines the encoding, the loop limit, and the translator's environment switches that are set, `victory_shader::emit::TRANSLATION_SWITCHES`: `VICTORY_DEBUG_*` and `VICTORY_NO_LOCKSTEP`). Before the switches were in the key, a debug switch did nothing on a warm cache, and a translation made with one was served to later runs without it. The folder is named by the start of the build key, so a changed translator reads nothing old and old folders can be deleted whole. It is the same store and encoding as the Wine path's (`use_shader_cache`), in its own folder; the encoding now carries `table_entries` and `splits` too. A refusal is stored with its reason.
+- **Translations** (`translated/`, `victory_gpu::shader_cache::native_shader`): the `HostShader` of a console container, including `table_entries` and `splits`, keyed by the container's bytes, the translation `Options` (rectangle lists, extra and copied parameters), and the build key (`victory_shader::SOURCE_HASH`: the translator's sources, manifest and build script, the compiler's version and the `Cargo.lock` entries of the packages the translator depends on, not the whole lock file, which made every dependency change anywhere in the workspace a cold cache, #334; the text of `shader_cache.rs` which defines the encoding, the loop limit, and the translator's environment switches that are set, `victory_shader::emit::TRANSLATION_SWITCHES`: `VICTORY_DEBUG_*` and `VICTORY_NO_LOCKSTEP`). Before the switches were in the key, a debug switch did nothing on a warm cache, and a translation made with one was served to later runs without it. The folder is named by the start of the build key, so a changed translator reads nothing old and old folders can be deleted whole. It is the same store and encoding as the Wine path's (`use_shader_cache`), in its own folder; the encoding now carries `table_entries` and `splits` too. A refusal is stored with its reason.
 - **Libraries** (`metal/`, `victory_metal::disk`): the converter's metallib and shader stage, keyed by the DXIL, the root layout, the entry name, the format and the converter itself (its path, size and modification time). Each file has a magic and a checksum; a damaged file is a miss and is converted again.
 - **Which converter.** At start-up the log names the converter it loaded (`metal: shader converter <path> <size> <mtime> (from VICTORY_MSC_DYLIB | the installed default)`, `msc::load_note`) and warns when it is not `/usr/local/lib/libmetalirconverter.dylib`. A tester's run with the copy bundled with Unreal Engine 5.6 (strings say `D3DRendererMetal-30.2`) drew the loading screen's panels but no logo or art, with no refusal or GPU error; Apple's 4.0 beta 3 package drew it (#295; which draws differ is not known). No version is logged because the library gives none: its Mach-O current version is 0.0.0, and the C API (`metal_irconverter.h`) has no version call. Because the library cache's keys hold the converter's path, size and modification time, two converters never share cached metallibs. Tests: `msc::tests`.
 - **Pipeline states** (`metal/pipelines-<gpu>.metalarchive`, `victory_metal::archive`): an `MTLBinaryArchive` of the compiled compute, render and mesh pipelines. A pipeline is looked up with `FailOnBinaryArchiveMiss`; on a miss it is compiled as before and added. A `pipeline-archive` thread serialises the archive every 5 s while pipelines are added (a write takes about half a second, and a cold world frame's thread waited for 21 of them, 10 s), and the backend does when it drops. Metal refuses an archive from another GPU or OS version; it is then replaced by an empty one. Limit: a run killed within 5 s of its last new pipeline loses those pipelines. Guess, marked in the code: Apple does not say an archive may be added to while another thread reads it, so adds hold a lock that lookups and the write share (`Archive::changing`), and a compile after a miss does not name the archive.
@@ -450,6 +450,55 @@ A program with register-relative moves (`v_movrel*`, `v_swaprel`) is structured 
 Slow work shows in the log: a translation or a conversion of 20 ms or more logs `native shader translation` / `library conversion` with whether the disk had it.
 
 Translations of 20 to 40 s (27 November; 44 to 48 KB pixel shaders) were lowering done over: `lower_graphics` lowered the whole program again for each join with an incoming value that has no DXIL form (574 times for one shader), and `fill_phis` now reports all the joins a pass finds, so two passes do. The shaders were refused in 30 ms until descriptor tracing followed dwords swapped by XORs, and then reached this. `descriptor_data` also searched every descriptor's sources for each load read as data: one table (`load_use`), worth about a tenth of the heaviest translations. The walk in `live_edges` is bounded separately (see "Liveness of phi edges"). A program with several such joins may now be refused for another of them than before, so tallies of refusals by reason shift without any shader changing between translated and refused. Test: `joins_without_a_value_are_found_in_one_pass` (`gfx_refusal_tests`) bounds the passes, not the time.
+
+## Buffer atomic subtraction
+
+DXIL's `AtomicBinOp` has no subtraction, so `buffer_atomic_sub` was refused by name (3 compute
+programs in a 12,020-shader corpus, Series S boot to the menus, 27 November). It is now an add of
+the negated data (`0 - d`): modulo 2^32 the dword left is the same, and the value returned with
+`glc` is the old one either way. Over that corpus the 3 translate and no other output changes.
+`heap_tests::a_buffer_atomic_sub_leaves_the_difference_and_returns_the_old_value` (`victory-gpu`)
+runs it on Metal, wrapping below zero (1 - 3). The 64-bit, image and global forms are not
+covered: no title shader in the corpus uses them.
+
+## Clamped integer sums and differences
+
+The VOP3 clamp bit on `v_add_nc_u32`, `v_sub_nc_u32` and `v_subrev_nc_u32` saturates the result
+as an unsigned number. LLVM's AMDGPU backend selects `uaddsat` and `usubsat` to these with clamp:
+a sum that wraps gives 0xffffffff, and a difference below zero gives 0 (`Lower::integer`,
+`SATURATING`). It was refused for every integer operation as "integer output modifiers": 8
+compute programs in a 12,020-shader corpus (Series S boot to the menus, 27 November), each a
+`v_sub_nc_u32 ... clamp` whose result goes to LDS. Over that corpus the 8 translate and no other
+output changes. Clamp on other integer operations (the signed `_i32` forms, `v_mad_u32_u24` and
+others) and `omod` stay refused. `split_wave_tests::clamped_unsigned_sums_and_differences_saturate`
+(`victory-gpu`) runs both on Metal.
+
+## A half kept by one `v_fma_mix` and replaced by the other
+
+The title's pixel programs often pack two f16 results into a register that still holds an input
+they are done with, a barycentric (`v0`/`v1`) or the first half of an interpolation.
+`v_fma_mixlo_f16 v1, ...` writes the low half and keeps the high half, then
+`v_fma_mixhi_f16 v1, ...` replaces it (or the two come in the other order), and `exp ... compr`
+writes the pair. The kept half has no DXIL form. A `v_fma_mixlo_f16` already recorded such a value
+as unknown, with the low half it made in `low16`, but `v_fma_mixhi_f16` refused it outright.
+
+Now either one records the half it writes (`low16` or `high16`) when the half it keeps is unknown,
+and the other one, finding that entry, keeps the known half and makes the value whole. Entries
+exist only for those `mix` results, so anything else that reads such a value is refused as before.
+So is a kept half that is exported or read: 2 shaders now name the other half's input, the first
+half of an interpolation, where they named the barycentric before, and some of the corpus's
+shaders export `v0` after a `mixlo` alone.
+
+Over a 12,020-shader corpus (Series S boot to the menus, 27 November), 91 shaders now translate
+(90 pixel, 1 vertex), and no other output changes. They were refused as:
+- "barycentrics read directly": 69;
+- "the first half of an interpolation": 18;
+- "a lane mask holding lanes elsewhere read as data: not written by a scalar ALU instruction": 3;
+- "a descriptor built around a table in the code": 1 (vertex).
+
+Each of the 91 has `mix` pairs. `mesh_tests::a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric`
+(`victory-gpu`) draws the shape on Metal in both orders: a pixel program that interpolates with
+`v0`/`v1` and then packs (1.0, 0.5) into `v1` draws (1.0, 0.5, 1.0, 1.0).
 
 ## LDS instructions addressed by M0
 
@@ -514,6 +563,7 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_PASSES_PER_BUFFER=<n>`: on macOS, the most passes of a submission in one command buffer (default 0: no limit, the whole submission in one; 1 is the safest value to try). See "Command buffers of at most N passes".
 - `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines). While work stays held (the `work held for a wait that does not hold` warning, when nothing is submitted any more) the same in-flight report is made, with a line giving how many command buffers are in flight, each queue whose order event is behind the command buffers encoded with it (`queue <title queue> at <reached> of <encoded>`), and the commands dropped so far at unmapped memory. Each piece of a split submission (`VICTORY_PASSES_PER_BUFFER`) is traced as a whole command buffer is, under its own passes: `metal: slow piece` or `metal: failed piece` with its time, and it is in the in-flight report (a time-out carries no encoder states, so the labels are what names the pass). An indirect dispatch's label shows its record as title memory held it at encode time (`indirect[x, y, z]`), and every indirect draw goes through the gate so that the lines above can end with what the GPU read (`gpu read <compute shader, or "draw k" / "mesh draw k" by place in the pass> [counts]`, zeros for a gate that has not run yet); `metal: an indirect dispatch past the most groups ran nothing` names the first four records of each pipeline that asked for more than the gate runs (see "ExecuteIndirect on the native host").
 - `VICTORY_TRACE_WRITES=1`: on macOS, a warning for every bottom-of-pipe value write a list records (value, address, whether a pool holds it, the list), every memory-value wait (address, comparison, reference, the list) and every `ExecuteCommandLists` (queue and lists): which list of which queue owes the word another queue waits for. About 100 lines a world frame. Without it, a value write the host has to drop (its address in no mapped pool, or not preparable) is still a warning, once per page (`native host drops a value write`): a queue may wait for that word for good.
+- `VICTORY_TRACE_FREED=1`: names host and GPU uses of title memory the title's allocator has freed. `XMemAllocDefault` notes every range it hands out, `XMemFreeDefault` the ones it takes back (the block header holds the size), and `Host::resolve` — the way every host and GPU use of title memory begins — logs any range it is asked to map that overlaps a freed span, with both ranges and a serial. Part-reuse leaves the freed ends beside it. What it cannot see: the title can hook the allocator, and pools it sub-allocates inside a live block free and reuse memory without any call here; this names the `XMem`-granularity class only (#339: a host copy or a GPU write into freed memory, one candidate for the corrupted pool links).
 - `VICTORY_TRACE_TEXTURE_SYNC=1`: on macOS, once a second, what keeping the host's textures in step with title memory cost (`texture sync in the last ..`): the submissions that read textures (batches), the textures and MiB they read (those never uploaded before, those read and found unchanged, the blank ones, those with memory that could not be read at once), the time under the host's lock (probing the hot textures, with how many of them went to be read whole; probing the blank ones; uploading), the time the submitting thread spent reading without the lock and the reading threads' time by step (read, hash, detile), and the placements that replaced another at their address (with how many of those had been at that address before). See "Texture sync without the host's lock".
 - `VICTORY_TRACE_RECORD_WRITERS=1`: for indirect mesh draws that leave no pixels. At each present with indirect mesh executions it logs `mesh records` (the frame's records, and how many had a group count of 0 in title memory as the execution was recorded; a culling pass that ran fills them on the GPU later, one that was dropped never does), `mesh record buffer holder` for each compute program, `ran` or `dropped`, whose descriptor tables hold a record buffer for unordered access (with the records in those buffers and the textures it reads), and `texture read by a mesh record buffer holder` with the compute programs that hold that texture for unordered access. Tables are read 64 entries deep whatever their length, so a holder is a candidate writer, not a proven one; the texture keys are those of the `VICTORY_TRACE_TARGETS` frame line. With compute shader hashes for a value (`VICTORY_TRACE_RECORD_WRITERS=<hash>[,<hash>...]`) the records watched are those of these shaders' indirect dispatches instead of the mesh records: the holders are then the candidate writers of their group counts.
 - `VICTORY_TRACE_PASSES=<dir>,<skip>,<presents>`: on macOS, an ordered trace of a few world frames, to find the first pass that writes nothing (`dive-lighting` research). It lets `<skip>` world presents go by (a present after 500 or more recorded draws; default 100), then for the next `<presents>` presents (default 4) writes to stderr, in the order each submission queues the work: `PASS exec=<submission> q=<queue> li=<list> ci=<command> kind=<draw|mesh|dispatch[..]|clear-rtv|copy-region|...> out=<"ran" or the drop reason> sh=[shaders] tg=[targets] rd=[shader-resource views] wr=[unordered-access views] none=<empty table entries> topo=<topology>` for every draw, dispatch, clear and copy recorded in the window; `PASSFAIL exec= li= ci= err=` for each of those the submission could not prepare (dropped then, e.g. "not in a mapped pool"); `PASSUPLOAD` for each upload of title memory over a render-target or unordered-access texture; and, at the window's last present, `PASSTEX key= fmt= WxH at= nonzero=` (plus range, mean and non-finite counts for DXGI 2, 10, 24, 26) for every texture the window named, with a `.ppm` of each in `<dir>` (only formats the dump decodes; arrays skipped). A texture is written `<key>:f<DXGI format>:<W>x<H>@<title address>`, a shader-resource view of a resource the host has no texture for `<key>:untracked`, and a view of memory that is not a texture `placed-dim<dimension>`; tables are read to the entries the shader's binding names (24 for a dropped draw or a dispatch, and never past the heap). Set `VICTORY_TRACE_PASSES_DUMP_EACH=1` to dump at every present of the window. Off unless set: the switch is read once, at the first present; outside the window every hook is one relaxed load of a flag and nothing is formatted or kept, and the commands are prepared once either way (a failure is reported from the submission's own preparation). Images hold game content: keep `<dir>` outside the repository. Runs that end with exit code 134 a minute or two after the window were seen with and without the trace on the same build (the dive's runs and the untraced c2comb run), so that abort is not the trace's.
@@ -1212,6 +1262,36 @@ logged programs use this pattern is unknown.
 Both `v_permlane16_b32` and `v_permlanex16_b32` also use those tracked SGPR constants as lane
 selectors. A selector with a runtime value still produces the computed-lane-select refusal.
 
+An EXEC write inside a section is followed when it is a constant lane set. Those were `s_mov`s of
+a constant only. `s_bfm_b32` and `s_bfm_b64` of two constant counts (`((1 << S0) - 1) << S1`) and
+`s_bitreplicate_b64_b32` of a constant (bit `i` to bits `2i` and `2i + 1`) are one too
+(`wave::exec_constant`). The title's prefix sums select rows with them:
+- wave32 finishes the upper row of sixteen lanes under `s_bfm_b32 exec_lo, 16, 16`, adding lane 15
+  through `v_permlanex16_b32`;
+- wave64 does the upper row of each half under `s_bitreplicate_b64_b32 exec, 0xff00ff00`, then the
+  upper half under `s_bfm_b64 exec, 32, 32`, adding lane 31.
+
+The section stopped at those writes. Either the opcode was named, as with "s_bfm_b32 is not
+supported" (a step that is no register operation is named by its opcode), or the values it left
+were unknown and a later read was refused instead. An `s_bfm` or `s_bitreplicate` with a
+non-constant operand is still refused there.
+
+Over a 12,020-shader corpus (Series S boot to the menus, 27 November):
+- 17 compute shaders now translate: 9 were refused as `s_bfm_b32`, 2 as `s_bitreplicate_b64_b32`,
+  and 6 as "a lane mask holding lanes elsewhere read as data: written by a scalar instruction of
+  the other width" (each has the wave64 section above);
+- 1 is refused for another reason ("a lane-mask join of an untracked mask: data, at a join of
+  several edges");
+- no other output changes.
+
+Tests:
+- `emit::wave::tests::s_bfm_gives_exec_its_field_of_constant_counts`;
+- `emit::lower::tests::a_wave32_prefix_sum_may_set_its_upper_row_with_s_bfm`;
+- `split_wave_tests::a_wave32_prefix_sum_whose_upper_row_s_bfm_selects_runs` (`victory-gpu`, on
+  Metal, with all 32 lanes and with lanes 20 and up off before the section);
+- `split_wave_tests::a_wave64_prefix_sum_whose_rows_s_bitreplicate_and_s_bfm_select_runs`
+  (`victory-gpu`, on Metal, across the two host waves of a console wave).
+
 The simulator keeps the original source lane of a VGPR value through a shuffle. A constant
 `v_readlane_b32` of that value reads the original lane with `WaveReadLaneAt`, or through the
 group-shared exchange when a console wave spans two host waves. Uniform values and whole-wave
@@ -1222,6 +1302,18 @@ outside one. That read was refused as "v_readlane_b32 of a constant lane in a pi
 (132 draws a frame in the G-buffer's warm log). A section's value shaped as a constant, a
 reduction or one lane's value is now that value at any lane (`Lower::section_uniform`).
 Test: `emit::gfx_refusal_tests::a_pixel_program_reads_a_lane_of_a_whole_wave_reduction_as_the_reduction`.
+
+A section of `v_add_f16` steps (`Shape::Half`: the low halves summed, the high half that of
+one console lane) was lowered only where a console wave is one host wave. Where the host splits
+it into two, it was refused as "a 16-bit wave reduction across the host's waves". Now each host
+wave's f32 sum is combined across the pair as other float sums are (`halves_reduce`, still one
+rounding to f16). The high half's lane is read across them with `wide_read_lane`. A lane that is
+elsewhere must give the identity there, but the exchange reads 0 for a lane that wrote nothing, so
+it carries `x ^ ident` and is XORed back. Over a 12,020-shader corpus (Series S boot to the menus,
+27 November) the 2 compute programs refused for it translate, and no other output changes.
+`split_wave_tests::a_whole_wave_half_sum_reads_across_the_host_waves` (`victory-gpu`) runs the
+title's form on Metal in groups of two console waves: 96.0 under lane 63's high half, and 60.0
+with the identity's high half when lanes 40 and up are off.
 
 A section of `v_mul_f32` steps is now followed: it is the product of the lanes
 (`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
@@ -1507,11 +1599,62 @@ through (16 MiB for 2^20 entries), made only for those heaps. shortcut: an entry
 as bytes outside a bound table keeps its old words until it is mirrored, as for the view-stride
 table. Measured offline (27 November): the 7 compute programs of the boot-dumped corpus that #304
 lets translate but the host refused for view addresses now make their Metal pipelines (not run;
-six walk title memory from a view's address, one reads the heap only). Test:
+six walk title memory from a view's address, one reads the heap only). In the all-shaders boot set
+(4,921 containers) 44 translated programs read the table: 42 compute, 2 pixel, no vertex. Test:
 `heap_tests::a_compute_shader_reads_title_memory_at_a_heap_views_address` (a raw SRV's address read
 from its descriptor, the word there stored to the output; refused before, and with only the
 refusal lifted the converter refused the pipeline: "Resource SRV in space 2 register 1 ... is not
 referenced by the root signature").
+
+A shader can need both per-heap tables: the view-stride table (#264) and the view addresses. The
+argument buffer then holds, in order:
+1. the user-data block;
+2. the root views, the stride table among them (root SRV 255 of the root-view space);
+3. the page table (`t0` of the memory space);
+4. the view addresses (`t1`).
+
+`Binding::layout` gives the converter that order, and `NativeHost::translated_args`,
+`memory_args` and `view_address_args` fill the buffer in that same order. Test:
+`heap_tests::a_compute_shader_reads_both_the_view_strides_and_the_view_addresses`. Its compute
+program stores through a buffer it takes from the heap itself, and loads the word at an SRV's
+title address. Swapping the two memory-space tables, in the layout or in the fill, makes it read
+a decoy view's word instead.
+
+The table gives every field it doesn't hold as 0. The translator refuses a program that can see a
+bit of one of them, rather than let it read 0 (`Lower::view_addresses`, `Lower::seen_bits`).
+Refused fields:
+- a buffer's stride and swizzle (dword 1 bits 16-31) and its dwords 2-3;
+- an image's base address, minimum level and format (dword 0, dword 1 bits 0-29);
+- an image's dword 2 bits 30-31, its tiling (dword 3 bits 20-27) and its dwords 4-7.
+
+The message is "a view address field the table gives as 0: " and the field.
+
+The bits a program can see are followed through its readers:
+- `s_and_b32` with a constant keeps that constant's bits;
+- `s_pack_ll_b32_b16` keeps the low half;
+- `s_or_b32` with a constant and `s_lshr_b64` by a constant (of which the dword is the high half)
+  are followed into their results, four readers deep, as long as nothing reads their SCC;
+- any other reader, or a phi, sees every bit.
+
+Measured offline (27 November, the 4,921-container all-shaders boot set, main 465db23b + #304):
+- 44 translated programs read the table: 42 compute, 2 pixel, no vertex.
+- 40 of them read a buffer's dword 1. 23 keep its low 16 bits with `s_and_b32`, 12 pack them with
+  `s_pack_ll_b32_b16`, and 5 shift the address pair right with `s_lshr_b64` before masking.
+- None reads an image's dwords through the table.
+- With the check, all 44 still translate:
+  - 40 have the same output;
+  - 3 no longer load a dword whose readers are never lowered;
+  - 1 is changed only in its refusal message.
+- 11 programs that were already refused now name the field (10 a buffer's stride or swizzle, 1 its
+  record count or format).
+
+Test: `gfx_refusal_tests::view_address_fields_the_table_gives_as_0_are_refused`. It runs one
+refusal per field class, plus accepted reads of a buffer's address (whole dword 0, dword 1 masked
+to 16 bits, or shifted with `s_lshr_b64` and masked) and of an image's size fields. Without the
+check, a read of a buffer's whole dword 1 translated.
+
+shortcut: the kind of view is the load's (eight dwords at a whole descriptor are an image), and the
+swizzle reads as the identity.
 
 ## Descriptor dwords read as data
 
@@ -1734,3 +1877,23 @@ Tests: `emit::export_tests` (the order, for pixel, vertex and mesh programs) and
 `native::mesh_tests::a_converted_mesh_program_with_run_time_parameters_is_valid_ir` (a converted
 mesh program listed with `metal-objdump` and assembled again with `metal-as`; skipped without the
 converter or the Metal toolchain).
+
+## Vertex-ID rectangle lists (#360)
+
+When `Options::rect_list` translates a guessed vertex program whose `Reg::V(0)` (`SV_VertexID`)
+input is read outside the ignored vertex-index operand of a `VERTEX_TABLE` stage-in fetch
+(`Lower::rect_vertex_id`, `emit/lower/rect.rs`), the program has no fetched position from which
+`Lower::vertex_fetch` alone can extrapolate the fourth corner, and strip instances past the first
+would otherwise see `SV_VertexID = 0..3` again. `Lower::run_rect_by_id` lowers the program body
+three times in one invocation — with `v0 = 3 * SV_InstanceID + 0..2` and `v3` (`SV_InstanceID`)
+fixed at `0` as on the console's non-instanced rectangle list — finds the right-angle corner
+opposite the longest `SV_Position.xy` side, extrapolates the missing fourth corner `p + q - r`
+across every exported float channel (keeping bitwise-equal shared corner values exact), and emits
+the `storeOutput` calls back to back after all values are computed. Programs with unordered-access
+writes are refused rather than replaying side effects.
+
+Tests: `victory-shader` `emit::export_tests::a_vertex_id_rect_list_export_makes_every_value_before_its_first_store`,
+`victory-gpu` `native::tests::mesh_tests::a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle`
+(64 of 64 texels) and `vertex_id_rectangle_lists_draw_half_tiles_multiple_rects_and_interpolated_params`
+(32 of 64 half-tile, multi-rectangle direct and indirect draws, and interpolated `TEXCOORD` across
+the fourth corner).

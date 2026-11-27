@@ -532,15 +532,10 @@ fn lit(t: &Title<Metal>, color: &Texture) -> usize {
     pixels(t, color).iter().filter(|p| **p == [255, 128, 128, 255]).count()
 }
 
-/// The contributor lead "a rectangle list whose vertex program takes everything from the vertex
-/// id covers half of each rectangle": so here too. The direct path (`glue::draw`, 3 vertices: one
-/// instance of 4) runs the program for ids 0 to 3, and the rectangle translation only builds the
-/// fourth corner from fetched attributes, so id 3 is the program's own (-1, -1): the second
-/// triangle repeats the first, and only the lower-left half of the target is drawn (28 texels:
-/// those strictly below the diagonal). With more rectangles every instance sees ids 0 to 3 again,
-/// so each draws this half of the first one (from the code; not drawn here).
-/// shortcut: recorded as it is; the fourth corner of such a program needs its position for ids
-/// 0 to 2 in one invocation (the program run three times), not a small change.
+/// A rectangle-list pipeline whose vertex program takes its corners from `SV_VertexID` alone runs
+/// the program for console vertex ids `3 * instance + 0..2`, finds the right-angle corner from
+/// `SV_Position.xy`, and extrapolates the fourth corner `p + q - r`, covering all 64 texels of the
+/// 8x8 target instead of only the lower-left 28 texels.
 #[test]
 fn a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle() {
     let Some(mut t) = title() else { return };
@@ -548,7 +543,135 @@ fn a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle() {
     list.draw_instanced(4, 1, 0, 0).unwrap();
     super::run(&t.host, &[&list]);
     let n = lit(&t, &color);
-    assert_eq!(n, 28, "{n} of 64 lit");
+    assert_eq!(n, 64, "{n} of 64 lit");
+}
+
+/// Multi-rectangle `SV_VertexID` draws (`vertices = 3 * N`, direct and `ExecuteIndirect`) advance
+/// `v0` by `3 * instance + corner`, handle half-size and quarter-size tiles regardless of which
+/// corner holds the right angle, and extrapolate `TEXCOORD` varyings linearly across the fourth
+/// corner.
+#[test]
+fn vertex_id_rectangle_lists_draw_half_tiles_multiple_rects_and_interpolated_params() {
+    // Rectangle 0 (`v0 = 0..2`, right angle at corner 0): left half `x in [-1, 0], y in [-1, 1]`,
+    // `param0 = (u, v)` in `[0, 0.5] x [0.5, 1.0]` (32 of 64 texels).
+    // Rectangle 1 (`v0 = 3..5`, right angle at corner 1): top-right quarter `x in [0, 1], y in [0, 1]`,
+    // `param0 = (u, v)` in `[0.5, 1.0] x [0.0, 0.5]` (16 of 64 texels).
+    const TILE_RECTS_BY_ID: &[u32] = &[
+        0x7E10_0280, // v_mov_b32 v8, 0.0
+        0x7E12_02F0, // v_mov_b32 v9, 0.5
+        0x7E14_02F3, // v_mov_b32 v10, -1.0
+        0x7E16_02F2, // v_mov_b32 v11, 1.0
+        0x7E04_030A, // v_mov_b32 v2, v10 (-1.0)
+        0x7E06_030A, // v_mov_b32 v3, v10 (-1.0)
+        0x7E0E_0308, // v_mov_b32 v7, v8  (0.0)
+        0x7E18_0309, // v_mov_b32 v12, v9 (0.5)
+        0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+        0x0204_1102, // v_cndmask_b32 v2, v2, v8, vcc
+        0x020E_1307, // v_cndmask_b32 v7, v7, v9, vcc
+        0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+        0x0206_1703, // v_cndmask_b32 v3, v3, v11, vcc
+        0x0218_170C, // v_cndmask_b32 v12, v12, v11, vcc
+        0x7D84_0083, // v_cmp_eq_u32 vcc, 3, v0
+        0x0204_1102, // v_cndmask_b32 v2, v2, v8, vcc
+        0x0206_1703, // v_cndmask_b32 v3, v3, v11, vcc
+        0x020E_1307, // v_cndmask_b32 v7, v7, v9, vcc
+        0x0218_110C, // v_cndmask_b32 v12, v12, v8, vcc
+        0x7D84_0084, // v_cmp_eq_u32 vcc, 4, v0
+        0x0204_1702, // v_cndmask_b32 v2, v2, v11, vcc
+        0x0206_1703, // v_cndmask_b32 v3, v3, v11, vcc
+        0x020E_1707, // v_cndmask_b32 v7, v7, v11, vcc
+        0x0218_110C, // v_cndmask_b32 v12, v12, v8, vcc
+        0x7D84_0085, // v_cmp_eq_u32 vcc, 5, v0
+        0x0204_1702, // v_cndmask_b32 v2, v2, v11, vcc
+        0x0206_1103, // v_cndmask_b32 v3, v3, v8, vcc
+        0x020E_1707, // v_cndmask_b32 v7, v7, v11, vcc
+        0x0218_130C, // v_cndmask_b32 v12, v12, v9, vcc
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7E0C_02F2, // v_mov_b32 v6, 1.0
+        0xF800_0203, 0x0000_0C07, // exp param0 v7, v12
+        0xF800_08CF, 0x0604_0302, // exp pos0 v2, v3, v4, v6 done
+        0xBF81_0000, // s_endpgm
+    ];
+    const INTERP_UV_PS: &[u32] = &[
+        0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+        0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+        0xC80C_0100, // v_interp_p1_f32 v3, v0, attr0.y
+        0xC80D_0101, // v_interp_p2_f32 v3, v1, attr0.y
+        0x7E08_02F0, // v_mov_b32 v4, 0.5
+        0x7E0A_02F2, // v_mov_b32 v5, 1.0
+        0xF800_180F, 0x0504_0302, // exp mrt0 v2, v3, v4, v5 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+
+    let Some(mut t) = title() else { return };
+    let mut meta = [0u8; 0x10];
+    meta[12] = 0x40;
+    let vs_bytes: Vec<_> = TILE_RECTS_BY_ID.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let vs_c = victory_shader::emit::graphics::container(HwStage::Vs, &vs_bytes, &meta).unwrap();
+    let vs = shaders::translate_rect(&vs_c).unwrap();
+    let ps = translate(HwStage::Ps, INTERP_UV_PS);
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], true);
+    let Pipe::Render(pso, binding) = t.render_pipe(&vs, Some(&ps), &state, "tile_rect") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+
+    // 1. Half-size tile alone (`1` instance = 3 console vertices): exact 32 of 64 texels (`x < 4`).
+    let (color, mut list) = list_into(&t, &pso, binding.clone());
+    list.set_graphics_pipeline(&pso, Topology::TriangleStrip);
+    list.draw_instanced(4, 1, 0, 0).unwrap();
+    super::run(&t.host, &[&list]);
+    let half = pixels(&t, &color);
+    let half_lit = half.iter().filter(|p| p[3] == 255).count();
+    assert_eq!(half_lit, 32, "half-size tile must light 32 of 64 texels, got {half_lit}");
+    for y in 0..8usize {
+        for x in 0..8usize {
+            let p = half[y * 8 + x];
+            if x < 4 {
+                let want_u = ((x as f32 + 0.5) / 8.0 * 255.0).round() as i32;
+                let want_v = ((1.0 - (y as f32 + 0.5) / 16.0) * 255.0).round() as i32;
+                assert!((p[0] as i32 - want_u).abs() <= 2 && (p[1] as i32 - want_v).abs() <= 2 && p[3] == 255, "half ({x},{y})={p:?}");
+            } else {
+                assert_eq!(p, [0; 4], "half outside ({x},{y})={p:?}");
+            }
+        }
+    }
+
+    // 2. Both tiles (`2` instances = 6 console vertices), checked for both direct and indirect draws:
+    //    32 + 16 = 48 texels lit, with the bottom-right 4x4 untouched.
+    let pool = super::Pool::new(&t.host, 1);
+    pool.write(0, &[6u32, 1, 0, 0]);
+    for indirect in [false, true] {
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.set_graphics_pipeline(&pso, Topology::TriangleStrip);
+        if indirect {
+            list.draw_rects_indirect(pool.va(0), None).unwrap();
+        } else {
+            list.draw_instanced(4, 2, 0, 0).unwrap();
+        }
+        super::run(&t.host, &[&list]);
+        let got = pixels(&t, &color);
+        let count_lit = got.iter().filter(|p| p[3] == 255).count();
+        assert_eq!(count_lit, 48, "indirect={indirect}: expected 48 of 64 texels, got {count_lit}");
+        for y in 0..8usize {
+            for x in 0..8usize {
+                let p = got[y * 8 + x];
+                if x < 4 {
+                    assert_eq!(p, half[y * 8 + x], "indirect={indirect} rect0 ({x},{y})");
+                } else if y < 4 {
+                    // Top-right quarter: `u` in `[0.5, 1.0]` across `x = 4..8`, `v` in `[0.0, 0.5]`
+                    // top-to-bottom across `y = 0..4`.
+                    let want_u = ((0.5 + (x as f32 - 3.5) / 8.0) * 255.0).round() as i32;
+                    let want_v = (((y as f32 + 0.5) / 8.0) * 255.0).round() as i32;
+                    assert!(
+                        (p[0] as i32 - want_u).abs() <= 2 && (p[1] as i32 - want_v).abs() <= 2 && p[3] == 255,
+                        "indirect={indirect} rect1 ({x},{y})={p:?} want=({want_u},{want_v})"
+                    );
+                } else {
+                    assert_eq!(p, [0; 4], "indirect={indirect} unlit ({x},{y})={p:?}");
+                }
+            }
+        }
+    }
 }
 
 /// `ExecuteIndirect` of a rectangle list draws each record as the direct path draws its arguments
@@ -687,4 +810,47 @@ fn a_pixel_program_reads_its_fixed_point_position_where_the_register_image_says(
 fn a_pixel_program_reads_a_zero_line_stipple_coordinate_on_a_triangle() {
     let Some(words) = exported_input(0x80, 0) else { return };
     assert_eq!(words, vec![0; 64]);
+}
+
+/// A pixel program that packs its colour as the title's do. It interpolates param0 with the
+/// barycentric inputs v0 and v1. Then `v_fma_mixlo_f16` writes the low half of v1 and keeps the
+/// high half, which still holds the barycentric, and `v_fma_mixhi_f16` replaces that high half
+/// (the test also runs the two in the other order).
+/// `exp ... compr` writes the pairs. The barycentric is never read for the colour, so the program
+/// translates (it was refused as "barycentrics read directly") and draws (1.0, 0.5, 1.0, 1.0).
+const PACKED_BY_MIX: &[u32] = &[
+    0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+    0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+    0xCC21_0001, 0x0201_E4F2, // v_fma_mixlo_f16 v1, 1.0, 1.0, 0
+    0xCC22_0001, 0x0201_E4F0, // v_fma_mixhi_f16 v1, 0.5, 1.0, 0
+    0x7E04_02FF, 0x3C00_3C00, // v_mov_b32 v2, 0x3c003c00 (two f16 1.0)
+    0xF800_1C0F, 0x0000_0201, // exp mrt0 v1, v1, v2, v2 done compr vm (vsrc0 v1, vsrc1 v2)
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_half_kept_by_mixlo_and_replaced_by_mixhi_draws_without_the_barycentric() {
+    // The triangle program, exporting param0 for the pixel program's interpolation.
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0xF800_0201, 0x0000_0006]); // exp param0 v6 (1.0)
+    // Also in the other order: `mixhi` first keeps the low half, `mixlo` replaces it.
+    let mut swapped = PACKED_BY_MIX.to_vec();
+    let at = swapped.iter().position(|&w| w == 0xCC21_0001).unwrap();
+    let (lo, hi) = (swapped[at..at + 2].to_vec(), swapped[at + 2..at + 4].to_vec());
+    swapped.splice(at..at + 4, hi.into_iter().chain(lo));
+    let ms = translate(HwStage::Vs, &words);
+    let Some(mut t) = title() else { return };
+    for (order, ps_words) in [("mixlo, mixhi", PACKED_BY_MIX), ("mixhi, mixlo", &swapped[..])] {
+        let ps = translate(HwStage::Ps, ps_words);
+        let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+        let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mix") else {
+            panic!("{order}: {:?}", t.shaders);
+        };
+        let (color, mut list) = list_into(&t, &pso, binding);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        let got = pixels(&t, &color);
+        assert!(got.iter().all(|p| *p == [255, 128, 255, 255]), "{order}: {got:?}");
+    }
 }

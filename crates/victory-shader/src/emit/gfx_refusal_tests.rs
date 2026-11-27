@@ -873,6 +873,82 @@ fn descriptor_dwords_read_as_data_say_which() {
     }
 }
 
+/// A descriptor read only as data takes its dwords from the view addresses (`t1`), which hold a
+/// buffer's address and an image's size fields and give every other field as 0: a program that
+/// can see a bit of those is refused naming the field, and one that keeps only the address or
+/// the sizes translates.
+#[test]
+fn view_address_fields_the_table_gives_as_0_are_refused() {
+    use crate::native::tests::{fspx, fspx_resource};
+    // The view at table dword 8, loaded as a buffer's four dwords to s[12:15] or an image's
+    // eight to s[12:19]; `read` leaves what it keeps in s20, which is stored.
+    let program = |image: bool, read: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            if image { 0xF40C_0302 } else { 0xF408_0302 },
+            0xFA00_0020, // s_load_dwordx4 (x8) s[12:15] (s[12:19]), s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        code.extend_from_slice(read);
+        code.extend_from_slice(&[
+            0x7E02_0214, // v_mov_b32 v1, s20
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let and = |src: u32, mask: u32| vec![0x8714_FF00 | src, mask]; // s_and_b32 s20, s<src>, mask
+    let mov = |src: u32| vec![0xBE94_0300 | src]; // s_mov_b32 s20, s<src>
+    // s_lshr_b64 s[20:21], s[12:13], 8, then s_and_b32 s20, s21, mask: dword 1 bits 8 on.
+    let shifted = |mask: u32| vec![0x9094_880C, 0x8714_FF15, mask];
+    let accepted = [
+        (false, mov(12)),
+        (false, and(13, 0xFFFF)),
+        (false, shifted(0xFF)),
+        (true, and(13, 0xC000_0000)),
+        (true, and(14, 0x3FFF_FFFF)),
+        (true, and(15, 0xF00F_FFFF)),
+    ];
+    for (image, read) in accepted {
+        let shader = translate_with(&program(image, &read), Options::default());
+        assert!(
+            shader.as_ref().is_ok_and(|s| s.view_addresses),
+            "{read:x?}: {:?}",
+            shader.err()
+        );
+    }
+    let prefix = "a view address field the table gives as 0: ";
+    let dword_1 = "an image's base address, minimum level or format (dword 1)";
+    let refused = [
+        (false, mov(13), "a buffer's stride or swizzle"),
+        (false, and(13, 0x3FFF_0000), "a buffer's stride or swizzle"),
+        (false, shifted(0xFFFF), "a buffer's stride or swizzle"),
+        (false, mov(14), "a buffer's record count or format"),
+        (true, mov(12), "an image's base address"),
+        (true, and(13, 0xFF), dword_1),
+        (true, and(13, 0x1FF0_0000), dword_1),
+        (true, mov(14), "an image's dword 2"),
+        (true, and(15, 0x01F0_0000), "an image's tiling"),
+        (true, mov(16), "an image's dwords 4-7"),
+    ];
+    for (image, read, why) in refused {
+        let err = translate_with(&program(image, &read), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{read:x?}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage
@@ -2963,4 +3039,71 @@ fn a_wave64_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     }
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("data whose high dword is not known"), "{err:?}");
+}
+
+/// [`SKIP`] with a second EXEC skip inside the region: the join `s[10:11]` reaches is not read in
+/// its own block (J1) but relayed unchanged, by one unconditional jump, into the next block's phi
+/// (J2) and read there only ANDed with EXEC. The outer skip (to J2) brings an empty EXEC there.
+const RELAY: &[u32] = &[
+    0xD4C4_000A,
+    0x0202_0090, // v_cmp_gt_u32 s[10:11], 16, v0
+    0xBE8A_0385, // s_mov_b32 s10, 5 (data; s11 keeps the mask's high dword)
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x4A06_00FF,
+    0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+    0xBF88_0008, // s_cbranch_execz J2 (the outer skip)
+    0x7DA8_0004, // v_cmpx_gt_u32 s4, v0
+    0xBF88_0005, // s_cbranch_execz J1 (the inner skip)
+    0xD760_0008,
+    0x0201_4703, // v_readlane_b32 s8, v3, 35 (refused on the fast path: lockstep)
+    0x7E04_0208, // v_mov_b32 v2, s8
+    0xD4C4_000A,
+    0x0202_0088, // v_cmp_gt_u32 s[10:11], 8, v0 (a mask on this path only)
+    0xBE89_0380, // J1: s_mov_b32 s9, 0 (the join is not read here, only relayed on)
+    0x878C_7E0A, // J2: s_and_b64 s[12:13], s[10:11], exec
+    0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+    0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+    0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+    0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+/// A join read only by an AND with EXEC in the block after an unconditional jump (`RELAY`): on the
+/// edge the outer skip takes, that EXEC is empty, so the relayed value is not needed there either.
+#[test]
+fn a_join_relayed_by_a_jump_and_read_only_with_exec_needs_nothing_from_an_exec_skip() {
+    if let Err(e) = emit_wave64_cs(RELAY, 64, false) {
+        panic!("{e}");
+    }
+}
+
+/// [`RELAY`] with J1 making EXEC `s_mov_b64 exec, s[6:7]`: the relay block now writes EXEC, so the
+/// EXEC J2 reads is not the one the skip found empty and the data is needed: still refused.
+#[test]
+fn a_relay_block_that_rewrites_exec_still_needs_the_data() {
+    let w: Vec<u32> = RELAY.iter().map(|&x| if x == 0xBE89_0380 { 0xBEFE_0406 } else { x }).collect();
+    assert_ne!(w, RELAY);
+    let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("lane-mask join") && err.contains("0x44"), "{err:?}");
+}
+
+/// [`RELAY`] with the inner skip written as `s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1`: in wave64
+/// that sees only half of EXEC, so the edge is not proved empty and stays refused.
+#[test]
+fn a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
+    let mut w = Vec::new();
+    for &x in RELAY {
+        match x {
+            0xBF88_0005 => w.extend([0xBF06_807E, 0xBF85_0005]), // s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1 J1
+            0xBF88_0008 => w.push(0xBF88_0009), // the outer branch, one word further
+            _ => w.push(x),
+        }
+    }
+    let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("lane-mask join") && err.contains("0x48"), "{err:?}");
 }

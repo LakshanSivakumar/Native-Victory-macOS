@@ -33,6 +33,7 @@ pub mod addr;
 pub mod console_state;
 pub(crate) mod descriptor_trace;
 pub mod descriptors;
+pub mod freed;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;
 pub mod host;

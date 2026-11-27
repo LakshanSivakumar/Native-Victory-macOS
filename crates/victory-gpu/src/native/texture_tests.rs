@@ -171,21 +171,18 @@ fn a_texture_blank_for_thousands_of_submissions_is_still_probed() {
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
     let key = res as usize;
+    // One title lock for the whole test, and no probe deadline for the submission after the write:
+    // other tests leave hundreds of blank textures, and a round the deadline cuts short under load
+    // probes only `MIN_SYNC_HOT` of them, so a few submissions may not reach this one.
     with_title(|t| {
         assert!(t.realize(key));
         for _ in 0..2000 {
             t.sync_dirty();
         }
         assert_eq!(t.uploads_of(key), 1, "the blank first upload");
-    });
-    pool.write(0, &vec![0xABu8; info.size]);
-    // Within a few submissions: other tests' blank textures share the probe's time budget.
-    with_title(|t| {
-        let n = (1..=4).find(|_| {
-            t.sync_dirty();
-            t.uploads_of(key) == 2
-        });
-        assert!(n.is_some(), "the first frame is uploaded within a few submissions");
+        pool.write(0, &vec![0xABu8; info.size]);
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 2, "still probed: the first frame is uploaded at the next submission");
     });
 }
 

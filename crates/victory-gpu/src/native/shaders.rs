@@ -81,7 +81,14 @@ pub fn translate_targets(container: &[u8], integer: u8) -> Result<HostShader, St
 
 /// Whether [`translate_targets`]'s translation is in the disk cache already.
 pub fn targets_cached(container: &[u8], integer: u8) -> bool {
-    crate::shader_cache::native_present(container, &format!("{:?}", Options { integer_targets: integer, ..options() }))
+    let o = Options { integer_targets: integer, ..options() };
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{o:?}"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (container, o);
+        false
+    }
 }
 
 /// Bit n set: colour target n has an integer format.

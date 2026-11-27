@@ -239,6 +239,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The buffer and pool-mapping address of `[addr, addr + len)` of title memory.
     /// Outside every pool, a buffer in the host's own memory that holds the whole range.
     pub fn resolve(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
+        crate::native::freed::check(addr, len, "resolve");
         self.forget_released();
         match self.memory.resolve(addr, len) {
             Some((pool, ptr)) => Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr)),

@@ -336,42 +336,32 @@ fn a_compute_shader_loads_a_texture_by_heap_index() {
     assert_eq!(f.get(0x2_0000, 2), [0x3F80_0000, super::addr_tests::CANARY]);
 }
 
-/// A compute program of our own with a raw UAV in the table at user data 4: it loads the dword at
-/// byte `at` of the view, swaps it for one more if it still holds what was loaded
-/// (`buffer_atomic_cmpswap`, which returns what the dword held), and stores what it loaded at byte
-/// 0 and what the swap returned at byte 4. The title's counted appends loop on that pair until
-/// the swap returns what was loaded.
-fn cs_load_then_swap(at: u32) -> Vec<u32> {
-    vec![
-        0xBE8A_0304, // s_mov_b32 s10, s4
-        0xBE8B_0380, // s_mov_b32 s11, 0
-        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
-        0x7E08_02FF, at, // v_mov_b32 v4, at
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xE030_1000, 0x8003_0104, // buffer_load_dword v1, v4, s[12:15], 0 offen
-        0xBF8C_3F70, // s_waitcnt vmcnt(0)
-        0x4A0C_0281, // v_add_nc_u32 v6, 1, v1
-        0x7E0E_0301, // v_mov_b32 v7, v1
-        0xE0C4_5000, 0x8003_0604, // buffer_atomic_cmpswap v[6:7], v4, s[12:15], 0 offen glc
-        0xBF8C_3F70, // s_waitcnt vmcnt(0)
-        0xE070_0000, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0
-        0xE070_0004, 0x8003_0600, // buffer_store_dword v6, off, s[12:15], 4
-        0xBF81_0000, // s_endpgm
-    ]
-}
+/// A compute program whose lane 0 subtracts 3 from the first dword of the raw UAV in its table
+/// (`buffer_atomic_sub` with `glc`) and stores the value it returns, the old one, in the second.
+const CS_ATOMIC_SUB: &[u32] = &[
+    0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0x7E04_0283, // v_mov_b32 v2, 3
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE0CC_4000, 0x8003_0200, // buffer_atomic_sub v2, off, s[12:15], 0 glc
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0004, 0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0 offset:4
+    0xBF81_0000, // s_endpgm
+];
 
-/// A load and a compare-and-swap of the same dword of a view agree on what it holds, inside the
-/// view and past its end: a swap that returned something else than the load read would keep a
-/// retry loop going for good (the GPU never finishes that command buffer). Guess: past the end of
-/// a view the console reads 0 and its atomics write nothing and return 0, as its loads and stores
-/// do.
+/// `buffer_atomic_sub` has no DXIL operation; it runs as an add of the negated data, which leaves
+/// the same dword and returns the same old value, wrapping below zero as the console does.
 #[test]
-fn a_swap_agrees_with_a_load_of_the_same_dword_inside_a_view_and_past_its_end() {
+fn a_buffer_atomic_sub_leaves_the_difference_and_returns_the_old_value() {
     let mut uav = [0u8; 32];
     uav[0] = 0x41;
     uav[4..6].copy_from_slice(&[3, 3]);
     uav[16] = 1;
     uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_ATOMIC_SUB, &[uav], 7);
+    let cs = shaders::translate(&c).expect("buffer_atomic_sub translates");
     let Some(mut t) = title() else { return };
     let f = super::addr_tests::Fixture::new(&t);
     let heap = Heap::new(&t);
@@ -384,171 +374,17 @@ fn a_swap_agrees_with_a_load_of_the_same_dword_inside_a_view_and_past_its_end() 
     let slot = heap._records.as_ptr() as u64 + 64;
     crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
     assert!(t.host.mirror(slot).unwrap());
-    // Byte 0x10 is in the view (256 bytes), byte 0x110 is title memory after it.
-    for (at, held, loaded, after) in [(0x10u32, 41u32, 41u32, 42u32), (0x110, 77, 0, 77)] {
-        let c = crate::pipeline::test_compute_container(&cs_load_then_swap(at), &[uav], 7);
-        let cs = shaders::translate(&c).unwrap();
-        let Pipe::Compute(pso) = t.compute_pipe(&cs, "swap") else { panic!("{:?}", t.shaders) };
-        f.put(0x2_0000, &[0u32, 0]);
-        f.put(0x2_0000 + at as usize, &[held]);
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "atomic sub") else { panic!("{:?}", t.shaders) };
+    for (before, after) in [(10u32, 7u32), (1, u32::MAX - 1)] {
+        f.put(0x2_0000, &[before]);
         let mut l = NativeList::default();
         l.set_heaps(Some(&heap.heap), None);
         l.set_compute_pipeline(&pso);
         l.set_compute_root_table(0, &heap.heap, 2);
         l.dispatch(1, 1, 1).unwrap();
         super::run(&t.host, &[&l]);
-        let out = f.get(0x2_0000, 2);
-        assert_eq!(out, [loaded, loaded], "byte {at:#x}: what the load read, what the swap returned");
-        assert_eq!(f.get(0x2_0000 + at as usize, 1), [after], "byte {at:#x}: the dword after the swap");
+        assert_eq!(f.get(0x2_0000, 2), [after, before], "{before} - 3");
     }
-}
-
-/// A compute program of our own, of the shape of the title's counted appends: every lane adds one
-/// to the dword at byte 16 of the raw UAV in the table at user data 4, by loading it and swapping
-/// it for one more until the swap returns what was loaded. A lane leaves the loop once the count
-/// or its own tries pass 60 (the title's leave at a full count; the tries are there so that a
-/// swap that never agrees with the load ends the test instead of hanging the GPU), and stores
-/// its tries at byte 64 + 4 x lane.
-const CS_APPEND: &[u32] = &[
-        0xBE8A_0304, // s_mov_b32 s10, s4
-        0xBE8B_0380, // s_mov_b32 s11, 0
-        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
-        0x7E08_0290, // v_mov_b32 v4, 16
-        0x7E12_0280, // v_mov_b32 v9, 0
-        0xBE90_037E, // s_mov_b32 s16, exec_lo
-        0xBE91_0380, // s_mov_b32 s17, 0
-        0xBE92_037E, // s_mov_b32 s18, exec_lo
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0xE030_1000, 0x8003_0104, // buffer_load_dword v1, v4, s[12:15], 0 offen
-        0xBF8C_3F70, // s_waitcnt vmcnt(0)
-        0x2814_1301, // v_max_u32 v10, v1, v9
-        0x7DA2_14BC, // v_cmpx_lt_u32 exec_lo, 60, v10
-        0x8811_7E11, // s_or_b32 s17, s17, exec_lo
-        0x8A10_7E10, // s_andn2_b32 s16, s16, exec_lo
-        0xBF84_000A, // s_cbranch_scc0 exit
-        0xBEFE_0310, // s_mov_b32 exec_lo, s16
-        0x4A0C_0281, // v_add_nc_u32 v6, 1, v1
-        0x7E0E_0301, // v_mov_b32 v7, v1
-        0x4A12_1281, // v_add_nc_u32 v9, 1, v9
-        0xE0C4_5000, 0x8003_0604, // buffer_atomic_cmpswap v[6:7], v4, s[12:15], 0 offen glc
-        0xBF8C_3F70, // s_waitcnt vmcnt(0)
-        0x7D24_0D01, // v_cmpx_eq_i32 exec_lo, v1, v6
-        0xBE90_4710, // s_andn2_wrexec_b32 s16, s16
-        0xBF85_FFEE, // s_cbranch_scc1 loop
-        0xBEFE_0312, // s_mov_b32 exec_lo, s18
-        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
-        0xE070_1040, 0x8003_0905, // buffer_store_dword v9, v5, s[12:15], 0 offen offset:0x40
-        0xBF81_0000, // s_endpgm
-];
-
-/// Lanes that append to one count at once all get in: each try, the lane whose swap finds what it
-/// loaded wins and the others load again. The count is the lanes, and no lane runs out of tries.
-#[test]
-fn lanes_that_swap_one_count_at_once_all_append() {
-    let mut uav = [0u8; 32];
-    uav[0] = 0x41;
-    uav[4..6].copy_from_slice(&[3, 3]);
-    uav[16] = 1;
-    uav[20..23].copy_from_slice(&[4, 4, 0]);
-    let c = crate::pipeline::test_compute_container(CS_APPEND, &[uav], 7);
-    let cs = shaders::translate(&c).unwrap();
-    let Some(mut t) = title() else { return };
-    let f = super::addr_tests::Fixture::new(&t);
-    let heap = Heap::new(&t);
-    // Entry 2: a raw buffer UAV of 64 dwords at `VA_A` (pool offset 0x2_0000).
-    let mut resource = [0u32; 14];
-    resource[0] = 1;
-    let mut view = [0u32; 16];
-    (view[1], view[4], view[8]) = (1, 64, 1);
-    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
-    let slot = heap._records.as_ptr() as u64 + 64;
-    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
-    assert!(t.host.mirror(slot).unwrap());
-    let Pipe::Compute(pso) = t.compute_pipe(&cs, "append") else { panic!("{:?}", t.shaders) };
-    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
-    f.put(0x2_0000, &[0u32; 64]);
-    let mut l = NativeList::default();
-    l.set_heaps(Some(&heap.heap), None);
-    l.set_compute_pipeline(&pso);
-    l.set_compute_root_table(0, &heap.heap, 2);
-    l.dispatch(1, 1, 1).unwrap();
-    super::run(&t.host, &[&l]);
-    let tries = f.get(0x2_0000 + 64, 32);
-    assert_eq!(f.get(0x2_0000 + 16, 1), [32], "the count; tries a lane: {tries:?}");
-    assert!(tries.iter().all(|n| (1..=32).contains(n)), "{tries:?}");
-}
-
-/// [`CS_APPEND`] in 64-lane waves, as the title's is: lane `i` appends to the count at dword
-/// `i & 7`, and stores its tries at byte 256 + 4 x lane.
-const CS_APPEND_64: &[u32] = &[
-    0xBE8A_0304, // s_mov_b32 s10, s4
-    0xBE8B_0380, // s_mov_b32 s11, 0
-    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
-    0x3608_0087, // v_and_b32 v4, 7, v0
-    0x3408_0882, // v_lshlrev_b32 v4, 2, v4
-    0x7E12_0280, // v_mov_b32 v9, 0
-    0xBE90_047E, // s_mov_b64 s[16:17], exec
-    0xBE92_0480, // s_mov_b64 s[18:19], 0
-    0xBE94_047E, // s_mov_b64 s[20:21], exec
-    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0xE030_1000, 0x8003_0104, // buffer_load_dword v1, v4, s[12:15], 0 offen
-    0xBF8C_3F70, // s_waitcnt vmcnt(0)
-    0x2814_1301, // v_max_u32 v10, v1, v9
-    0x7DA2_14BC, // v_cmpx_lt_u32 exec, 60, v10
-    0x8892_7E12, // s_or_b64 s[18:19], s[18:19], exec
-    0x8A90_7E10, // s_andn2_b64 s[16:17], s[16:17], exec
-    0xBF84_000A, // s_cbranch_scc0 exit
-    0xBEFE_0410, // s_mov_b64 exec, s[16:17]
-    0x4A0C_0281, // v_add_nc_u32 v6, 1, v1
-    0x7E0E_0301, // v_mov_b32 v7, v1
-    0x4A12_1281, // v_add_nc_u32 v9, 1, v9
-    0xE0C4_5000, 0x8003_0604, // buffer_atomic_cmpswap v[6:7], v4, s[12:15], 0 offen glc
-    0xBF8C_3F70, // s_waitcnt vmcnt(0)
-    0x7D24_0D01, // v_cmpx_eq_i32 exec, v1, v6
-    0xBE90_3A10, // s_andn2_wrexec_b64 s[16:17], s[16:17]
-    0xBF85_FFEE, // s_cbranch_scc1 loop
-    0xBEFE_0414, // s_mov_b64 exec, s[20:21]
-    0x340A_0082, // v_lshlrev_b32 v5, 2, v0
-    0xE070_1100, 0x8003_0905, // buffer_store_dword v9, v5, s[12:15], 0 offen offset:0x100
-    0xBF81_0000, // s_endpgm
-];
-
-/// The same in the title's shape: 256 lanes a group in 64-lane waves, which the host runs as
-/// eight waves of 32. Each of the eight counts is appended to by 32 lanes, eight from each
-/// console wave.
-#[test]
-fn lanes_of_split_waves_that_swap_counts_at_once_all_append() {
-    let mut uav = [0u8; 32];
-    uav[0] = 0x41;
-    uav[4..6].copy_from_slice(&[3, 3]);
-    uav[16] = 1;
-    uav[20..23].copy_from_slice(&[4, 4, 0]);
-    let c = crate::pipeline::test_compute_container_of(CS_APPEND_64, &[uav], 7, 256, true);
-    let cs = shaders::translate(&c).unwrap();
-    let Some(mut t) = title() else { return };
-    let f = super::addr_tests::Fixture::new(&t);
-    let heap = Heap::new(&t);
-    // Entry 2: a raw buffer UAV of 512 dwords at `VA_A` (pool offset 0x2_0000).
-    let mut resource = [0u32; 14];
-    resource[0] = 1;
-    let mut view = [0u32; 16];
-    (view[1], view[4], view[8]) = (1, 512, 1);
-    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
-    let slot = heap._records.as_ptr() as u64 + 64;
-    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
-    assert!(t.host.mirror(slot).unwrap());
-    let Pipe::Compute(pso) = t.compute_pipe(&cs, "append 64") else { panic!("{:?}", t.shaders) };
-    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
-    f.put(0x2_0000, &[0u32; 512]);
-    let mut l = NativeList::default();
-    l.set_heaps(Some(&heap.heap), None);
-    l.set_compute_pipeline(&pso);
-    l.set_compute_root_table(0, &heap.heap, 2);
-    l.dispatch(1, 1, 1).unwrap();
-    super::run(&t.host, &[&l]);
-    let tries = f.get(0x2_0000 + 256, 256);
-    assert_eq!(f.get(0x2_0000, 8), [32; 8], "the counts; tries a lane: {tries:?}");
-    assert!(tries.iter().all(|n| (1..=32).contains(n)), "{tries:?}");
 }
 
 /// A compute program that takes its output buffer from the resource heap itself (entry 2, by
@@ -1531,4 +1367,305 @@ fn a_compute_shader_reads_title_memory_at_a_heap_views_address() {
     super::run(&t.host, &[&l]);
     assert_eq!(f.get(0x2_0000, 2), [0x1234_5678, super::addr_tests::CANARY]);
     drop(records);
+}
+
+/// A compute program that needs both of the host's per-heap tables: the view-stride table (root
+/// SRV 255, among its root views) for the output buffer it takes from the resource heap itself
+/// (entry 2, by the heap's base in s6), and the view addresses (`t1` of the memory space, after
+/// the page table) for the title address of the SRV in its table (entry 1). The converter lays
+/// the argument buffer out by `Binding::layout` and the host fills it in the same order (user
+/// data, root views, page table, view addresses): were two swapped, the shader would read one
+/// table as the other and store nothing, or the wrong word.
+const CS_STRIDES_AND_ADDRESSES: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0405, 0xFA00_0000, // s_load_dwordx4 s[16:19], s[10:11], 0x0
+    0xBE80_0306, // s_mov_b32 s0, s6
+    0xBE81_0380, // s_mov_b32 s1, 0
+    0xF408_0300, 0xFA00_0040, // s_load_dwordx4 s[12:15], s[0:1], 0x40
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x8711_FF11, 0x0000_FFFF, // s_and_b32 s17, s17, 0xffff
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0xDC30_8000, 0x0110_0000, // global_load_dword v1, v0, s[16:17]
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_compute_shader_reads_both_the_view_strides_and_the_view_addresses() {
+    // A raw SRV (kind 0) in a table (root type 3) at user data 4.
+    let mut record = [0u8; 32];
+    record[0] = 0x41;
+    record[4..6].copy_from_slice(&[0, 3]);
+    record[16] = 1;
+    record[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_STRIDES_AND_ADDRESSES, &[record], 7);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.view_addresses && cs.memory && cs.heap, "{cs:?}");
+    assert_eq!(cs.root_srvs, [victory_shader::emit::VIEW_STRIDES]);
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    // The word the program finds by the SRV's address: pool offset 0x2_1000 (`VA_A + 0x1000`);
+    // a decoy at `VA_A + 0x2000`, which entry 0 views.
+    f.put(0x2_1000, &[0x1234_5678u32]);
+    f.put(0x2_2000, &[0xDEC0_DEC0u32]);
+    let records = vec![0u32; 8 * 3];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 3).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let view_at = |address: u64| {
+        let mut v = [0u32; 16];
+        (v[1], v[4], v[8]) = (1, 64, 1);
+        [v[10], v[11]] = super::addr_tests::halves(address);
+        v
+    };
+    // Entry 0: the decoy; entry 1: the SRV (the table starts there); entry 2: the output, 64 raw
+    // dwords at `VA_A` (pool offset 0x2_0000). A program that read the page table as the view
+    // addresses, or the other way round, would not find the SRV's word.
+    let srv = |address: u64| {
+        let mut v = view_at(address);
+        (v[4], v[6]) = (0, 64);
+        v
+    };
+    let views = [
+        srv(super::addr_tests::VA_A + 0x2000),
+        srv(super::addr_tests::VA_A + 0x1000),
+    ];
+    for (entry, view) in views.iter().enumerate() {
+        let at = start + 32 * entry as u64;
+        crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, view, at);
+        assert!(t.host.mirror(at).unwrap());
+    }
+    let uav = view_at(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 64);
+    assert!(t.host.mirror(start + 64).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "strides and addresses") else {
+        panic!("{:?}", t.shaders)
+    };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 1);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(f.get(0x2_0000, 2), [0x1234_5678, super::addr_tests::CANARY]);
+    assert_eq!((t.host.unset_roots(), t.host.failed()), (0, 0));
+    drop(records);
+}
+
+/// A compute program of our own with a raw UAV in the table at user data 4: it loads the dword at
+/// byte `at` of the view, swaps it for one more if it still holds what was loaded
+/// (`buffer_atomic_cmpswap`, which returns what the dword held), and stores what it loaded at byte
+/// 0 and what the swap returned at byte 4. The title's counted appends loop on that pair until
+/// the swap returns what was loaded.
+fn cs_load_then_swap(at: u32) -> Vec<u32> {
+    vec![
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0x7E08_02FF, at, // v_mov_b32 v4, at
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_1000, 0x8003_0104, // buffer_load_dword v1, v4, s[12:15], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x4A0C_0281, // v_add_nc_u32 v6, 1, v1
+        0x7E0E_0301, // v_mov_b32 v7, v1
+        0xE0C4_5000, 0x8003_0604, // buffer_atomic_cmpswap v[6:7], v4, s[12:15], 0 offen glc
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_0000, 0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0
+        0xE070_0004, 0x8003_0600, // buffer_store_dword v6, off, s[12:15], 4
+        0xBF81_0000, // s_endpgm
+    ]
+}
+
+/// A load and a compare-and-swap of the same dword of a view agree on what it holds, inside the
+/// view and past its end: a swap that returned something else than the load read would keep a
+/// retry loop going for good (the GPU never finishes that command buffer). Guess: past the end of
+/// a view the console reads 0 and its atomics write nothing and return 0, as its loads and stores
+/// do.
+#[test]
+fn a_swap_agrees_with_a_load_of_the_same_dword_inside_a_view_and_past_its_end() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    // Entry 2: a raw buffer UAV of 64 dwords at `VA_A` (pool offset 0x2_0000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    // Byte 0x10 is in the view (256 bytes), byte 0x110 is title memory after it.
+    for (at, held, loaded, after) in [(0x10u32, 41u32, 41u32, 42u32), (0x110, 77, 0, 77)] {
+        let c = crate::pipeline::test_compute_container(&cs_load_then_swap(at), &[uav], 7);
+        let cs = shaders::translate(&c).unwrap();
+        let Pipe::Compute(pso) = t.compute_pipe(&cs, "swap") else { panic!("{:?}", t.shaders) };
+        f.put(0x2_0000, &[0u32, 0]);
+        f.put(0x2_0000 + at as usize, &[held]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap.heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap.heap, 2);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        let out = f.get(0x2_0000, 2);
+        assert_eq!(out, [loaded, loaded], "byte {at:#x}: what the load read, what the swap returned");
+        assert_eq!(f.get(0x2_0000 + at as usize, 1), [after], "byte {at:#x}: the dword after the swap");
+    }
+}
+
+/// A compute program of our own, of the shape of the title's counted appends: every lane adds one
+/// to the dword at byte 16 of the raw UAV in the table at user data 4, by loading it and swapping
+/// it for one more until the swap returns what was loaded. A lane leaves the loop once the count
+/// or its own tries pass 60 (the title's leave at a full count; the tries are there so that a
+/// swap that never agrees with the load ends the test instead of hanging the GPU), and stores
+/// its tries at byte 64 + 4 x lane.
+const CS_APPEND: &[u32] = &[
+        0xBE8A_0304, // s_mov_b32 s10, s4
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+        0x7E08_0290, // v_mov_b32 v4, 16
+        0x7E12_0280, // v_mov_b32 v9, 0
+        0xBE90_037E, // s_mov_b32 s16, exec_lo
+        0xBE91_0380, // s_mov_b32 s17, 0
+        0xBE92_037E, // s_mov_b32 s18, exec_lo
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_1000, 0x8003_0104, // buffer_load_dword v1, v4, s[12:15], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x2814_1301, // v_max_u32 v10, v1, v9
+        0x7DA2_14BC, // v_cmpx_lt_u32 exec_lo, 60, v10
+        0x8811_7E11, // s_or_b32 s17, s17, exec_lo
+        0x8A10_7E10, // s_andn2_b32 s16, s16, exec_lo
+        0xBF84_000A, // s_cbranch_scc0 exit
+        0xBEFE_0310, // s_mov_b32 exec_lo, s16
+        0x4A0C_0281, // v_add_nc_u32 v6, 1, v1
+        0x7E0E_0301, // v_mov_b32 v7, v1
+        0x4A12_1281, // v_add_nc_u32 v9, 1, v9
+        0xE0C4_5000, 0x8003_0604, // buffer_atomic_cmpswap v[6:7], v4, s[12:15], 0 offen glc
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7D24_0D01, // v_cmpx_eq_i32 exec_lo, v1, v6
+        0xBE90_4710, // s_andn2_wrexec_b32 s16, s16
+        0xBF85_FFEE, // s_cbranch_scc1 loop
+        0xBEFE_0312, // s_mov_b32 exec_lo, s18
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0xE070_1040, 0x8003_0905, // buffer_store_dword v9, v5, s[12:15], 0 offen offset:0x40
+        0xBF81_0000, // s_endpgm
+];
+
+/// Lanes that append to one count at once all get in: each try, the lane whose swap finds what it
+/// loaded wins and the others load again. The count is the lanes, and no lane runs out of tries.
+#[test]
+fn lanes_that_swap_one_count_at_once_all_append() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_APPEND, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    // Entry 2: a raw buffer UAV of 64 dwords at `VA_A` (pool offset 0x2_0000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "append") else { panic!("{:?}", t.shaders) };
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    f.put(0x2_0000, &[0u32; 64]);
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap.heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap.heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    let tries = f.get(0x2_0000 + 64, 32);
+    assert_eq!(f.get(0x2_0000 + 16, 1), [32], "the count; tries a lane: {tries:?}");
+    assert!(tries.iter().all(|n| (1..=32).contains(n)), "{tries:?}");
+}
+
+/// [`CS_APPEND`] in 64-lane waves, as the title's is: lane `i` appends to the count at dword
+/// `i & 7`, and stores its tries at byte 256 + 4 x lane.
+const CS_APPEND_64: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0x3608_0087, // v_and_b32 v4, 7, v0
+    0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+    0x7E12_0280, // v_mov_b32 v9, 0
+    0xBE90_047E, // s_mov_b64 s[16:17], exec
+    0xBE92_0480, // s_mov_b64 s[18:19], 0
+    0xBE94_047E, // s_mov_b64 s[20:21], exec
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE030_1000, 0x8003_0104, // buffer_load_dword v1, v4, s[12:15], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x2814_1301, // v_max_u32 v10, v1, v9
+    0x7DA2_14BC, // v_cmpx_lt_u32 exec, 60, v10
+    0x8892_7E12, // s_or_b64 s[18:19], s[18:19], exec
+    0x8A90_7E10, // s_andn2_b64 s[16:17], s[16:17], exec
+    0xBF84_000A, // s_cbranch_scc0 exit
+    0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+    0x4A0C_0281, // v_add_nc_u32 v6, 1, v1
+    0x7E0E_0301, // v_mov_b32 v7, v1
+    0x4A12_1281, // v_add_nc_u32 v9, 1, v9
+    0xE0C4_5000, 0x8003_0604, // buffer_atomic_cmpswap v[6:7], v4, s[12:15], 0 offen glc
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7D24_0D01, // v_cmpx_eq_i32 exec, v1, v6
+    0xBE90_3A10, // s_andn2_wrexec_b64 s[16:17], s[16:17]
+    0xBF85_FFEE, // s_cbranch_scc1 loop
+    0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+    0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+    0xE070_1100, 0x8003_0905, // buffer_store_dword v9, v5, s[12:15], 0 offen offset:0x100
+    0xBF81_0000, // s_endpgm
+];
+
+/// The same in the title's shape: 256 lanes a group in 64-lane waves, which the host runs as
+/// eight waves of 32. Each of the eight counts is appended to by 32 lanes, eight from each
+/// console wave.
+#[test]
+fn lanes_of_split_waves_that_swap_counts_at_once_all_append() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container_of(CS_APPEND_64, &[uav], 7, 256, true);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let heap = Heap::new(&t);
+    // Entry 2: a raw buffer UAV of 512 dwords at `VA_A` (pool offset 0x2_0000).
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 512, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    let slot = heap._records.as_ptr() as u64 + 64;
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, slot);
+    assert!(t.host.mirror(slot).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "append 64") else { panic!("{:?}", t.shaders) };
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    f.put(0x2_0000, &[0u32; 512]);
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap.heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap.heap, 2);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    let tries = f.get(0x2_0000 + 256, 256);
+    assert_eq!(f.get(0x2_0000, 8), [32; 8], "the counts; tries a lane: {tries:?}");
+    assert!(tries.iter().all(|n| (1..=32).contains(n)), "{tries:?}");
 }

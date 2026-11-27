@@ -178,6 +178,63 @@ fn a_vertex_export_makes_every_value_before_its_first_store() {
     assert_eq!(check(&l, "storeOutput"), (4, 4));
 }
 
+#[test]
+fn a_vertex_id_rect_list_export_makes_every_value_before_its_first_store() {
+    let words: [u32; 13] = [
+        0x7E14_02F3, // v_mov_b32 v10, -1.0
+        0x7E16_02F2, // v_mov_b32 v11, 1.0
+        0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+        0x0204_170A, // v_cndmask_b32 v2, v10, v11, vcc
+        0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+        0x0206_170A, // v_cndmask_b32 v3, v10, v11, vcc
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7E0C_02F2, // v_mov_b32 v6, 1.0
+        0xF800_0203,
+        0x0000_0302, // exp param0 v2, v3, off, off
+        0xF800_08CF,
+        0x0604_0302, // exp pos0 v2, v3, v4, v6 done
+        0xBF81_0000, // s_endpgm
+    ];
+    let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut meta = [0u8; 0x10];
+    meta[12] = 0x40;
+    let raw = super::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
+    let c = crate::Container::parse(&raw).unwrap();
+    let dxil = c.part(crate::FourCC::DXIL).or(c.part(crate::FourCC::ACCC)).unwrap();
+    let native = crate::native_programs(dxil.data).unwrap().into_iter().next().unwrap();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track_graphics(&p, &native.layout, native.stage, Some(&st), true).unwrap();
+    let io = io::raise_graphics(&p, &native, true).unwrap();
+    let outputs = super::signature(c.part(crate::FourCC::OSG1).unwrap().data).unwrap();
+    let l = lower::lower_graphics(
+        &Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs,
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: true,
+            zero_copy_memory: true,
+            view_marks: false,
+            rect_list: true,
+            copy_params: [0; 32],
+        },
+        true,
+    )
+    .unwrap();
+    // SV_Position (4) + TEXCOORD0 padded to 4 = 8 stores, all computed before their element's
+    // first `storeOutput`.
+    assert_eq!(check(&l, "storeOutput"), (8, 8));
+}
+
 /// A one-wave triangle mesh program. Each lane exports, as its vertex: the position
 /// (two computed floats, which need no cast, then two dwords, which do), parameter 0 (four
 /// dwords declared floats) and parameter 2 (four 16-bit values, each converted to a float);
