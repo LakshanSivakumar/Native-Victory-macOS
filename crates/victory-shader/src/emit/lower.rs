@@ -298,6 +298,8 @@ struct Lower<'a> {
     lane_bits: Map<Value, V>,
     /// IR phi location by value.
     phi_at: Map<Value, (usize, usize)>,
+    /// Lazy map of scalar copy destinations (`s_mov_b32`/`s_mov_b64` and `restored`) to source values.
+    scalar_copies: std::cell::OnceCell<Map<Value, Value>>,
     mask_phis: Map<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     /// [`Lower::unneeded_edges`], made at the first join that asks.
@@ -309,9 +311,13 @@ struct Lower<'a> {
     /// incoming values are still to fill (block, phi index, lane).
     spill_phis: Map<(Value, u32), V>,
     pending_spills: Vec<(V, usize, usize, u32)>,
-    /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
+    /// Phis that code reads. Left a std set: [`Lower::resolve_kept_and_live_edges`] starts
     /// its walk in this set's iteration order, and few phis are read.
     read_phis: HashSet<Value>,
+    /// Guarded/partial VGPR writes (`new -> old`) whose kept old value is checked lane-sensitively.
+    kept_writes: Map<Value, KeptWrite>,
+    /// Genuine reads of [`KeptWrite`] values, checked at `fill_phis`.
+    kept_reads: Vec<ValueRead>,
     params: Map<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -408,8 +414,11 @@ struct Lower<'a> {
     balloting: Set<Value>,
     /// Block writing each value.
     def_block: Map<Value, usize>,
-    /// IR block being lowered.
+    /// IR block and instruction index being lowered (`None` in block exits).
     cur_ir: usize,
+    cur_inst: Option<usize>,
+    /// True while lowering `valu_op` of a DPP instruction whose mask restricted writes.
+    dpp_guarded: bool,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -528,6 +537,37 @@ struct MemoryEntry {
     l1: V,
     /// No host copy holds the page.
     miss: V,
+}
+
+/// What a guarded or partial VGPR write kept: `(old value, optional direct refusal)`.
+type KeptOld = (Value, Option<(usize, Why)>);
+
+/// A guarded or partial VGPR write that kept `old` in inactive lanes or unwritten bits.
+struct KeptWrite {
+    old: Value,
+    /// Present when `old` itself had no DXIL form (`(inst.machine.offset, why)`).
+    missing: Option<(usize, Why)>,
+    reach: Bool,
+    /// Guard under which `new` replaced `old`; lanes keeping `old` satisfy `!guard`.
+    /// `None` when unwritten bits or unmodeled runtime masks leave `old` in any reaching lane.
+    guard: Option<Bool>,
+}
+
+/// A genuine source-operand read of a value that may originate in a [`KeptWrite`].
+struct ValueRead {
+    val: Value,
+    block: usize,
+    inst: Option<usize>,
+    /// Lane constraints at this read (widened across the quad / wave for cross-lane ops).
+    facts: Vec<(Bool, bool)>,
+    cross_lane: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadKind {
+    Lane,
+    Quad,
+    Wave,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1092,6 +1132,7 @@ impl<'a> Lower<'a> {
             bools: Map::default(),
             lane_bits: Map::default(),
             phi_at,
+            scalar_copies: std::cell::OnceCell::new(),
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
             unneeded: std::cell::OnceCell::new(),
@@ -1100,6 +1141,8 @@ impl<'a> Lower<'a> {
             spill_phis: Map::default(),
             pending_spills: Vec::new(),
             read_phis: HashSet::new(),
+            kept_writes: Map::default(),
+            kept_reads: Vec::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -1165,6 +1208,8 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            cur_inst: None,
+            dpp_guarded: false,
             sections: HashMap::new(),
             section_out: Set::default(),
             section_lane_reads: Set::default(),
@@ -1616,6 +1661,7 @@ impl<'a> Lower<'a> {
     /// An instruction inside a whole-wave section: the values that leave
     /// the section are made from what the simulation found them to be.
     fn section_inst(&mut self, b: usize, i: usize, start: usize) -> Result<(), Stop> {
+        self.cur_inst = Some(i);
         let inst = &self.x.p.blocks[b].insts[i];
         if super::wave::scalar_alone(inst) {
             return self.inst(b, i);
@@ -2473,10 +2519,330 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.i32(c))
     }
 
+    /// Records a genuine read of `v` (from `kept_writes`) with its lane/quad constraints.
+    fn record_kept_read(&mut self, v: Value) {
+        let b = self.cur_ir;
+        let reach = self.x.st.reach[b];
+        let Some(i) = self.cur_inst else {
+            self.kept_reads.push(ValueRead {
+                val: v,
+                block: b,
+                inst: None,
+                facts: vec![(reach, true)],
+                cross_lane: false,
+            });
+            return;
+        };
+        let inst = &self.x.p.blocks[b].insts[i];
+        let kind = self.read_kind(b, i, inst);
+        let facts = match kind {
+            ReadKind::Lane => {
+                let mut f = vec![(reach, true)];
+                if let Some(g) = self.x.st.guards[b][i] {
+                    f.push((g, true));
+                }
+                f
+            }
+            ReadKind::Quad => self.quad_facts(b, i),
+            ReadKind::Wave => Vec::new(),
+        };
+        self.kept_reads.push(ValueRead {
+            val: v,
+            block: b,
+            inst: Some(i),
+            facts,
+            cross_lane: kind != ReadKind::Lane,
+        });
+    }
+
+    fn read_kind(&self, b: usize, i: usize, inst: &Inst) -> ReadKind {
+        let name = inst.name();
+        if let Fields::Valu(v) = &inst.fields {
+            if let Some(dpp) = v.dpp {
+                let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+                return if quad && (self.s.pixel || self.s.mesh.is_some()) {
+                    ReadKind::Quad
+                } else {
+                    ReadKind::Wave
+                };
+            }
+            if name == "v_readfirstlane_b32" {
+                if inst
+                    .writes
+                    .first()
+                    .is_some_and(|w| self.waterfall_reads.contains(&w.1))
+                {
+                    return ReadKind::Lane;
+                }
+                // Guess: `v_readfirstlane_b32` reads lane 0 on RDNA when EXEC == 0,
+                // so outside pixel shaders a proved-nonzero EXEC guarantees an
+                // active lane (matching its console source lane) is read.
+                if !self.s.pixel && self.exec_nonzero_at(b, i, inst) {
+                    return ReadKind::Lane;
+                }
+                return ReadKind::Wave;
+            }
+            if name.starts_with("v_readlane") || name.starts_with("v_permlane") {
+                return ReadKind::Wave;
+            }
+        }
+        if name.starts_with("ds_bpermute") || name.starts_with("ds_permute") {
+            return ReadKind::Wave;
+        }
+        if name.starts_with("ds_swizzle")
+            && let Fields::Ds { offset0, offset1, .. } = inst.fields
+        {
+            let offset = u32::from(offset0) | u32::from(offset1) << 8;
+            let quad = offset & 0x8000 != 0
+                || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
+            return if quad && (self.s.pixel || self.s.mesh.is_some()) {
+                ReadKind::Quad
+            } else {
+                ReadKind::Wave
+            };
+        }
+        if (self.s.pixel || self.s.mesh.is_some())
+            && matches!(
+                name,
+                "image_sample" | "image_sample_b" | "image_sample_c" | "image_get_lod"
+            )
+        {
+            return ReadKind::Quad;
+        }
+        ReadKind::Lane
+    }
+
+    fn scalar_copy_map(&self) -> &Map<Value, Value> {
+        self.scalar_copies.get_or_init(|| {
+            let mut m = self.x.st.restored.clone();
+            for block in &self.x.p.blocks {
+                for inst in &block.insts {
+                    let Fields::Sop {
+                        dst: Some(Operand::Scalar { code: dcode, .. }),
+                        src,
+                        ..
+                    } = &inst.fields
+                    else {
+                        continue;
+                    };
+                    let Some(&Operand::Scalar { code: scode, .. }) = src.first() else {
+                        continue;
+                    };
+                    let halves: &[u8] = match inst.name() {
+                        "s_mov_b32" => &[0],
+                        "s_mov_b64" => &[0, 1],
+                        _ => continue,
+                    };
+                    for &h in halves {
+                        if let (Some(d), Some(s)) = (
+                            inst.write(Reg::S(*dcode + h)),
+                            inst.read(Reg::S(scode + h)),
+                        ) {
+                            m.insert(d, s);
+                        }
+                    }
+                }
+            }
+            m
+        })
+    }
+
+    fn unwrap_scalar_copy(&self, mut v: Value) -> Value {
+        let copies = self.scalar_copy_map();
+        for _ in 0..16 {
+            let Some(&src) = copies.get(&v) else {
+                break;
+            };
+            if src == v {
+                break;
+            }
+            v = src;
+        }
+        v
+    }
+
+    /// Whether EXEC at `(b, i)` is guaranteed nonzero by a dominating `execz`/`execnz`
+    /// check of the same lane mask (or identical scalar EXEC value, including loop-invariant EXEC phis).
+    fn exec_nonzero_at(&self, b: usize, i: usize, inst: &Inst) -> bool {
+        let p = self.x.p;
+        let Some(exec_lo) = inst.read(Reg::S(EXEC)) else {
+            return false;
+        };
+        let exec_hi = if p.wave64 {
+            let Some(hi) = inst.read(Reg::S(EXEC + 1)) else {
+                return false;
+            };
+            Some(hi)
+        } else {
+            None
+        };
+        let target = self.x.st.guards[b][i].unwrap_or(self.x.st.reach[b]);
+        let tracked_exec = self.x.st.mask_bits(exec_lo, exec_hi);
+        let mask_matches = |blo: Value, bhi: Option<Value>| {
+            (self.x.st.guards[b][i].is_some() || tracked_exec.is_some())
+                && self
+                    .x
+                    .st
+                    .mask_bits(blo, bhi)
+                    .is_some_and(|m| m == target || tracked_exec == Some(m))
+        };
+
+        let mut cur = b;
+        let mut cur_lo = self.unwrap_scalar_copy(exec_lo);
+        let mut cur_hi = exec_hi.map(|h| self.unwrap_scalar_copy(h));
+        for _ in 0..16 {
+            let (q, next_lo, next_hi) = match &p.blocks[cur].preds[..] {
+                &[q] => (q, cur_lo, cur_hi),
+                preds => {
+                    let Some(&(pb_lo, pi_lo)) = self.phi_at.get(&cur_lo) else {
+                        break;
+                    };
+                    if pb_lo != cur {
+                        break;
+                    }
+                    let phi_lo = &p.blocks[cur].phis[pi_lo];
+                    let phi_hi = match cur_hi {
+                        Some(hi) => {
+                            let Some(&(pb_hi, pi_hi)) = self.phi_at.get(&hi) else {
+                                break;
+                            };
+                            if pb_hi != cur {
+                                break;
+                            }
+                            Some((hi, &p.blocks[cur].phis[pi_hi]))
+                        }
+                        None => None,
+                    };
+                    let mut entry: Option<(usize, usize)> = None;
+                    let mut valid = true;
+                    for (k, &pred) in preds.iter().enumerate() {
+                        if self.rpo[pred] == usize::MAX {
+                            continue;
+                        }
+                        if self.rpo[pred] < self.rpo[cur] && self.tail[pred].is_some() {
+                            if entry.is_some() {
+                                valid = false;
+                                break;
+                            }
+                            entry = Some((k, pred));
+                        } else {
+                            let same_lo = self.unwrap_scalar_copy(phi_lo.args[k]) == cur_lo;
+                            let same_hi = phi_hi.is_none_or(|(hi, ph)| {
+                                self.unwrap_scalar_copy(ph.args[k]) == hi
+                            });
+                            if !(same_lo && same_hi) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some((fk, fq)) = entry.filter(|_| valid) else {
+                        break;
+                    };
+                    let nlo = self.unwrap_scalar_copy(phi_lo.args[fk]);
+                    let nhi = phi_hi.map(|(_, ph)| self.unwrap_scalar_copy(ph.args[fk]));
+                    (fq, nlo, nhi)
+                }
+            };
+            if self.tail[q].is_none() || self.rpo[q] >= self.rpo[cur] {
+                break;
+            }
+            if let Exit::Branch { taken, not_taken } = p.blocks[q].exit
+                && taken != not_taken
+            {
+                let insts = &p.blocks[q].insts;
+                let branch_read = |ins: &Inst| -> Option<(Value, Option<Value>)> {
+                    let lo = ins.read(Reg::S(EXEC))?;
+                    let hi = if p.wave64 {
+                        Some(ins.read(Reg::S(EXEC + 1))?)
+                    } else {
+                        None
+                    };
+                    Some((lo, hi))
+                };
+                let exec_of_branch = match &insts[..] {
+                    [.., last] if last.name() == "s_cbranch_execz" && not_taken == cur => {
+                        branch_read(last)
+                    }
+                    [.., last] if last.name() == "s_cbranch_execnz" && taken == cur => {
+                        branch_read(last)
+                    }
+                    [.., cmp, branch]
+                        if branch.write(Reg::Scc).is_none()
+                            && cmp.write(Reg::Scc).is_some()
+                            && branch.read(Reg::Scc) == cmp.write(Reg::Scc)
+                            && matches!(&cmp.fields, Fields::Sop { src, .. }
+                                if src.get(1).copied().and_then(scalar_constant) == Some(0))
+                            && matches!(
+                                (cmp.name(), p.wave64, branch.name(), taken == cur, not_taken == cur),
+                                ("s_cmp_eq_u64", _, "s_cbranch_scc1", false, true)
+                                    | ("s_cmp_eq_u32", false, "s_cbranch_scc1", false, true)
+                                    | ("s_cmp_lg_u64", _, "s_cbranch_scc0", false, true)
+                                    | ("s_cmp_lg_u32", false, "s_cbranch_scc0", false, true)
+                                    | ("s_cmp_lg_u64", _, "s_cbranch_scc1", true, false)
+                                    | ("s_cmp_lg_u32", false, "s_cbranch_scc1", true, false)
+                                    | ("s_cmp_eq_u64", _, "s_cbranch_scc0", true, false)
+                                    | ("s_cmp_eq_u32", false, "s_cbranch_scc0", true, false)
+                            ) =>
+                    {
+                        branch_read(cmp)
+                    }
+                    _ => None,
+                };
+                if let Some((blo, bhi)) = exec_of_branch {
+                    let ublo = self.unwrap_scalar_copy(blo);
+                    let ubhi = bhi.map(|h| self.unwrap_scalar_copy(h));
+                    if (ublo, ubhi) == (next_lo, next_hi)
+                        || mask_matches(blo, bhi)
+                        || mask_matches(ublo, ubhi)
+                    {
+                        return true;
+                    }
+                }
+            }
+            cur = q;
+            cur_lo = next_lo;
+            cur_hi = next_hi;
+        }
+        false
+    }
+
+    fn quad_facts(&self, b: usize, i: usize) -> Vec<(Bool, bool)> {
+        let is_quad_uniform = |bool_val: Bool| {
+            self.x
+                .st
+                .bools
+                .support(bool_val)
+                .into_iter()
+                .all(|a| matches!(a, Atom::Uniform(_) | Atom::Quad(_)))
+        };
+        let mut facts = Vec::new();
+        let reach = self.x.st.reach[b];
+        if reach != Bool::TRUE && is_quad_uniform(reach) {
+            facts.push((reach, true));
+        }
+        if let Some(g) = self.x.st.guards[b][i]
+            && is_quad_uniform(g)
+        {
+            facts.push((g, true));
+        }
+        facts
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
-        if self.phi_at.contains_key(&v) {
-            self.read_phis.insert(v);
+        self.get_val(v, true)
+    }
+
+    fn get_val(&mut self, v: Value, genuine: bool) -> Result<Val, Why> {
+        if genuine {
+            let is_phi = self.phi_at.contains_key(&v);
+            if is_phi {
+                self.read_phis.insert(v);
+            }
+            if is_phi || self.kept_writes.contains_key(&v) {
+                self.record_kept_read(v);
+            }
         }
         let found = self.vals.get(&v).copied();
         // Most values have a DXIL form, which is the answer whatever they
@@ -4522,6 +4888,52 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Reads `o` as the old value kept by inactive lanes or unwritten bits of
+    /// a write, without marking `o` as genuinely read.
+    fn kept_old_of(&mut self, inst: &Inst, o: Option<Value>) -> (V, Option<KeptOld>) {
+        let Some(o) = o else {
+            return (self.s.m.i32(0), None);
+        };
+        let was_read = self.read_phis.contains(&o);
+        let res = match self.get_val(o, false) {
+            Ok(Val::I32(x)) => Ok(x),
+            Ok(Val::Bit(x)) => Ok(self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)),
+            Ok(Val::Missing(w)) | Err(w) => Err(w),
+        };
+        if !was_read {
+            self.read_phis.remove(&o);
+        }
+        match res {
+            Ok(x) => {
+                let track = self.phi_at.contains_key(&o) || self.kept_writes.contains_key(&o);
+                (x, track.then_some((o, None)))
+            }
+            Err(why) => (
+                self.s.m.i32(0),
+                Some((o, Some((inst.machine.offset, why)))),
+            ),
+        }
+    }
+
+    fn record_kept_write(&mut self, new: Value, kept: KeptOld, keep_all_reaching: bool) {
+        let (old, missing) = kept;
+        let b = self.cur_ir;
+        let guard = if keep_all_reaching || self.dpp_guarded {
+            None
+        } else {
+            self.cur_inst.and_then(|i| self.x.st.guards[b][i])
+        };
+        self.kept_writes.insert(
+            new,
+            KeptWrite {
+                old,
+                missing,
+                reach: self.x.st.reach[b],
+                guard,
+            },
+        );
+    }
+
     /// Writes VGPR `reg` (or the SGPR of a lane read), under `guard`.
     fn write(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
         let x = match (Self::sdwa_dst(inst), reg) {
@@ -4533,26 +4945,38 @@ impl<'a> Lower<'a> {
 
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
+        self.write_placed_with(inst, reg, x, guard, None, None);
+    }
+
+    fn write_placed_with(
+        &mut self,
+        inst: &Inst,
+        reg: Reg,
+        x: V,
+        guard: Option<V>,
+        pre_kept: Option<KeptOld>,
+        low16: Option<V>,
+    ) {
         let Some(new) = inst.write(reg) else { return };
+        let mut kept = pre_kept;
+        let keep_all_reaching = pre_kept.is_some();
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
-                let o = inst.read(reg);
-                let read = o.is_some_and(|o| self.read_phis.contains(&o));
-                let old = match o.map(|o| self.i32_of(o)) {
-                    Some(Ok(o)) => o,
-                    // The validator refuses reads of undef.
-                    _ => self.s.m.i32(0),
-                };
-                // What lanes keep is zero where it has no DXIL form (as
-                // above), so keeping a phi does not make it live.
-                if let Some(o) = o.filter(|_| !read) {
-                    self.read_phis.remove(&o);
+                let (old, g_kept) = self.kept_old_of(inst, inst.read(reg));
+                if kept.is_none() {
+                    kept = g_kept;
                 }
                 self.s.m.select(self.cur, g, x, old)
             }
             _ => x,
         };
         self.vals.insert(new, Val::I32(x));
+        if let Some(low) = low16 {
+            self.low16.insert(new, low);
+        }
+        if let Some(k) = kept {
+            self.record_kept_write(new, k, keep_all_reaching);
+        }
     }
 
     /// The SDWA destination selection: a byte or word, and what the other
@@ -5233,10 +5657,10 @@ impl<'a> Lower<'a> {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,
         };
-        let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
-        let outside = match old_reg {
-            Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
-            None => self.s.m.i32(0),
+        let (outside, ds_kept) = if guard.is_some() {
+            self.kept_old_of(inst, dst_reg.and_then(|r| inst.read(Reg::V(r))))
+        } else {
+            (self.s.m.i32(0), None)
         };
         let p = dword(self, offset);
         let at = self.begin_guarded(guard);
@@ -5250,7 +5674,7 @@ impl<'a> Lower<'a> {
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
-            self.write(inst, Reg::V(reg), r, None);
+            self.write_placed_with(inst, Reg::V(reg), r, None, ds_kept, None);
         }
         Ok(())
     }
@@ -5320,9 +5744,10 @@ impl<'a> Lower<'a> {
             return Err("ds_append or ds_consume in a console wave the host splits");
         }
         let reg = dst_reg.ok_or("an append result")?;
-        let outside = match inst.read(Reg::V(reg)) {
-            Some(v) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
-            None => self.s.m.i32(0),
+        let (outside, ds_kept) = if guard.is_some() {
+            self.kept_old_of(inst, inst.read(Reg::V(reg)))
+        } else {
+            (self.s.m.i32(0), None)
         };
         let g = self.begin_guarded(guard);
         let c = self.cur;
@@ -5349,7 +5774,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let r = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
         let r = self.end_guarded(g, &[(r, outside)])[0];
-        self.write(inst, Reg::V(reg), r, None);
+        self.write_placed_with(inst, Reg::V(reg), r, None, ds_kept, None);
         Ok(())
     }
 
@@ -5367,6 +5792,8 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        self.cur_inst = Some(i);
+        self.dpp_guarded = false;
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
@@ -8555,6 +8982,7 @@ impl<'a> Lower<'a> {
         };
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d, self.x.st.guards[b][i])?;
+            self.dpp_guarded = enable.is_some();
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -8562,6 +8990,7 @@ impl<'a> Lower<'a> {
             self.src0 = Some(x);
         }
         let r = self.valu_op(inst, guard);
+        self.dpp_guarded = false;
         self.src0 = None;
         r
     }
@@ -14023,6 +14452,7 @@ impl<'a> Lower<'a> {
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
+        self.cur_inst = None;
         let offset = self.x.p.blocks[b]
             .insts
             .last()
@@ -14641,30 +15071,26 @@ impl<'a> Lower<'a> {
     }
 
     /// The incoming edges (phi, predecessor index) over which a value can
-    /// reach a read. A phi that only another read phi consumes is live too
-    /// (else a value with no DXIL form reaching a read through two joins
-    /// would be replaced by zero), but only over edges a lane can take on
-    /// its way there: each step back adds the branch a lane took on that
-    /// edge, and a contradiction (the lane that skipped an arm is not one
-    /// that ran it) leaves the edge dead. A back edge forgets the branches
-    /// (the loop redefines their conditions). Fewer conditions are weaker,
-    /// so keeping only the last few stays sound, and so does walking a phi
-    /// knowing nothing once it has been walked with `MAX_PATHS` sets.
-    fn live_edges(&self) -> Set<(Value, usize)> {
+    /// reach a read, plus whether any kept value of a guarded or partial
+    /// write (`kept_writes`) can reach a genuine reader (`kept_reads`).
+    fn resolve_kept_and_live_edges(&self) -> Result<Set<(Value, usize)>, Stop> {
         const MAX_KNOWN: usize = 4;
         // A branchy pixel shader of the title reached thousands of sets per
         // phi, each compared with all before it, and never finished.
         const MAX_PATHS: usize = 64;
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
-            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
         let mut live = Set::default();
-        let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
-        while let Some((v, known)) = work.pop() {
+
+        // Keep `main`'s exact `live_edges` over `read_phis` so programs without
+        // reached `kept_writes` lower identically.
+        let mut phi_work: Vec<(Value, Vec<(Bool, bool)>)> =
+            self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        let mut phi_seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
+        while let Some((v, known)) = phi_work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
-            let done = seen.entry(v).or_default();
+            let done = phi_seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
             if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
                 continue;
@@ -14700,11 +15126,320 @@ impl<'a> Lower<'a> {
                 live.insert((v, n));
                 let arg = p.blocks[b].phis[i].args[n];
                 if self.phi_at.contains_key(&arg) {
-                    work.push((arg, k));
+                    phi_work.push((arg, k));
                 }
             }
         }
-        live
+
+        if self.kept_writes.is_empty() || self.kept_reads.is_empty() {
+            return Ok(live);
+        }
+
+        // Only `kept_reads` whose value can backward-reach a `kept_writes` entry
+        // through `kept_writes` / `phi` chains need checking.
+        let mut reaches_kept: Set<Value> = self.kept_writes.keys().copied().collect();
+        let mut rev_kw: Map<Value, Vec<Value>> = Map::default();
+        for (&new, kw) in &self.kept_writes {
+            rev_kw.entry(kw.old).or_default().push(new);
+        }
+        let mut rev_phi: Map<Value, Vec<Value>> = Map::default();
+        for block in &p.blocks {
+            for phi in &block.phis {
+                for &arg in &phi.args {
+                    if arg != phi.value {
+                        rev_phi.entry(arg).or_default().push(phi.value);
+                    }
+                }
+            }
+        }
+        let mut fwd: Vec<Value> = reaches_kept.iter().copied().collect();
+        while let Some(v) = fwd.pop() {
+            for next in rev_kw.get(&v).into_iter().flatten().chain(rev_phi.get(&v).into_iter().flatten()) {
+                if reaches_kept.insert(*next) {
+                    fwd.push(*next);
+                }
+            }
+        }
+
+        let uses = self.s.pixel.then(|| self.build_uses());
+        let push_fact = |facts: &mut Vec<(Bool, bool)>, pair: (Bool, bool)| {
+            if !facts.contains(&pair) {
+                facts.push(pair);
+            }
+        };
+
+        struct KeptWork {
+            v: Value,
+            known: Vec<(Bool, bool)>,
+            helper_site: Option<(usize, usize)>,
+            through_kept: bool,
+        }
+
+        let mut work = Vec::new();
+        for read in &self.kept_reads {
+            if !reaches_kept.contains(&read.val) {
+                continue;
+            }
+            let helper_site = (!read.cross_lane && self.s.pixel)
+                .then(|| read.inst.map(|i| (read.block, i)))
+                .flatten();
+            work.push(KeptWork {
+                v: read.val,
+                known: read.facts.clone(),
+                helper_site,
+                through_kept: false,
+            });
+        }
+
+        type KeptKey = (Value, bool, Option<(usize, usize)>);
+        type FactSet = Vec<(Bool, bool)>;
+        let mut seen: Map<KeptKey, Vec<FactSet>> = Map::default();
+        while let Some(item) = work.pop() {
+            let KeptWork {
+                v,
+                known,
+                helper_site,
+                through_kept,
+            } = item;
+            if let Some(kw) = self.kept_writes.get(&v) {
+                let mut combined = known;
+                if kw.reach != Bool::TRUE {
+                    push_fact(&mut combined, (kw.reach, true));
+                }
+                if let Some(g) = kw.guard {
+                    push_fact(&mut combined, (g, false));
+                }
+                combined.drain(..combined.len().saturating_sub(MAX_KNOWN));
+                if !st.bools.meet(&combined) {
+                    continue;
+                }
+                if let (Some(site), Some(u)) = (helper_site, uses.as_ref())
+                    && self.safe_wqm_helper_read(site, &combined, u)
+                {
+                    continue;
+                }
+                let done = seen.entry((v, through_kept, helper_site)).or_default();
+                if done.iter().any(|d| d.iter().all(|c| combined.contains(c))) {
+                    continue;
+                }
+                let next = if done.len() < MAX_PATHS {
+                    combined
+                } else {
+                    Vec::new()
+                };
+                done.push(next.clone());
+                if let Some((offset, why)) = kw.missing {
+                    return Err(unsupported(offset, why));
+                }
+                work.push(KeptWork {
+                    v: kw.old,
+                    known: next,
+                    helper_site,
+                    through_kept: true,
+                });
+                continue;
+            }
+            let Some(&(b, i)) = self.phi_at.get(&v) else {
+                continue;
+            };
+            let done = seen.entry((v, through_kept, helper_site)).or_default();
+            if done.iter().any(|d| d.iter().all(|c| known.contains(c))) {
+                continue;
+            }
+            let known = if done.len() < MAX_PATHS { known } else { Vec::new() };
+            done.push(known.clone());
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.tail[q].is_none() {
+                    continue;
+                }
+                let mut k = Vec::new();
+                if let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = st.exits[q]
+                    && taken != not_taken
+                    && self.rpo[taken] > self.rpo[q]
+                    && self.rpo[not_taken] > self.rpo[q]
+                {
+                    k.clone_from(&known);
+                    push_fact(&mut k, (when, taken == b));
+                    if st.reach[q] != Bool::TRUE {
+                        push_fact(&mut k, (st.reach[q], true));
+                    }
+                    k.drain(..k.len().saturating_sub(MAX_KNOWN));
+                    if !st.bools.meet(&k) {
+                        continue;
+                    }
+                } else if self.rpo[q] < self.rpo[b] {
+                    k.clone_from(&known);
+                    if st.reach[q] != Bool::TRUE {
+                        push_fact(&mut k, (st.reach[q], true));
+                        k.drain(..k.len().saturating_sub(MAX_KNOWN));
+                        if !st.bools.meet(&k) {
+                            continue;
+                        }
+                    }
+                }
+                if through_kept {
+                    live.insert((v, n));
+                }
+                let arg = p.blocks[b].phis[i].args[n];
+                if self.phi_at.contains_key(&arg) || self.kept_writes.contains_key(&arg) {
+                    work.push(KeptWork {
+                        v: arg,
+                        known: k,
+                        helper_site,
+                        through_kept,
+                    });
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    fn build_uses(&self) -> Map<Value, Vec<(usize, Option<usize>)>> {
+        let mut uses: Map<Value, Vec<(usize, Option<usize>)>> = Map::default();
+        for (bb, block) in self.x.p.blocks.iter().enumerate() {
+            if self.tail[bb].is_none() {
+                continue;
+            }
+            for phi in &block.phis {
+                for &arg in &phi.args {
+                    uses.entry(arg).or_default().push((bb, None));
+                }
+            }
+            for (ii, inst) in block.insts.iter().enumerate() {
+                for &(_, r) in &inst.reads {
+                    uses.entry(r).or_default().push((bb, Some(ii)));
+                }
+            }
+        }
+        uses
+    }
+
+    /// Whether a pixel shader read at `site` under `facts` is provably isolated
+    /// to helper/dead lanes whose values never reach any quad/implicit-LOD op,
+    /// wave op, export, store, or branch condition.
+    fn safe_wqm_helper_read(
+        &self,
+        site: (usize, usize),
+        facts: &[(Bool, bool)],
+        uses: &Map<Value, Vec<(usize, Option<usize>)>>,
+    ) -> bool {
+        if !self.s.pixel {
+            return false;
+        }
+        let p = self.x.p;
+        let st = &self.x.st;
+        let start = &p.blocks[site.0].insts[site.1];
+        if start.writes.is_empty() || self.read_kind(site.0, site.1, start) != ReadKind::Lane {
+            return false;
+        }
+        if st.discards.contains_key(&site)
+            || matches!(start.fields, Fields::Exp { .. })
+            || start.writes.iter().any(|&(r, _)| !matches!(r, Reg::V(_)))
+        {
+            return false;
+        }
+        let mut seen = Set::default();
+        let mut work: Vec<Value> = start.writes.iter().map(|&(_, w)| w).collect();
+        while let Some(val) = work.pop() {
+            if !seen.insert(val) {
+                continue;
+            }
+            let Some(list) = uses.get(&val) else { continue };
+            for &(bb, opt_ii) in list {
+                let Some(ii) = opt_ii else {
+                    for phi in &p.blocks[bb].phis {
+                        if phi.args.contains(&val) {
+                            work.push(phi.value);
+                        }
+                    }
+                    continue;
+                };
+                let uinst = &p.blocks[bb].insts[ii];
+                if self.read_kind(bb, ii, uinst) != ReadKind::Lane
+                    || st.discards.contains_key(&(bb, ii))
+                {
+                    return false;
+                }
+                let mut sink_facts = facts.to_vec();
+                if st.reach[bb] != Bool::TRUE {
+                    sink_facts.push((st.reach[bb], true));
+                }
+                if let Some(g) = st.guards[bb][ii] {
+                    sink_facts.push((g, true));
+                }
+                let name = uinst.name();
+                if matches!(uinst.fields, Fields::Exp { .. }) {
+                    let is_null = self
+                        .exports
+                        .get(&(bb, ii))
+                        .is_some_and(|e| matches!(e.target, crate::io::Target::Null));
+                    if !is_null && st.bools.meet(&sink_facts) {
+                        return false;
+                    }
+                    continue;
+                }
+                let mem_effect = (matches!(uinst.fields, Fields::Flat { .. })
+                    && !name.starts_with("global_load_"))
+                    || name.contains("store")
+                    || name.contains("atomic")
+                    || (matches!(uinst.fields, Fields::Ds { .. })
+                        && !(name.starts_with("ds_read")
+                            || name.starts_with("ds_swizzle")
+                            || name.contains("permute")));
+                if mem_effect && st.bools.meet(&sink_facts) {
+                    return false;
+                }
+                if uinst.writes.iter().any(|&(r, _)| !matches!(r, Reg::V(_))) {
+                    return false;
+                }
+                for &(_, w) in &uinst.writes {
+                    if let Some(kw) = self.kept_writes.get(&w)
+                        && kw.old == val
+                        && !Self::inst_reads_as_source(uinst, val)
+                    {
+                        let mut kept_facts = facts.to_vec();
+                        if kw.reach != Bool::TRUE {
+                            kept_facts.push((kw.reach, true));
+                        }
+                        if let Some(g) = kw.guard {
+                            kept_facts.push((g, false));
+                        }
+                        if !st.bools.meet(&kept_facts) {
+                            continue;
+                        }
+                    }
+                    work.push(w);
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether `inst` reads `val` as a non-keep source operand (as opposed to
+    /// solely preserving it as the destination's old value under a guard).
+    fn inst_reads_as_source(inst: &Inst, val: Value) -> bool {
+        let Fields::Valu(v) = &inst.fields else {
+            return true;
+        };
+        let name = inst.name();
+        if name.starts_with("v_mac_")
+            || name.starts_with("v_fmac_")
+            || matches!(
+                name,
+                "v_dot4c_i32_i8" | "v_swap_b32" | "v_movreld_b32"
+            )
+        {
+            return true;
+        }
+        v.src.iter().any(|op| match *op {
+            Operand::Vector { reg, dwords } => (0..dwords.max(1))
+                .any(|k| inst.read(Reg::V(reg + k)) == Some(val)),
+            _ => false,
+        })
     }
 
     /// An unguarded indexed write replaces the incoming value before a
@@ -14874,7 +15609,7 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
-        let live = self.live_edges();
+        let live = self.resolve_kept_and_live_edges()?;
         let mut retry = Vec::new();
         'phi: for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
@@ -16514,6 +17249,65 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(refusal(&kept), None);
+
+        // Guarded write over the phi WITHOUT a covering unguarded write leaves
+        // `v1` holding `s_memtime` in inactive lanes, which the compare reads: refused.
+        let kept_read = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert!(refusal(&kept_read).is_some());
+
+        // Direct non-phi `Val::Missing` kept in `!guard` lanes and read: refused.
+        let non_phi_kept = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001,
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert!(refusal(&non_phi_kept).is_some());
+
+        // Two complementary guarded writes overwrite every lane before the read: accepted.
+        let complement_guarded = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF82_0001, // s_branch
+            0xBE83_0381, // s_mov_b32 s3, 1
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0080, // v_cmpx_eq_u32 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0x8A7E_7E04, // s_andn2_b32 exec_lo, s4, exec_lo
+            0x7E02_0283, // v_mov_b32 v1, 3
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001,
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&complement_guarded), None);
     }
 
     #[test]
@@ -17131,5 +17925,191 @@ mod tests {
             "deep SGPR phi chain took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_compute_readfirstlane_under_proved_nonzero_exec_reads_its_lane() {
+        // v1 starts as s_memtime (Missing), then guarded write under v0 >= 8 sets v1 = 7
+        // (keeping Missing in lanes < 8). Inside v0 >= 8, `v_readfirstlane_b32 s6, v1`
+        // copies into v2 (cleanly initialized to 0).
+        let mk = |branch_or_nop: &[u32], mut_hi: bool, wave64: bool| {
+            let save_exec = if wave64 { 0xBE88_246A } else { 0xBE88_3C6A };
+            let restore_exec = if wave64 { 0xBEFE_0408 } else { 0xBEFE_0308 };
+            let mut w = vec![
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xF490_0180,
+                0x0000_0000, // s_memtime s[6:7]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E02_0206, // v_mov_b32 v1, s6 (v1 = Missing in all lanes)
+                0x7D86_0088, // v_cmp_le_u32 vcc_lo, 8, v0 (v0 >= 8)
+                save_exec,   // s_and_saveexec_*
+                0x7E02_0287, // v_mov_b32 v1, 7 (clean in lanes >= 8; < 8 keeps Missing)
+                restore_exec,
+                save_exec,   // s_and_saveexec_* reuses same vcc mask
+            ];
+            w.extend_from_slice(branch_or_nop);
+            if mut_hi {
+                w.push(0xBEFF_0380); // s_mov_b32 exec_hi, 0
+            }
+            w.extend([
+                0x7E0C_0501, // v_readfirstlane_b32 s6, v1
+                0x7E04_0206, // v_mov_b32 v2, s6
+                restore_exec,
+                0xD834_0000,
+                0x0000_0200, // ds_write_b32 v0, v2
+                S_ENDPGM,
+            ]);
+            w
+        };
+        // Proved nonzero via s_cbranch_execz -> ReadKind::Lane -> translates.
+        lower_wave(&mk(&[0xBF88_0002], false, false), vec![], vec![], false).unwrap();
+        // No execz branch (guards == Some) -> ReadKind::Wave -> refused.
+        assert!(lower_wave(&mk(&[0xBF80_0000], false, false), vec![], vec![], false).is_err());
+        // Divergent if with s_cbranch_vccz (guards == None, no execz) -> ReadKind::Wave -> refused.
+        assert!(lower_wave(&mk(&[0xBF86_0002], false, false), vec![], vec![], false).is_err());
+        // Wave64 with s_cbranch_execz translates, unless exec_hi is mutated before readfirstlane.
+        lower_wave(&mk(&[0xBF88_0002], false, true), vec![], vec![], true).unwrap();
+        assert!(lower_wave(&mk(&[0xBF88_0003], true, true), vec![], vec![], true).is_err());
+    }
+
+    #[test]
+    fn a_waterfall_loop_overwrite_feeds_reads_after_exit_but_not_inside_loop() {
+        // v7 and v12 start as s_memtime (Missing). Guarded writes under v0 >= 8 set v7
+        // (leaving < 8 Missing), then `s_cbranch_vccz` (no execz) skips lanes < 8 so
+        // st.reach[L] is v0 >= 8. Inside waterfall loop L, `v_readfirstlane_b32 s20, v7`
+        // stays `ReadKind::Lane` via `waterfall_reads`, while `image_sample_lz` overwrites
+        // v12 under `v_cmpx_eq_u32`. Reading v12 after exit translates; reading v12 before
+        // overwrite inside L refuses.
+        let (layout, used) = texture_and_uav_tables();
+        let build = |read_in_loop: bool| {
+            let mut w = vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF490_0180,
+                0x0000_0000, // s_memtime s[6:7]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E0E_0206, // v_mov_b32 v7, s6 (v7 = Missing in all lanes)
+                0x7E18_0206, // v_mov_b32 v12, s6 (v12 = Missing before L)
+                0x7E10_0280, // v_mov_b32 v8, 0
+                0xBE86_0301, // s_mov_b32 s6, s1
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+                0x7E06_0302, // v_mov_b32 v3, v2
+                0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7D86_0088, // v_cmp_le_u32 vcc_lo, 8, v0 (v0 >= 8)
+                0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+                0x360E_0081, // v_and_b32 v7, 1, v0 (clean in lanes >= 8; < 8 keeps Missing)
+                0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+                0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            ];
+            let branch_pos = w.len();
+            w.push(0xBF86_0000); // s_cbranch_vccz end (patched below; no execz)
+            w.extend([
+                0xBE97_037E, // s_mov_b32 s23, exec_lo
+                0xBE95_037E, // s_mov_b32 s21, exec_lo
+            ]);
+            let loop_top = w.len();
+            if read_in_loop {
+                w.push(0x4A10_1881); // v_add_nc_u32 v8, 1, v12 (reads v12 before overwrite)
+            }
+            w.extend([
+                0x7E28_0507, // L: v_readfirstlane_b32 s20, v7
+                0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+                0xF40C_0302,
+                0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF09C_0F08,
+                0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0x8A15_7E15, // s_andn2_b32 s21, s21, exec_lo
+                0xBEFE_0315, // s_mov_b32 exec_lo, s21
+            ]);
+            let back_off = ((loop_top as isize - (w.len() as isize + 1)) as i16) as u16 as u32;
+            w.push(0xBF89_0000 | back_off); // s_cbranch_execnz L
+            w.push(0xBEFE_0317); // s_mov_b32 exec_lo, s23
+            let store_src = if read_in_loop { 0x800A_0810 } else { 0x800A_0C10 };
+            w.extend([0xE070_1000, store_src]);
+            let end_off = (w.len() - branch_pos - 1) as u32;
+            w[branch_pos] = 0xBF86_0000 | end_off;
+            w.push(S_ENDPGM);
+            w
+        };
+        lower_wave(&build(false), layout.clone(), used.clone(), false).unwrap();
+        assert!(lower_wave(&build(true), layout, used, false).is_err());
+    }
+
+    #[test]
+    fn a_guarded_write_through_a_phi_and_forward_edge_reach_translates() {
+        // v1 starts as s_memtime (Missing), overwritten with 7 under v0 >= 8. A branch
+        // on v0 >= 8 goes through two Jump blocks (testing st.reach[q] on non-branch
+        // forward edges into join's phi), while the else block overwrites v1 cleanly
+        // with 0. Broadening the branch to v0 >= 4 lets lanes < 8 reach join and refuses.
+        let mk = |cmp_vcc: u32| {
+            [
+                0xF490_0180,
+                0x0000_0000, // s_memtime s[6:7]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E02_0206, // v_mov_b32 v1, s6 (v1 = Missing in all lanes)
+                0x7D86_0088, // v_cmp_le_u32 vcc_lo, 8, v0 (v0 >= 8)
+                0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+                0x7E02_0287, // v_mov_b32 v1, 7 (clean in lanes >= 8; < 8 keeps Missing)
+                0xBEFE_0308, // s_mov_b32 exec_lo, s8
+                cmp_vcc,     // s_nop 0 reuses exact vcc (v0 >= 8); v_cmp_le_u32 v0 >= 4 broadens
+                0xBF86_0004, // s_cbranch_vccz else_lbl
+                0xBF80_0000, // then_a: s_nop 0
+                0xBF82_0000, // s_branch then_b
+                0xBF80_0000, // then_b: s_nop 0
+                0xBF82_0001, // s_branch join
+                0x7E02_0280, // else_lbl: v_mov_b32 v1, 0
+                0x4A02_0281, // join: v_add_nc_u32 v1, 1, v1
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        lower_wave(&mk(0xBF80_0000), vec![], vec![], false).unwrap();
+        assert!(lower_wave(&mk(0x7D86_0084), vec![], vec![], false).is_err());
+    }
+
+    #[test]
+    fn a_phi_read_of_a_guarded_write_uses_the_readers_guard() {
+        // v1 starts as s_memtime (Missing), overwritten with 7 under v0 >= 8, then
+        // joined via a uniform s0 == 0 diamond (`else` sets v1 = 0) so st.reach at the
+        // join imposes no lane constraint. Reading phi(v1) under the same guard (v0 >= 8)
+        // translates via `get_val` recording phi reads with the reader's (reach, guard);
+        // reading it outside the guard refuses.
+        let build = |guarded_reader: bool| {
+            let enter = if guarded_reader { 0xBE88_3C6A } else { 0xBF80_0000 };
+            let leave = if guarded_reader { 0xBEFE_0308 } else { 0xBF80_0000 };
+            [
+                0xF490_0180,
+                0x0000_0000, // s_memtime s[6:7]
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E02_0206, // v_mov_b32 v1, s6 (v1 = Missing in all lanes)
+                0x7D86_0088, // v_cmp_le_u32 vcc_lo, 8, v0 (v0 >= 8)
+                0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+                0x7E02_0287, // v_mov_b32 v1, 7 (clean in >= 8; < 8 keeps Missing)
+                0xBEFE_0308, // s_mov_b32 exec_lo, s8
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0 (uniform branch for non-trivial phi)
+                0xBF84_0002, // s_cbranch_scc0 else_lbl
+                0xBF80_0000, // then_lbl: s_nop 0
+                0xBF82_0001, // s_branch join
+                0x7E02_0280, // else_lbl: v_mov_b32 v1, 0
+                enter,       // join: guard v0 >= 8 (s_and_saveexec) or unguarded (s_nop)
+                0x4A02_0281, // v_add_nc_u32 v1, 1, v1 (reads phi(v1))
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                leave,       // restore exec (s_mov) or s_nop
+                S_ENDPGM,
+            ]
+        };
+        let layout = vec![root(RootType::Constants, 0, 0)];
+        lower_wave(&build(true), layout.clone(), vec![], false).unwrap();
+        assert!(lower_wave(&build(false), layout, vec![], false).is_err());
     }
 }

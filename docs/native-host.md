@@ -2190,3 +2190,40 @@ traced run of 3 world frames, `VICTORY_TRACE_PASSES`, Series S, M5 Pro):
   so an access's later dwords past a page boundary are read from the pool, not the title's next page.
 - Next run: `VICTORY_DEBUG_PS=id` with the pass trace names the pixel program, so the draws and the
   vertex program, of each shard.
+
+## Guarded writes keep missing values per lane (#256)
+
+`Lower::write_placed_with` and guarded LDS reads record a `KeptWrite` entry (`new -> old`) with the
+reachability predicate `st.reach[b]` and write guard whenever a guarded VGPR write leaves inactive
+lanes holding `old`; `Lower::get_val` records genuine reads of both `kept_writes` and `phi_at` phis
+(`is_phi || self.kept_writes.contains_key(&v)`) into `kept_reads` with their block, instruction,
+cross-lane flag, and active branch facts. Recording the reader's `(reach, guard)` facts on phi reads
+is sound for the same reason as on direct `kept_writes` reads: in `ReadKind::Lane`, a lane reading
+its own phi receives only the value from its own execution path, so inactive-lane `old` values whose
+lanes contradict the reader's `(reach, guard)` never reach that lane through the phi (while cross-lane
+`ReadKind::Quad` / `ReadKind::Wave` reads widen or clear facts as before). `Lower::resolve_kept_and_live_edges`
+keeps `main`'s backward `live_edges` walk over `read_phis` (with `phi_at` only and `MAX_KNOWN = 4`
+branch conditions) separate from checking `kept_reads`: first taking the backward closure
+`reaches_kept` of values that can reach a `KeptWrite`, then walking each reaching read back across
+`kept_writes` and `phi_at` edges (carrying forward-edge `st.reach[q]` and branch conditions, and
+marking `live` edges for phis reached behind a `KeptWrite`). A `KeptWrite` whose `old` has no DXIL value (`Val::Missing`)
+refuses the program only when the lane conditions arriving at the write do not rule out inactive lanes
+of the guard, or, in pixel shaders, when helper invocations can still read the kept lane (`safe_wqm_helper_read`).
+
+For `v_readfirstlane_b32`: `waterfall_reads` lower literally to each active lane's own descriptor dword
+rather than a wave broadcast (`ReadKind::Lane`). Guess (RDNA hardware behaviour for empty `EXEC`):
+outside pixel shaders, `Lower::read_kind` also treats `v_readfirstlane_b32` as `ReadKind::Lane` when
+`Lower::exec_nonzero_at` finds a dominating `execz`/`execnz` check (`s_cbranch_execz`, `s_cbranch_execnz`,
+or `s_cmp_{eq,lg}_u{64,32}` against `0` with `s_cbranch_scc{0,1}`) whose lane mask (both `lo` and, on
+wave64, `hi`, unwrapped across pure scalar copies and self-preserving loop-header `EXEC` phis) matches
+`EXEC` at the `v_readfirstlane_b32` site. On GFX10 hardware `v_readfirstlane_b32` reads lane 0 when
+`EXEC == 0`, so proving `EXEC != 0` ensures an active lane matching its console source is read; a
+`v_readfirstlane_b32` inside a divergent block without a matching nonzero check (even when
+`st.guards[b][i]` is `None` under `st.reach[b]`) stays `ReadKind::Wave`.
+
+Tests: `victory-shader` `emit::gfx_refusal_tests` (guarded missing writes read in active/inactive lanes
+and helper lanes), `emit::lower::tests::a_compute_readfirstlane_under_proved_nonzero_exec_reads_its_lane`,
+`emit::lower::tests::a_waterfall_loop_overwrite_feeds_reads_after_exit_but_not_inside_loop`,
+`emit::lower::tests::a_guarded_write_through_a_phi_and_forward_edge_reach_translates`,
+`emit::lower::tests::a_phi_read_of_a_guarded_write_uses_the_readers_guard`, and
+`victory-gpu` `native::guarded_write_tests`.
