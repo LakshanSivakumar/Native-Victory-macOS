@@ -2387,6 +2387,23 @@ for now: texture size queries in a waterfall loop that test dword 1 against 0 fo
 (the view-address table holds dword 1 as width bits only, so a texture of width 4k + 1 would
 read as null); buffer dwords 2-3 and image dwords 5-7, which no host table holds.
 
+**Null tests of image dword 1.** Before it sizes an image from its descriptor the console
+compiler tests dword 1 against 0 (`s_cmp_eq_i32 d1, 0; s_cselect_b32 size, 0, size`): a null
+descriptor is all zeros, and a view's dword 1 is never 0, since its format field (bits 20-28) is
+nonzero for every image format (RDNA2 `IMG_FORMAT` 0 is invalid). The rebuilt dword 1 of
+`Lower::descriptor_data` held only the width bits (30-31, width - 1), so a view of width 4k + 1
+read as null and was sized 0, and a null view (host size 0) read as one of width 65,536. When the
+code tests the dword against 0 and otherwise reads only its width bits (`s_bfe_u32` or
+`s_lshr_b32` from bit 30) or passes it to an image instruction as the descriptor, and no join
+takes it (`Lower::width_bits_or_null_test`), dword 1 is now 0 for a view of size 0 and has
+format bit 20 set otherwise: exact for such code, which sees no other bit. Anything else that
+reads it keeps the old dword. The view-address table path (`view_addresses`, a size read with no
+use of the view) is unchanged. Test (`victory-gpu`, Metal):
+`heap_tests::an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor` (a 5x8 image
+read as null before). Corpus (tmi-agent, 21,600): 0 newly translated, 0 regressed, 2,739 outputs
+changed (94 compute, 589 pixel, 2,056 vertex), each a program whose rebuilt dword 1 is tested
+against 0.
+
 ## The device's own memory ceiling, logged at native host startup (issue #8)
 
 16 GB Macs still run the title out of GPU memory past the menus (`kIOGPUCommandBufferCallbackErrorOutOfMemory`),

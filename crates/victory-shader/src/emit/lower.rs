@@ -6812,7 +6812,21 @@ impl<'a> Lower<'a> {
                     k(self, 16),
                     k(self, 0x3FFF),
                 );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                let mut d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                // A null test of dword 1 (`s_cmp_eq_i32 d1, 0`, the compiler's guard before it
+                // sizes from it): the console's dword 1 is never 0 for a view, its format field
+                // (bits 20-28) being nonzero for every image format, and 0 for a null descriptor
+                // (all zeros), whose size the host reads as 0. When the code reads nothing else of
+                // the dword, set a format bit for a view and give 0 for a null one.
+                let d1_value = inst.write(Reg::S(code + first + 1));
+                if d1_value.is_some_and(|v| self.width_bits_or_null_test(v)) {
+                    let width = field(self, 0);
+                    let zero = k(self, 0);
+                    let null = self.s.m.cmp(c, pred::EQ, width, zero);
+                    let format = k(self, 1 << 20);
+                    let view = self.s.m.bin(c, Bin::Or, d1, format);
+                    d1 = self.s.m.select(c, null, zero, view);
+                }
                 let hi = self.s.m.bin(c, Bin::LShr, w, k2);
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
@@ -7359,6 +7373,32 @@ impl<'a> Lower<'a> {
             l1,
             miss,
         }
+    }
+
+    /// Whether the code tests image descriptor dword 1 (value `v`) against 0 and reads it
+    /// otherwise only for its width bits (30-31, by `s_bfe_u32` or `s_lshr_b32`) or as an image
+    /// instruction's descriptor, and passes it through no join.
+    fn width_bits_or_null_test(&self, v: Value) -> bool {
+        let p = self.x.p;
+        let reads = |i: &&Inst| i.reads.iter().any(|r| r.1 == v);
+        let allowed = |i: &Inst| {
+            // An image instruction's descriptor operand: the view, which the host binds itself.
+            if matches!(i.fields, Fields::Image { .. }) {
+                return true;
+            }
+            let Fields::Sop { src, .. } = &i.fields else { return false };
+            let [a, b] = src[..] else { return false };
+            let other = if sgpr_operand(i, a) == Some(v) { b } else { a };
+            match (i.name(), scalar_constant(other)) {
+                ("s_bfe_u32", Some(k)) => k & 0x1F >= 30 && sgpr_operand(i, a) == Some(v),
+                ("s_lshr_b32", Some(k)) => k & 0x1F >= 30 && sgpr_operand(i, a) == Some(v),
+                ("s_cmp_eq_i32" | "s_cmp_lg_i32" | "s_cmp_eq_u32" | "s_cmp_lg_u32", Some(0)) => true,
+                _ => false,
+            }
+        };
+        p.blocks.iter().all(|b| {
+            b.phis.iter().all(|phi| !phi.args.contains(&v)) && b.insts.iter().filter(reads).all(allowed)
+        }) && p.blocks.iter().flat_map(|b| &b.insts).filter(reads).any(|i| i.name().starts_with("s_cmp_"))
     }
 
     /// A descriptor load from a table or heap whose dwords the program only
