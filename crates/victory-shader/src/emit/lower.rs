@@ -2639,6 +2639,52 @@ impl<'a> Lower<'a> {
         Err("a value defined after its use")
     }
 
+    /// Whether lane `lane` of VGPR value `r` (just written by `v_writelane_b32` of an SGPR with
+    /// no host value) is read only by `v_readlane_b32` that the tracer restores to an SGPR
+    /// (`restored`) on every way on: through joins and lane writes of other lanes, the VGPR
+    /// read by nothing else. Then the lane need not hold the dword.
+    fn spill_of_missing(&self, r: Value, lane: u32) -> bool {
+        let p = self.x.p;
+        let (mut work, mut seen) = (vec![r], Set::default());
+        while let Some(v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            for b in &p.blocks {
+                work.extend(b.phis.iter().filter(|ph| ph.args.contains(&v)).map(|ph| ph.value));
+                for i in b.insts.iter().filter(|i| i.reads.iter().any(|r| r.1 == v)) {
+                    let Fields::Valu(w) = &i.fields else { return false };
+                    if w.sdwa.is_some() || w.dpp.is_some() {
+                        return false;
+                    }
+                    let (Some(Operand::Vector { reg, .. }), Some(l)) = (
+                        w.src.first().copied().filter(|_| i.name() == "v_readlane_b32").or(w.dst),
+                        w.src.get(1).and_then(|&l| crate::resource::lane_of(l)),
+                    ) else {
+                        return false;
+                    };
+                    match i.name() {
+                        // Another lane's write keeps this one; this lane's ends it.
+                        "v_writelane_b32" if i.read(Reg::V(reg)) == Some(v) => {
+                            if let Some(&(_, x)) = i.writes.first()
+                                && l != lane
+                            {
+                                work.push(x);
+                            }
+                        }
+                        "v_readlane_b32" if i.read(Reg::V(reg)) == Some(v) => {
+                            if l == lane && !i.writes.first().is_some_and(|w| self.x.st.restored.contains_key(&w.1)) {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
@@ -9736,7 +9782,13 @@ impl<'a> Lower<'a> {
                     .first()
                     .is_some_and(|w| self.x.st.restored.contains_key(&w.1)) =>
             {
-                let a = self.i32_of(self.x.st.restored[&inst.writes[0].1])?;
+                let w = inst.writes[0].1;
+                // A spilled dword the host has no value for (`spill_of_missing`) is still none.
+                if let Val::Missing(why) = self.get(self.x.st.restored[&w])? {
+                    self.vals.insert(w, Val::Missing(why));
+                    return Ok(());
+                }
+                let a = self.i32_of(self.x.st.restored[&w])?;
                 int(self, a)
             }
             "v_writelane_b32"
@@ -9747,6 +9799,28 @@ impl<'a> Lower<'a> {
                         .is_some() =>
             {
                 Err("a VGPR of spilled SGPRs read per lane")
+            }
+            // An SGPR with no host value (a descriptor's address or metadata dwords) spilled to a
+            // lane: the lane keeps its old value, as nothing reads it but reloads of that SGPR.
+            "v_writelane_b32"
+                if let [Operand::Scalar { code, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(x) = inst.read(Reg::S(code))
+                    // (A lane mask has a number: the generic arm takes its ballot.)
+                    && !self.x.st.masks.contains_key(&x)
+                    && !self.x.st.highs.contains_key(&x)
+                    && let Some(&Val::Missing(why)) = self.vals.get(&x)
+                    && let Some(Operand::Vector { reg, .. }) = v.dst =>
+            {
+                let r = inst.write(Reg::V(reg)).ok_or(why)?;
+                if !self.spill_of_missing(r, lane) {
+                    return Err(why);
+                }
+                let old = match inst.read(Reg::V(reg)) {
+                    Some(o) => self.i32_of(o)?,
+                    None => self.s.m.i32(0),
+                };
+                int(self, old)
             }
             // A constant lane of a VGPR only `v_writelane_b32` fills on every path: the SGPR (or
             // constant) last written there, a phi where paths wrote different ones.
@@ -16347,6 +16421,64 @@ mod tests {
         w[21] = 0x0001_0808; // v_writelane_b32 v5, s8, 4
         let (layout, used) = two_buffers();
         assert!(lower_with(&w, layout, used).is_err());
+    }
+
+    /// The image descriptor of the table at s0, its width bits (dword 1) read as data, dword 5
+    /// (no host value) spilled to lane 0 of v7 and read back into its register before the
+    /// image load: only the reload that restores it reads the lane.
+    const SPILLED_WITH_NO_VALUE: [u32; 29] = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x9014_9E0D, // s_lshr_b32 s20, s13, 30
+        0x7E0C_0214, // v_mov_b32 v6, s20
+        0xD761_0007,
+        0x0001_0011, // v_writelane_b32 v7, s17, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0002, // s_cbranch_scc1 RELOAD
+        0xD761_0007,
+        0x0001_0201, // v_writelane_b32 v7, s1, 1
+        0xD760_0011, // RELOAD:
+        0x0001_0107, // v_readlane_b32 s17, v7, 0
+        0xD760_0015,
+        0x0001_0307, // v_readlane_b32 s21, v7, 1 (written on one path only)
+        0x7E14_0215, // v_mov_b32 v10, s21
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xF000_1F08,
+        0x0003_0200, // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        0xD834_0000,
+        0x0000_0600, // ds_write_b32 v0, v6
+        0xD834_0000,
+        0x0000_0A00, // ds_write_b32 v0, v10
+    ];
+
+    #[test]
+    fn a_descriptor_dword_with_no_host_value_spilled_and_restored_is_no_data_read() {
+        let (layout, used) = texture_tables();
+        lower_with(&[&SPILLED_WITH_NO_VALUE[..], &[S_ENDPGM]].concat(), layout, used).unwrap();
+    }
+
+    /// The same with the VGPR also read per lane (`v_mov_b32 v8, v7`): lane 0 would give its
+    /// old value for the dword, so the spill stays refused.
+    #[test]
+    fn a_descriptor_dword_with_no_host_value_spilled_and_read_per_lane_stays_refused() {
+        let more = [
+            0x7E10_0307, // v_mov_b32 v8, v7
+            0xD834_0000,
+            0x0000_0800, // ds_write_b32 v0, v8
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        let Err(err) = lower_with(&[&SPILLED_WITH_NO_VALUE[..], &more].concat(), layout, used) else {
+            panic!("lowered");
+        };
+        assert!(format!("{err:?}").contains("dwords 5 to 7"), "{err:?}");
     }
 
     #[test]

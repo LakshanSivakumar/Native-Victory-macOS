@@ -2456,6 +2456,18 @@ the 305 compute programs now stop later: 123 "an image's dwords N to N", 114 "a 
 holding lanes elsewhere read as data: a program input", 65 "a buffer's dword 1", 3 "a register
 joining a lane mask and data".
 
+**Spilled dwords the host has no value for.** World compute programs that size an image from its
+descriptor (so `Lower::descriptor_data` rebuilds dwords 1-4) also spill the whole descriptor to
+VGPR lanes and reload it before the image instruction. Dwords 5-7 (and a buffer's address) have
+no host value, so the `v_writelane_b32` of them failed and took the whole spill VGPR, read for
+its other lanes, with it: refused as "an image's dwords 5 to 7". The lane now keeps its old value
+when nothing reads it but `v_readlane_b32` that the structure pass restores to the spilled SGPR
+(`Lower::spill_of_missing`: through joins and writes of other lanes; any other read of the VGPR,
+a per-lane copy say, keeps the refusal), and such a reload is that SGPR, still with no value, so
+reading it as data stays refused and only the image instruction (whose descriptor the host binds)
+uses it. Tests: `lower::tests::a_descriptor_dword_with_no_host_value_spilled_and_restored_is_no_data_read`
+(refused without the rule) and `a_descriptor_dword_with_no_host_value_spilled_and_read_per_lane_stays_refused`.
+
 ## The device's own memory ceiling, logged at native host startup (issue #8)
 
 16 GB Macs still run the title out of GPU memory past the menus (`kIOGPUCommandBufferCallbackErrorOutOfMemory`),
