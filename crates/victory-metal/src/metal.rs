@@ -49,6 +49,15 @@ pub struct Metal {
     /// Tracing: the gate buffers of the indirect dispatches encoded since the last commit.
     pub(crate) trace_args: std::cell::RefCell<Vec<(String, usize, usize)>>,
     pub(crate) pipe_names: std::cell::RefCell<std::collections::HashMap<usize, String>>,
+    /// Texture buffers made for typed buffer views in heap entries (`write_typed_buffer`), by
+    /// buffer, offset, width, pixel format and whether it is writable. The title writes the same
+    /// records into its heaps again and again; each one mirrored again is a raw view first, then
+    /// promoted to a typed view, which made a new texture each time. `VICTORY_TYPED_VIEW_CACHE=0`
+    /// makes one each time, as before.
+    #[allow(clippy::type_complexity)]
+    pub(crate) typed_views: std::cell::RefCell<
+        std::collections::HashMap<(usize, usize, usize, usize, bool), Retained<ProtocolObject<dyn MTLTexture>>>,
+    >,
     /// The kernel that gates `ExecuteIndirect` records by a count (`gfx.rs`), made at first use.
     pub(crate) gate:
         std::cell::OnceCell<Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String>>,
@@ -298,6 +307,7 @@ impl Metal {
             request_residency: std::env::var("VICTORY_METAL_REQUEST_RESIDENCY").is_ok_and(|v| v.trim() == "1"),
             committed: Default::default(),
             pipe_names: Default::default(),
+            typed_views: Default::default(),
             trace_enc: Default::default(),
             trace_args: Default::default(),
             gate: Default::default(),
