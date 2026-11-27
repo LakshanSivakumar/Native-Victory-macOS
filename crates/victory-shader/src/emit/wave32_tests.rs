@@ -710,3 +710,60 @@ fn split_first_lane_divergent_branch_refuses_two_waves_and_runs_lockstep_for_one
         );
     }
 }
+
+#[test]
+fn split_first_lane_loop_phi_accepts_uniform_and_rejects_divergent() {
+    // Uniform scalar loop: `s6` starts at 0 and increments by 1 under a uniform SCC branch.
+    // Every lane sees the same `s6` after the loop, so `v_readfirstlane_b32` needs no exchange.
+    const UNIFORM_LOOP: &[u32] = &[
+        0xBE86_0380, // s_mov_b32 s6, 0
+        // loop:
+        0x8006_8106, // s_add_u32 s6, s6, 1
+        0xBF0A_8406, // s_cmp_lt_u32 s6, 4
+        0xBF85_FFFD, // s_cbranch_scc1 -3 (back to s_add_u32)
+        0x7E02_0206, // v_mov_b32_e32 v1, s6
+        0x7E18_0501, // v_readfirstlane_b32 s12, v1
+        0x7E04_020C, // v_mov_b32_e32 v2, s12
+        S_ENDPGM,
+    ];
+    let l = host32(UNIFORM_LOOP, 64);
+    assert_eq!((l.barriers, l.exchanges), (0, false));
+
+    // Divergent loop-carried VGPR: `v1` starts at uniform 0, is updated with lane-varying `v0`
+    // inside a uniform loop, and then read via `v_readfirstlane_b32`. `wave_uniform` must reject
+    // the vector loop phi, so `split_first_lane` emits the 2-barrier exchange.
+    const DIVERGENT_LOOP_VGPR: &[u32] = &[
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x7E02_0280, // v_mov_b32_e32 v1, 0
+        // loop:
+        0x4A02_0101, // v_add_nc_u32_e32 v1, v1, v0
+        0x8006_8106, // s_add_u32 s6, s6, 1
+        0xBF0A_8406, // s_cmp_lt_u32 s6, 4
+        0xBF85_FFFC, // s_cbranch_scc1 -4 (back to v_add_nc_u32)
+        0x7E18_0501, // v_readfirstlane_b32 s12, v1
+        0x7E04_020C, // v_mov_b32_e32 v2, s12
+        S_ENDPGM,
+    ];
+    let l = host32(DIVERGENT_LOOP_VGPR, 64);
+    assert_eq!((l.barriers, l.exchanges), (2, true));
+
+    // Divergent loop (lanes exit at different iterations): `v1` is updated only with a constant
+    // inside the loop, so each lane accumulates its own iteration count. After restoring EXEC,
+    // `wave_uniform` must reject `v1` and emit the 2-barrier exchange.
+    const DIVERGENT_ITER_LOOP: &[u32] = &[
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0x7E06_0300, // v_mov_b32_e32 v3, v0
+        0x7E02_0280, // v_mov_b32_e32 v1, 0
+        // loop:
+        0x4A02_0281, // v_add_nc_u32_e32 v1, 1, v1
+        0x4A06_0690, // v_add_nc_u32_e32 v3, 16, v3
+        0x7DA8_06C0, // v_cmpx_gt_u32_e32 64, v3
+        0xBF89_FFFC, // s_cbranch_execnz -4 (back to v_add_nc_u32 v1)
+        0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+        0x7E18_0501, // v_readfirstlane_b32 s12, v1
+        0x7E04_020C, // v_mov_b32_e32 v2, s12
+        S_ENDPGM,
+    ];
+    let l = host32(DIVERGENT_ITER_LOOP, 64);
+    assert_eq!((l.barriers, l.exchanges), (2, true));
+}

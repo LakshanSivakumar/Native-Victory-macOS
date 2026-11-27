@@ -308,7 +308,8 @@ impl Lower<'_> {
             .and_then(|e| self.x.st.masks.get(&e).or_else(|| self.x.st.other.get(&e)).copied());
         let mut memo = Map::default();
         let mut visiting = Set::default();
-        self.uniform_in(execs, at_mask, self.cur_ir, reg, v, &mut memo, &mut visiting)
+        let mut hit_cycle = false;
+        self.uniform_in(execs, at_mask, self.cur_ir, reg, v, &mut memo, &mut visiting, &mut hit_cycle)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -321,6 +322,7 @@ impl Lower<'_> {
         v: crate::ir::Value,
         memo: &mut Map<crate::ir::Value, bool>,
         visiting: &mut Set<crate::ir::Value>,
+        hit_cycle: &mut bool,
     ) -> bool {
         use crate::gfx10::{Fields, Operand};
         use crate::ir::{EXEC, Reg, VCC};
@@ -328,10 +330,13 @@ impl Lower<'_> {
             return cached;
         }
         if !visiting.insert(v) {
-            // A cycle (loop phi): only accept if the cycle's header is a uniform join, which the
-            // phi arm below checks before recursing.
+            // A cycle (loop phi): optimistically return true (greatest fixed point) so we still
+            // inspect every non-cyclic input to the cycle; mark `hit_cycle` so intermediate nodes
+            // inside an open cycle do not cache a tentative `true` in `memo`.
+            *hit_cycle = true;
             return true;
         }
+        let mut child_cycle = false;
         let res = (|| {
             if self.section_uniform(v) {
                 return true;
@@ -363,14 +368,32 @@ impl Lower<'_> {
                     if !self.uniform_join(b, |_| true) {
                         return false;
                     }
-                    return args
-                        .iter()
-                        .all(|&x| self.uniform_in(execs, at_mask, at_block, phi.reg, x, memo, visiting));
+                    return args.iter().all(|&x| {
+                        self.uniform_in(
+                            execs,
+                            at_mask,
+                            at_block,
+                            phi.reg,
+                            x,
+                            memo,
+                            visiting,
+                            &mut child_cycle,
+                        )
+                    });
                 }
                 // A vector join merges lanes from different paths: uniform only when every
                 // non-self edge brings the exact same uniform SSA value.
                 return args.iter().all(|&x| x == first)
-                    && self.uniform_in(execs, at_mask, at_block, phi.reg, first, memo, visiting);
+                    && self.uniform_in(
+                        execs,
+                        at_mask,
+                        at_block,
+                        phi.reg,
+                        first,
+                        memo,
+                        visiting,
+                        &mut child_cycle,
+                    );
             };
             let name = inst.name();
             let dst = match &inst.fields {
@@ -437,18 +460,40 @@ impl Lower<'_> {
                             return true;
                         }
                         !mask(r)
-                            && self.uniform_in(execs, at_mask, at_block, r, x, memo, visiting)
+                            && self.uniform_in(
+                                execs,
+                                at_mask,
+                                at_block,
+                                r,
+                                x,
+                                memo,
+                                visiting,
+                                &mut child_cycle,
+                            )
                     })
                 }
-                Fields::Sop { .. } | Fields::Smem { .. } => inst
-                    .reads
-                    .iter()
-                    .all(|&(r, x)| self.uniform_in(execs, at_mask, at_block, r, x, memo, visiting)),
+                Fields::Sop { .. } | Fields::Smem { .. } => inst.reads.iter().all(|&(r, x)| {
+                    self.uniform_in(
+                        execs,
+                        at_mask,
+                        at_block,
+                        r,
+                        x,
+                        memo,
+                        visiting,
+                        &mut child_cycle,
+                    )
+                }),
                 _ => false,
             }
         })();
         visiting.remove(&v);
-        memo.insert(v, res);
+        if !res || !child_cycle || visiting.is_empty() {
+            memo.insert(v, res);
+        }
+        if child_cycle && !visiting.is_empty() {
+            *hit_cycle = true;
+        }
         res
     }
 
