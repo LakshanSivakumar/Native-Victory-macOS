@@ -452,6 +452,46 @@ fn halves_of_many_parameters_stay_within_the_mesh_size() {
     };
 }
 
+/// A mesh shader exporting 16 parameters + `SV_Position` (17 rows = 34,816 bytes at 128 vertices)
+/// exceeds Metal's 32 KiB mesh output limit on its own, but fits and draws when trimmed to the
+/// `TEXCOORD`/`HALF` inputs the paired pixel shader actually reads (#528).
+#[test]
+fn oversized_mesh_outputs_fit_when_trimmed_to_pixel_reads() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
+    words.splice(at..at, [0x7E10_02F2]); // v_mov_b32 v8, 1.0
+    let at = at + 1;
+    // exp param0..15 v8, v8, v8, v8 (16 generic rows + SV_Position = 17 rows = 34,816 bytes)
+    words.splice(at..at, (0..16u32).flat_map(|n| [0xF800_020F | n << 4, 0x0808_0808]));
+    let bytes: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    let container = victory_shader::emit::graphics::container(HwStage::Vs, &bytes, &meta).unwrap();
+    let ms_full = shaders::translate(&container).unwrap();
+    let ps = translate(HwStage::Ps, RED);
+
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    // Untrimmed: Metal rejects > 32 KiB.
+    assert!(matches!(t.render_pipe(&ms_full, Some(&ps), &state, "oversized"), Pipe::Refused));
+    assert!(
+        t.shaders.refused.iter().any(|(why, _)| why.contains("32768")),
+        "{:?}",
+        t.shaders.refused
+    );
+
+    // Trimmed to what `RED` reads (0 TEXCOORDs, 0 HALFs): fits in Metal and draws.
+    let trim = crate::native::state::pixel_reads(&ps.dxil);
+    let ms_trimmed = shaders::translate_trim_mesh(&container, trim).unwrap();
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms_trimmed, Some(&ps), &state, "trimmed") else {
+        panic!("{:?}", t.shaders.refused);
+    };
+    let (color, mut list) = list_into(&t, &pso, binding);
+    list.dispatch_mesh(1, 1, 1).unwrap();
+    super::run(&t.host, &[&list]);
+    assert!(pixels(&t, &color).iter().all(|p| *p == [255, 128, 128, 255]), "{:?}", pixels(&t, &color));
+}
+
 /// A parameter only a packing instruction makes (`v_cvt_pkrtz_f16_f32`: 0.5 low, 1.0 high) is
 /// exported as its halves alone, and the pixel program's f16 interpolations of both halves of
 /// x read them.

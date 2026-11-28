@@ -743,22 +743,46 @@ pub fn vertex_inputs(dxil: &[u8]) -> Option<Vec<(String, u32)>> {
     Some(reads)
 }
 
-/// The `TEXCOORD` indices of a translated shader's `ISG1` (inputs) or `OSG1` (outputs) as a mask.
-pub fn texcoords(dxil: &[u8], fourcc: victory_shader::FourCC) -> u32 {
+/// The `TEXCOORD` (`< 32`), `HALF` (`< 64`) masks and total element count of a translated shader's
+/// `ISG1` (inputs) or `OSG1` (outputs).
+pub fn sig_masks(dxil: &[u8], fourcc: victory_shader::FourCC) -> (u32, u64, usize) {
     use victory_shader::Container;
     let Some(part) = Container::parse(dxil).ok().and_then(|c| c.part(fourcc).map(|p| p.data.to_vec())) else {
-        return 0;
+        return (0, 0, 0);
     };
     let word = |at: usize| part.get(at..at + 4).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
-    let mut mask = 0;
-    for i in 0..word(0) as usize {
+    let count = word(0) as usize;
+    let (mut tc, mut halves) = (0u32, 0u64);
+    for i in 0..count {
         let at = 8 + 32 * i;
         let name = part.get(word(at + 4) as usize..).and_then(|t| t.split(|&b| b == 0).next()).unwrap_or(&[]);
-        if name == b"TEXCOORD" && word(at + 12) == 0 && word(at + 8) < 32 {
-            mask |= 1 << word(at + 8);
+        let index = word(at + 8);
+        let kind = word(at + 12);
+        if kind == 0 {
+            if name == b"TEXCOORD" && index < 32 {
+                tc |= 1 << index;
+            } else if name == b"HALF" && index < 64 {
+                halves |= 1 << index;
+            }
         }
     }
-    mask
+    (tc, halves, count)
+}
+
+/// The `TEXCOORD` indices of a translated shader's `ISG1` (inputs) or `OSG1` (outputs) as a mask.
+pub fn texcoords(dxil: &[u8], fourcc: victory_shader::FourCC) -> u32 {
+    sig_masks(dxil, fourcc).0
+}
+
+/// The `TEXCOORD` and `HALF` masks a pixel shader reads (`ISG1`).
+pub fn pixel_reads(dxil: &[u8]) -> (u32, u64) {
+    let (tc, halves, _) = sig_masks(dxil, victory_shader::FourCC::ISG1);
+    (tc, halves)
+}
+
+/// Number of output signature elements in `OSG1`.
+pub fn osg1_count(dxil: &[u8]) -> usize {
+    sig_masks(dxil, victory_shader::FourCC::OSG1).2
 }
 
 /// The render targets a pixel shader writes (`SV_Target` index and write mask), from its DXIL

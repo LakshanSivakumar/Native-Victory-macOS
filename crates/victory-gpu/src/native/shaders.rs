@@ -123,6 +123,23 @@ pub fn targets_cached(container: &[u8], integer: u8) -> bool {
     }
 }
 
+/// A mesh shader's container translated with generic outputs trimmed to what the pixel shader reads.
+pub fn translate_trim_mesh(container: &[u8], trim: (u32, u64)) -> Result<HostShader, String> {
+    translate_cached(container, Options { trim_outputs: Some(trim), ..options() })
+}
+
+/// Whether [`translate_trim_mesh`]'s translation is in the disk cache already.
+pub fn trim_mesh_cached(container: &[u8], trim: (u32, u64)) -> bool {
+    let o = Options { trim_outputs: Some(trim), ..options() };
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{o:?}"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (container, o);
+        false
+    }
+}
+
 /// Bit n set: colour target n has an integer format.
 pub fn integer_targets(color: &[Format]) -> u8 {
     color.iter().enumerate().filter(|(n, f)| *n < 8 && f.is_integer()).fold(0, |m, (n, _)| m | 1 << n)
