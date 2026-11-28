@@ -2000,6 +2000,117 @@ fn a_whole_wave_half_sum_reads_across_the_host_waves() {
     assert_eq!(got, want, "60.0, and lane 63 (off) holds the identity");
 }
 
+/// Exercises lane-mask phis, post-loop wave-converged ballots across split 64-lane waves,
+/// `s_mov exec, s` loop-header `EXEC` shadows, unchanged masks carried across divergent loops,
+/// loop-local scalar mask accumulators, and wave32 `s_movk_i32`/`s_cmovk_i32` masks read as data
+/// (#524).
+#[test]
+fn lane_mask_phis_post_loop_ballots_and_wave32_movk_masks_run_on_the_gpu() {
+    // Part 1: 128 threads (two 64-lane console waves split into four 32-lane Metal SIMD-groups,
+    // fast path without lockstep):
+    // - `s[16:17]` carries an unchanged mask of console lanes `< 50` (`50` bits per wave) through
+    //   a non-trivial phi inside a 4-iteration per-lane loop and reads `s_bcnt1` inside the loop;
+    // - `s[14:15]` shadows `EXEC` at the loop header via `s_mov_b64 exec, s[14:15]`;
+    // - `s[10:11]` accumulates exited lanes with `(lane & 3) == 0` (`16` bits per 64-lane wave,
+    //   `0x1111` in bits `32..47` of `s11`) and is balloted across the split halves at `OEND`.
+    const SPLIT_LOOP_MASK: &[u32] = &[
+        0x3606_00BF, // v_and_b32 v3, 63, v0
+        0xD4C4_0008, 0x0202_06B2, // v_cmp_gt_u32 s[8:9], 50, v3
+        0xBE90_0408, // s_mov_b64 s[16:17], s[8:9]
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0xBE8C_0480, // s_mov_b64 s[12:13], 0
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x2C08_0684, // v_lshrrev_b32 v4, 4, v3
+        0xBE94_0410, // loop: s_mov_b64 s[20:21], s[16:17]
+        0xBE90_0414, // s_mov_b64 s[16:17], s[20:21]
+        0xBE86_1010, // s_bcnt1_i32_b64 s6, s[16:17]
+        0x7E0C_0206, // v_mov_b32 v6, s6
+        0x7D84_0880, // v_cmp_eq_u32 vcc, 0, v4
+        0x4E08_0881, // v_subrev_nc_u32 v4, 1, v4
+        0x360A_0683, // v_and_b32 v5, 3, v3
+        0xD4C2_0012, 0x0202_0A80, // v_cmp_eq_u32 s[18:19], 0, v5
+        0x8792_126A, // s_and_b64 s[18:19], vcc, s[18:19]
+        0x888A_120A, // s_or_b64 s[10:11], s[10:11], s[18:19]
+        0x888C_6A0C, // s_or_b64 s[12:13], s[12:13], vcc
+        0x8A8E_0C0E, // s_andn2_b64 s[14:15], s[14:15], s[12:13]
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0xBF89_FFF1, // s_cbranch_execnz loop
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0xBE87_100A, // s_bcnt1_i32_b64 s7, s[10:11]
+        0x8705_FF0B, 0x0000_FFFF, // s_and_b32 s5, s11, 0xffff
+        0x8F07_9007, // s_lshl_b32 s7, s7, 16
+        0x8805_0705, // s_or_b32 s5, s5, s7
+        0x340C_0C98, // v_lshlrev_b32 v6, 24, v6
+        0x3804_0C05, // v_or_b32 v2, s5, v6
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal(SPLIT_LOOP_MASK), None);
+    let got = run_io(SPLIT_LOOP_MASK, 0, 128, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(
+        got,
+        vec![(50u32 << 24) | (16u32 << 16) | 0x1111; 128],
+        "both 64-lane waves must ballot unchanged + post-loop masks across their split 32-lane halves"
+    );
+
+    // Part 2: wave32 (`run32`) exercising:
+    // - loop-local mask accumulator `s10` read inside a divergent loop (`s_bcnt1` before exit gives
+    //   `(lane / 4) * 4` in `v2`);
+    // - `s_movk_i32 s8, 0` merged across a divergent `if (lane < 12)` into a join phi read via
+    //   `s_bcnt1` (`6` even lanes `< 12` in bits `8..15`);
+    // - `s_cmovk_i32 s9, 0x00ff` on `s4 == 1` over a 20-lane mask (`20` when `flag == 0`, `8` when
+    //   `flag == 1` in bits `16..23`).
+    const WAVE32_MASKS: &[u32] = &[
+        0x2C06_0082, // v_lshrrev_b32 v3, 2, v0
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_037E, // s_mov_b32 s11, exec_lo
+        0xBE86_0F0A, // loop32: s_bcnt1_i32_b32 s6, s10
+        0x7D84_0680, // v_cmp_eq_u32 vcc_lo, 0, v3
+        0x7E04_0206, // v_mov_b32 v2, s6
+        0x4E06_0681, // v_subrev_nc_u32 v3, 1, v3
+        0x880A_6A0A, // s_or_b32 s10, s10, vcc_lo
+        0x8A0B_0A0B, // s_andn2_b32 s11, s11, s10
+        0xBEFE_030B, // s_mov_b32 exec_lo, s11
+        0xBF89_FFF8, // s_cbranch_execnz loop32
+        0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+        0xB008_0000, // s_movk_i32 s8, 0
+        0x7D88_008C, // v_cmp_gt_u32 vcc_lo, 12, v0
+        0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+        0xBF88_0003, // s_cbranch_execz join32
+        0x3608_0081, // v_and_b32 v4, 1, v0
+        0x7D84_0880, // v_cmp_eq_u32 vcc_lo, 0, v4
+        0x8808_6A08, // s_or_b32 s8, s8, vcc_lo
+        0xBEFE_030C, // join32: s_mov_b32 exec_lo, s12
+        0xBE87_0F08, // s_bcnt1_i32_b32 s7, s8
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0x8709_7E6A, // s_and_b32 s9, vcc_lo, exec_lo
+        0xBF06_8104, // s_cmp_eq_u32 s4, 1
+        0xB109_00FF, // s_cmovk_i32 s9, 0x00ff
+        0xBE85_0F09, // s_bcnt1_i32_b32 s5, s9
+        0x8F07_8807, // s_lshl_b32 s7, s7, 8
+        0x8F05_9005, // s_lshl_b32 s5, s5, 16
+        0x8807_0507, // s_or_b32 s7, s7, s5
+        0x3804_0407, // v_or_b32 v2, s7, v2
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal32(WAVE32_MASKS), None);
+    for (flag, cmov_bits) in [(0u32, 20u32), (1u32, 8u32)] {
+        let got = run32(WAVE32_MASKS, flag);
+        let want: Vec<u32> = (0..32u32)
+            .map(|i| (cmov_bits << 16) | (6 << 8) | ((i / 4) * 4))
+            .collect();
+        assert_eq!(got, want, "flag={flag}");
+    }
+}
+
 /// `v_cvt_pk_u16_u32` and `v_cvt_pk_i16_i32` saturate each source to 16 bits, src0 in the low
 /// half and src1 in the high one. Lane `i` packs `i << 12` (from lane 16 past 0xffff) and
 /// `0x10002 - i` (past 0xffff in lanes 0 to 2) unsigned; and `(i << 12) - 0x10000` (below -32768

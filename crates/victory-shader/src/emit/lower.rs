@@ -2902,15 +2902,40 @@ impl<'a> Lower<'a> {
         }
         let p = self.x.p;
         // A register the compiler reuses: a mask on one path, data on another.
-        if let Some(&(b, i)) = self.phi_at.get(&lo)
-            && p.blocks[b].phis[i]
+        if let Some(&(b, i)) = self.phi_at.get(&lo) {
+            let non_opaque_other = |a: &Value| {
+                self.x.st.other.get(a).is_some_and(|&m| {
+                    !self
+                        .x
+                        .st
+                        .bools
+                        .support(m)
+                        .iter()
+                        .any(|at| matches!(at, Atom::Opaque(_)))
+                })
+            };
+            let preds = &p.blocks[b].preds;
+            if p.blocks[b].phis[i]
                 .args
                 .iter()
-                .any(|a| !self.x.st.masks.contains_key(a))
-        {
-            return Err("a register joining a lane mask and data, read as data");
+                .enumerate()
+                .any(|(n, a)| {
+                    self.block[preds[n]].is_some()
+                        && !self.never_taken(preds[n], b)
+                        && !self.x.st.masks.contains_key(a)
+                        && !non_opaque_other(a)
+                })
+            {
+                return Err("a register joining a lane mask and data, read as data");
+            }
+            return self.phi_mask_number(lo);
         }
         let &b = self.def_block.get(&lo).ok_or(INPUT)?;
+        if self.on_cycle(b)
+            && let Some(xy) = self.post_loop_inst_ballot(lo, b)?
+        {
+            return Ok(xy);
+        }
         let inst = p.blocks[b]
             .insts
             .iter()
@@ -2919,11 +2944,45 @@ impl<'a> Lower<'a> {
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
             src,
-            ..
+            imm,
         } = &inst.fields
         else {
             return Err(VECTOR);
         };
+        if !self.x.native.wave64 && matches!(inst.name(), "s_movk_i32" | "s_cmovk_i32") {
+            let writes_dst = inst.write(Reg::S(*code)) == Some(lo);
+            let writes_exec = inst.write(Reg::S(EXEC)) == Some(lo);
+            if !writes_dst && !writes_exec || *code != EXEC && inst.write(Reg::S(EXEC)).is_some() {
+                return Err(SAVED);
+            }
+            let imm = i32::from(imm.ok_or(OPERAND)? as i16) as u32;
+            if self.mask_data != MaskData::Console && imm != 0 && imm != u32::MAX {
+                return Err(SHIFT);
+            }
+            let at = if b == self.cur_ir {
+                self.cur
+            } else {
+                self.tail[b].ok_or("a lane mask written after its use")?
+            };
+            let (was_ok, was_cur, was_ir) = (self.mask_ok, self.cur, self.cur_ir);
+            (self.mask_ok, self.cur, self.cur_ir) = (true, at, b);
+            let res = (|| -> Result<(V, V), Why> {
+                let (k, z) = (self.s.m.i32(imm), self.s.m.i32(0));
+                if inst.name() == "s_movk_i32" {
+                    return Ok((k, z));
+                }
+                let scc = inst.read(Reg::Scc).ok_or(OPERAND)?;
+                let cond = match self.get(scc)? {
+                    Val::Bit(x) => x,
+                    Val::I32(x) => self.s.m.cmp(at, pred::NE, x, z),
+                    Val::Missing(w) => return Err(w),
+                };
+                let old = self.i32_of(inst.read(Reg::S(*code)).ok_or(OPERAND)?)?;
+                Ok((self.s.m.select(at, cond, k, old), z))
+            })();
+            (self.mask_ok, self.cur, self.cur_ir) = (was_ok, was_cur, was_ir);
+            return res;
+        }
         let wave64 = self.x.native.wave64;
         let width = if wave64 { "_b64" } else { "_b32" };
         let op = inst
@@ -2960,8 +3019,8 @@ impl<'a> Lower<'a> {
         } else {
             self.tail[b].ok_or("a lane mask written after its use")?
         };
-        let was_ok = self.mask_ok;
-        self.mask_ok = true;
+        let (was_ok, was_cur, was_ir) = (self.mask_ok, self.cur, self.cur_ir);
+        (self.mask_ok, self.cur, self.cur_ir) = (true, at, b);
         let result = (|| -> Result<(V, V), Why> {
             // Dword `h` of source `k` (inline constants sign-extend).
             let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
@@ -3191,8 +3250,996 @@ impl<'a> Lower<'a> {
             }
             Ok((out[0], out[1]))
         })();
-        self.mask_ok = was_ok;
+        (self.mask_ok, self.cur, self.cur_ir) = (was_ok, was_cur, was_ir);
         result
+    }
+
+    fn has_quad_atom(&self, m: Bool) -> bool {
+        self.x
+            .st
+            .bools
+            .support(m)
+            .iter()
+            .any(|a| matches!(a, Atom::Quad(_)))
+    }
+
+    fn copy_step(&self, v: Value) -> Option<Value> {
+        match self.x.st.restored.get(&v) {
+            Some(&s) => Some(s),
+            None => crate::structure::copied(self.def_inst(v)?, v, |x| self.def_inst(x)),
+        }
+    }
+
+    /// Whether all lanes of the host/console wave arrive at IR block `b` together.
+    fn wave_converged(&self, b: usize) -> bool {
+        if self.x.st.lockstep {
+            return true;
+        }
+        if self.halves {
+            return self.once[b];
+        }
+        wave_blocks(self.x.p, self.x.st)[b]
+    }
+
+    /// When every live incoming path into `lo` (and its wave64 high half) copies a single
+    /// mask pair defined strictly before `b`, returns that dominating pair.
+    fn unchanged_mask_pair(&self, lo: Value, b: usize) -> Option<(Value, Option<Value>)> {
+        let p = self.x.p;
+        let leaf_of = |start: Value| -> Option<Value> {
+            let (mut seen, mut todo, mut leaf) = (Set::default(), vec![start], None);
+            while let Some(mut a) = todo.pop() {
+                for _ in 0..64 {
+                    let Some(c) = self.copy_step(a) else { break };
+                    a = c;
+                }
+                if !seen.insert(a) {
+                    continue;
+                }
+                if seen.len() > 64 {
+                    return None;
+                }
+                match self.phi_at.get(&a) {
+                    Some(&(qb, qi)) => {
+                        for (n, &pred) in p.blocks[qb].preds.iter().enumerate() {
+                            if self.block[pred].is_some() && !self.never_taken(pred, qb) {
+                                todo.push(p.blocks[qb].phis[qi].args[n]);
+                            }
+                        }
+                    }
+                    None if leaf.is_none_or(|x| x == a) => leaf = Some(a),
+                    None => return None,
+                }
+            }
+            let l = leaf?;
+            if self
+                .def_block
+                .get(&l)
+                .is_some_and(|&db| db == b || !self.dominates(db, b))
+            {
+                return None;
+            }
+            Some(l)
+        };
+        let l0 = leaf_of(lo)?;
+        if !self.x.native.wave64 {
+            return Some((l0, None));
+        }
+        let hi = self.pair_high(lo)?;
+        Some((l0, Some(leaf_of(hi)?)))
+    }
+
+    /// If `inst` updates an earlier mask pair `(prev_lo, prev_hi)` without modifying bits of
+    /// lanes outside `EXEC` (`s_mov`, XOR swap, spill restore, or `s_or`/`s_xor`/`s_andn2` with
+    /// an active-subset mask), returns `(prev_lo, prev_hi)`.
+    fn step_preserves_inactive(
+        &self,
+        inst: &Inst,
+        d_lo: Value,
+        d_hi: Option<Value>,
+    ) -> Option<(Value, Option<Value>)> {
+        if let Some(h) = d_hi
+            && !self.def_inst(h).is_some_and(|ih| std::ptr::eq(inst, ih))
+        {
+            return None;
+        }
+        if !self.x.native.wave64 {
+            if let Some(c0) = self.copy_step(d_lo) {
+                return Some((c0, None));
+            }
+        } else if let (Some(c0), Some(c1)) = (self.copy_step(d_lo), d_hi.and_then(|h| self.copy_step(h))) {
+            return Some((c0, Some(c1)));
+        }
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            src,
+            ..
+        } = &inst.fields
+        else {
+            return None;
+        };
+        if inst.write(Reg::S(*code)) != Some(d_lo) || inst.write(Reg::S(EXEC)).is_some() {
+            return None;
+        }
+        let wave64 = self.x.native.wave64;
+        let w = if wave64 { "_b64" } else { "_b32" };
+        let op_pair = |k: usize| -> Option<(Value, Option<Value>, u8)> {
+            let &Operand::Scalar { code: sc, .. } = src.get(k)? else {
+                return None;
+            };
+            if sc == NULL {
+                return None;
+            }
+            let lo = inst.read(Reg::S(sc))?;
+            let hi = if wave64 {
+                Some(inst.read(Reg::S(sc + 1))?)
+            } else {
+                None
+            };
+            Some((lo, hi, sc))
+        };
+        let is_active = |(lo, hi, sc): (Value, Option<Value>, u8)| -> bool {
+            sc == EXEC
+                || self.x.st.active.contains(&lo) && self.x.st.mask_bits(lo, hi).is_some()
+        };
+        let name = inst.name();
+        if name == format!("s_or{w}") || name == format!("s_xor{w}") {
+            if op_pair(1).is_some_and(is_active) {
+                let (pl, ph, _) = op_pair(0)?;
+                return Some((pl, ph));
+            }
+            if op_pair(0).is_some_and(is_active) {
+                let (pl, ph, _) = op_pair(1)?;
+                return Some((pl, ph));
+            }
+        } else if name == format!("s_andn2{w}") && op_pair(1).is_some_and(is_active) {
+            let (pl, ph, _) = op_pair(0)?;
+            return Some((pl, ph));
+        }
+        None
+    }
+
+    fn paired_mask_bool(&self, lo: Value, hi: Option<Value>) -> Option<Bool> {
+        let m = if self.x.native.wave64 {
+            let h = hi?;
+            if let Some(m) = self.x.st.mask_bits(lo, Some(h)) {
+                m
+            } else {
+                let &m = self.x.st.other.get(&lo)?;
+                let empty = HashMap::new();
+                let same_const = matches!(
+                    (m, self.konst(&empty, lo), self.konst(&empty, h)),
+                    (Bool::FALSE, Some(0), Some(0))
+                        | (Bool::TRUE, Some(u32::MAX), Some(u32::MAX))
+                );
+                if !same_const && self.pair_high(lo) != Some(h) {
+                    return None;
+                }
+                m
+            }
+        } else {
+            *self
+                .x
+                .st
+                .masks
+                .get(&lo)
+                .or_else(|| self.x.st.other.get(&lo))?
+        };
+        (!self.has_quad_atom(m)).then_some(m)
+    }
+
+    /// Extended [`Self::mask_differs_on_edge`] for converged mask ballots: also accepts
+    /// direct inactive-preserving updates (`s_or`/`s_xor`/`s_andn2` with an active mask)
+    /// and dominating `EXEC == 0` loop-break edges.
+    fn mask_differs_on_edge_ballot(
+        &self,
+        b: usize,
+        args: &[Value],
+        hi_args: Option<&[Value]>,
+        n: usize,
+        x: Bool,
+    ) -> bool {
+        if !self.mask_differs_on_edge(b, args, n, x) {
+            return false;
+        }
+        let p = self.x.p;
+        let st = self.x.st;
+        let preds = &p.blocks[b].preds;
+        let start = preds[n];
+        let mut after = vec![false; p.blocks.len()];
+        let mut stack = p.blocks[start].exit.successors();
+        while let Some(q) = stack.pop() {
+            if q != b && !std::mem::replace(&mut after[q], true) {
+                stack.extend(p.blocks[q].exit.successors());
+            }
+        }
+        let on_n = self.lane_edge(start, b);
+        let want_lo = args[n];
+        let want_hi = hi_args.map(|h| h[n]);
+        let active_keeps = |k: usize| -> bool {
+            if after[start]
+                || self.def_block.get(&want_lo).is_some_and(|&d| after[d])
+                || want_hi
+                    .and_then(|h| self.def_block.get(&h))
+                    .is_some_and(|&d| after[d])
+            {
+                return false;
+            }
+            let (mut cl, mut ch) = (args[k], hi_args.map(|h| h[k]));
+            for _ in 0..16 {
+                if (cl, ch) == (want_lo, want_hi) {
+                    return true;
+                }
+                if let Some(&(qb, qi)) = self.phi_at.get(&cl).filter(|&&(qb, _)| after[qb]) {
+                    let mut from = p.blocks[qb]
+                        .preds
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &pred)| pred == start || after[pred]);
+                    let (Some((e, _)), None) = (from.next(), from.next()) else {
+                        return false;
+                    };
+                    cl = p.blocks[qb].phis[qi].args[e];
+                    if let Some(h) = ch {
+                        let Some(&(hqb, hqi)) = self.phi_at.get(&h).filter(|&&(hqb, _)| hqb == qb)
+                        else {
+                            return false;
+                        };
+                        ch = Some(p.blocks[hqb].phis[hqi].args[e]);
+                    }
+                    continue;
+                }
+                let Some(&db) = self.def_block.get(&cl).filter(|&&db| after[db]) else {
+                    return false;
+                };
+                let Some(inst) = p.blocks[db]
+                    .insts
+                    .iter()
+                    .find(|i| i.writes.iter().any(|w| w.1 == cl))
+                else {
+                    return false;
+                };
+                let Some(prev) = self.step_preserves_inactive(inst, cl, ch) else {
+                    return false;
+                };
+                (cl, ch) = prev;
+            }
+            false
+        };
+        let execz_dominator = |k: usize| -> bool {
+            let pk = preds[k];
+            if pk == start || after[pk] || !self.dominates(pk, start) {
+                return false;
+            }
+            let Some(last) = p.blocks[pk].insts.last() else {
+                return false;
+            };
+            match (last.name(), p.blocks[pk].exit) {
+                ("s_cbranch_execz", crate::ir::Exit::Branch { taken, not_taken }) => {
+                    taken == b && not_taken != b
+                }
+                ("s_cbranch_execnz", crate::ir::Exit::Branch { taken, not_taken }) => {
+                    not_taken == b && taken != b
+                }
+                _ => false,
+            }
+        };
+        // Two exits of the same inactive-preserving loop `hdr` whose values lie on one linear
+        // chain `hdr_phi ->* earlier ->* later ->* back_edge` never overwrite an exited lane's bit.
+        let traces_within_loop = |mut fl: Value,
+                                  mut fh: Option<Value>,
+                                  tl: Value,
+                                  th: Option<Value>,
+                                  hdr: usize|
+         -> bool {
+            for _ in 0..16 {
+                if (fl, fh) == (tl, th) {
+                    return true;
+                }
+                if self.phi_at.get(&fl).is_some_and(|&(qb, _)| qb == hdr) {
+                    return false;
+                }
+                let Some(&db) = self.def_block.get(&fl) else {
+                    return false;
+                };
+                if !self.dominates(hdr, db) {
+                    return false;
+                }
+                let Some(inst) = self.def_inst(fl) else {
+                    return false;
+                };
+                let Some(prev) = self.step_preserves_inactive(inst, fl, fh) else {
+                    return false;
+                };
+                (fl, fh) = prev;
+            }
+            false
+        };
+        let find_loop_hdr = |mut fl: Value, mut fh: Option<Value>| -> Option<(usize, Value, Option<Value>)> {
+            for _ in 0..16 {
+                if let Some(&(qb, _)) = self.phi_at.get(&fl)
+                    && self.on_cycle(qb)
+                {
+                    return Some((qb, fl, fh));
+                }
+                let inst = self.def_inst(fl)?;
+                (fl, fh) = self.step_preserves_inactive(inst, fl, fh)?;
+            }
+            None
+        };
+        let loop_exit_chain = |k: usize| -> bool {
+            let (kl, kh) = (args[k], hi_args.map(|h| h[k]));
+            let Some((hdr, hl, hh)) = find_loop_hdr(want_lo, want_hi) else {
+                return false;
+            };
+            if !self.loop_phi_preserves_inactive(hdr, hl, hh) {
+                return false;
+            }
+            let (el, eh, ll, lh) = if traces_within_loop(kl, kh, want_lo, want_hi, hdr) {
+                (want_lo, want_hi, kl, kh)
+            } else if traces_within_loop(want_lo, want_hi, kl, kh, hdr) {
+                (kl, kh, want_lo, want_hi)
+            } else {
+                return false;
+            };
+            if !traces_within_loop(el, eh, hl, hh, hdr) {
+                return false;
+            }
+            let Some(&(_, li)) = self.phi_at.get(&hl) else {
+                return false;
+            };
+            let hi_phi = hh
+                .and_then(|h| self.phi_at.get(&h))
+                .map(|&(hb, hi)| &p.blocks[hb].phis[hi]);
+            p.blocks[hdr].preds.iter().enumerate().all(|(bn, &bp)| {
+                if self.block[bp].is_none() || self.never_taken(bp, hdr) || !self.dominates(hdr, bp)
+                {
+                    return true;
+                }
+                let bl = p.blocks[hdr].phis[li].args[bn];
+                let bh = hi_phi.map(|hp| hp.args[bn]);
+                traces_within_loop(bl, bh, ll, lh, hdr)
+            })
+        };
+        for (k, &arg_k) in args.iter().enumerate() {
+            if k == n
+                || self.block[preds[k]].is_none()
+                || self.never_taken(preds[k], b)
+                || self.dominates(b, preds[k])
+                || self.merge_keeps_edge(b, args, n, k)
+                || active_keeps(k)
+                || execz_dominator(k)
+                || loop_exit_chain(k)
+            {
+                continue;
+            }
+            let Some(m_k) = self.paired_mask_bool(arg_k, hi_args.map(|h| h[k])) else {
+                return true;
+            };
+            let differs = [true, false].into_iter().any(|set| {
+                let mut lanes = on_n.clone();
+                lanes.extend([(m_k, set), (x, !set)]);
+                st.bools.meet(&lanes)
+            });
+            if differs {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn traces_inactive_to(
+        &self,
+        mut cur_lo: Value,
+        mut cur_hi: Option<Value>,
+        hdr: usize,
+        root_lo: Value,
+        root_hi: Option<Value>,
+        seen: &mut Set<(Value, Option<Value>)>,
+    ) -> bool {
+        let p = self.x.p;
+        for _ in 0..64 {
+            if !self.x.native.wave64 {
+                if let Some(c0) = self.copy_step(cur_lo) {
+                    cur_lo = c0;
+                    continue;
+                }
+            } else if let (Some(c0), Some(c1)) =
+                (self.copy_step(cur_lo), cur_hi.and_then(|h| self.copy_step(h)))
+            {
+                (cur_lo, cur_hi) = (c0, Some(c1));
+                continue;
+            }
+            break;
+        }
+        if (cur_lo, cur_hi) == (root_lo, root_hi) {
+            return true;
+        }
+        if seen.len() >= 64 || !seen.insert((cur_lo, cur_hi)) {
+            return false;
+        }
+        if let Some(&(qb, qi)) = self.phi_at.get(&cur_lo) {
+            if qb == hdr || !self.dominates(hdr, qb) {
+                return false;
+            }
+            let hi_phi = if self.x.native.wave64 {
+                let Some(h) = cur_hi else { return false };
+                let Some(&(hqb, hqi)) = self.phi_at.get(&h) else {
+                    return false;
+                };
+                if hqb != qb {
+                    return false;
+                }
+                Some(&p.blocks[hqb].phis[hqi])
+            } else {
+                None
+            };
+            let lo_phi = &p.blocks[qb].phis[qi];
+            if self.on_cycle(qb) {
+                if !self.loop_phi_preserves_inactive(qb, cur_lo, cur_hi) {
+                    return false;
+                }
+                for (n, &pred) in p.blocks[qb].preds.iter().enumerate() {
+                    if self.block[pred].is_none()
+                        || self.never_taken(pred, qb)
+                        || self.dominates(qb, pred)
+                    {
+                        continue;
+                    }
+                    let a_lo = lo_phi.args[n];
+                    let a_hi = hi_phi.map(|hp| hp.args[n]);
+                    if !self.traces_inactive_to(a_lo, a_hi, hdr, root_lo, root_hi, seen) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            let hi_args = hi_phi.map(|hp| hp.args.as_slice());
+            for (n, &pred) in p.blocks[qb].preds.iter().enumerate() {
+                if self.block[pred].is_none() || self.never_taken(pred, qb) {
+                    continue;
+                }
+                let a_lo = lo_phi.args[n];
+                let a_hi = hi_phi.map(|hp| hp.args[n]);
+                let Some(m_n) = self.paired_mask_bool(a_lo, a_hi) else {
+                    return false;
+                };
+                if !self.uniform_join(qb, |_| true)
+                    && self.mask_differs_on_edge_ballot(qb, &lo_phi.args, hi_args, n, m_n)
+                {
+                    return false;
+                }
+                if !self.traces_inactive_to(a_lo, a_hi, hdr, root_lo, root_hi, seen) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        let Some(&db) = self.def_block.get(&cur_lo) else {
+            return false;
+        };
+        if !self.dominates(hdr, db) {
+            return false;
+        }
+        let Some(inst) = self.def_inst(cur_lo) else {
+            return false;
+        };
+        let Some((pl, ph)) = self.step_preserves_inactive(inst, cur_lo, cur_hi) else {
+            return false;
+        };
+        self.traces_inactive_to(pl, ph, hdr, root_lo, root_hi, seen)
+    }
+
+    fn loop_phi_preserves_inactive(
+        &self,
+        hdr: usize,
+        root_lo: Value,
+        root_hi: Option<Value>,
+    ) -> bool {
+        let p = self.x.p;
+        let Some(&(b, li)) = self.phi_at.get(&root_lo).filter(|&&(b, _)| b == hdr) else {
+            return false;
+        };
+        let hi_phi = if self.x.native.wave64 {
+            let Some(h) = root_hi else { return false };
+            let Some(&(hb, hi)) = self.phi_at.get(&h).filter(|&&(hb, _)| hb == hdr) else {
+                return false;
+            };
+            Some(&p.blocks[hb].phis[hi])
+        } else {
+            None
+        };
+        let lo_phi = &p.blocks[b].phis[li];
+        let mut any_back = false;
+        for (n, &pred) in p.blocks[hdr].preds.iter().enumerate() {
+            if self.block[pred].is_none() || self.never_taken(pred, hdr) {
+                continue;
+            }
+            if self.dominates(hdr, pred) {
+                any_back = true;
+                let a_lo = lo_phi.args[n];
+                let a_hi = hi_phi.map(|hp| hp.args[n]);
+                if !self.traces_inactive_to(
+                    a_lo,
+                    a_hi,
+                    hdr,
+                    root_lo,
+                    root_hi,
+                    &mut Set::default(),
+                ) {
+                    return false;
+                }
+            }
+        }
+        any_back
+    }
+
+    /// Verifies that every join in the phi web of `(lo, hi)` preserves each lane's bit up to a
+    /// wave-converged block.
+    fn phi_web_preserved_at_join(&self, lo: Value, hi: Option<Value>) -> bool {
+        if self.x.st.lockstep {
+            return true;
+        }
+        let p = self.x.p;
+        let (mut seen, mut todo) = (Set::default(), vec![(lo, hi)]);
+        while let Some((q_lo, q_hi)) = todo.pop() {
+            if !seen.insert((q_lo, q_hi)) {
+                continue;
+            }
+            if seen.len() > 64 {
+                return false;
+            }
+            let Some(&(qb, qi)) = self.phi_at.get(&q_lo) else {
+                continue;
+            };
+            let hi_phi = if self.x.native.wave64 {
+                let Some(h) = q_hi else { return false };
+                let Some(&(hqb, hqi)) = self.phi_at.get(&h) else {
+                    return false;
+                };
+                if hqb != qb {
+                    return false;
+                }
+                Some(&p.blocks[hqb].phis[hqi])
+            } else {
+                None
+            };
+            let lo_phi = &p.blocks[qb].phis[qi];
+            let hi_args = hi_phi.map(|hp| hp.args.as_slice());
+            if self.on_cycle(qb) {
+                if !self.loop_phi_preserves_inactive(qb, q_lo, q_hi) {
+                    return false;
+                }
+                for (n, &pred) in p.blocks[qb].preds.iter().enumerate() {
+                    if self.block[pred].is_none()
+                        || self.never_taken(pred, qb)
+                        || self.dominates(qb, pred)
+                    {
+                        continue;
+                    }
+                    let a_lo = lo_phi.args[n];
+                    let a_hi = hi_phi.map(|hp| hp.args[n]);
+                    let Some(m_n) = self.paired_mask_bool(a_lo, a_hi) else {
+                        return false;
+                    };
+                    if !self.uniform_join(qb, |_| true)
+                        && self.mask_differs_on_edge_ballot(qb, &lo_phi.args, hi_args, n, m_n)
+                    {
+                        return false;
+                    }
+                    if self.phi_at.contains_key(&a_lo) {
+                        todo.push((a_lo, a_hi));
+                    }
+                }
+            } else {
+                for (n, &pred) in p.blocks[qb].preds.iter().enumerate() {
+                    if self.block[pred].is_none() || self.never_taken(pred, qb) {
+                        continue;
+                    }
+                    let a_lo = lo_phi.args[n];
+                    let a_hi = hi_phi.map(|hp| hp.args[n]);
+                    let Some(m_n) = self.paired_mask_bool(a_lo, a_hi) else {
+                        return false;
+                    };
+                    if !self.uniform_join(qb, |_| true)
+                        && self.mask_differs_on_edge_ballot(qb, &lo_phi.args, hi_args, n, m_n)
+                    {
+                        return false;
+                    }
+                    if self.phi_at.contains_key(&a_lo) {
+                        todo.push((a_lo, a_hi));
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Checks that every instruction or phi site requiring the scalar number of `lo` (or its
+    /// paired high half) is dominated by IR block `cb`.
+    fn mask_data_uses_dominated_by(&self, lo: Value, cb: usize) -> bool {
+        let p = self.x.p;
+        let st = self.x.st;
+        let hi = self.pair_high(lo);
+        let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+        let scc_read_as_data = |ub: usize, scc: Value| -> bool {
+            p.blocks.iter().enumerate().any(|(rb, blk)| {
+                blk.phis.iter().any(|ph| ph.args.contains(&scc))
+                    || blk.insts.iter().enumerate().any(|(ri, ri_inst)| {
+                        if !ri_inst.reads.iter().any(|r| r.1 == scc) {
+                            return false;
+                        }
+                        let is_lane_branch = rb == ub
+                            && ri + 1 == blk.insts.len()
+                            && ri_inst.name().starts_with("s_cbranch_scc")
+                            && matches!(st.exits[ub], LaneExit::Branch { when, .. }
+                                if !st.bools.support(when).contains(&Atom::Uniform(scc)));
+                        !is_lane_branch
+                    })
+            })
+        };
+        let mut reach = Set::default();
+        let mut work = vec![lo];
+        if let Some(h) = hi {
+            work.push(h);
+        }
+        while let Some(w) = work.pop() {
+            if !reach.insert(w) {
+                continue;
+            }
+            for blk in &p.blocks {
+                for ph in &blk.phis {
+                    if !matches!(ph.reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                        && ph.args.contains(&w)
+                    {
+                        work.push(ph.value);
+                    }
+                }
+                for inst in &blk.insts {
+                    if !inst.reads.iter().any(|r| r.1 == w) {
+                        continue;
+                    }
+                    if matches!(inst.fields, Fields::Sop { .. })
+                        && inst
+                            .writes
+                            .iter()
+                            .any(|&(r, dw)| matches!(r, Reg::S(_)) && is_mask(dw))
+                    {
+                        for &(r, dw) in &inst.writes {
+                            if matches!(r, Reg::S(c) if c != EXEC && c != EXEC + 1) && is_mask(dw) {
+                                work.push(dw);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut need_back = Vec::new();
+        for (ub, blk) in p.blocks.iter().enumerate() {
+            for inst in &blk.insts {
+                if !inst.reads.iter().any(|&(_, rv)| reach.contains(&rv)) {
+                    continue;
+                }
+                let mask_sop = matches!(inst.fields, Fields::Sop { .. })
+                    && inst
+                        .writes
+                        .iter()
+                        .any(|&(r, dw)| matches!(r, Reg::S(_)) && is_mask(dw))
+                    && inst
+                        .write(Reg::Scc)
+                        .is_none_or(|scc| !scc_read_as_data(ub, scc));
+                if mask_sop {
+                    continue;
+                }
+                if let Fields::Valu(v) = &inst.fields
+                    && (inst.name() == "v_cndmask_b32" || inst.name().contains("_co_ci_"))
+                {
+                    let data_op = v.src.iter().take(2).any(|op| match *op {
+                        Operand::Scalar { code, .. } if code != NULL => inst
+                            .read(Reg::S(code))
+                            .is_some_and(|rv| reach.contains(&rv)),
+                        Operand::Vector { reg, .. } => {
+                            inst.read(Reg::V(reg)).is_some_and(|rv| reach.contains(&rv))
+                        }
+                        _ => false,
+                    });
+                    if !data_op {
+                        continue;
+                    }
+                }
+                if !self.dominates(cb, ub) {
+                    return false;
+                }
+                for &(_, rv) in &inst.reads {
+                    if reach.contains(&rv) {
+                        need_back.push(rv);
+                    }
+                }
+            }
+        }
+        let mut seen_back = Set::default();
+        while let Some(w) = need_back.pop() {
+            if w == lo || Some(w) == hi || !seen_back.insert(w) {
+                continue;
+            }
+            if let Some(&(qb, qi)) = self.phi_at.get(&w) {
+                if !self.dominates(cb, qb) {
+                    return false;
+                }
+                for (n, &pred) in p.blocks[qb].preds.iter().enumerate() {
+                    let arg = p.blocks[qb].phis[qi].args[n];
+                    if reach.contains(&arg)
+                        && self.block[pred].is_some()
+                        && !self.never_taken(pred, qb)
+                    {
+                        if !is_mask(w) && !self.dominates(cb, pred) {
+                            return false;
+                        }
+                        need_back.push(arg);
+                    }
+                }
+            } else if let Some(&db) = self.def_block.get(&w) {
+                if !self.dominates(cb, db) {
+                    return false;
+                }
+                if let Some(inst) = self.def_inst(w) {
+                    for &(_, rv) in &inst.reads {
+                        if reach.contains(&rv) {
+                            need_back.push(rv);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn find_post_loop_ballot_block(&self, b: usize, lo: Value) -> Option<usize> {
+        (0..self.x.p.blocks.len())
+            .filter(|&c| {
+                c != b
+                    && (self.tail[c].is_some() || c == self.cur_ir)
+                    && self.dominates(b, c)
+                    && self.dominates(c, self.cur_ir)
+                    && self.wave_converged(c)
+                    && self.mask_data_uses_dominated_by(lo, c)
+            })
+            .min_by_key(|&c| self.rpo[c])
+    }
+
+    /// Lowers a mask written inside a divergent loop (`on_cycle(b)`) when it updates an
+    /// inactive-preserving loop-header mask and is only read as data at/after a post-loop
+    /// wave-converged block `cb`.
+    fn post_loop_inst_ballot(&mut self, lo: Value, b: usize) -> Result<Option<(V, V)>, Why> {
+        if self.x.st.lockstep {
+            return Ok(None);
+        }
+        let Some(&m) = self.x.st.masks.get(&lo).filter(|&&m| !self.has_quad_atom(m)) else {
+            return Ok(None);
+        };
+        let hi = if self.x.native.wave64 {
+            let Some(h) = self.pair_high(lo) else {
+                return Ok(None);
+            };
+            if self.x.st.mask_bits(lo, Some(h)).is_none() {
+                return Ok(None);
+            }
+            Some(h)
+        } else {
+            None
+        };
+        let Some(cb) = self.find_post_loop_ballot_block(b, lo) else {
+            return Ok(None);
+        };
+        // Walk back through inactive-preserving steps inside the loop to its header phi.
+        let (mut cl, mut ch) = (lo, hi);
+        let mut hdr_pair = None;
+        for _ in 0..16 {
+            if let Some(&(qb, _)) = self.phi_at.get(&cl)
+                && self.on_cycle(qb)
+                && self.dominates(qb, b)
+            {
+                hdr_pair = Some((cl, ch));
+                break;
+            }
+            let Some(inst) = self.def_inst(cl) else {
+                break;
+            };
+            let Some(prev) = self.step_preserves_inactive(inst, cl, ch) else {
+                break;
+            };
+            (cl, ch) = prev;
+        }
+        let Some((hdr_lo, hdr_hi)) = hdr_pair else {
+            return Ok(None);
+        };
+        if !self.phi_web_preserved_at_join(hdr_lo, hdr_hi) {
+            return Ok(None);
+        }
+        if !self.balloting.insert(lo) {
+            return Err("a lane mask whose lanes depend on its own value");
+        }
+        let cb_at = if cb == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[cb].ok_or("a lane mask written after its use")?
+        };
+        let bit = self.boolean(m, cb_at);
+        self.balloting.remove(&lo);
+        let bit = bit?;
+        self.wide_ballot(cb_at, cb, bit).map(Some)
+    }
+
+    fn phi_mask_number(&mut self, lo: Value) -> Result<(V, V), Why> {
+        const DIVERGENT_JOIN: Why =
+            "a lane mask holding lanes elsewhere read as data: a divergent join";
+        if !self.balloting.insert(lo) {
+            return Err("a lane mask whose lanes depend on its own value");
+        }
+        let res = (|| -> Result<(V, V), Why> {
+            let &(b, _) = self.phi_at.get(&lo).expect("phi checked");
+            if let Some((leaf_lo, leaf_hi)) = self.unchanged_mask_pair(lo, b) {
+                let was_ok = std::mem::replace(&mut self.mask_ok, true);
+                let out = (|| -> Result<(V, V), Why> {
+                    let x = self.i32_of(leaf_lo)?;
+                    let y = match leaf_hi {
+                        Some(h) => self.i32_of(h)?,
+                        None => self.s.m.i32(0),
+                    };
+                    Ok((x, y))
+                })();
+                self.mask_ok = was_ok;
+                return out;
+            }
+            let hi = if self.x.native.wave64 {
+                let h = self.pair_high(lo).ok_or(DIVERGENT_JOIN)?;
+                if self.x.st.mask_bits(lo, Some(h)).is_none() {
+                    return Err(DIVERGENT_JOIN);
+                }
+                Some(h)
+            } else {
+                None
+            };
+            let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+            if self.has_quad_atom(m) || !self.phi_web_preserved_at_join(lo, hi) {
+                return Err(DIVERGENT_JOIN);
+            }
+            let cb = if self.wave_converged(b) {
+                b
+            } else if self.on_cycle(b) {
+                self.find_post_loop_ballot_block(b, lo).ok_or(DIVERGENT_JOIN)?
+            } else {
+                return Err(DIVERGENT_JOIN);
+            };
+            let cb_at = if cb == self.cur_ir {
+                self.cur
+            } else {
+                self.tail[cb].ok_or("a lane mask written after its use")?
+            };
+            let bit = self.boolean(m, cb_at)?;
+            self.wide_ballot(cb_at, cb, bit)
+        })();
+        self.balloting.remove(&lo);
+        res
+    }
+
+    /// Whether `phi_val` at single-preheader, single-latch loop header `b` can be lowered as an
+    /// SSA scalar accumulator in `fill_phis` because no scalar derived from it is read outside
+    /// the natural loop of `(b, latch)` (except pure `EXEC` restores).
+    fn loop_local_mask_phi(&self, b: usize, phi_val: Value) -> bool {
+        let p = self.x.p;
+        let st = self.x.st;
+        let (mut pre, mut latch) = (None, None);
+        for &q in &p.blocks[b].preds {
+            if self.block[q].is_none() || self.never_taken(q, b) {
+                continue;
+            }
+            if self.dominates(b, q) {
+                if latch.replace(q).is_some() {
+                    return false;
+                }
+            } else if pre.replace(q).is_some() {
+                return false;
+            }
+        }
+        let (Some(_), Some(latch)) = (pre, latch) else {
+            return false;
+        };
+        // Check that all args of the phi pair are tracked masks or non-opaque constant masks.
+        let lo_val = st.highs.get(&phi_val).copied().unwrap_or(phi_val);
+        let hi_val = self.pair_high(lo_val);
+        for root in [Some(lo_val), hi_val].into_iter().flatten() {
+            let Some(&(_, pi)) = self.phi_at.get(&root).filter(|&&(pb, _)| pb == b) else {
+                return false;
+            };
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if self.block[q].is_none() || self.never_taken(q, b) {
+                    continue;
+                }
+                let a = p.blocks[b].phis[pi].args[n];
+                let ok = st.masks.contains_key(&a)
+                    || st.highs.contains_key(&a)
+                    || st.other.get(&a).is_some_and(|&m| {
+                        !st.bools
+                            .support(m)
+                            .iter()
+                            .any(|at| matches!(at, Atom::Opaque(_)))
+                    });
+                if !ok {
+                    return false;
+                }
+            }
+        }
+        let mut in_loop = vec![false; p.blocks.len()];
+        in_loop[b] = true;
+        let mut stack = vec![latch];
+        while let Some(x) = stack.pop() {
+            if !self.dominates(b, x) {
+                return false;
+            }
+            if !std::mem::replace(&mut in_loop[x], true) {
+                stack.extend(
+                    p.blocks[x]
+                        .preds
+                        .iter()
+                        .copied()
+                        .filter(|&q| self.block[q].is_some() && !self.never_taken(q, x)),
+                );
+            }
+        }
+        let scc_read_any = |scc: Value| -> bool {
+            p.blocks.iter().any(|blk| {
+                blk.phis.iter().any(|ph| ph.args.contains(&scc))
+                    || blk
+                        .insts
+                        .iter()
+                        .any(|ri_inst| ri_inst.reads.iter().any(|r| r.1 == scc))
+            })
+        };
+        let mut seen = Set::default();
+        let mut work = vec![(lo_val, false)];
+        if let Some(h) = hi_val {
+            work.push((h, false));
+        }
+        while let Some((w, outside)) = work.pop() {
+            if !seen.insert((w, outside)) {
+                continue;
+            }
+            for (ub, blk) in p.blocks.iter().enumerate() {
+                for ph in &blk.phis {
+                    if matches!(ph.reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                        continue;
+                    }
+                    if ph.args.contains(&w) {
+                        work.push((ph.value, outside || !in_loop[ub]));
+                    }
+                }
+                for inst in &blk.insts {
+                    if !inst.reads.iter().any(|r| r.1 == w) {
+                        continue;
+                    }
+                    let now_out = outside || !in_loop[ub];
+                    if now_out {
+                        let exec_only = inst.write(Reg::S(EXEC)).is_some()
+                            && inst.writes.iter().all(|&(r, sw)| {
+                                matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                                    || r == Reg::Scc && !scc_read_any(sw)
+                            });
+                        if !exec_only {
+                            return false;
+                        }
+                    } else {
+                        for &(r, dw) in &inst.writes {
+                            if matches!(r, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                                || r == Reg::Scc
+                            {
+                                work.push((dw, false));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     // ---- operands ----
@@ -15372,7 +16419,8 @@ impl<'a> Lower<'a> {
                                 && self.is_host_wave_mask_phi(phi.value))
                         && (self.x.st.masks.contains_key(&arg)
                             || self.x.st.highs.contains_key(&arg))
-                        && self.uniform_join(b, |_| true) =>
+                        && (self.uniform_join(b, |_| true)
+                            || self.loop_local_mask_phi(b, phi.value)) =>
                     {
                         match self.mask_dword(arg) {
                             Ok(x) => x,
