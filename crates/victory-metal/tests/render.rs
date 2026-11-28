@@ -130,6 +130,7 @@ impl<'a> Scene<'a> {
                 resource: Some(&self.res),
                 sampler: Some(&self.smp),
             },
+            heap_access: Default::default(),
             resources: vec![],
             vertex_buffers: vec![(0, &self.arena.buf, self.arena.at(verts))],
             index_buffer: idx.then(|| (&self.arena.buf, self.arena.at(4096) as *const u8)),
@@ -291,6 +292,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
             resource: Some(&res),
             sampler: Some(&s.smp),
         },
+        heap_access: Default::default(),
         groups: [W / 4, W / 4, 1],
         threads_per_group: [4, 4, 1],
         indirect: None,
@@ -503,6 +505,26 @@ fn indirect_draws_read_their_records_from_title_memory() {
     assert_eq!(px(&p, 12, 8), [255, 0, 0, 255], "plain record where only it covers");
 }
 
+/// A draw record that asks for more than 2^20 instances, or 2^26 vertices in all, is what its
+/// writer left unfinished in title memory (stale float bits where the instance count should be):
+/// it draws nothing, where Metal would draw it for as long as it takes. One at the limit draws.
+#[test]
+fn an_indirect_draw_past_the_most_instances_draws_nothing() {
+    let Some(m) = backend() else { return };
+    let none = DrawCall::Arrays { vertex_count: 0, instance_count: 0, first_vertex: 0, first_instance: 0 };
+    // Instances past the limit, vertices in all past theirs, then a record within both.
+    for (record, drawn) in [([3u32, (1 << 20) + 1, 0, 0], false), ([128, 1 << 20, 0, 0], false), ([3, 4, 0, 0], true)] {
+        let s = Scene::new(&m, None);
+        s.arena.write(512, &[v(-1.0, -1.0, RED), v(3.0, -1.0, RED), v(-1.0, 3.0, RED)]);
+        s.arena.write(6144, &record);
+        let mut tri = s.draw(0.5, none, 512, false);
+        tri.indirect = Some((&s.arena.buf, s.arena.at(6144) as *const u8));
+        s.submit(&[s.pass(vec![tri], [0.0, 0.0, 0.0, 1.0])]);
+        let want = if drawn { [255, 0, 0, 255] } else { [0, 0, 0, 255] };
+        assert_eq!(px(&s.pixels(), 8, 8), want, "{record:?}");
+    }
+}
+
 #[test]
 fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
     // The submission commits even when a pass cannot be encoded (its fence signals and the value
@@ -633,6 +655,7 @@ fn a_target_drawn_in_one_pass_is_sampled_by_the_next() {
                 resource: Some(&s.res),
                 sampler: Some(&s.smp),
             },
+            heap_access: Default::default(),
             resources: vec![],
             vertex_buffers: vec![(0, &s.arena.buf, s.arena.at(512))],
             index_buffer: None,
@@ -750,6 +773,7 @@ fn heap_sampled(m: &Metal, ps: &str, index: usize, sampler: [u32; 10]) -> [u8; 4
             resource: Some(&heap),
             sampler: Some(&s.smp),
         },
+        heap_access: Default::default(),
         resources: vec![],
         vertex_buffers: vec![(0, &s.arena.buf, s.arena.at(512))],
         index_buffer: None,

@@ -352,6 +352,97 @@ fn isa(offset: usize, reason: &'static str) -> ShaderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::opcodes as t;
+
+    /// Every encoding's table, so the resolution tests below cover all of them.
+    const TABLES: &[(Encoding, &[(u16, &str)])] = &[
+        (Encoding::Sop2, t::SOP2),
+        (Encoding::Sopk, t::SOPK),
+        (Encoding::Sop1, t::SOP1),
+        (Encoding::Sopc, t::SOPC),
+        (Encoding::Sopp, t::SOPP),
+        (Encoding::Smem, t::SMEM),
+        (Encoding::Vop2, t::VOP2),
+        (Encoding::Vop1, t::VOP1),
+        (Encoding::Vopc, t::VOPC),
+        (Encoding::Vop3p, t::VOP3P),
+        (Encoding::Vintrp, t::VINTRP),
+        (Encoding::Ds, t::DS),
+        (Encoding::Mubuf, t::MUBUF),
+        (Encoding::Mtbuf, t::MTBUF),
+        (Encoding::Mimg, t::MIMG),
+        (Encoding::Flat, t::FLAT),
+        (Encoding::Global, t::GLOBAL),
+        (Encoding::Scratch, t::SCRATCH),
+    ];
+
+    #[test]
+    fn tables_are_sorted_so_the_binary_search_finds_them() {
+        for &(enc, table) in TABLES {
+            assert!(!table.is_empty(), "{enc:?} table empty");
+            for w in table.windows(2) {
+                assert!(
+                    w[0].0 < w[1].0,
+                    "{enc:?} table out of order: {:#06x} then {:#06x}",
+                    w[0].0,
+                    w[1].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_table_entry_resolves_to_its_own_name() {
+        for &(enc, table) in TABLES {
+            for &(op, nm) in table {
+                assert_eq!(name(enc, op), Some(nm), "{enc:?} {op:#06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_opcode_past_the_end_of_a_table_has_no_name() {
+        for &(enc, table) in TABLES {
+            let past = table.last().map_or(0, |&(o, _)| o + 1);
+            assert_eq!(name(enc, past), None, "{enc:?} {past:#06x}");
+            assert_eq!(name(enc, u16::MAX), None, "{enc:?} max");
+        }
+        // EXP names itself whatever its opcode field holds.
+        assert_eq!(name(Encoding::Exp, 0), Some("exp"));
+        assert_eq!(name(Encoding::Exp, 0x2a), Some("exp"));
+    }
+
+    #[test]
+    fn vop3_carries_vopc_vop2_and_vop1_at_their_bases_and_its_own_table_between() {
+        // VOPC opcodes at 0x000..0x100 use the VOPC table as is.
+        for &(op, nm) in t::VOPC {
+            assert!(op < 0x100, "VOPC table out of the VOP3 base range: {op:#x}");
+            assert_eq!(name(Encoding::Vop3, op), Some(nm), "vop3 vopc {op:#06x}");
+        }
+        // VOP2 opcodes at 0x100..0x140 index the VOP2 table from 0.
+        for &(op, nm) in t::VOP2 {
+            if op < 0x40 {
+                assert_eq!(name(Encoding::Vop3, 0x100 + op), Some(nm), "vop3 vop2 {op:#06x}");
+            }
+        }
+        // VOP1 opcodes at 0x180..0x200 index the VOP1 table from 0.
+        for &(op, nm) in t::VOP1 {
+            if op < 0x80 {
+                assert_eq!(name(Encoding::Vop3, 0x180 + op), Some(nm), "vop3 vop1 {op:#06x}");
+            }
+        }
+        // Everything else (0x140..0x180 and 0x200 on) is the VOP3 table: 0x140 is
+        // RDNA2's v_fma_legacy_f32 (#321). The table holds only VOP3-only opcodes, so no
+        // entry sits in the bases' ranges where another table would shadow it.
+        assert_eq!(name(Encoding::Vop3, 0x140), Some("v_fma_legacy_f32"));
+        for &(op, nm) in t::VOP3 {
+            assert!(
+                !(0x000..0x140).contains(&op) && !(0x180..0x200).contains(&op),
+                "VOP3 table entry {op:#06x} is shadowed by a base range"
+            );
+            assert_eq!(name(Encoding::Vop3, op), Some(nm), "vop3 own {op:#06x}");
+        }
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
     /// s_branch / s_cbranch_scc0 with a dword offset relative to the next instruction.

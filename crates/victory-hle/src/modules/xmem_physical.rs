@@ -685,6 +685,33 @@ pub(super) fn release_pool_backing(base: usize, len: usize) {
     unmap(&mut physical(), base, len);
 }
 
+/// Sub-ranges of `[base, end)` (both multiples of `PAGE`) where no physical-page
+/// view is mapped yet.
+#[cfg(not(windows))]
+pub(super) fn unbacked_ranges(base: usize, end: usize) -> Vec<(usize, usize)> {
+    let physical = physical();
+    let mut gaps = Vec::new();
+    let mut cur = base;
+    let first = physical
+        .views
+        .range(..base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base);
+    for (&at, &(size, _)) in first.into_iter().chain(physical.views.range(base..end)) {
+        if cur < at {
+            gaps.push((cur, at.min(end)));
+        }
+        cur = cur.max(at + size);
+        if cur >= end {
+            return gaps;
+        }
+    }
+    if cur < end {
+        gaps.push((cur, end));
+    }
+    gaps
+}
+
 /// `VirtualFree(MEM_DECOMMIT)` of `[base, base + len)`: the physical-page views there stay, so the
 /// GPU's pool table and the aliases keep showing what the title address shows, and are made no
 /// access; the rest of the range is decommitted. Decommitting over the views put anonymous pages

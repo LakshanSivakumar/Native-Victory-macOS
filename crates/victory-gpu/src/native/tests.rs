@@ -280,6 +280,73 @@ fn a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping() 
     drop(slots);
 }
 
+/// A heap entry of a view one pool run holds points into the pool's buffer at the pages the
+/// title had there when it was written. The title maps other pool pages at the same addresses
+/// (it frees memory and takes it again) and writes the same record for its view: the entry kept
+/// the old pages, which belong to something else by then, so shaders read that and wrote into
+/// it (a world run, 2026-11-27: 2,048 such views moved in 300 s). It is followed as a wrap is.
+#[test]
+fn a_view_one_pool_run_holds_follows_title_pages_remapped_under_it() {
+    let Some(h) = host() else { return };
+    let page = page_size().max(16384);
+    let pool = Alias::new(5 * page).unwrap();
+    let info = PoolInfo { id: 1, base: pool.primary as usize, len: pool.len, memory_entry: None };
+    h.memory().pool_created(&info);
+    // Title page 0, pool page 2, holds the source; title page 1, pool page 3, takes the output.
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, 3 * page], page);
+    let (src, dst) = (0, page);
+    title.write(src, &(0..64u32).collect::<Vec<_>>());
+    // Pool page 4 holds other words.
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::copy_nonoverlapping((100..164u32).collect::<Vec<_>>().as_ptr(), pool.primary.add(4 * page).cast(), 64) };
+    let slots = vec![0u32; 8 * 8];
+    let start = slots.as_ptr() as u64;
+    let heap = h.heap(HeapKind::Resource, start, 8).unwrap();
+    let placed = |at: usize| {
+        let mut d = [0u32; 16];
+        d[1] = 1; // buffer view
+        d[6] = 64; // elements
+        d[8] = 1; // raw (SRV flags word)
+        d[10] = (title.va + at as u64) as u32;
+        d[11] = ((title.va + at as u64) >> 32) as u32;
+        d
+    };
+    let mut resource = [0u32; 14];
+    resource[0] = 1; // buffer
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &placed(src), start);
+    let mut uav = placed(dst);
+    (uav[4], uav[6]) = (64, 0);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 32);
+    assert!(h.mirror(start).unwrap());
+    assert!(h.mirror(start + 32).unwrap());
+    let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
+    // dst[i] = src[i] * 3 + 1 through the heap's views; dst starts at a canary.
+    let pass = || {
+        title.write(dst, &[0xCAFE_CAFEu32; 64]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_constants(0, &[3, 1]);
+        l.set_compute_root_table(1, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        run(&h, &[&l]);
+        title.read::<u32>(dst, 64)
+    };
+    assert_eq!(pass(), (0..64u32).map(|i| i * 3 + 1).collect::<Vec<_>>());
+    // The source's title page is pool page 4 now: the view reads it.
+    title.remap(&h, &info, &pool, 0, 4 * page, page);
+    assert_eq!(pass(), (0..64u32).map(|i| (i + 100) * 3 + 1).collect::<Vec<_>>(), "the view still read the old pool page");
+    // The output's title page is pool page 0 now: the store lands there, not in pool page 3.
+    // SAFETY: inside the pool's own mapping; the GPU is idle.
+    unsafe { std::ptr::write_bytes(pool.primary.add(3 * page), 0, 256) };
+    title.remap(&h, &info, &pool, 1, 0, page);
+    assert_eq!(pass(), (0..64u32).map(|i| (i + 100) * 3 + 1).collect::<Vec<_>>(), "the store went to the old pool page");
+    // SAFETY: as above; read after the fence wait.
+    let old = unsafe { std::slice::from_raw_parts(pool.primary.add(3 * page).cast::<u32>(), 64) };
+    assert_eq!(old, [0u32; 64], "the old pool page, someone else's by now, was written");
+    drop(slots);
+}
+
 /// A wrap keeps the physical pages it was made over: once the title maps other pool pages at
 /// those title addresses, or unmaps them, the GPU still reads the old pages through it (no fault,
 /// no zeros; seen on an M5 Pro, macOS 27). The host mirrors such a heap entry again before the
@@ -384,12 +451,13 @@ fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
     crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &uav, start + 96);
     assert!(h.mirror(start + 96).unwrap());
     let walks = || super::host::SIGNATURES.with(|n| n.replace(0));
-    // A pool-table change elsewhere: one walk for the three copies, none moved.
+    // A pool-table change elsewhere: one walk for the three copies and one for the output's view
+    // (one pool run holds it, and it is followed too), none moved.
     h.memory().pool_created(&PoolInfo { id: 2, base: 0x1000, len: 0x1000, memory_entry: None });
     walks();
     run(&h, &[]);
-    assert_eq!(walks(), 1);
-    // Remapped under them: still one walk, and the copy the program reads follows.
+    assert_eq!(walks(), 2);
+    // Remapped under them: still one walk a range, and the copy the program reads follows.
     let pso = h.compute_pipeline(&fixture("heap_rw"), [64, 1, 1]).unwrap();
     title.remap(&h, &info, &pool, 1, 4 * page, page);
     title.write(dst, &[0xCAFE_CAFEu32; 64]);
@@ -401,7 +469,7 @@ fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
     l.dispatch(1, 1, 1).unwrap();
     walks();
     run(&h, &[&l]);
-    assert_eq!(walks(), 1);
+    assert_eq!(walks(), 2);
     let expect: Vec<u32> = (0..64u32).map(|i| if i < 32 { i * 3 + 1 } else { (i + 68) * 3 + 1 }).collect();
     assert_eq!(title.read::<u32>(dst, 64), expect);
     drop(slots);
@@ -1035,6 +1103,128 @@ fn a_draw_tests_against_the_depth_compute_wrote_through_an_unordered_view() {
     drop((views, smp));
 }
 
+/// Console DXGI 119 (`R16_UNORM_X8_TYPELESS`, mapped to 21) and DXGI 21 (`R32_FLOAT_X8X24_TYPELESS`)
+/// depth-plane SRVs mirrored before any UAV exists are immediately re-mirrored onto the twin and
+/// read both compute-written depth (surviving a stencil-only clear) and render-cleared depth when
+/// sampled by a render pass with no compute pass in between.
+#[test]
+fn depth_plane_srvs_and_render_sampled_twins_read_compute_and_depth_writes() {
+    let Some(h) = host() else { return };
+    const W: usize = 16;
+    let pool = Pool::new(&h, 4);
+    let verts: [Vertex; 3] = [
+        [-1.0, -1.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+        [3.0, -1.0, 2.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+        [-1.0, 3.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
+    ];
+    pool.write(0, &verts);
+    let attrs = [
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+        VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+    ];
+    let pso = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let fill = h.compute_pipeline(&fixture("tex_fill"), [8, 8, 1]).unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let color = h.texture(&rt).unwrap();
+
+    // Console DXGI 118 (D16_UNORM_S8_UINT, kept on the host as D32FloatS8).
+    let res = crate::resource::test_texture_at(
+        pool.va(16384),
+        (W as u64, W as u32),
+        1,
+        118,
+        victory_formats::texture::Swizzle::LINEAR.0,
+        2 | 4,
+    );
+    let desc = crate::resource::texture_info(res).unwrap().desc().unwrap();
+    assert_eq!(desc.format, Format::D32FloatS8);
+    let depth = h.texture(&desc).unwrap();
+    h.register_texture(res as usize, &depth);
+
+    let views = vec![0u32; 8 * 4];
+    let smp = vec![0u32; 4 * 4];
+    let (vstart, sstart) = (views.as_ptr() as u64, smp.as_ptr() as u64);
+    let vheap = h.heap(HeapKind::Resource, vstart, 4).unwrap();
+    let sheap = h.heap(HeapKind::Sampler, sstart, 4).unwrap();
+
+    // Mirror entry 0 as DXGI 119 (R16_UNORM_X8_TYPELESS) and entry 2 as DXGI 21 *before* creating
+    // the R16_UNORM UAV at entry 1.
+    let srv_119 = [119u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+    let srv_21 = [21u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+    let uav_56 = [56u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_srv(std::ptr::null_mut(), res, &srv_119, vstart);
+    crate::descriptor::create_srv(std::ptr::null_mut(), res, &srv_21, vstart + 64);
+    assert!(h.mirror(vstart).unwrap() && h.mirror(vstart + 64).unwrap());
+    crate::descriptor::create_uav(std::ptr::null_mut(), res, std::ptr::null_mut(), &uav_56, vstart + 32);
+    assert!(h.mirror(vstart + 32).unwrap());
+
+    let mut sw = [0u32; 27];
+    (sw[6], sw[7], sw[8]) = (3, 3, 3); // point clamp
+    crate::descriptor::create_sampler_x(std::ptr::null_mut(), &sw, sstart);
+    assert!(h.mirror(sstart).unwrap());
+
+    // 1. Compute writes `x / 255` through R16_UNORM UAV -> stencil-only clear must not clobber the
+    //    twin -> pixel shader samples DXGI 119 SRV (entry 0).
+    let mut l1 = NativeList::default();
+    l1.clear_depth(&depth, 1.0);
+    l1.set_heaps(Some(&vheap), Some(&sheap));
+    l1.set_compute_pipeline(&fill);
+    l1.set_compute_root_table(0, &vheap, 1);
+    l1.dispatch((W / 8) as u32, (W / 8) as u32, 1).unwrap();
+    l1.clear_depth_stencil(&depth, None, Some(5));
+    l1.set_render_targets(std::slice::from_ref(&color), None);
+    l1.clear_render_target(&color, [0.0, 0.0, 0.0, 1.0]);
+    l1.set_graphics_pipeline(&pso, Topology::Triangles);
+    l1.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l1.set_graphics_root_table(1, &vheap, 0);
+    l1.set_graphics_root_table(2, &sheap, 0);
+    l1.set_vertex_buffer(0, pool.va(0));
+    l1.draw_instanced(3, 1, 0, 0).unwrap();
+    run(&h, &[&l1]);
+
+    let mut out = vec![0u8; W * W * 4];
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    let row: Vec<u8> = (0..W).map(|x| out[(8 * W + x) * 4]).collect();
+    assert_eq!(row, (0..W as u8).collect::<Vec<_>>(), "DXGI 119 SRV reads compute-written twin");
+
+    // 2. Depth clear writes 128/255 into `depth`, and a render pass immediately samples DXGI 21 SRV
+    //    (entry 2) with NO compute pass in between: `twin_copies` syncs `depth -> twin` first.
+    let mut l2 = NativeList::default();
+    l2.clear_depth(&depth, 128.0 / 255.0);
+    l2.set_heaps(Some(&vheap), Some(&sheap));
+    l2.set_render_targets(std::slice::from_ref(&color), None);
+    l2.clear_render_target(&color, [0.0, 0.0, 0.0, 1.0]);
+    l2.set_graphics_pipeline(&pso, Topology::Triangles);
+    l2.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l2.set_graphics_root_table(1, &vheap, 2);
+    l2.set_graphics_root_table(2, &sheap, 0);
+    l2.set_vertex_buffer(0, pool.va(0));
+    l2.draw_instanced(3, 1, 0, 0).unwrap();
+    run(&h, &[&l2]);
+
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    let row: Vec<u8> = (0..W).map(|x| out[(8 * W + x) * 4]).collect();
+    assert_eq!(row, vec![128u8; W], "render pass samples freshly cleared depth via DXGI 21 SRV");
+    crate::native::glue::resource_released(res);
+    drop((views, smp));
+}
+
 /// A draw left with no render target (the title's targets were of formats the host does not
 /// represent) is dropped by itself: Metal opens no pass without an attachment, and the value
 /// write recorded with it still runs.
@@ -1136,6 +1326,70 @@ fn a_count_written_earlier_on_the_gpu_limits_the_indirect_dispatches() {
         .map(|i| if i < 256 { i * 5 + 7 } else { 0 })
         .collect();
     assert_eq!(out, want);
+}
+
+/// `ExecuteIndirect` recorded as one command ([`NativeList::indirect_records`]) runs what the
+/// records one by one do: dispatch records of 2, 0, 8 and 4 groups (12 bytes apart, or 16 with
+/// padding), with no count or a count of 0 to 4 written on the GPU, leave the same values.
+#[test]
+fn batched_indirect_dispatches_write_what_one_by_one_ones_do() {
+    let Some(h) = host() else { return };
+    let pool = Pool::new(&h, 4);
+    let (src, dst, records, staged, count) = (0, 16384, 32768, 32896, 32912);
+    pool.write(src, &(0..N as u32).collect::<Vec<_>>());
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+    let groups = [[2u32, 1, 1], [0, 1, 1], [8, 1, 1], [4, 1, 1]];
+    for stride in [12u32, 16] {
+        let mut words = vec![0u32; 16];
+        for (i, g) in groups.iter().enumerate() {
+            words[i * stride as usize / 4..][..3].copy_from_slice(g);
+        }
+        pool.write(records, &words);
+        for counted in [None, Some(0u32), Some(1), Some(2), Some(3), Some(4)] {
+            let out = |batched: bool| {
+                pool.write(dst, &[0u32; N]);
+                pool.write(staged, &[counted.unwrap_or(0)]);
+                pool.write(count, &[0u32]);
+                let mut l = NativeList::default();
+                l.copy_buffer_region(pool.va(count), pool.va(staged), 4);
+                l.set_compute_pipeline(&pso);
+                l.set_compute_root_constants(0, &[5, 7]);
+                l.set_compute_root_view(1, pool.va(src));
+                l.set_compute_root_view(2, pool.va(dst));
+                let before = l.cmds.len();
+                let n = groups.len() as u32;
+                let at = |i: u32| pool.va(records + (i * stride) as usize);
+                if batched {
+                    l.indirect_records(at(0), stride, n, counted.map(|_| pool.va(count)), |l, r, c| match c {
+                        Some((c, i)) => l.dispatch_indirect_counted(r, c, i),
+                        None => l.dispatch_indirect(r),
+                    })
+                    .unwrap();
+                    assert_eq!(l.cmds.len() - before, 1, "one command");
+                } else {
+                    for i in 0..n {
+                        match counted {
+                            Some(_) => l.dispatch_indirect_counted(at(i), pool.va(count), i),
+                            None => l.dispatch_indirect(at(i)),
+                        }
+                        .unwrap();
+                    }
+                }
+                run(&h, &[&l]);
+                pool.read::<u32>(dst, N)
+            };
+            let one_by_one = out(false);
+            let lit = one_by_one.iter().filter(|v| **v != 0).count();
+            let want = match counted {
+                Some(0) => 0,
+                Some(1) | Some(2) => 128,
+                _ => 512,
+            };
+            // Value 0 is 0 * 5 + 7, never 0: every written value counts.
+            assert_eq!(lit, want, "stride {stride} {counted:?}: the per-record path itself");
+            assert_eq!(out(true), one_by_one, "stride {stride} {counted:?}");
+        }
+    }
 }
 
 /// `ExecuteIndirect` of a dispatch: the record is read on the GPU when the dispatch runs, so a copy
@@ -1602,4 +1856,181 @@ fn zero_count_commands_are_not_recorded_and_still_check_pipeline() {
     l.draw_indexed_instanced(3, 0, 0, 0, 0).unwrap();
     l.dispatch_mesh(0, 1, 1).unwrap();
     assert!(l.is_empty());
+}
+
+/// Stage-in vertex buffers, hardware index buffers, and buffer blits/fills that cross 64 KiB
+/// title-page boundaries mapped in descending pool order wrap the title's contiguous virtual
+/// pages (`resolve_span` / `resolve_or_alias`), follow page remaps, tolerate partially mapped
+/// reserved `SizeInBytes`, and ignore stale unmapped index bindings on non-indexed draws (#442).
+#[test]
+fn descending_pool_page_vertex_index_and_blit_spans_render_and_follow_remaps() {
+    let Some(h) = host() else { return };
+    const W: usize = 16;
+    const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let page = page_size().max(16384);
+    let pool = Alias::new(8 * page).unwrap();
+    let info = PoolInfo {
+        id: 1,
+        base: pool.primary as usize,
+        len: pool.len,
+        memory_entry: None,
+    };
+    h.memory().pool_created(&info);
+    // Title pages 0..2 -> pool pages 2, 1 (descending VB); title pages 2..4 -> pool pages 5, 4
+    // (descending IB), followed by an unmapped gap after title page 3.
+    let title = TitlePages::new(&h, &pool, &info, &[2 * page, page, 5 * page, 4 * page], page);
+
+    // Poison physical pool pages 3 and 6 (immediately after pool pages 2 and 5 in the pool) so a
+    // linear pool read past the first page produces off-screen vertices and out-of-bounds indices.
+    let poison_verts = [vertex(10.0, 10.0, [0.0; 4]); 4];
+    let poison_idx = [99u16; 8];
+    // SAFETY: inside `pool.primary` while the GPU is idle.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            poison_verts.as_ptr(),
+            pool.primary.add(3 * page).cast(),
+            poison_verts.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            poison_idx.as_ptr(),
+            pool.primary.add(6 * page).cast(),
+            poison_idx.len(),
+        );
+    }
+
+    // Quad vertices straddle title page 0 -> 1 (2 vertices on page 0, 2 vertices on page 1).
+    let vb_off = page - 2 * std::mem::size_of::<Vertex>();
+    title.write(
+        vb_off,
+        &[
+            vertex(-1.0, -1.0, GREEN),
+            vertex(1.0, -1.0, GREEN),
+            vertex(-1.0, 1.0, GREEN),
+            vertex(1.0, 1.0, GREEN),
+        ],
+    );
+    // 6 uint16 indices straddle title page 2 -> 3 (first triangle on page 2, second on page 3).
+    let ib_off = 3 * page - 3 * std::mem::size_of::<u16>();
+    title.write(ib_off, &[0u16, 1, 2, 2, 1, 3]);
+
+    let pso = h
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &fixture("tri_vs"),
+            ps: Some(&fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &[
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+                VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+                VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+            ],
+            streams: &[VertexStream {
+                slot: 0,
+                stride: 32,
+                per_instance: false,
+            }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let color = h.texture(&rt).unwrap();
+    let white = h.texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1)).unwrap();
+    h.backend.upload_texture(&white, 0, 0, &[255; 4], 4, 0);
+    h.register_texture(0xBEEF, &white);
+
+    let views = vec![0u32; 8 * 4];
+    let smp = vec![0u32; 4 * 4];
+    let (vstart, sstart) = (views.as_ptr() as u64, smp.as_ptr() as u64);
+    let vheap = h.heap(HeapKind::Resource, vstart, 4).unwrap();
+    let sheap = h.heap(HeapKind::Sampler, sstart, 4).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null_mut(), 0xBEEF as _, &srv, vstart);
+    let mut sw = [0u32; 27];
+    (sw[1], sw[2], sw[6], sw[7], sw[8]) = (1, 1, 3, 3, 3);
+    crate::descriptor::create_sampler_x(std::ptr::null_mut(), &sw, sstart);
+    assert!(h.mirror(vstart).unwrap() && h.mirror(sstart).unwrap());
+
+    // Pass a reserved `SizeInBytes` (8 * page) extending past the 4 mapped title pages: `resolve_span`
+    // wraps the mapped prefix rather than dropping the draw or reading only the first pool page.
+    let mut l = NativeList::default();
+    l.set_render_targets(std::slice::from_ref(&color), None);
+    l.clear_render_target(&color, [0.0, 0.0, 1.0, 1.0]);
+    l.set_graphics_pipeline(&pso, Topology::Triangles);
+    l.set_heaps(Some(&vheap), Some(&sheap));
+    l.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l.set_graphics_root_table(1, &vheap, 0);
+    l.set_graphics_root_table(2, &sheap, 0);
+    l.set_vertex_buffer_sized(0, title.va + vb_off as u64, (8 * page) as u32);
+    l.set_index_buffer_sized(title.va + ib_off as u64, 12, false);
+    l.draw_indexed_instanced(6, 1, 0, 0, 0).unwrap();
+    run(&h, &[&l]);
+    assert_eq!(h.unmapped(), 0);
+
+    let mut out = vec![0u8; W * W * 4];
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    let px = |o: &[u8], x: usize, y: usize| <[u8; 4]>::try_from(&o[(y * W + x) * 4..][..4]).unwrap();
+    for y in 0..W {
+        for x in 0..W {
+            assert_eq!(px(&out, x, y), [0, 255, 0, 255], "missing quad coverage at ({x}, {y})");
+        }
+    }
+
+    // Remap title page 1 (vertices 2 and 3) to pool page 7 with RED vertices and draw again, plus
+    // leave a stale unmapped index buffer before a non-indexed draw.
+    let red_tail = [vertex(-1.0, 1.0, RED), vertex(1.0, 1.0, RED)];
+    // SAFETY: inside `pool.primary` while the GPU is idle.
+    unsafe {
+        std::ptr::copy_nonoverlapping(red_tail.as_ptr(), pool.primary.add(7 * page).cast(), 2);
+    }
+    title.remap(&h, &info, &pool, 1, 7 * page, page);
+
+    let mut l2 = NativeList::default();
+    l2.set_render_targets(std::slice::from_ref(&color), None);
+    l2.clear_render_target(&color, [0.0, 0.0, 1.0, 1.0]);
+    l2.set_graphics_pipeline(&pso, Topology::Triangles);
+    l2.set_heaps(Some(&vheap), Some(&sheap));
+    l2.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l2.set_graphics_root_table(1, &vheap, 0);
+    l2.set_graphics_root_table(2, &sheap, 0);
+    l2.set_vertex_buffer_sized(0, title.va + vb_off as u64, 128);
+    l2.set_index_buffer_sized(title.va + ib_off as u64, 12, false);
+    l2.draw_indexed_instanced(6, 1, 0, 0, 0).unwrap();
+    // Stale unmapped index buffer does not drop a subsequent non-indexed draw.
+    l2.set_index_buffer_sized(0xDEAD_0000, 64, false);
+    l2.draw_instanced(3, 1, 0, 0).unwrap();
+    run(&h, &[&l2]);
+    assert_eq!(h.unmapped(), 0);
+    h.backend.read_texture(&color, 0, 0, &mut out, W * 4, 0);
+    assert!(
+        (0..W).flat_map(|y| (0..W).map(move |x| (x, y))).any(|(x, y)| px(&out, x, y)[0] > 128),
+        "remapped second vertex page was not picked up"
+    );
+
+    // Multi-page Fill and Copy across descending pool pages execute on the GPU without dropping,
+    // and leave the adjacent physical pool page untouched.
+    let sentinel = 0x77u8;
+    // SAFETY: inside `pool.primary` while the GPU is idle.
+    unsafe {
+        std::ptr::write_bytes(pool.primary.add(3 * page), sentinel, 64);
+    }
+    let copy_src = page - 32;
+    let copy_dst = 3 * page - 32;
+    let mut l3 = NativeList::default();
+    l3.fill(title.va + copy_src as u64, 64, 0x5A);
+    l3.copy_buffer_region(title.va + copy_dst as u64, title.va + copy_src as u64, 64);
+    run(&h, &[&l3]);
+    assert_eq!(h.unmapped(), 0);
+    assert_eq!(title.read::<u8>(copy_dst, 64), vec![0x5Au8; 64]);
+    // SAFETY: reading the untouched sentinel in pool page 3 after GPU wait.
+    let untouched = unsafe { *pool.primary.add(3 * page) };
+    assert_eq!(untouched, sentinel, "fill over descending title pages bled into the next pool page");
+
+    drop((views, smp));
 }

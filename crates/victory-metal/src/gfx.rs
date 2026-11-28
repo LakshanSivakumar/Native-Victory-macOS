@@ -5,7 +5,7 @@
 //! (`IRDescriptorTableSetBuffer` / `SetTexture` / `SetSampler`, 24-byte entries), so no Apple header
 //! is needed at build time.
 
-use crate::backend::{ComputeBackend, Heaps, RootArgs};
+use crate::backend::{ComputeBackend, HeapAccess, Heaps, RootArgs, STAGE_FIRST, STAGE_FRAGMENT};
 use crate::metal::{Buffer, Metal, Queue};
 use crate::resources::*;
 use objc2::Message;
@@ -17,6 +17,26 @@ use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 
 type Res = Retained<ProtocolObject<dyn MTLResource>>;
+type RawRes = NonNull<ProtocolObject<dyn MTLResource>>;
+type HeapEntryRef = (Res, bool, Option<Retained<ProtocolObject<dyn MTLTexture>>>);
+
+const STAGE_BIT_VERTEX: u8 = 1;
+const STAGE_BIT_MESH: u8 = 2;
+const STAGE_BIT_FRAGMENT: u8 = 4;
+
+fn render_stages(bits: u8) -> MTLRenderStages {
+    let mut s = MTLRenderStages::empty();
+    if bits & STAGE_BIT_VERTEX != 0 {
+        s |= MTLRenderStages::Vertex;
+    }
+    if bits & STAGE_BIT_MESH != 0 {
+        s |= MTLRenderStages::Mesh;
+    }
+    if bits & STAGE_BIT_FRAGMENT != 0 {
+        s |= MTLRenderStages::Fragment;
+    }
+    s
+}
 
 /// A fence chaining the encoders of one command buffer, and whether one has run: what a pass waits
 /// for and updates when the queue's buffers are made resident by a set instead of named.
@@ -44,22 +64,46 @@ pub struct Heap {
     buf: Retained<ProtocolObject<dyn MTLBuffer>>,
     kind: HeapKind,
     count: usize,
-    /// What each entry names: `(resident_allocation, optional_buffer_backed_texture_view)`.
+    /// What each entry names: `(resident_allocation, can_write, optional_buffer_backed_texture_view)`.
     /// A buffer-backed `TypeTextureBuffer` shares its parent `MTLBuffer`'s backing allocation, so
     /// retaining it here keeps its `gpuResourceID` live without duplicating the pool's pages in
-    /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResource`.
-    refs: RefCell<std::collections::HashMap<usize, (Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>>,
+    /// `alloc_counts` / `MTLResidencySet` / per-encoder `useResources`.
+    refs: RefCell<std::collections::HashMap<usize, HeapEntryRef>>,
     /// Entries in `refs` that currently hold `Some(texture_buffer)`.
     typed_views: Cell<usize>,
-    /// The distinct allocations `refs` names, by raw `MTLResource` pointer, with how many entries
-    /// name each: an allocation is added to `set` once and removed + committed before its last
-    /// `refs` entry is dropped, and without a set each is named to an encoder once.
-    alloc_counts: RefCell<std::collections::HashMap<usize, (usize, Res)>>,
+    /// The distinct allocations `refs` names, by raw `MTLResource` pointer: `(count, can_write, res)`.
+    /// An allocation is added to `set` once and removed + committed before its last `refs` entry is
+    /// dropped; without sets, `alloc_slices` caches contiguous read-only and writable pointer lists.
+    alloc_counts: RefCell<std::collections::HashMap<usize, (usize, bool, Res)>>,
+    alloc_slices: RefCell<(Vec<RawRes>, Vec<RawRes>)>,
+    slices_dirty: Cell<bool>,
     /// Residency set holding the heap buffer and everything its entries name.
     set: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     dirty: Cell<bool>,
     /// The set asked to stay resident (`VICTORY_METAL_REQUEST_RESIDENCY`): it ends that when dropped.
     requested: bool,
+}
+
+impl Heap {
+    fn with_slices<R>(&self, f: impl FnOnce(&[RawRes], &[RawRes]) -> R) -> R {
+        if self.slices_dirty.replace(false) {
+            let counts = self.alloc_counts.borrow();
+            let mut slices = self.alloc_slices.borrow_mut();
+            let (ro, rw) = &mut *slices;
+            ro.clear();
+            rw.clear();
+            for (_, can_write, r) in counts.values() {
+                let ptr = NonNull::from(ProtocolObject::from_ref(&**r));
+                if *can_write {
+                    rw.push(ptr);
+                } else {
+                    ro.push(ptr);
+                }
+            }
+        }
+        let slices = self.alloc_slices.borrow();
+        f(&slices.0, &slices.1)
+    }
 }
 
 impl Drop for Heap {
@@ -516,7 +560,7 @@ impl Metal {
         heap: &Heap,
         index: usize,
         words: [u64; 3],
-        keep: Option<(Res, Option<Retained<ProtocolObject<dyn MTLTexture>>>)>,
+        keep: Option<HeapEntryRef>,
     ) {
         assert!(
             index < heap.count,
@@ -537,40 +581,48 @@ impl Metal {
                 .enumerate()
                 .for_each(|(i, w)| p.add(i).write_volatile(*w));
         }
-        let added_typed = matches!(keep, Some((_, Some(_))));
+        let added_typed = matches!(keep, Some((_, _, Some(_))));
         let old = match keep {
-            Some((r, tex_view)) => {
+            Some((r, can_write, tex_view)) => {
                 let ptr = (&*r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
                 let mut counts = heap.alloc_counts.borrow_mut();
-                let (count, _) = counts.entry(ptr).or_insert_with(|| (0, r.clone()));
-                if *count == 0
-                    && let Some(set) = &heap.set
-                {
-                    set.addAllocation(ProtocolObject::from_ref(&*r));
-                    heap.dirty.set(true);
+                let (count, cw, _) = counts
+                    .entry(ptr)
+                    .or_insert_with(|| (0, can_write, r.clone()));
+                if !*cw && can_write {
+                    *cw = true;
+                    heap.slices_dirty.set(true);
+                }
+                if *count == 0 {
+                    heap.slices_dirty.set(true);
+                    if let Some(set) = &heap.set {
+                        set.addAllocation(ProtocolObject::from_ref(&*r));
+                        heap.dirty.set(true);
+                    }
                 }
                 *count += 1;
                 drop(counts);
-                heap.refs.borrow_mut().insert(index, (r, tex_view))
+                heap.refs.borrow_mut().insert(index, (r, can_write, tex_view))
             }
             None => heap.refs.borrow_mut().remove(&index),
         };
-        let removed_typed = matches!(old, Some((_, Some(_))));
+        let removed_typed = matches!(old, Some((_, _, Some(_))));
         if added_typed != removed_typed {
             let n = heap.typed_views.get();
             heap.typed_views
                 .set(if added_typed { n + 1 } else { n - 1 });
         }
-        if let Some((old, old_tex_view)) = old {
+        if let Some((old, _, old_tex_view)) = old {
             let old_ptr = (&*old as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let mut counts = heap.alloc_counts.borrow_mut();
             let last = match counts.get_mut(&old_ptr) {
-                Some((n, _)) if *n > 1 => {
+                Some((n, ..)) if *n > 1 => {
                     *n -= 1;
                     false
                 }
                 Some(_) => {
                     counts.remove(&old_ptr);
+                    heap.slices_dirty.set(true);
                     true
                 }
                 None => false,
@@ -616,7 +668,9 @@ impl Metal {
         let cb = self.new_command_buffer(queue)?;
         attached_heaps.clear();
         for (f, v) in waits {
-            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
+            if let Some((ev, raw)) = f.encode_wait(*v) {
+                cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*ev), raw);
+            }
         }
         if let Some((event, v)) = after {
             cb.encodeWaitForEvent_value(ProtocolObject::from_ref(event), v);
@@ -664,29 +718,151 @@ impl Metal {
         }
     }
 
-    /// Residency without sets: the heap buffer and each distinct allocation its entries name, once
-    /// per encoder (`named` holds the heaps this encoder was given; residency lasts the encoder).
-    /// Naming every entry at every draw cost a `useResource` per entry per draw, and the title fills
-    /// more entries as the world streams in, so frame time grew with play time.
-    fn use_heap_encoder(
+    /// Residency without sets across all active commands of one encoder:
+    /// - Bounded encoders name only `&heap.buf` (`Read`) and the deduplicated allocations of their
+    ///   accessed heap ranges via batched `useResources`, marking read-only resources `Read` and
+    ///   shader-writable resources in UAV ranges `Read | Write`.
+    /// - Unbounded (`all_stages != 0`) encoders submit the heap's cached read-only and writable
+    ///   slices via batched `useResources`, keeping non-`ShaderWrite` textures `Read`.
+    fn use_heaps_encoder<'a>(
         &self,
-        heap: &Heap,
-        named: &mut Vec<*const Heap>,
-        mut use_res: impl FnMut(&ProtocolObject<dyn MTLResource>),
+        cmds: impl Iterator<Item = (&'a Heaps<'a, Metal>, HeapAccess<'a>, u8)>,
+        has_fragment: bool,
+        mut use_batch: impl FnMut(&[RawRes], MTLResourceUsage, u8),
     ) {
-        if heap.set.is_some() || named.contains(&(heap as *const Heap)) {
-            return;
+        struct ResPlan<'a> {
+            heap: &'a Heap,
+            full_stages: u8,
+            full_writes: bool,
+            ranges: Vec<(usize, usize, bool, u8)>,
         }
-        named.push(heap);
-        use_res(ProtocolObject::from_ref(&*heap.buf));
-        let refs = heap.refs.borrow().len() as u64;
-        let allocations = heap.alloc_counts.borrow();
-        allocations.values().for_each(|(_, r)| use_res(r));
-        self.count(|c| {
-            c.heap_resources += 1 + allocations.len() as u64;
-            c.heap_entries = c.heap_entries.max(refs);
-            c.heap_allocations = c.heap_allocations.max(allocations.len() as u64);
-        });
+
+        let mut samplers: Vec<(&'a Heap, u8)> = Vec::new();
+        let mut resources: Vec<ResPlan<'a>> = Vec::new();
+        for (heaps, access, first_bit) in cmds {
+            if let Some(sh) = heaps.sampler
+                && sh.set.is_none()
+            {
+                let st = if has_fragment {
+                    first_bit | STAGE_BIT_FRAGMENT
+                } else {
+                    first_bit
+                };
+                match samplers
+                    .iter_mut()
+                    .find(|(h, _)| std::ptr::eq(*h, sh))
+                {
+                    Some((_, s)) => *s |= st,
+                    None => samplers.push((sh, st)),
+                }
+            }
+            if let Some(rh) = heaps.resource
+                && rh.set.is_none()
+            {
+                let plan = match resources
+                    .iter_mut()
+                    .find(|p| std::ptr::eq(p.heap, rh))
+                {
+                    Some(p) => p,
+                    None => {
+                        resources.push(ResPlan {
+                            heap: rh,
+                            full_stages: 0,
+                            full_writes: false,
+                            ranges: Vec::new(),
+                        });
+                        resources.last_mut().unwrap()
+                    }
+                };
+                if access.all_stages & STAGE_FIRST != 0 {
+                    plan.full_stages |= first_bit;
+                }
+                if has_fragment && access.all_stages & STAGE_FRAGMENT != 0 {
+                    plan.full_stages |= STAGE_BIT_FRAGMENT;
+                }
+                if access.all_stages != 0 {
+                    plan.full_writes |= access.all_writes;
+                }
+                for r in access.ranges {
+                    let start = r.start.min(rh.count);
+                    let end = r.end.min(rh.count);
+                    if start < end {
+                        let st = if has_fragment && r.fragment {
+                            STAGE_BIT_FRAGMENT
+                        } else {
+                            first_bit
+                        };
+                        plan.ranges.push((start, end, r.writes, st));
+                    }
+                }
+            }
+        }
+
+        for (sh, st) in samplers {
+            let buf_ptr = NonNull::from(ProtocolObject::from_ref(&*sh.buf));
+            use_batch(std::slice::from_ref(&buf_ptr), MTLResourceUsage::Read, st);
+            self.count(|c| c.heap_resources += 1);
+        }
+
+        for plan in resources {
+            if plan.full_stages == 0 && plan.ranges.is_empty() {
+                continue;
+            }
+            let rh = plan.heap;
+            let buf_stages = plan
+                .ranges
+                .iter()
+                .fold(plan.full_stages, |acc, r| acc | r.3);
+            let buf_ptr = NonNull::from(ProtocolObject::from_ref(&*rh.buf));
+            let refs_len = rh.refs.borrow().len() as u64;
+            let allocs_len = rh.alloc_counts.borrow().len() as u64;
+
+            if plan.full_stages != 0 {
+                use_batch(
+                    std::slice::from_ref(&buf_ptr),
+                    MTLResourceUsage::Read,
+                    buf_stages,
+                );
+                rh.with_slices(|ro, rw| {
+                    if !ro.is_empty() {
+                        use_batch(ro, MTLResourceUsage::Read, plan.full_stages);
+                    }
+                    if !rw.is_empty() {
+                        let u = if plan.full_writes {
+                            MTLResourceUsage::Read | MTLResourceUsage::Write
+                        } else {
+                            MTLResourceUsage::Read
+                        };
+                        use_batch(rw, u, plan.full_stages);
+                    }
+                });
+                let overrides: Vec<_> = plan
+                    .ranges
+                    .into_iter()
+                    .filter(|r| (r.3 & !plan.full_stages) != 0 || (r.2 && !plan.full_writes))
+                    .collect();
+                if !overrides.is_empty() {
+                    emit_scoped_ranges(rh, overrides, None, &mut use_batch);
+                }
+                self.count(|c| {
+                    c.heap_resources += 1 + allocs_len;
+                    c.heap_entries = c.heap_entries.max(refs_len);
+                    c.heap_allocations = c.heap_allocations.max(allocs_len);
+                });
+            } else {
+                let distinct = emit_scoped_ranges(
+                    rh,
+                    plan.ranges,
+                    Some((buf_ptr, false, buf_stages)),
+                    &mut use_batch,
+                );
+                self.count(|c| {
+                    c.heap_resources += 1 + distinct;
+                    c.heap_entries = c.heap_entries.max(refs_len);
+                    c.heap_allocations = c.heap_allocations.max(allocs_len);
+                });
+            }
+        }
     }
 
     /// The static samplers of one stage's `layout`, if it declares any.
@@ -749,7 +925,6 @@ impl Metal {
         root: &RootArgs,
         heaps: &Heaps<'_, Metal>,
         statics: Option<&StaticSamplers>,
-        named: &mut Vec<*const Heap>,
     ) {
         let root = StaticSamplers::args(statics, &root.0);
         if !root.is_empty() {
@@ -772,9 +947,6 @@ impl Metal {
             if let Some(h) = h {
                 // SAFETY: a live buffer at an in-range slot.
                 unsafe { e.setBuffer_offset_atIndex(Some(&h.buf), 0, slot) };
-                self.use_heap_encoder(h, named, |r| {
-                    e.useResource_usage(r, MTLResourceUsage::Read | MTLResourceUsage::Write)
-                });
             }
         }
     }
@@ -786,7 +958,6 @@ impl Metal {
         fragment: Option<&RootArgs>,
         heaps: &Heaps<'_, Metal>,
         pipeline: &RenderPipeline,
-        named: &mut Vec<*const Heap>,
     ) {
         let fragment = fragment.unwrap_or(root);
         let (vs, ps) = (pipeline.vs_static.as_ref(), pipeline.ps_static.as_ref());
@@ -834,16 +1005,76 @@ impl Metal {
                     }
                     e.setFragmentBuffer_offset_atIndex(Some(&h.buf), 0, slot);
                 }
-                self.use_heap_encoder(h, named, |r| {
-                    e.useResource_usage_stages(
-                        r,
-                        MTLResourceUsage::Read | MTLResourceUsage::Write,
-                        first | MTLRenderStages::Fragment,
-                    )
-                });
             }
         }
     }
+}
+
+fn emit_scoped_ranges(
+    rh: &Heap,
+    mut ranges: Vec<(usize, usize, bool, u8)>,
+    extra_first: Option<(RawRes, bool, u8)>,
+    use_batch: &mut impl FnMut(&[RawRes], MTLResourceUsage, u8),
+) -> u64 {
+    ranges.sort_unstable_by_key(|r| (r.0, r.1));
+    let mut merged: Vec<(usize, usize, bool, u8)> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        if let Some(prev) = merged.last_mut() {
+            if prev.0 == r.0 && prev.1 == r.1 {
+                prev.2 |= r.2;
+                prev.3 |= r.3;
+                continue;
+            }
+            if prev.1 == r.0 && prev.2 == r.2 && prev.3 == r.3 {
+                prev.1 = r.1;
+                continue;
+            }
+        }
+        merged.push(r);
+    }
+    let refs = rh.refs.borrow();
+    let mut items: Vec<(usize, RawRes, bool, u8)> = Vec::new();
+    for &(start, end, writes, st) in &merged {
+        for idx in start..end {
+            if let Some((res, can_write, _)) = refs.get(&idx) {
+                let raw = NonNull::from(ProtocolObject::from_ref(&**res));
+                items.push((raw.as_ptr() as usize, raw, writes && *can_write, st));
+            }
+        }
+    }
+    drop(refs);
+    items.sort_unstable_by_key(|x| x.0);
+    items.dedup_by(|b, a| {
+        if a.0 == b.0 {
+            a.2 |= b.2;
+            a.3 |= b.3;
+            true
+        } else {
+            false
+        }
+    });
+    let distinct = items.len() as u64;
+    if let Some((raw, w, st)) = extra_first {
+        items.push((raw.as_ptr() as usize, raw, w, st));
+    }
+    items.sort_unstable_by_key(|x| (x.2, x.3));
+    let mut batch: Vec<RawRes> = Vec::with_capacity(items.len());
+    let mut i = 0;
+    while i < items.len() {
+        let (_, _, w, st) = items[i];
+        batch.clear();
+        while i < items.len() && items[i].2 == w && items[i].3 == st {
+            batch.push(items[i].1);
+            i += 1;
+        }
+        let usage = if w {
+            MTLResourceUsage::Read | MTLResourceUsage::Write
+        } else {
+            MTLResourceUsage::Read
+        };
+        use_batch(&batch, usage, st);
+    }
+    distinct
 }
 
 impl ResourceBackend for Metal {
@@ -875,6 +1106,8 @@ impl ResourceBackend for Metal {
             refs: RefCell::default(),
             typed_views: Cell::new(0),
             alloc_counts: RefCell::default(),
+            alloc_slices: RefCell::default(),
+            slices_dirty: Cell::new(false),
             requested: set.is_some() && self.request_residency,
             set,
             dirty: Cell::new(false),
@@ -897,7 +1130,7 @@ impl ResourceBackend for Metal {
         let gpu = self.gpu_address(buffer, title);
         let keep: Res = ProtocolObject::from_ref(&*buffer.buf).retain();
         // IRDescriptorTableSetBuffer(entry, gpu, metadata = size & 0xffffffff).
-        self.heap_entry(heap, index, [gpu, 0, size as u64], Some((keep, None)));
+        self.heap_entry(heap, index, [gpu, 0, size as u64], Some((keep, true, None)));
     }
 
     fn write_typed_buffer(
@@ -978,7 +1211,7 @@ impl ResourceBackend for Metal {
             heap,
             index,
             [gpu, tex_id, size as u64],
-            Some((keep_buf, Some(tex))),
+            Some((keep_buf, true, Some(tex))),
         );
         true
     }
@@ -986,9 +1219,15 @@ impl ResourceBackend for Metal {
     fn write_texture(&self, heap: &Heap, index: usize, t: &Texture, min_lod: f32) {
         debug_assert_eq!(heap.kind, HeapKind::Resource);
         let id = resource_id(t.tex.gpuResourceID());
+        let can_write = t.tex.usage().contains(MTLTextureUsage::ShaderWrite);
         let keep: Res = ProtocolObject::from_ref(&*t.tex).retain();
         // IRDescriptorTableSetTexture(entry, tex, minLODClamp, metadata = 0).
-        self.heap_entry(heap, index, [0, id, min_lod.to_bits() as u64], Some((keep, None)));
+        self.heap_entry(
+            heap,
+            index,
+            [0, id, min_lod.to_bits() as u64],
+            Some((keep, can_write, None)),
+        );
     }
 
     fn write_sampler(&self, heap: &Heap, index: usize, s: &Sampler, lod_bias: f32) {
@@ -1011,7 +1250,7 @@ impl ResourceBackend for Metal {
         heap.set.as_ref()?;
         // Each allocation's latest use over the entries naming it.
         let mut latest = std::collections::HashMap::<usize, u32>::new();
-        for (&index, (r, _)) in heap.refs.borrow().iter() {
+        for (&index, (r, ..)) in heap.refs.borrow().iter() {
             let ptr = (&**r as *const ProtocolObject<dyn MTLResource>).cast::<()>() as usize;
             let used = last_used.get(index).copied().unwrap_or(0);
             let e = latest.entry(ptr).or_insert(0);
@@ -1020,7 +1259,7 @@ impl ResourceBackend for Metal {
         // A view's (or a texture over a buffer's) memory is its parent's: count the allocation under
         // it, once, with the latest use over every object made of it.
         let mut under = std::collections::HashMap::<usize, HeapAllocation>::new();
-        for (&id, (_, r)) in heap.alloc_counts.borrow().iter() {
+        for (&id, (.., r)) in heap.alloc_counts.borrow().iter() {
             let used = latest.get(&id).copied().unwrap_or(0);
             let texture = r.respondsToSelector(objc2::sel!(textureType));
             let root: Res = if texture {
@@ -1308,7 +1547,9 @@ impl GraphicsBackend for Metal {
             cb.setLabel(Some(&objc2_foundation::NSString::from_str(&label)));
         }
         for (f, v) in work.waits {
-            cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*f.0), *v);
+            if let Some((ev, raw)) = f.encode_wait(*v) {
+                cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*ev), raw);
+            }
         }
         // With residency sets the encoders do not name what they reach through a heap (nor, with
         // the pool's set on the queue, the title's buffers), so Metal cannot order them: this
@@ -1335,6 +1576,23 @@ impl GraphicsBackend for Metal {
         let mut refused: Vec<usize> = Vec::new();
         let mut first_error: Option<String> = None;
         let mut attached_heaps = Vec::new();
+        // Fills of passes refused at encode time, re-encoded below as one blit pass of the same
+        // command buffer (#80): on the console a refused pass's value write ran in the GPU's
+        // order — after the submission's earlier passes, before its fence signals — and a queue
+        // waiting on the fence or polling the memory value must see it there. Paying it on the
+        // CPU at submit time instead lets a waiting queue go on before this command buffer's
+        // earlier GPU passes have run. A blit fill always encodes (it needs no attachments or
+        // pipeline), so the re-encode cannot fail; copies are not re-encoded (a copy may have
+        // partly run, and its source may have changed since — see `Owed::of`).
+        let mut refused_fills: Vec<BlitOp<'_, Metal>> = Vec::new();
+        fn take_fills<'a>(ops: &[BlitOp<'a, Metal>]) -> Vec<BlitOp<'a, Metal>> {
+            ops.iter()
+                .filter_map(|op| match op {
+                    BlitOp::Fill { dst, len, value } => Some(BlitOp::Fill { dst: *dst, len: *len, value: *value }),
+                    _ => None,
+                })
+                .collect()
+        }
         // A submission's passes can go in command buffers of at most `passes_per_buffer` passes
         // (`VICTORY_PASSES_PER_BUFFER`; default 0: all in one). macOS stops a command buffer that
         // runs too long on the GPU (`kIOGPUCommandBufferCallbackErrorTimeout`): a world
@@ -1368,7 +1626,11 @@ impl GraphicsBackend for Metal {
             if let Err(e) = encoded {
                 // A pass that cannot be encoded (a render target with no attachments, a piece
                 // whose root arguments were never set) is dropped; the passes after it still run,
-                // so one bad pass does not cost the frame's whole picture.
+                // so one bad pass does not cost the frame's whole picture. Its fills are
+                // re-encoded below, in the GPU's order (#80).
+                if let Pass::Blit(ops) = pass {
+                    refused_fills.extend(take_fills(ops));
+                }
                 refused.push(n);
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -1379,6 +1641,11 @@ impl GraphicsBackend for Metal {
                 && n + 1 < work.passes.len()
             {
                 let piece = ((n + 1) / per) as u64;
+                // This piece's refused fills first, then its piece event (#80, GPU order).
+                if !refused_fills.is_empty() {
+                    let _ = self.encode_blit(&cb, &refused_fills, order);
+                    refused_fills.clear();
+                }
                 cb.encodeSignalEvent_value(ProtocolObject::from_ref(&**event), piece);
                 let owed = Owed::of(vec![(event.clone(), piece)], &work.passes[first..=n], 0);
                 // The trace names what this piece holds, not the whole submission.
@@ -1386,14 +1653,26 @@ impl GraphicsBackend for Metal {
                     let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
                     (format!("{label} piece {piece} | {enc}"), std::mem::take(&mut *self.trace_args.borrow_mut()))
                 });
-                self.commit_piece(queue, &cb, owed, piece, tinfo);
+                let piece_owed = self.commit_piece(queue, &cb, owed, piece, tinfo);
                 first = n + 1;
                 cb = match self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece))) {
                     Ok(cb) => cb,
                     Err(e) => {
                         // The current piece never started: every pass from `first` on was lost,
-                        // and the earlier pieces did commit.
-                        refused.extend(first..work.passes.len());
+                        // and the earlier pieces did commit. Their fills are paid once the last
+                        // committed piece's passes have run on the GPU (#80): the console's
+                        // order kept, where paying at submit time would let a waiter go on
+                        // before those passes ran. They count as refused for the caller's log.
+                        let mut lost: Vec<usize> = refused.iter().copied().collect();
+                        lost.extend(first..work.passes.len());
+                        let mut refund = std::mem::take(&mut refused_fills);
+                        for n in &lost {
+                            if let Pass::Blit(ops) = &work.passes[*n] {
+                                refund.extend(take_fills(ops));
+                            }
+                        }
+                        piece_owed.attach_refund(refund);
+                        refused = lost;
                         return Err(SubmitFailure {
                             committed: true,
                             refused,
@@ -1410,14 +1689,29 @@ impl GraphicsBackend for Metal {
         if set_on_queue {
             cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*queue.2), queue.3.get());
         }
-        for (f, v) in work.signals {
-            cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*f.0), *v);
+        // The refused passes' fills, in the GPU's order: after the passes that ran (the order
+        // fence above orders each encoder after the one before), before this command buffer's
+        // fence signals, which encode after this.
+        if !refused_fills.is_empty() {
+            let _ = self.encode_blit(&cb, &refused_fills, order);
         }
         let mut events = Vec::with_capacity(work.signals.len() + 1);
         if set_on_queue {
             events.push((queue.2.clone(), queue.3.get()));
         }
-        events.extend(work.signals.iter().map(|(f, v)| (f.0.clone(), *v)));
+        for (f, v) in work.signals {
+            match f.encode_signal(&self.dev, *v) {
+                Ok(pairs) => {
+                    for (ev, raw) in pairs {
+                        cb.encodeSignalEvent_value(ProtocolObject::from_ref(&*ev), raw);
+                        events.push((ev, raw));
+                    }
+                }
+                Err(e) => {
+                    first_error.get_or_insert_with(|| e.to_string());
+                }
+            }
+        }
         let owed = std::sync::Arc::new(Owed::of(events, &work.passes[first..], work.signals.len()));
         flights().push_back(Flight { serial, queue: queue_id, since: std::time::Instant::now(), owed: owed.clone() });
         // A command buffer the GPU fails is logged (the first few), not silently dropped.
@@ -1530,7 +1824,7 @@ impl Metal {
         owed: Owed,
         piece: u64,
         tinfo: Option<(String, Vec<(String, usize, usize)>)>,
-    ) {
+    ) -> std::sync::Arc<Owed> {
         let owed = std::sync::Arc::new(owed);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
@@ -1557,7 +1851,9 @@ impl Metal {
             GATED.lock().unwrap().insert(serial, args);
             d
         });
-        let failed = block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+        let failed = {
+            let owed = std::sync::Arc::clone(&owed);
+            block2::RcBlock::new(move |done: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
@@ -1593,11 +1889,18 @@ impl Metal {
             if dropped || error.is_some() {
                 owed.recover();
             }
-        });
+            // The fills of passes a piece boundary stopped from encoding: paid once this
+            // command buffer's passes have run (completion), failed or not (#80). The flag goes
+            // up first, so an attach that races the completion sees it and pays at once.
+            owed.completed.store(true, std::sync::atomic::Ordering::Release);
+            owed.pay_refund();
+            })
+        };
         // SAFETY: the block is retained by Metal until it has run.
         unsafe { cb.addCompletedHandler(&*failed as *const _ as *mut _) };
         crate::metal::residency_timed("cb_commit", None, || cb.commit());
         self.committed.set(self.committed.get() + 1);
+        owed
     }
 
     /// The pipeline of a compiled state `pso`: what the passes set beside it.
@@ -1821,6 +2124,16 @@ pub(crate) struct Owed {
     #[allow(clippy::type_complexity)]
     fills: Vec<(Retained<ProtocolObject<dyn MTLBuffer>>, usize, usize, u8)>,
     signals: usize,
+    /// Fills paid once the GPU has run this command buffer's passes, failed or not (#80): the
+    /// fills of later passes a piece boundary stopped from ever being encoded. On the console
+    /// they ran after this command buffer's passes; paying them in the completion handler keeps
+    /// that order, where paying at submit time would let a waiter go on first. Attached after
+    /// the commit (the failure is known when the next piece fails to start), hence the mutex;
+    /// an attach after the completion pays what is there at once, which is that order kept.
+    #[allow(clippy::type_complexity)]
+    refund: std::sync::Mutex<Vec<(Retained<ProtocolObject<dyn MTLBuffer>>, usize, usize, u8)>>,
+    /// Set by the completion handler before it pays a refund: an attach past it pays at once.
+    completed: std::sync::atomic::AtomicBool,
 }
 
 impl Owed {
@@ -1854,7 +2167,65 @@ impl Owed {
                 }
             }
         }
-        Owed { recovery: std::sync::Once::new(), events, fills, signals }
+        Owed {
+            recovery: std::sync::Once::new(),
+            events,
+            fills,
+            signals,
+            refund: std::sync::Mutex::default(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// What later passes owe if a piece boundary stopped them from ever being encoded: paid once
+    /// the GPU has run this command buffer ([`Self::pay_refund`]). A completion that already ran
+    /// pays at once — its passes have run, so that is the order kept.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn attach_refund(
+        &self,
+        refund: Vec<BlitOp<'_, Metal>>,
+    ) {
+        let fills = refund
+            .iter()
+            .filter_map(|op| match op {
+                BlitOp::Fill { dst, len, value } => {
+                    Some((dst.0.buf.clone(), dst.1 as usize - dst.0.base as usize, *len, *value))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if fills.is_empty() {
+            return;
+        }
+        self.refund.lock().unwrap_or_else(|e| e.into_inner()).extend(fills);
+        // The completion handler already ran (the command buffer was done before this call): its
+        // passes have run, so paying at once is the console's order. Else the handler pays.
+        if self.completed.load(std::sync::atomic::Ordering::Acquire) {
+            self.pay_refund();
+        }
+    }
+
+    /// Writes each refunded fill, in order. Called from the completion handler, so a waiter sees
+    /// the writes only after this command buffer's passes have run — the order the console kept.
+    /// The fills are taken out under the lock, so the handler and a racing attach never both pay
+    /// them (a second payment could overwrite a newer value the title wrote in between).
+    fn pay_refund(&self) {
+        let refund = std::mem::take(&mut *self.refund.lock().unwrap_or_else(|e| e.into_inner()));
+        if refund.is_empty() {
+            return;
+        }
+        for (buf, off, len, value) in refund.iter() {
+            // SAFETY: the range lies inside the wrapped title memory (the caller resolved it).
+            unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            tracing::warn!(
+                "metal: paid {} value writes of passes a piece boundary stopped from encoding, after the GPU's earlier passes",
+                refund.len()
+            );
+        }
     }
 
     /// Writes each fill, in order, then raises each event (never lowers it): a waiter that sees
@@ -1874,7 +2245,7 @@ impl Owed {
             }
             if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
                 tracing::warn!(
-                    "metal: a command buffer failed; paid {} fence signals and {} value writes on the CPU",
+                    "metal: a command buffer failed, was lost or was left at a stop; paid {} fence signals and {} value writes on the CPU",
                     self.signals,
                     self.fills.len()
                 );
@@ -2034,14 +2405,19 @@ const STOP_VALUE: u64 = 1 << 62;
 
 /// Stops the process's GPU work cleanly before it exits: raises every shared event a command
 /// buffer may wait on ([`track_event`]), waits up to `wait` for the command buffers in flight to
-/// complete, and pays what the ones that did not still owe on the CPU. Returns how many were in
-/// flight and how many of them did not complete.
+/// complete, then, for those still in flight (running on the GPU: no event wakes them), up to
+/// `longest` in all, and pays what the ones that did not complete still owe on the CPU. Returns
+/// how many were in flight and how many of them did not complete.
+///
+/// Guess (#357): a process that exits while its command buffers still run on the GPU is what
+/// leaves their memory allocated; one long pass ran 25 s and then completed (res5), so a bounded
+/// longer wait lets most finish first. Paying their debts on the CPU does not stop the GPU.
 ///
 /// A process killed while its command buffers sleep in the kernel on events it never signals can
 /// leave the GPU memory they hold allocated after it exits: on macOS 26.5 an M5 Max kept about
 /// 20 GB "in use" by the GPU driver, owned by no process, until a reboot (#357). Woken first, they
 /// finish and the process exits with nothing pending.
-pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
+pub fn stop_gpu(wait: std::time::Duration, longest: std::time::Duration) -> (usize, usize) {
     let events: Vec<_> = EVENTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2049,7 +2425,7 @@ pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
         .iter()
         .filter_map(objc2::rc::Weak::load)
         .collect();
-    let drained = wake_and_drain(&events, wait);
+    let drained = wake_and_drain(&events, wait, longest);
     // Then what the residency sets keep resident is given back before the process goes, not left
     // to the driver's teardown: a run that hung the GPU at world entry with ~16 GB in its heaps'
     // sets left 19.7 GB "in use" after it exited (#357). Process exit skips `Heap`'s `Drop`.
@@ -2069,6 +2445,7 @@ pub fn stop_gpu(wait: std::time::Duration) -> (usize, usize) {
 fn wake_and_drain(
     events: &[Retained<ProtocolObject<dyn MTLSharedEvent>>],
     wait: std::time::Duration,
+    longest: std::time::Duration,
 ) -> (usize, usize) {
     let in_flight = flights().len();
     for e in events {
@@ -2076,9 +2453,25 @@ fn wake_and_drain(
             e.setSignaledValue(STOP_VALUE);
         }
     }
-    let deadline = std::time::Instant::now() + wait;
-    while !flights().is_empty() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(2));
+    let start = std::time::Instant::now();
+    let drain_until = |deadline: std::time::Instant| {
+        while !flights().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    drain_until(start + wait);
+    if !flights().is_empty() && longest > wait {
+        let still: Vec<String> = flights()
+            .iter()
+            .map(|f| format!("q{:x} #{} for {:.1}s", f.queue, f.serial, f.since.elapsed().as_secs_f64()))
+            .collect();
+        tracing::warn!(
+            "stopping: {} command buffers still in flight {:.1}s after their events were raised (running on the GPU); waiting up to {:.0}s in all: {still:?}",
+            still.len(),
+            wait.as_secs_f64(),
+            longest.as_secs_f64()
+        );
+        drain_until(start + longest);
     }
     let left: Vec<Flight> = flights().drain(..).collect();
     for f in &left {
@@ -2131,19 +2524,25 @@ fn gated_args(serial: u64, forget: bool) -> String {
     let args = if forget { gated.remove(&serial) } else { gated.get(&serial).cloned() };
     let mut out = String::new();
     for (name, at, words) in args.unwrap_or_default() {
-        // SAFETY: a shared buffer of `words` words, alive while its command buffer is in flight; a
-        // landed one is read in its completion handler, before Metal releases it.
-        let w: Vec<u32> = (0..words).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect();
-        // A dispatch's gate holds what it runs, then what the record asked for.
-        let asked = if words == 6 { &w[3..] } else { &w[..] };
+        // SAFETY: a shared buffer of twice `words` words (what the gate ran, then what the record
+        // asked for), alive while its command buffer is in flight; a landed one is read in its
+        // completion handler, before Metal releases it.
+        let w: Vec<u32> = (0..2 * words).map(|k| unsafe { (at as *const u32).add(k).read_unaligned() }).collect();
+        let (ran, asked) = w.split_at(words);
         out.push_str(&format!(" | gpu read {name} {asked:?}"));
-        // A record past the most groups the gate runs, which ran nothing: each pipeline's first few.
-        if words == 6 && asked.iter().map(|g| u128::from(*g)).product::<u128>() > 1 << 22 {
+        // A record past what the gate runs, which ran nothing (not one its count buffer left
+        // out, or a rectangle list's, rewritten): each pipeline's first few.
+        let total = |n: &[u32]| n.iter().map(|g| u64::from(*g)).fold(1u128, |a, g| a * u128::from(g));
+        let past = match words {
+            3 => total(asked) > 1 << 22,
+            _ => asked[1] > 1 << 20 || total(&asked[..2]) > 1 << 26,
+        };
+        if past && ran.iter().all(|x| *x == 0) {
             static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
             let mut seen = SEEN.lock().unwrap();
             if seen.iter().filter(|n| **n == name).count() < 4 {
                 seen.push(name.clone());
-                tracing::warn!("metal: an indirect dispatch past the most groups ran nothing: {name} {asked:?}");
+                tracing::warn!("metal: an indirect record past the most the gate runs ran nothing: {name} {asked:?}");
             }
         }
     }
@@ -2530,10 +2929,14 @@ pub fn direct_copy(a: Format, b: Format) -> bool {
 /// ended, and every one behind it on the queue timed out). A guard of ours, not a console rule:
 /// the title's own records ask for far less (9,192 groups at most seen here), but for more than
 /// D3D12's 65,535 in one dimension on larger targets, so the limit is on the product.
+/// A draw's record draws nothing if it asks for more than 2^20 instances or 2^26 vertices in all,
+/// for the same reason: one read as 3 vertices and 864,026,624 instances (stale float bits where
+/// the count should be) kept the GPU at 100 % until the process was gone, and the driver then
+/// kept the process's 19 GB. Guess: no draw of the title's comes near either limit.
 /// Bound at 20 and up, apart from the converter's slots. `at`: the record's index, its words,
 /// whether a count applies, 1 for a rectangle list's record or 2 for a dispatch's or a mesh
-/// dispatch's (six words out: the three it runs, then the three the record asked for, for
-/// `VICTORY_TRACE_GPU_FAILS`).
+/// dispatch's (three words). After the words it runs, `out` holds the words the record asked for
+/// (`VICTORY_TRACE_GPU_FAILS`).
 const GATE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2546,14 +2949,15 @@ kernel void gate(device const uint *count [[buffer(20)]],
         // Two steps: the product of three words does not fit 64 bits.
         ulong plane = ulong(record[0]) * record[1];
         run = run && plane <= 4194304ul && plane * record[2] <= 4194304ul;
-        for (uint w = 0; w < 3u; w++) {
-            out[w] = run ? record[w] : 0u;
-            out[3u + w] = record[w];
-        }
-        return;
+    } else if (at.w == 1u) {
+        // A rectangle a vertex triple.
+        run = run && record[0] <= (3u << 20);
+    } else {
+        run = run && record[1] <= (1u << 20) && ulong(record[0]) * record[1] <= (1ul << 26);
     }
     for (uint w = 0; w < at.y; w++) {
         out[w] = run ? record[w] : 0u;
+        out[at.y + w] = record[w];
     }
     if (at.w == 1u) {
         // shortcut: an instanced rectangle list draws nothing (the rectangle translation takes the
@@ -2606,8 +3010,8 @@ impl Metal {
         let out = self
             .dev
             .newBufferWithLength_options(
-                // A dispatch's gate also keeps what the record asked for.
-                if kind == 2 { 24 } else { words as usize * 4 },
+                // The words it runs, then the words the record asked for.
+                words as usize * 8,
                 // Tracing reads the record the GPU used back (`GATED`).
                 if self.trace_fails { MTLResourceOptions::StorageModeShared } else { MTLResourceOptions::StorageModePrivate },
             )
@@ -2675,7 +3079,19 @@ impl Metal {
         {
             e.waitForFence(f);
         }
-        let mut named = Vec::new();
+        self.use_heaps_encoder(
+            dispatches
+                .iter()
+                .filter(|d| runs(d))
+                .map(|d| (&d.heaps, d.heap_access, STAGE_BIT_VERTEX)),
+            false,
+            |slice, usage, _| {
+                if let Some(ptr) = NonNull::new(slice.as_ptr().cast_mut()) {
+                    // SAFETY: `slice` holds live non-null `MTLResource` pointers retained by `Heap`.
+                    unsafe { e.useResources_count_usage(ptr, slice.len(), usage) };
+                }
+            },
+        );
         for d in dispatches.iter().filter(|d| runs(d)) {
             // Every indirect record goes through the gate: the count buffer's limit, and the most
             // groups a record may ask for.
@@ -2690,13 +3106,13 @@ impl Metal {
             if let (true, Some(g)) = (self.trace_fails, &gated) {
                 let k = Retained::as_ptr(&d.pipeline.0) as *const u8 as usize;
                 let name = self.pipe_names.borrow().get(&k).cloned().unwrap_or_else(|| format!("{k:#x}"));
-                self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, 6));
+                self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, 3));
             }
             e.setComputePipelineState(&d.pipeline.0);
             for h in [d.heaps.resource, d.heaps.sampler].into_iter().flatten() {
                 self.use_heap_cb(h, attached_heaps, |set| cb.useResidencySet(set));
             }
-            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref(), &mut named);
+            self.bind_root_compute(&e, &d.root, &d.heaps, d.pipeline.1.as_ref());
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage(
                     ProtocolObject::from_ref(&*b.buf),
@@ -2887,13 +3303,9 @@ impl Metal {
                 None => a.setLoadAction(MTLLoadAction::Load),
             }
         }
-        // Counted indirect draws, indirect rectangle lists and indirect mesh dispatches (for the
-        // most groups they may ask for) are gated first, in a compute pass of their own; when
-        // tracing, every indirect draw is, so what the GPU read is known.
-        let gated = |d: &Draw<'_, Metal>| {
-            d.indirect.is_some()
-                && (d.count.is_some() || matches!(d.call, DrawCall::Rects | DrawCall::Mesh { .. }) || self.trace_fails)
-        };
+        // Indirect draws are gated first, in a compute pass of their own: the count buffer's
+        // limit, a rectangle list's record, and the most a record may ask for.
+        let gated = |d: &Draw<'_, Metal>| d.indirect.is_some();
         let mut gates = Vec::new();
         if rp.draws.iter().any(gated) {
             let c = cb.computeCommandEncoder().ok_or("no compute encoder")?;
@@ -2918,7 +3330,7 @@ impl Metal {
                         let g = self.encode_gate(&c, d.count, record, words, kind, set_on_queue).inspect_err(|_| c.endEncoding())?;
                         if self.trace_fails {
                             let name = format!("{} {}", if kind == 2 { "mesh draw" } else { "draw" }, gates.len());
-                            self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, if kind == 2 { 6 } else { words as usize }));
+                            self.trace_args.borrow_mut().push((name, g.contents().as_ptr() as usize, words as usize));
                         }
                         Some(g)
                     }
@@ -2975,7 +3387,45 @@ impl Metal {
         {
             e.waitForFence_beforeStages(f, MTLRenderStages::Vertex | MTLRenderStages::Object | MTLRenderStages::Mesh);
         }
-        let mut named = Vec::new();
+        let active_draw = |d: &Draw<'_, Metal>| -> Option<u8> {
+            let first_bit = match (d.pipeline.mesh, d.call) {
+                (Some(_), DrawCall::Mesh { .. }) => STAGE_BIT_MESH,
+                (None, DrawCall::Arrays { .. } | DrawCall::Indexed { .. } | DrawCall::Rects) => {
+                    STAGE_BIT_VERTEX
+                }
+                _ => return None,
+            };
+            if d.indirect.is_none() && empty_draw(&d.call) {
+                return None;
+            }
+            if matches!(d.state.viewport, Some(v) if v.width <= 0.0 || v.height <= 0.0) {
+                return None;
+            }
+            let (tw, th) = rt_size;
+            if let Some([l, t, r, b]) = d.state.scissor {
+                let (l, t) = (l.clamp(0, tw as i32) as usize, t.clamp(0, th as i32) as usize);
+                let (r, b) = (r.clamp(0, tw as i32) as usize, b.clamp(0, th as i32) as usize);
+                if r <= l || b <= t {
+                    return None;
+                }
+            } else if tw == 0 || th == 0 {
+                return None;
+            }
+            Some(first_bit)
+        };
+        self.use_heaps_encoder(
+            rp.draws
+                .iter()
+                .filter_map(|d| active_draw(d).map(|fb| (&d.heaps, d.heap_access, fb))),
+            true,
+            |slice, usage, stage_bits| {
+                if let Some(ptr) = NonNull::new(slice.as_ptr().cast_mut()) {
+                    let stages = render_stages(stage_bits);
+                    // SAFETY: `slice` holds live non-null `MTLResource` pointers retained by `Heap`.
+                    unsafe { e.useResources_count_usage_stages(ptr, slice.len(), usage, stages) };
+                }
+            },
+        );
         let mut depth_set = false;
         let mut default_depth = None;
         for (k, d) in rp.draws.iter().enumerate() {
@@ -3078,7 +3528,7 @@ impl Metal {
                 continue;
             }
             e.setScissorRect(scissor);
-            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline, &mut named);
+            self.bind_root_render(&e, &d.root, d.fragment_root.as_ref(), &d.heaps, d.pipeline);
             for b in d.resources.iter().filter(|b| self.names(b, set_on_queue)) {
                 e.useResource_usage_stages(
                     ProtocolObject::from_ref(&*b.buf),
@@ -3410,6 +3860,7 @@ mod render_target_tests {
                 root: RootArgs::default(),
                 fragment_root: None,
                 heaps: Heaps::default(),
+                heap_access: HeapAccess::default(),
                 resources: vec![],
                 vertex_buffers: vec![],
                 index_buffer: None,
@@ -3685,7 +4136,8 @@ mod owed_tests {
         m.submit_passes(&q, &PassSubmission { waits: &waits, passes: &[], signals: &signals }).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(m.completed(&fence), 0, "the command buffer sleeps on its wait");
-        let (in_flight, left) = wake_and_drain(&[never.0.clone(), q.2.clone()], std::time::Duration::from_secs(5));
+        let (in_flight, left) =
+            wake_and_drain(&[never.0.clone(), q.2.clone()], std::time::Duration::from_secs(5), std::time::Duration::from_secs(5));
         assert!(in_flight >= 1);
         assert_eq!(left, 0, "every command buffer completed on the GPU");
         assert_eq!(m.completed(&fence), 3);
@@ -3695,6 +4147,49 @@ mod owed_tests {
         };
         assert!(tracked(&never.0) && tracked(&q.2));
     }
+
+    /// A command buffer the stop's raised events do not wake (here asleep on an event the stop
+    /// does not know; in a game, one still running on the GPU) gets the longer wait: one that
+    /// completes within it is not left behind, and one that never does is paid and left after
+    /// `longest`, not before and not much after.
+    #[test]
+    fn a_stop_waits_longer_for_command_buffers_its_events_do_not_wake() {
+        let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
+        let ms = std::time::Duration::from_millis;
+        let m = Metal::new().unwrap();
+        let q = m.create_queue().unwrap();
+        // Finishes 300 ms into the stop: past the first wait, within the longer one.
+        let (late, fence) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
+        m.submit_passes(&q, &PassSubmission { waits: &[(&late, 1)], passes: &[], signals: &[(&fence, 2)] }).unwrap();
+        let event = late.0.clone();
+        struct Send<T>(T);
+        // SAFETY: test only; Metal's shared events may be signalled from any thread.
+        unsafe impl<T> std::marker::Send for Send<T> {}
+        let event = Send(event);
+        let finisher = std::thread::spawn(move || {
+            let event = event;
+            std::thread::sleep(ms(300));
+            event.0.setSignaledValue(1);
+        });
+        let started = std::time::Instant::now();
+        let (in_flight, left) = wake_and_drain(&[], ms(50), ms(3000));
+        finisher.join().unwrap();
+        assert!(in_flight >= 1);
+        assert_eq!(left, 0, "it completed within the longer wait");
+        assert_eq!(m.completed(&fence), 2, "on the GPU");
+        assert!(started.elapsed() < ms(2500), "the stop goes on once nothing is in flight");
+        // Never completes: left after the bound, its debt paid.
+        let (never, owed) = (m.create_fence(0).unwrap(), m.create_fence(0).unwrap());
+        m.submit_passes(&q, &PassSubmission { waits: &[(&never, 1)], passes: &[], signals: &[(&owed, 4)] }).unwrap();
+        let started = std::time::Instant::now();
+        let (_, left) = wake_and_drain(&[], ms(50), ms(400));
+        let took = started.elapsed();
+        assert_eq!(left, 1);
+        assert!(took >= ms(400) && took < ms(1500), "bounded: {took:?}");
+        assert_eq!(m.completed(&owed), 4, "what it owed is paid on the CPU");
+        never.0.setSignaledValue(1);
+    }
+
 
     /// A stop empties the residency sets it tracks, so nothing it made stays resident.
     #[test]
@@ -3712,6 +4207,104 @@ mod owed_tests {
         assert!(SETS.lock().unwrap().0.iter().any(|w| w.load().is_some_and(|t| Retained::as_ptr(&t) == Retained::as_ptr(&set))));
         assert!(release_sets(std::slice::from_ref(&set)) >= 1 << 20);
         assert_eq!(set.allocationCount(), 0);
+    }
+
+    /// Fills attached after a piece commit (a later `next_piece` failed: the piece boundary
+    /// stopped those passes from being encoded) are paid once the piece's GPU passes have run:
+    /// by the completion handler, or at once when it already ran (#80). Either way the waiter
+    /// that released the piece saw the writes only after the GPU's earlier passes.
+    #[test]
+    fn fills_attached_after_a_piece_commit_are_paid_by_the_completion() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        unsafe { std::ptr::write_bytes(region.ptr, 0xEE, 16) };
+        let owed = std::sync::Arc::new(Owed::of(vec![], &[], 0));
+
+        // In flight: an attach is stored, not paid (the completion pays it in the GPU's order).
+        owed.attach_refund(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x11 }]);
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 16) }, [0xEE; 16], "not paid while in flight");
+
+        // The completion handler: the flag goes up, then what is attached is paid.
+        owed.completed.store(true, std::sync::atomic::Ordering::Release);
+        owed.pay_refund();
+        // SAFETY: inside the region; the GPU is done with it.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 16) };
+        assert_eq!(&bytes[..8], &[0x11; 8], "paid by the completion");
+        assert_eq!(&bytes[8..], &[0xEE; 8], "and only the attached range");
+
+        // An attach that races a finished completion pays at once (the order is the same).
+        owed.attach_refund(vec![BlitOp::Fill { dst: (&buf, unsafe { region.ptr.add(8) } as *const u8), len: 8, value: 0x22 }]);
+        // SAFETY: inside the region.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 16) };
+        assert_eq!(&bytes[8..], &[0x22; 8], "paid at once past the completion");
+        // Paid once only: a second payment writes nothing.
+        // SAFETY: inside the region.
+        unsafe { std::ptr::write_bytes(region.ptr, 0x44, 16) };
+        owed.pay_refund();
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 16) }, [0x44; 16], "nothing paid twice");
+    }
+
+    /// The race the attach has with the completion handler: the attach stores its fills, the
+    /// handler runs (flag up, pays them), the title writes a newer value, and only then does the
+    /// attach see the flag and pay. The fills are paid once, by the handler; the newer value stays.
+    #[test]
+    fn a_completion_between_an_attach_and_its_flag_check_pays_the_fills_once() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        let owed = Owed::of(vec![], &[], 0);
+        // The attach's store (its first half).
+        owed.refund.lock().unwrap().push((buf.buf.clone(), 0, 8, 0x11));
+        // The completion handler, in between.
+        owed.completed.store(true, std::sync::atomic::Ordering::Release);
+        owed.pay_refund();
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x11; 8], "the handler paid");
+        // The title writes a newer value; then the attach's second half sees the flag and pays.
+        // SAFETY: inside the region.
+        unsafe { std::ptr::write_bytes(region.ptr, 0x33, 8) };
+        assert!(owed.completed.load(std::sync::atomic::Ordering::Acquire));
+        owed.pay_refund();
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x33; 8], "not paid again over it");
+    }
+
+    /// A real piece committed through `commit_piece`: Metal runs its completion handler (the
+    /// block must reach Metal as a block and stay alive), which pays a fill attached after the
+    /// commit, once.
+    #[test]
+    fn a_committed_piece_pays_its_attached_fills_from_the_completion_handler() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        unsafe { std::ptr::write_bytes(region.ptr, 0xEE, 16) };
+        let q = m.create_queue().unwrap();
+        let cb = m.new_command_buffer(&q).unwrap();
+        let owed = m.commit_piece(&q, &cb, Owed::of(vec![], &[], 0), 1, None);
+        owed.attach_refund(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x11 }]);
+        cb.waitUntilCompleted();
+        // The handler raises the flag before it pays: wait for the bytes.
+        let start = std::time::Instant::now();
+        // SAFETY: inside the region; volatile, as the handler's thread writes it.
+        while unsafe { region.ptr.read_volatile() } != 0x11 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "the completion handler never paid");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // SAFETY: inside the region; the GPU is done with it.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 16) };
+        assert_eq!(&bytes[..8], &[0x11; 8], "paid");
+        assert_eq!(&bytes[8..], &[0xEE; 8], "and only the attached range");
+        // SAFETY: inside the region.
+        unsafe { std::ptr::write_bytes(region.ptr, 0x33, 8) };
+        owed.pay_refund();
+        // SAFETY: inside the region.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x33; 8], "paid once");
     }
 
     #[test]

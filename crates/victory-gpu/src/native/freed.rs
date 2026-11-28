@@ -73,6 +73,16 @@ fn alloc(spans: &mut Vec<(u64, u64, u64)>, addr: u64, len: u64) {
     }
 }
 
+/// Whether any freed span overlaps `[addr, addr + len)`: for a write the host
+/// skips when it lands in freed memory, not just logs it.
+pub fn overlaps(addr: u64, len: u64) -> bool {
+    if len == 0 || !tracing_on() {
+        return false;
+    }
+    let spans = FREED.lock().unwrap_or_else(|e| e.into_inner());
+    !overlapping(&spans, addr, len).is_empty()
+}
+
 /// Names every freed span that `[addr, addr + len)` overlaps, with `what`
 /// (the host use that reached for it).
 pub fn check(addr: u64, len: u64, what: &str) {

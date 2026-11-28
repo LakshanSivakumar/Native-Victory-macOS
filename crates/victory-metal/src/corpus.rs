@@ -508,3 +508,35 @@ pub fn run(args: &[String]) {
         std::fs::write(f, fails.join("\n")).expect("write --fails");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{code_name, normalise};
+
+    #[test]
+    fn error_codes_have_their_names_and_beyond_the_table_they_are_unknown() {
+        assert_eq!(code_name(0), "NoError");
+        assert_eq!(code_name(8), "CompilationError");
+        assert_eq!(code_name(19), "FP64Usage");
+        assert_eq!(code_name(20), "Unknown");
+        assert_eq!(code_name(u32::MAX), "Unknown");
+    }
+
+    #[test]
+    fn each_digit_run_collapses_to_one_n() {
+        assert_eq!(normalise("no digits here"), "no digits here");
+        assert_eq!(normalise("abc123def456"), "abcNdefN");
+        assert_eq!(normalise("12a34"), "NaN");
+        // Hex addresses group with other numbers, whatever the letters in them.
+        assert_eq!(normalise("at 0x1F2A in 42"), "at NxNFNA in N");
+        assert_eq!(normalise(""), "");
+    }
+
+    #[test]
+    fn normalise_reads_at_most_160_chars() {
+        let long = "x".repeat(200);
+        assert_eq!(normalise(&long).len(), 160);
+        let long_digits = "7".repeat(200);
+        assert_eq!(normalise(&long_digits), "N");
+    }
+}

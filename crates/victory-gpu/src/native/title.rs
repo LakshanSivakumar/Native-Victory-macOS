@@ -255,6 +255,8 @@ pub struct Title<B: PresentBackend> {
     /// once nothing uses them (or under budget once all work from that epoch has finished on the GPU)
     /// ([`Self::give_up_covered`]).
     pub(super) covered: HashMap<usize, u64>,
+    /// The covered copies [`Self::give_up_covered`] has still to check in its current sweep.
+    pub(super) covered_queue: Vec<usize>,
     /// Covered placed copies evicted under a budget (`give_up_covered`), so if a descriptor
     /// mirror or table scan realizes one again while a newer overlapping placement is still live,
     /// it is marked covered again instead of pinning duplicate memory permanently.
@@ -318,6 +320,7 @@ impl<B: PresentBackend> Title<B> {
             at_memory: HashMap::new(),
             at_pool: HashMap::new(),
             covered: Default::default(),
+            covered_queue: Default::default(),
             covered_evicted: Default::default(),
             trimmed: Default::default(),
             trimmed_pool_gen: 0,
@@ -383,7 +386,7 @@ impl<B: PresentBackend> Title<B> {
     /// Fence `key`'s completed value (made with `initial` if it has no backend fence yet).
     pub fn fence_value(&mut self, key: usize, initial: u64) -> u64 {
         let value = match self.fence(key, initial) {
-            Ok(f) => self.host.backend.completed(&f).max(initial),
+            Ok(f) => self.host.backend.completed(&f),
             Err(_) => initial,
         };
         // As in `completed`: read first, then copy back.

@@ -54,6 +54,10 @@ impl Event {
         })
     }
 
+    pub fn is_manual(&self) -> bool {
+        self.manual
+    }
+
     /// Signals the event. A manual-reset event releases every waiter and
     /// stays set; an auto-reset one releases one and resets.
     pub fn set(&self) {

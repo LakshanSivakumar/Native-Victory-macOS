@@ -1870,7 +1870,12 @@ mod state {
     /// `D3D12_INDEX_BUFFER_VIEW`: address, size, format (DXGI `R32_UINT` is 42).
     pub(super) extern "system" fn index_buffer(this: This, view: *const (u64, u32, u32)) {
         // SAFETY: the title passes a view or null.
-        glue::index_buffer(this, unsafe { view.as_ref() }.map(|v| (v.0, v.2 == 42)));
+        glue::index_buffer(
+            this,
+            unsafe { view.as_ref() }
+                .filter(|v| v.0 != 0 && v.1 != 0)
+                .map(|v| (v.0, v.1, v.2 == 42)),
+        );
     }
     /// `D3D12_VERTEX_BUFFER_VIEW`: address, size, stride.
     pub(super) extern "system" fn vertex_buffers(
