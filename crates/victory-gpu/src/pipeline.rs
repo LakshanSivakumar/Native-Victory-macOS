@@ -522,10 +522,11 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-/// The `VICTORY_SKIP_PIPELINES` list: lower-case 16-digit shader hashes, others warned about and
+/// A list of shader hashes from variable `var` (`VICTORY_SKIP_PIPELINES`, and on macOS
+/// `VICTORY_TRACE_PASSES_AFTER`): lower-case 16-digit shader hashes, others warned about and
 /// left out (the D3D12 path and the native host read it alike).
 #[cfg(any(target_os = "macos", all(windows, feature = "diagnostics")))]
-pub(crate) fn parse_skip_hashes(value: &str) -> Vec<String> {
+pub(crate) fn parse_skip_hashes(var: &str, value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -534,10 +535,7 @@ pub(crate) fn parse_skip_hashes(value: &str) -> Vec<String> {
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 Some(hash.to_ascii_lowercase())
             } else {
-                tracing::warn!(
-                    hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
-                );
+                tracing::warn!(hash, var, "expects 16-digit shader hashes");
                 None
             }
         })
@@ -549,7 +547,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_skip_hashes("VICTORY_SKIP_PIPELINES", &value)
     });
     if hashes.is_empty() {
         return None;
@@ -1387,9 +1385,9 @@ mod tests {
     #[cfg(any(target_os = "macos", all(windows, feature = "diagnostics")))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_skip_hashes("V", " , ").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            super::parse_skip_hashes("V", " 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
     }

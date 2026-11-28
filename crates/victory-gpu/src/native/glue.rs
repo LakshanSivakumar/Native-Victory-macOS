@@ -1302,6 +1302,11 @@ fn pass_trace_reads_its_switch_and_stays_off_without_it() {
     assert_eq!(pass_config(",x,"), (".".into(), 100, 4));
     // No test sets `VICTORY_TRACE_PASSES`, so the window never opens and nothing is noted.
     assert!(!pass_on());
+    // Nor `VICTORY_TRACE_PASSES_AFTER`: a draw or dispatch arms nothing.
+    assert!(pass_after().is_empty());
+    pass_arm(0);
+    assert!(!pass_on());
+    assert_eq!(PASS_LEFT.load(Ordering::Relaxed), i64::MIN);
 }
 
 fn pass_tex(k: usize) -> String {
@@ -1368,32 +1373,73 @@ fn the_pass_trace_reads_no_object_at_a_placed_textures_key() {
     assert!(pass_info(key, |_| None).is_none());
 }
 
+/// Presents left in the pass trace's window: `i64::MIN` before it opens, below 0 after it closed.
+static PASS_LEFT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// World presents so far (500 draws or more recorded since the present before), for `<skip>`.
+static PASS_WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_TRACE_PASSES` read once: `None` when unset.
+fn pass_settings() -> Option<&'static (String, u64, i64)> {
+    static CONFIG: OnceLock<Option<(String, u64, i64)>> = OnceLock::new();
+    CONFIG.get_or_init(|| std::env::var("VICTORY_TRACE_PASSES").ok().map(|v| pass_config(&v))).as_ref()
+}
+
+/// `VICTORY_TRACE_PASSES_AFTER=<hash>[,<hash>...]`: the 16-digit shader hashes whose first
+/// recorded draw or dispatch, once `<skip>` world presents have gone by, opens the pass trace's
+/// window (instead of the world-present count alone).
+/// Read once; empty when unset.
+fn pass_after() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| crate::pipeline::parse_skip_hashes("VICTORY_TRACE_PASSES_AFTER", &std::env::var("VICTORY_TRACE_PASSES_AFTER").unwrap_or_default()))
+}
+
+/// Opens the pass trace's window at the first draw or dispatch, after `<skip>` world presents, of
+/// a pipeline with a shader `VICTORY_TRACE_PASSES_AFTER` lists, before that work is noted, so it and the rest of its frame
+/// are in the trace; the window then lasts `<presents>` more presents. Called for every draw and
+/// dispatch; with either variable unset it costs two reads of a set-once value.
+fn pass_arm(pipeline: usize) {
+    let after = pass_after();
+    if after.is_empty() || PASS_LEFT.load(Ordering::Relaxed) != i64::MIN {
+        return;
+    }
+    let Some((_, skip, presents)) = pass_settings() else { return };
+    if PASS_WORLD.load(Ordering::Relaxed) < *skip {
+        return;
+    }
+    let Some(hit) = crate::pipeline::native_stages(pipeline as This)
+        .and_then(|(stages, _)| stages.iter().find(|(_, sh)| after.contains(&sh.hash)).map(|(_, sh)| sh.hash.clone()))
+    else {
+        return;
+    };
+    if PASS_LEFT.compare_exchange(i64::MIN, *presents, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        super::PASS_ON.store(true, Ordering::Relaxed);
+        eprintln!("PASSWINDOW start after={hit}");
+    }
+}
+
 /// At each present: switch the window on and off, and while on write every texture the window's
 /// work named: its range, how much is non-zero and not finite, and (colour formats) an image.
 fn pass_present(resource: This) {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    static LEFT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
     static NUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static CONFIG: OnceLock<Option<(String, u64, i64)>> = OnceLock::new();
-    let Some((dir, skip, presents)) =
-        CONFIG.get_or_init(|| std::env::var("VICTORY_TRACE_PASSES").ok().map(|v| pass_config(&v)))
-    else {
+    let Some((dir, skip, presents)) = pass_settings() else {
         return;
     };
     let (skip, presents) = (*skip, *presents);
     let num = NUM.fetch_add(1, Ordering::Relaxed);
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
-    let left = LEFT.load(Ordering::Relaxed);
+    let left = PASS_LEFT.load(Ordering::Relaxed);
     // `skip` counts world presents (500 draws or more recorded since the last present).
     static LASTREC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let rec = RECORDED.load(Ordering::Relaxed);
     if rec - LASTREC.swap(rec, Ordering::Relaxed) >= 500 {
-        WORLD.fetch_add(1, Ordering::Relaxed);
+        PASS_WORLD.fetch_add(1, Ordering::Relaxed);
     }
     if left == i64::MIN {
-        if WORLD.load(Ordering::Relaxed) >= skip {
-            LEFT.store(presents, Ordering::Relaxed);
+        // With `VICTORY_TRACE_PASSES_AFTER` set, `pass_arm` opens the window instead.
+        if pass_after().is_empty() && PASS_WORLD.load(Ordering::Relaxed) >= skip {
+            PASS_LEFT.store(presents, Ordering::Relaxed);
             super::PASS_ON.store(true, Ordering::Relaxed);
             eprintln!("PASSWINDOW start present={num} t={now}");
         }
@@ -1407,7 +1453,7 @@ fn pass_present(resource: This) {
     if left == 0 {
         super::PASS_ON.store(false, Ordering::Relaxed);
     }
-    LEFT.store(left - 1, Ordering::Relaxed);
+    PASS_LEFT.store(left - 1, Ordering::Relaxed);
     if !dump {
         return;
     }
@@ -1804,7 +1850,7 @@ fn stage_hashes(pipeline: usize) -> Vec<String> {
 fn skipped_pipeline(pipeline: usize) -> bool {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
-        crate::pipeline::parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default())
+        crate::pipeline::parse_skip_hashes("VICTORY_SKIP_PIPELINES", &std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default())
     });
     !hashes.is_empty()
         && crate::pipeline::native_stages(pipeline as This)
@@ -1814,6 +1860,7 @@ fn skipped_pipeline(pipeline: usize) -> bool {
 /// A dispatch of a pipeline `VICTORY_SKIP_PIPELINES` lists: counted as dropped and noted in the
 /// pass trace. Returns whether it was skipped.
 fn skipped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) -> bool {
+    pass_arm(l.pipeline);
     if !skipped_pipeline(l.pipeline) {
         return false;
     }
@@ -1995,6 +2042,7 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
 /// `mesh`: the call is a mesh dispatch, which only a mesh pipeline runs (and a draw only a vertex
 /// pipeline).
 fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
+    pass_arm(l.pipeline);
     if !pass_on() {
         return graphics_inner(t, l, mesh);
     }
