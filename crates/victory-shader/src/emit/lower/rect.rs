@@ -87,6 +87,7 @@ impl<'a> Lower<'a> {
         self.vals.clear();
         self.floats.clear();
         self.low16.clear();
+        self.high16.clear();
         self.block.fill(None);
         self.bools.clear();
         self.lane_bits.clear();
