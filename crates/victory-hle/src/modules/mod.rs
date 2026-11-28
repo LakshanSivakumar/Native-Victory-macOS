@@ -87,7 +87,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
-    #[cfg(windows)]
+    // macOS: MetalFX (`VICTORY_METALFX=1`) serves the title's FidelityFX (#375, M2).
+    #[cfg(any(windows, all(target_vendor = "apple", target_arch = "x86_64")))]
     if fidelityfx::serving() {
         all.push(fidelityfx::module());
     }

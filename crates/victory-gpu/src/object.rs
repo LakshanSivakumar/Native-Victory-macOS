@@ -59,7 +59,7 @@ impl Object {
     }
 }
 
-pub(crate) type This = *const Object;
+pub type This = *const Object;
 
 /// A method table, with its length just before the first slot, where
 /// [`expose`] finds it from an object.

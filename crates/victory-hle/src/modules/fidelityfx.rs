@@ -177,11 +177,64 @@ unsafe fn metalfx_destroy(context: *mut *mut c_void) -> Option<u32> {
     }
 }
 
-/// The M1 dispatch path: a MetalFX context's upscaling is refused until the
-/// scaler itself is built (M2). `None` when the dispatch is not ours.
+/// The MetalFX dispatch on macOS: the title's upscaling is recorded into its
+/// own list through the native host (`native::metalfx_record`), which resolves
+/// the dispatch's textures to host copies; the temporal scaler itself is built
+/// from them at the first encode (`victory_metal::metalfx::encode_temporal`).
+/// `None` when the dispatch is not ours.
 ///
 /// # Safety
 /// `context` and `desc` are the title's pointers; `desc` names a dispatch.
+#[cfg(target_os = "macos")]
+unsafe fn metalfx_dispatch(
+    context: *mut *mut c_void,
+    desc: *mut Header,
+) -> Option<u32> {
+    // SAFETY: the title passes a description.
+    let kind = unsafe { (*desc).kind };
+    if kind != DISPATCH_UPSCALE || !metalfx_holds(context) {
+        return None;
+    }
+    // SAFETY: a DispatchUpscale description, by its type.
+    let d = unsafe { desc.cast::<DispatchUpscale>().read() };
+    // The FidelityFX order is colour, depth, motion vectors, exposure,
+    // reactive, transparency, output (`fidelityfx_common`'s comment); the
+    // temporal scaler takes the first five and the output last.
+    let textures: [victory_gpu::object::This; 7] = d
+        .resources
+        .map(|r| r.resource.cast::<victory_gpu::object::Object>().cast_const());
+    // `rest` opens with the jitter offsets (`fidelityfx_common`'s comment:
+    // "then jitter, motion-vector scale, sizes, ...").
+    let jitter = [f32::from_bits(d.rest[0]), f32::from_bits(d.rest[1])];
+    // The scaler's history starts at the context's first dispatch.
+    static DISPATCHED: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+    let reset = DISPATCHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(context as usize);
+    // SAFETY: the title's list and texture objects, read per their ABI.
+    if unsafe { victory_gpu::native::metalfx_record(d.list.cast(), context as usize, &textures, reset, jitter) } {
+        once!(
+            info,
+            "FidelityFX MetalFX: the upscaling was recorded into the title's list"
+        );
+        Some(OK)
+    } else {
+        once!(
+            warn,
+            "FidelityFX MetalFX: a texture or the list did not resolve; the upscaling did not run"
+        );
+        Some(PARAMETER)
+    }
+}
+
+/// The M1 dispatch path (Windows only): a MetalFX context's upscaling is
+/// refused there, where the PC build serves instead. `None` when the dispatch
+/// is not ours.
+///
+/// # Safety
+/// `context` and `desc` are the title's pointers; `desc` names a dispatch.
+#[cfg(windows)]
 unsafe fn metalfx_dispatch_refusal(
     context: *mut *mut c_void,
     desc: *mut Header,
@@ -570,6 +623,12 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
     if metalfx_enabled() {
+        #[cfg(target_os = "macos")]
+        // SAFETY: the title's pointers; the kind was just read.
+        if let Some(code) = unsafe { metalfx_dispatch(context, desc) } {
+            return code;
+        }
+        #[cfg(windows)]
         // SAFETY: the title's pointers; the kind was just read.
         if let Some(code) = unsafe { metalfx_dispatch_refusal(context, desc) } {
             return code;
@@ -643,7 +702,11 @@ unsafe fn pc_dispatch(context: *mut *mut c_void, desc: *mut Header) -> Option<u3
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "fidelityfx",
-        dlls: &["amd_fidelityfx_loader_xbox.dll"],
+        // The loader answers the SDK's version queries; the upscaler DLL is
+        // what the title's loader LoadLibraryWs next — on macOS MetalFX serves
+        // both with the same five-function API (kernel.rs refused the xbox
+        // upscaler as "outside the host policy" before this).
+        dlls: &["amd_fidelityfx_loader_xbox.dll", "amd_fidelityfx_upscaler_xbox.dll"],
         exports: vec![
             hle_export!(ffxConfigure),
             hle_export!(ffxCreateContext),
@@ -762,7 +825,11 @@ mod metalfx_tests {
             rest: [0; 18],
         };
         let mut dc: *mut c_void = ctx;
-        // SAFETY: our own context and description.
+        // SAFETY: our own context and description. A null list resolves to
+        // nothing on either path, so the dispatch is refused either way.
+        #[cfg(target_os = "macos")]
+        assert_eq!(unsafe { metalfx_dispatch(&mut dc, &mut dispatch.header) }.unwrap(), PARAMETER);
+        #[cfg(windows)]
         assert_eq!(unsafe { metalfx_dispatch_refusal(&mut dc, &mut dispatch.header) }.unwrap(), PARAMETER);
 
         // SAFETY: our own context.

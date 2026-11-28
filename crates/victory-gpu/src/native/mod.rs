@@ -36,6 +36,8 @@ pub mod descriptors;
 pub mod freed;
 #[cfg(target_os = "macos")]
 pub(crate) mod glue;
+#[cfg(target_os = "macos")]
+pub use glue::metalfx_record;
 pub mod host;
 pub mod list;
 pub mod memory;
