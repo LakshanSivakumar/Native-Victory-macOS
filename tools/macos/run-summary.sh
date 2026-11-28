@@ -28,6 +28,15 @@ function tomsec(v,   n) {
   if (v ~ /ms$/ || v !~ /[0-9]s$/) return n
   return n * 1000
 }
+function field(line, key,   re, s) { # value of `key=...` (optionally quoted) in line
+  re = key "=\"?[^ \"]+"
+  if (match(line, re)) {
+    s = substr(line, RSTART, RLENGTH)
+    sub("^" key "=\"?", "", s)
+    return s
+  }
+  return ""
+}
 {
   ts = ""
   if ($0 ~ /^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/) { ts = $1; t = secs(ts); if (!tset) { t0 = t; tset = 1 } tlast = t; nlines++ }
@@ -111,6 +120,24 @@ function tomsec(v,   n) {
   if (line ~ /the world.s first frame/ && world == "" && match(line, /frame=[0-9]+/)) world = substr(line, RSTART + 6, RLENGTH - 6)
   if (line ~ /profile at [0-9.]+s:/) { np = 0; prof = line }
   else if (line ~ /[ ]profile .* calls [0-9]+ total/) { np++; pl[np] = line }
+  # VICTORY_PASS_TIMING (#460): one line per timed pass (`pass time frame=.. rank=..`), one total
+  # per frame (`pass time: frame=.. passes=.. total_ms=..` — the colon keeps the two apart).
+  if (line ~ /pass time frame=[0-9]+ rank=/) {
+    nptp++
+    pms[nptp] = field(line, "ms") + 0
+    pdesc[nptp] = sprintf("frame=%s rank=%s kind=%s pipe=%s work=%s", field(line, "frame"), field(line, "rank"), field(line, "kind"), field(line, "pipe"), field(line, "work"))
+    a = field(line, "kind") SUBSEP field(line, "pipe")
+    pac[a]++; pat[a] += pms[nptp]
+    if (pms[nptp] > pam[a]) pam[a] = pms[nptp]
+    paw[a] = field(line, "work")
+  }
+  if (line ~ /pass time: frame=/) {
+    nptf++
+    ftp += field(line, "passes") + 0
+    t = field(line, "total_ms") + 0
+    ptt += t
+    if (t > ptm) ptm = t
+  }
 }
 function top(arr, n, outn, idx,   i, j, best, bi, used) { # selection sort of arr[1..n] indices by value
   for (i = 1; i <= outn && i <= n; i++) {
@@ -140,6 +167,12 @@ function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, on
   emit("row", "first binds", nbind + 0)
   emit("row", "prewarm shaders", pre_n + 0)
   emit("row", "prewarm DXIL MB", pre_mb + 0)
+  # Only when the log has them: a log without VICTORY_PASS_TIMING keeps the table as it was.
+  if (nptf) {
+    emit("row", "pass-timing frames", nptf + 0)
+    emit("row", "pass-timing passes", nptp + 0)
+    emit("row", "pass-timing GPU ms (frame totals)", sprintf("%.1f", ptt))
+  }
   u = 0; for (r in refc) { u += refc[r]; emit("cause", r, refc[r]) }
   emit("row", "refused lines", nref + 0)
   emit("row", "refused (unique reason+shader)", u)
@@ -196,6 +229,25 @@ END {
   k = top(rc, nr, 12, ix)
   for (i = 1; i <= k; i++) printf "    %5d  %s\n", rc[ix[i]], rk[ix[i]]
   print ""
+
+  # Only when the log has pass time lines: other logs keep the summary they had.
+  if (nptf || nptp) {
+    print "-- pass timing (VICTORY_PASS_TIMING)"
+    printf "  frames timed: %d, passes timed: %d, GPU pass time %.1f ms total, %.1f ms mean/frame, max frame %.1f ms\n", nptf, nptp, ptt, nptf ? ptt / nptf : 0, ptm
+    if (nptp) {
+      print "  slowest passes of the run:"
+      k = top(pms, nptp, 10, ix)
+      for (i = 1; i <= k; i++) printf "    %8.2f ms  %s\n", pms[ix[i]], pdesc[ix[i]]
+      na = 0; for (a in pat) { av[++na] = pat[a]; ak[na] = a }
+      print "  pipelines by total GPU time:"
+      k = top(av, na, 10, ix)
+      for (i = 1; i <= k; i++) {
+        a = ak[ix[i]]; split(a, q, SUBSEP)
+        printf "    %8.2f ms x%d (max %.2f)  kind=%s pipe=%s work~%s\n", av[ix[i]], pac[a], pam[a], q[1], q[2], paw[a]
+      }
+    }
+    print ""
+  }
 
   print "-- dropped work / warnings (by template)"
   nd = 0; for (d in drop) { dc[++nd] = drop[d]; dk[nd] = d }
@@ -318,6 +370,9 @@ metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (0000000
 @ESC@[2m2026-01-01T00:00:04.500000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host_posix::wasapi: WASAPI: render client released frames in the last second frames=48000
 @ESC@[2m2026-01-01T00:00:04.000000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::x: profile at 4.0s: 1 methods
 @ESC@[2m2026-01-01T00:00:04.000100Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::x: profile k!f0x1 calls 3 total 9.0 ms max 4.00 ms
+@ESC@[2m2026-01-01T00:00:05.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_metal::pass_timing: pass time frame=64 rank=1 kind=render pipe=6adfc332b21374b3 work=12 ms=42.5
+@ESC@[2m2026-01-01T00:00:05.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_metal::pass_timing: pass time frame=64 rank=2 kind=compute pipe="abc123def456" work=64 ms=9.25
+@ESC@[2m2026-01-01T00:00:05.100000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_metal::pass_timing: pass time: frame=64 passes=2 total_ms=51.75
 VIctory: unhandled exception 0xc0000005 at image+0x1234 [0]
 victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef
 LOG
@@ -332,6 +387,11 @@ LOG
   chk 'output fell back to silence t=+3.5s frame~128 (AudioQueueStart failed with OSStatus N)'
   chk 'mixer seconds: 1, spatial stream activations: 1, DSP connects: 0, DSP streams: 0'
   chk 'victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef'
+  chk 'frames timed: 1, passes timed: 2, GPU pass time 51.8 ms total, 51.8 ms mean/frame, max frame 51.8 ms'
+  chk '42.50 ms  frame=64 rank=1 kind=render pipe=6adfc332b21374b3 work=12'
+  chk '9.25 ms  frame=64 rank=2 kind=compute pipe=abc123def456 work=64'
+  chk '42.50 ms x1 (max 42.50)  kind=render pipe=6adfc332b21374b3 work~12'
+  chk '9.25 ms x1 (max 9.25)  kind=compute pipe=abc123def456 work~64'
   [ "$ok" = 1 ] && echo "self-test ok" || { printf '%s\n' "$out"; exit 1; }
 }
 
