@@ -629,16 +629,26 @@ pub(crate) fn views_of(records: &[[u32; 3]]) -> Vec<Option<View>> {
         .collect()
 }
 
+/// The view named by a 12-byte descriptor slot record (`[tag, index, generation]`), if current.
+pub(crate) fn view_record(record: [u8; 12]) -> Option<View> {
+    let [tag, i, generation] = std::array::from_fn(|k| {
+        u32::from_le_bytes(record[4 * k..][..4].try_into().expect("4 bytes"))
+    });
+    if tag != VIEW_TAG {
+        return None;
+    }
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let (view, current) = views.list.get(i as usize)?;
+    (*current == generation).then(|| view.clone())
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    view_record(unsafe { (handle as *const [u8; 12]).read_unaligned() })
 }
 
 /// A description of `N` words, if the title passes one.

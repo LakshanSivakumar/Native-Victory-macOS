@@ -916,6 +916,61 @@ fn submission_retries_an_unrealized_resource_descriptor_once_registered() {
     crate::descriptor::forget(res_key);
 }
 
+#[test]
+fn table_entries_rewritten_after_recording_keep_each_commands_recorded_view() {
+    let host = super::host::NativeHost::new(super::vertex_tests::Capture::default());
+    let pool = PoolInfo {
+        id: 1,
+        base: 0x40000,
+        len: 0x4000,
+        memory_entry: None,
+    };
+    host.memory().mapped(0x80000, pool.len, &pool, 0);
+
+    let mut slot = [0u32; 8];
+    let handle = slot.as_mut_ptr() as u64;
+    let heap = host.heap(HeapKind::Resource, handle, 1).unwrap();
+    let rt = Rc::new(victory_backend::resources::TextureDesc::d2(
+        victory_backend::resources::Format::Rgba8Unorm,
+        1,
+        1,
+    ));
+
+    // Bind a 2,048-byte CBV, record list1, then unbind (null CBV + mirror) and record list2
+    // BEFORE submitting either list (#538).
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0x80100, 0, 2048, 0], handle);
+    let mut list1 = NativeList::default();
+    list1.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list1.set_render_targets(std::slice::from_ref(&rt), None);
+    list1.set_heaps(Some(&heap), None);
+    list1.set_graphics_root_table(0, &heap, 0);
+    list1.draw_instanced(3, 1, 0, 0).unwrap();
+
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 0, 0], handle);
+    assert!(host.mirror(handle).unwrap());
+    let mut list2 = NativeList::default();
+    list2.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list2.set_render_targets(std::slice::from_ref(&rt), None);
+    list2.set_heaps(Some(&heap), None);
+    list2.set_graphics_root_table(0, &heap, 0);
+    list2.draw_instanced(3, 1, 0, 0).unwrap();
+
+    host.backend.buffer_writes.borrow_mut().clear();
+    host.execute(&(), &[&list1], &[], &[]).unwrap();
+    assert_eq!(
+        host.backend.buffer_writes.borrow().as_slice(),
+        &[(0, pool.base, pool.base + 0x100, 2048)],
+        "list1 must mirror the 2,048-byte CBV recorded with its draw, not the later null CBV"
+    );
+
+    host.backend.buffer_writes.borrow_mut().clear();
+    host.execute(&(), &[&list2], &[], &[]).unwrap();
+    assert!(
+        matches!(host.backend.buffer_writes.borrow().as_slice(), [(0, _, _, 0)]),
+        "list2 must mirror the null CBV recorded with its draw"
+    );
+}
+
 fn vertex(x: f32, y: f32, c: [f32; 4]) -> Vertex {
     [x, y, 0.5, 0.5, c[0], c[1], c[2], c[3]]
 }

@@ -2392,3 +2392,311 @@ fn per_encoder_residency_10k_textures_benchmark() {
     );
     drop((records, f));
 }
+
+/// #538: GTA VI rewrites entries 8..251 of its shared descriptor table at root slot 0 between
+/// recording a dispatch and submitting the command list (bind, dispatch, unbind). Verify on Metal:
+/// 1. A dispatch recorded with a 2,048-byte CBV at entry 251 still reads its first and last dwords
+///    when entry 251 is overwritten with a null CBV before submission, while a dispatch recorded
+///    after the unbind reads 0.
+/// 2. In a single submission, Dispatch A recorded with a texture SRV at entry 82 still samples that
+///    texture even after entry 82 is overwritten with a null SRV and Dispatch B (reading a CBV at
+///    entry 100, whose `0..101` span covers entry 82) is recorded onto the same list.
+/// 3. A dispatch recorded with a null buffer SRV at entry 48 still reads 0 when a placed buffer SRV
+///    is written to entry 48 before submission, and a bindless shader in the next submission sees
+///    the placed buffer SRV via `sync_rolled_back`.
+#[test]
+fn recorded_dispatches_keep_their_table_entries_when_unbound_or_rewritten_before_submission() {
+    let uav_meta = {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[3, 3]);
+        r[16] = 1;
+        r[20..23].copy_from_slice(&[4, 4, 0]);
+        r
+    };
+    let table_meta = |kind: u8, entry: u32, dwords: u8| {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[kind, 3]);
+        r[8..12].copy_from_slice(&(entry * 8).to_le_bytes());
+        r[16] = 1;
+        r[20..23].copy_from_slice(&[dwords, 4, 0]);
+        r
+    };
+    let make_cbv_cs = |entry: u32, last_byte: u32, out_byte: u32| {
+        let words = [
+            0xBE8A_0304u32, // s_mov_b32 s10, s4
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF408_0305,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+            0xF408_0405,
+            0xFA00_0000 | (entry * 32), // s_load_dwordx4 s[16:19], s[10:11], entry*32
+            0xBF8C_C07F,                // s_waitcnt lgkmcnt(0)
+            0xF420_0508,
+            0xFA00_0000, // s_buffer_load_dword s20, s[16:19], 0x0
+            0xF420_0548,
+            0xFA00_0000 | last_byte, // s_buffer_load_dword s21, s[16:19], last_byte
+            0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+            0x7E00_0214,             // v_mov_b32 v0, s20
+            0x7E02_0215,             // v_mov_b32 v1, s21
+            0xE070_0000 | out_byte,
+            0x8003_0000, // buffer_store_dword v0, off, s[12:15], out_byte
+            0xE070_0000 | (out_byte + 4),
+            0x8003_0100, // buffer_store_dword v1, off, s[12:15], out_byte + 4
+            0xBF81_0000, // s_endpgm
+        ];
+        let c = crate::pipeline::test_compute_container(
+            &words,
+            &[uav_meta, table_meta(2, entry, 4)],
+            5,
+        );
+        shaders::translate(&c).expect("cbv cs translates")
+    };
+    let cs_tex_82 = {
+        let words = [
+            0xBE8A_0304u32, // s_mov_b32 s10, s4
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF408_0305,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+            0xF40C_0405,
+            0xFA00_0000 | (82 * 32), // s_load_dwordx8 s[16:23], s[10:11], 82*32
+            0x7E00_0280,             // v_mov_b32 v0, 0
+            0x7E02_0280,             // v_mov_b32 v1, 0
+            0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+            0xF000_1F08,
+            0x0004_0200, // image_load v[2:5], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_0010,
+            0x8003_0300, // buffer_store_dword v3, off, s[12:15], 16
+            0xBF81_0000, // s_endpgm
+        ];
+        let c = crate::pipeline::test_compute_container(
+            &words,
+            &[uav_meta, table_meta(0, 82, 8)],
+            5,
+        );
+        shaders::translate(&c).expect("tex 82 cs translates")
+    };
+    let cs_srv_48 = {
+        let words = [
+            0xBE8A_0304u32, // s_mov_b32 s10, s4
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF408_0305,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+            0xF408_0405,
+            0xFA00_0000 | (48 * 32), // s_load_dwordx4 s[16:19], s[10:11], 48*32
+            0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+            0xF420_0508,
+            0xFA00_0000, // s_buffer_load_dword s20, s[16:19], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E00_0214, // v_mov_b32 v0, s20
+            0xE070_0020,
+            0x8003_0000, // buffer_store_dword v0, off, s[12:15], 32
+            0xBF81_0000, // s_endpgm
+        ];
+        let c = crate::pipeline::test_compute_container(
+            &words,
+            &[uav_meta, table_meta(0, 48, 4)],
+            5,
+        );
+        shaders::translate(&c).expect("srv 48 cs translates")
+    };
+    // Bindless compute shader reading entry 48 directly via inferred resource-heap SGPR `s6`.
+    let cs_bindless_48 = {
+        let words = [
+            0xBE8A_0304u32, // s_mov_b32 s10, s4
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0xF408_0305,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+            0xBE80_0306, // s_mov_b32 s0, s6
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0400,
+            0xFA00_0000 | (48 * 32), // s_load_dwordx4 s[16:19], s[0:1], 48*32
+            0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+            0xF420_0508,
+            0xFA00_0000, // s_buffer_load_dword s20, s[16:19], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E00_0214, // v_mov_b32 v0, s20
+            0xE070_0024,
+            0x8003_0000, // buffer_store_dword v0, off, s[12:15], 36
+            0xBF81_0000, // s_endpgm
+        ];
+        let c = crate::pipeline::test_compute_container(&words, &[uav_meta], 7);
+        shaders::translate(&c).expect("bindless 48 cs translates")
+    };
+
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let mut records = vec![0u32; 8 * 256];
+    let start = records.as_mut_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 256).unwrap();
+
+    // Entry 0: output raw UAV at VA_A (pool offset 0x2_0000).
+    let mut uav_res = [0u32; 14];
+    uav_res[0] = 1;
+    let mut uav_view = [0u32; 16];
+    (uav_view[1], uav_view[4], uav_view[8]) = (1, 64, 1);
+    [uav_view[10], uav_view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &uav_res, &uav_view, start);
+    assert!(t.host.mirror(start).unwrap());
+
+    let Pipe::Compute(pso_cbv_251) = t.compute_pipe(&make_cbv_cs(251, 2044, 0), "cbv 251") else {
+        panic!("{:?}", t.shaders)
+    };
+    let Pipe::Compute(pso_cbv_100) = t.compute_pipe(&make_cbv_cs(100, 0, 24), "cbv 100") else {
+        panic!("{:?}", t.shaders)
+    };
+    let Pipe::Compute(pso_tex_82) = t.compute_pipe(&cs_tex_82, "tex 82") else {
+        panic!("{:?}", t.shaders)
+    };
+    let Pipe::Compute(pso_srv_48) = t.compute_pipe(&cs_srv_48, "srv 48") else {
+        panic!("{:?}", t.shaders)
+    };
+    let Pipe::Compute(pso_bindless_48) = t.compute_pipe(&cs_bindless_48, "bindless 48") else {
+        panic!("{:?}", t.shaders)
+    };
+
+    // 1. 2,048-byte CBV at entry 251 (written by plain stores), unbound before submission.
+    let mut cbv_data = vec![0u32; 512];
+    cbv_data[0] = 0xCAFE_1234;
+    cbv_data[511] = 0xBEEF_5678;
+    f.put(0x2_1000, &cbv_data);
+    let cbv_addr = super::addr_tests::VA_A + 0x1000;
+    let [cbv_lo, cbv_hi] = super::addr_tests::halves(cbv_addr);
+    let mut scratch_slot = [0u32; 8];
+    crate::descriptor::create_cbv(
+        std::ptr::null_mut(),
+        &[cbv_lo, cbv_hi, 2048, 0],
+        scratch_slot.as_mut_ptr() as u64,
+    );
+    records[251 * 8..252 * 8].copy_from_slice(&scratch_slot);
+
+    let mut l_bound = NativeList::default();
+    l_bound.set_heaps(Some(&heap), None);
+    l_bound.set_compute_pipeline(&pso_cbv_251);
+    l_bound.set_compute_root_table(0, &heap, 0);
+    l_bound.dispatch(1, 1, 1).unwrap();
+
+    // Unbind entry 251 (null CBV + immediate mirror) BEFORE `l_bound` is submitted, and record a
+    // second list after the unbind.
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 0, 0], start + 251 * 32);
+    assert!(t.host.mirror(start + 251 * 32).unwrap());
+    let mut l_unbound = NativeList::default();
+    l_unbound.set_heaps(Some(&heap), None);
+    l_unbound.set_compute_pipeline(&pso_cbv_251);
+    l_unbound.set_compute_root_table(0, &heap, 0);
+    l_unbound.dispatch(1, 1, 1).unwrap();
+
+    f.put(0x2_0000, &[super::addr_tests::CANARY; 16]);
+    super::run(&t.host, &[&l_bound]);
+    assert_eq!(
+        f.get(0x2_0000, 2),
+        [0xCAFE_1234, 0xBEEF_5678],
+        "dispatch recorded before unbind must read its 2,048-byte CBV"
+    );
+    f.put(0x2_0000, &[super::addr_tests::CANARY; 16]);
+    super::run(&t.host, &[&l_unbound]);
+    assert_eq!(
+        f.get(0x2_0000, 2),
+        [0, 0],
+        "dispatch recorded after unbind must read the null CBV"
+    );
+
+    // 2. Same-submission sequence: Dispatch A recorded with a texture SRV at entry 82, then entry
+    //    82 is unbound to a null SRV and Dispatch B (reading entry 100) is recorded on the same list.
+    let tex = t
+        .host
+        .texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4))
+        .unwrap();
+    let tex_px: Vec<u8> = [0u8, 200, 0, 255].repeat(16);
+    t.host.backend.upload_texture(&tex, 0, 0, &tex_px, 16, 64);
+    let tex_key = 0x5380_0082usize;
+    t.host.register_texture(tex_key, &tex);
+    let mut tex_srv = [0u32; 10];
+    (tex_srv[0], tex_srv[1], tex_srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), tex_key as _, &tex_srv, start + 82 * 32);
+
+    let mut l_same = NativeList::default();
+    l_same.set_heaps(Some(&heap), None);
+    l_same.set_compute_pipeline(&pso_tex_82);
+    l_same.set_compute_root_table(0, &heap, 0);
+    l_same.dispatch(1, 1, 1).unwrap();
+
+    // Unbind entry 82 (null texture SRV + mirror) and bind CBV at entry 100, then record Dispatch B.
+    crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &tex_srv, start + 82 * 32);
+    assert!(t.host.mirror(start + 82 * 32).unwrap());
+    f.put(0x2_2000, &[0x7777_8888u32; 4]);
+    let [c100_lo, c100_hi] = super::addr_tests::halves(super::addr_tests::VA_A + 0x2000);
+    crate::descriptor::create_cbv(
+        std::ptr::null_mut(),
+        &[c100_lo, c100_hi, 64, 0],
+        start + 100 * 32,
+    );
+    l_same.set_compute_pipeline(&pso_cbv_100);
+    l_same.dispatch(1, 1, 1).unwrap();
+    // Unbind entry 100 too before submitting `l_same`.
+    crate::descriptor::create_cbv(std::ptr::null_mut(), &[0, 0, 0, 0], start + 100 * 32);
+    assert!(t.host.mirror(start + 100 * 32).unwrap());
+
+    f.put(0x2_0000, &[0u32; 16]);
+    super::run(&t.host, &[&l_same]);
+    let green = f32::from_bits(f.get(0x2_0000, 8)[4]);
+    assert!(
+        (green - (200.0 / 255.0)).abs() < 1e-4,
+        "Dispatch A must sample entry 82's texture (got {green})"
+    );
+    assert_eq!(
+        f.get(0x2_0000, 8)[6],
+        0x7777_8888,
+        "Dispatch B must read entry 100's CBV without clobbering entry 82"
+    );
+
+    // 3. Entry 48 recorded with a null buffer SRV, then overwritten with a placed buffer SRV +
+    //    mirror before submission; bindless dispatch in the next submission catches up to the placed SRV.
+    let mut buf_srv = [0u32; 10];
+    (buf_srv[1], buf_srv[6], buf_srv[8]) = (1, 4, 1); // BUFFER, 4 dwords, RAW
+    crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &buf_srv, start + 48 * 32);
+    let mut l_null48 = NativeList::default();
+    l_null48.set_heaps(Some(&heap), None);
+    l_null48.set_compute_pipeline(&pso_srv_48);
+    l_null48.set_compute_root_table(0, &heap, 0);
+    l_null48.dispatch(1, 1, 1).unwrap();
+
+    f.put(0x2_3000, &[0x4242_4242u32; 4]);
+    let mut placed_48 = [0u32; 16];
+    (placed_48[1], placed_48[6], placed_48[8]) = (1, 4, 1);
+    [placed_48[10], placed_48[11]] = super::addr_tests::halves(super::addr_tests::VA_A + 0x3000);
+    crate::descriptor::create_placed_srv(
+        std::ptr::null_mut(),
+        &uav_res,
+        &placed_48,
+        start + 48 * 32,
+    );
+    assert!(t.host.mirror(start + 48 * 32).unwrap());
+
+    f.put(0x2_0000, &[super::addr_tests::CANARY; 16]);
+    super::run(&t.host, &[&l_null48]);
+    assert_eq!(
+        f.get(0x2_0000, 10)[8],
+        0,
+        "dispatch recorded with null SRV at entry 48 must read 0, not the later placed buffer"
+    );
+
+    // Next submission: bindless compute shader reads entry 48 directly via `s6` (with table bound
+    // only at 0..16, which does NOT cover entry 48). `sync_rolled_back` restores entry 48!
+    let mut l_bindless = NativeList::default();
+    l_bindless.set_heaps(Some(&heap), None);
+    l_bindless.set_compute_pipeline(&pso_bindless_48);
+    l_bindless.set_compute_root_table(0, &heap, 0);
+    l_bindless.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l_bindless]);
+    assert_eq!(
+        f.get(0x2_0000, 10)[9],
+        0x4242_4242,
+        "bindless shader in the next submission must see the placed buffer written at entry 48"
+    );
+
+    t.host.release_resource(tex_key);
+    crate::descriptor::forget(tex_key);
+    drop((records, f));
+}
