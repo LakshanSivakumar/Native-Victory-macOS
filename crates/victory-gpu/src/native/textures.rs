@@ -325,6 +325,19 @@ struct Level {
     slice_pitch: usize,
 }
 
+/// Hashes title memory: on the rayon pool when there is a lot of it, so a big texture's sync
+/// does not serialize on one core while the others idle.
+fn hash_of(bytes: &[u8]) -> blake3::Hash {
+    const PARALLEL: usize = 1 << 20;
+    if bytes.len() >= PARALLEL {
+        let mut h = blake3::Hasher::new();
+        h.update_rayon(bytes);
+        h.finalize()
+    } else {
+        blake3::hash(bytes)
+    }
+}
+
 fn is_all_zero(bytes: &[u8]) -> bool {
     let (chunks, tail) = bytes.as_chunks::<64>();
     chunks.iter().all(|&c| c == [0u8; 64]) && tail.iter().all(|&b| b == 0)
@@ -607,13 +620,23 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
             continue;
         };
         let mut h = blake3::Hasher::new();
+        // Big textures are hashed whole on the rayon pool instead of chunk by chunk here.
+        let big = size >= (1 << 20);
+        let mut whole: Vec<u8> = Vec::new();
+        if big {
+            whole.reserve(size);
+        }
         let mut unreadable = false;
         for off in (0..size).step_by(buf.len()) {
             let n = buf.len().min(size - off);
             unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
-            h.update(&buf[..n]);
+            if big {
+                whole.extend_from_slice(&buf[..n]);
+            } else {
+                h.update(&buf[..n]);
+            }
         }
-        let h = h.finalize();
+        let h = if big { hash_of(&whole) } else { h.finalize() };
         watch_in(watched, |w| {
             // Released, or begun/applied by a submission while it was hashed here: this reading is
             // the older one, and the next round compares with the submission's.
@@ -1096,7 +1119,7 @@ impl<B: PresentBackend> Title<B> {
         let _ = read_into(Some(&pools), info.memory as usize, &mut tiled, t.partial);
         // The title wrote the memory since the host texture was filled from it: its bytes stay,
         // and the next submission uploads them.
-        if t.last != Some(blake3::hash(&tiled)) {
+        if t.last != Some(hash_of(&tiled)) {
             return;
         }
         if let Err(error) = download(&self.host.backend, &t.texture, info, &mut tiled) {
@@ -1105,7 +1128,7 @@ impl<B: PresentBackend> Title<B> {
             }
             return;
         }
-        let hash = blake3::hash(&tiled);
+        let hash = hash_of(&tiled);
         if t.last == Some(hash) {
             return;
         }
@@ -1893,7 +1916,7 @@ impl Job {
         let tiled = &mut tiled[..self.size];
         let unreadable = read_into(Some(&self.pools), self.memory, tiled, self.partial);
         let read = started.elapsed();
-        let hash = blake3::hash(tiled);
+        let hash = hash_of(tiled);
         let hashed = started.elapsed();
         let changed = self.last != Some(hash);
         let addressable = self.layout.addressable();
@@ -2282,6 +2305,19 @@ mod tests {
         rest.sort_unstable();
         assert!(first.iter().copied().eq(0..20_000));
         assert!(rest.iter().copied().eq(20_000..30_000));
+    }
+
+    #[test]
+    fn hash_of_matches_blake3_across_the_parallel_threshold() {
+        // Sizes straddling the 1 MiB rayon cutoff, including empty and odd tails.
+        let sizes = [
+            0usize, 1, 63, 64, 65, (1 << 20) - 1, 1 << 20, (1 << 20) + 1, (1 << 20) + 63,
+            (1 << 20) * 3 + 7,
+        ];
+        for size in sizes {
+            let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            assert_eq!(hash_of(&bytes), blake3::hash(&bytes), "size {size}");
+        }
     }
 
     fn watched(entries: impl Into<HashMap<usize, (usize, usize, bool, u64)>>) -> Watched {
