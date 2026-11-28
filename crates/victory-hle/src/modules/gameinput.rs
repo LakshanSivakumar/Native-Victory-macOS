@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
@@ -60,6 +60,56 @@ const DEVICES: usize = PADS + 2;
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
+
+/// `VICTORY_INPUT_LATCH=1`: a button change the title has not read yet waits for its next
+/// reading, so a tap between two of the title's readings (which happen once a frame) is seen.
+/// Ported from halfwave50's VIctory-macOS-halfwave50 (`52e0325`, GPL-3.0, credited there).
+const LATCH_AGREE_US: u64 = 15_000;
+/// With no reading for this long, the latch lets go.
+const LATCH_TIMEOUT_US: u64 = 2_000_000;
+
+/// Whether `VICTORY_INPUT_LATCH` is set (off by default).
+fn latch_env() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_INPUT_LATCH").is_some_and(|v| !v.is_empty() && v != "0")
+    });
+    *ON
+}
+
+/// `VICTORY_STICK_DEADZONE=<share>`: a round dead zone of that share of the travel per stick,
+/// the rest spread over 0 to 1. 0 (unset) keeps host values raw.
+fn dead_zone_env() -> f32 {
+    static SHARE: LazyLock<f32> = LazyLock::new(|| {
+        std::env::var("VICTORY_STICK_DEADZONE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .map_or(0.0, |d| d.min(0.9))
+    });
+    *SHARE
+}
+
+/// Applies the round dead zone `share` to a pad's sticks.
+fn dead_zone(p: PadState, share: f32) -> PadState {
+    if share <= 0.0 {
+        return p;
+    }
+    let dz = |v: f32| {
+        let a = v.abs();
+        if a < share {
+            0.0
+        } else {
+            v.signum() * (a - share) / (1.0 - share)
+        }
+    };
+    PadState {
+        left_x: dz(p.left_x),
+        left_y: dz(p.left_y),
+        right_x: dz(p.right_x),
+        right_y: dz(p.right_y),
+        ..p
+    }
+}
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
@@ -253,7 +303,7 @@ impl Device {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Value {
     Pad(PadState),
     Keys(Vec<KeyState>),
@@ -275,6 +325,12 @@ impl Reading {
             Value::Pad(_) => GAMEPAD_KIND,
             Value::Keys(_) => KEYBOARD_KIND,
         }
+    }
+
+    /// Another reference to this reading, for the title.
+    fn share(&self) -> *const Reading {
+        reading_add_ref(self);
+        self
     }
 }
 
@@ -353,6 +409,14 @@ struct Slot {
     connected: bool,
     sequence: u64,
     history: VecDeque<Ref>,
+    /// Button bits pressed since the last reading handed out (`VICTORY_INPUT_LATCH`): a tap
+    /// between two of the title's readings shows as down for one reading.
+    latched: u32,
+    /// Trigger peaks since the last reading handed out.
+    latch_lt: f32,
+    latch_rt: f32,
+    /// When a reading was last handed out for this device, in `now()` microseconds.
+    last_handout: u64,
 }
 
 struct State {
@@ -373,6 +437,11 @@ pub struct Hub {
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
+    /// `VICTORY_INPUT_LATCH`: latch unseen button changes for the next reading. Set before
+    /// the hub is shared (in `start`); tests set it on their own hub.
+    latch: AtomicBool,
+    /// `VICTORY_STICK_DEADZONE`'s share, as f32 bits. As `latch`.
+    dead_zone: AtomicU32,
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -406,6 +475,8 @@ impl Hub {
                 running: Vec::new(),
             }),
             returned: Condvar::new(),
+            latch: AtomicBool::new(false),
+            dead_zone: AtomicU32::new(0.0f32.to_bits()),
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
         unsafe {
@@ -421,6 +492,8 @@ impl Hub {
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source);
+        hub.latch.store(latch_env(), Ordering::Relaxed);
+        hub.dead_zone.store(dead_zone_env().to_bits(), Ordering::Relaxed);
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -435,11 +508,19 @@ impl Hub {
         lock(&self.state)
     }
 
+    fn latch_on(&self) -> bool {
+        self.latch.load(Ordering::Relaxed)
+    }
+
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
             let mut pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
+            let dz = f32::from_bits(self.dead_zone.load(Ordering::Relaxed));
+            for p in pads.iter_mut().flatten() {
+                *p = dead_zone(*p, dz);
+            }
             #[cfg(any(test, feature = "diagnostics"))]
             {
                 let scripted = source.scripted_keys();
@@ -449,7 +530,7 @@ impl Hub {
             let _ = &mut pads;
             (pads, source.keys())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, self.latch_on());
         self.deliver(events);
     }
 
@@ -500,16 +581,17 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        latch: bool,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
-            self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
+            self.update(devices, slot, pad.map(Value::Pad), now, latch, &mut events);
         }
         let fallback = (!any_pad).then(|| Value::Pad(stand_in_pad(&keys)));
-        self.update(devices, FALLBACK, fallback, now, &mut events);
-        self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+        self.update(devices, FALLBACK, fallback, now, latch, &mut events);
+        self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, latch, &mut events);
         events
     }
 
@@ -521,14 +603,42 @@ impl State {
         index: usize,
         value: Option<Value>,
         now: u64,
+        latch: bool,
         events: &mut Vec<Event>,
     ) {
         let slot = &mut self.slots[index];
         let was = slot.connected;
         slot.connected = value.is_some();
+        // The latch (VICTORY_INPUT_LATCH): with no reading for LATCH_TIMEOUT it lets go.
+        // Never handed out counts as timed out too (the process's first seconds).
+        if latch
+            && matches!(value, Some(Value::Pad(_)))
+            && (slot.last_handout == 0 || now.saturating_sub(slot.last_handout) > LATCH_TIMEOUT_US)
+        {
+            slot.latched = 0;
+            slot.latch_lt = 0.0;
+            slot.latch_rt = 0.0;
+        }
         if let Some(value) = value
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
+            // Presses since the last handed-out reading wait for the next one, so a tap between
+            // two of the title's readings is seen; triggers keep their peak.
+            if latch
+                && let Value::Pad(p) = value
+            {
+                let prev = slot
+                    .history
+                    .back()
+                    .and_then(|r| match r.value {
+                        Value::Pad(p) => Some(p),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                slot.latched |= p.buttons & !prev.buttons;
+                slot.latch_lt = slot.latch_lt.max(p.left_trigger);
+                slot.latch_rt = slot.latch_rt.max(p.right_trigger);
+            }
             slot.sequence += 1;
             if slot.history.len() == HISTORY {
                 slot.history.pop_front();
@@ -556,6 +666,31 @@ impl State {
                     .map(|r| r.event(index, now, current, previous)),
             );
         }
+    }
+
+    /// With the latch on, merges what was pressed since the last reading handed out for
+    /// device `index` into `value` (buttons OR-ed in, triggers at their peak, sticks as they
+    /// are), and clears the latch — unless the last hand-out was within `LATCH_AGREE_US`, so
+    /// readings that close agree. Returns `None` when there is nothing latched. `last_handout`
+    /// follows every hand-out, latched or not.
+    fn latched(&mut self, index: usize, value: Value, now: u64) -> Option<Value> {
+        let slot = &mut self.slots[index];
+        let Value::Pad(p) = value else { return None };
+        let had = slot.latched != 0 || slot.latch_lt > p.left_trigger || slot.latch_rt > p.right_trigger;
+        let merged = Value::Pad(PadState {
+            buttons: p.buttons | slot.latched,
+            left_trigger: p.left_trigger.max(slot.latch_lt),
+            right_trigger: p.right_trigger.max(slot.latch_rt),
+            ..p
+        });
+        // A first hand-out (last_handout 0) always clears: only readings that close agree.
+        if slot.last_handout == 0 || now.saturating_sub(slot.last_handout) >= LATCH_AGREE_US {
+            slot.latched = 0;
+            slot.latch_lt = 0.0;
+            slot.latch_rt = 0.0;
+        }
+        slot.last_handout = now;
+        had.then_some(merged)
     }
 }
 
@@ -887,12 +1022,13 @@ fn fail(out: Out, hr: HRESULT) -> HRESULT {
 }
 
 /// Gives the title a reference to `reading`, or fails as with none.
-fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
+fn hand(out: Out, reading: Option<*const Reading>) -> HRESULT {
     match reading {
         _ if out.is_null() => E_INVALIDARG,
         Some(reading) => {
-            // SAFETY: checked non-null; the title passes room for a pointer.
-            unsafe { out.write(reading.share().cast()) };
+            // SAFETY: checked non-null; the title passes room for a pointer. The reference was
+            // counted in `Reading::share`.
+            unsafe { out.write(reading.cast()) };
             S_OK
         }
         None => fail(out, READING_NOT_FOUND),
@@ -919,18 +1055,19 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
             .history
             .back()
             .filter(|r| r.kind() & kind != 0)
+            .map(|r| (i, &**r as *const Reading, r.device, r.sequence, r.timestamp, r.value.clone()))
     };
     let found = if device.is_null() {
         (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
             .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
+            .max_by_key(|&(_, _, _, _, ts, _)| ts)
     } else {
         match hub.index(device) {
             None => return fail(out, E_INVALIDARG),
@@ -941,10 +1078,35 @@ extern "system" fn current_reading(
     tracing::trace!(
         kind = format_args!("{kind:#x}"),
         device = ?hub.index(device),
-        sequence = found.map(|r| r.sequence),
+        sequence = found.as_ref().map(|(_, _, _, seq, _, _)| *seq),
         "current reading"
     );
-    hand(out, found)
+    let ptr = found.map(|f| hand_latched(&mut state, hub, f));
+    hand(out, ptr)
+}
+
+/// A found reading: device index, the reading, its device, sequence, timestamp and value.
+type Found = (usize, *const Reading, *const Device, u64, u64, Value);
+
+/// The found reading as it would be handed out: with the latch on, what was pressed since the
+/// last hand-out merged in (a fresh reading then); else the reading itself.
+fn hand_latched(state: &mut State, hub: &Hub, found: Found) -> *const Reading {
+    let (index, r, device, sequence, timestamp, value) = found;
+    if hub.latch_on()
+        && let Some(merged) = state.latched(index, value, now())
+    {
+        return Ref::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(1),
+            device,
+            sequence,
+            timestamp,
+            value: merged,
+        })
+        .share();
+    }
+    // SAFETY: `r` is a live history entry, held by the state we still lock.
+    unsafe { &*r }.share()
 }
 
 /// The reading after (`forward`) or before `reference`: on `device`, or with
@@ -1001,7 +1163,8 @@ fn relative(
             .filter(|(key, _)| *key < at)
             .max_by_key(|(key, _)| *key)
     };
-    hand(out, found.map(|(_, r)| r))
+    // The latch merges into current and temporal readings; next/previous walk the history as recorded.
+    hand(out, found.map(|(_, r)| &**r as *const Reading))
 }
 extern "system" fn next_reading(
     this: This,
@@ -1032,9 +1195,18 @@ extern "system" fn temporal_reading(
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
     };
-    let state = hub.state();
-    let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    let found = {
+        let state = hub.state();
+        let history = &state.slots[index].history;
+        history
+            .iter()
+            .rev()
+            .find(|r| r.timestamp <= time)
+            .map(|r| (index, &**r as *const Reading, r.device, r.sequence, r.timestamp, r.value.clone()))
+    };
+    let mut state = hub.state();
+    let ptr = found.map(|f| hand_latched(&mut state, hub, f));
+    hand(out, ptr)
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -2228,6 +2400,164 @@ mod tests {
         hub.poll();
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(r), physical);
+        release(r);
+    }
+
+    fn pad_at(host: &Arc<Mutex<FakeHost>>, p: PadState) {
+        host.lock().unwrap().pads[0] = Some(p);
+    }
+
+    /// Pretends the last handed-out reading was `us` ago, so the next one does not "agree".
+    fn age_last_handout(hub: &Hub, us: u64) {
+        let mut state = hub.state();
+        for slot in &mut state.slots {
+            if slot.last_handout != 0 {
+                slot.last_handout = now().saturating_sub(us);
+            }
+        }
+    }
+
+    /// A reading as the title would take it a frame later (past the agree window).
+    fn read_aged(hub: &Hub) -> *const Reading {
+        age_last_handout(hub, LATCH_AGREE_US + 1);
+        current(hub, GAMEPAD_KIND, 0).unwrap()
+    }
+
+    #[test]
+    fn input_latch_shows_a_tap_between_two_readings_once() {
+        let (hub, host) = fake();
+        hub.latch.store(true, Ordering::Relaxed);
+        pad_at(&host, PadState::default());
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).buttons, 0, "nothing pressed yet");
+        release(r);
+
+        // A tap between two of the title's readings: down, then up before the next read.
+        pad_at(&host, PadState { buttons: A, ..Default::default() });
+        hub.poll();
+        pad_at(&host, PadState::default());
+        hub.poll();
+
+        let r = read_aged(hub);
+        assert_eq!(pad(r).buttons, A, "the tap is seen once");
+        release(r);
+        let r = read_aged(hub);
+        assert_eq!(pad(r).buttons, 0, "and not again");
+        release(r);
+    }
+
+    #[test]
+    fn input_latch_keeps_a_held_button_and_shows_a_release() {
+        let (hub, host) = fake();
+        hub.latch.store(true, Ordering::Relaxed);
+        pad_at(&host, PadState { buttons: A, ..Default::default() });
+        hub.poll();
+        let r = read_aged(hub);
+        assert_eq!(pad(r).buttons, A);
+        release(r);
+
+        // Held across readings: still down.
+        hub.poll();
+        let r = read_aged(hub);
+        assert_eq!(pad(r).buttons, A);
+        release(r);
+
+        // Released between readings: up at the next one.
+        pad_at(&host, PadState::default());
+        hub.poll();
+        let r = read_aged(hub);
+        assert_eq!(pad(r).buttons, 0);
+        release(r);
+    }
+
+    #[test]
+    fn input_latch_shows_a_trigger_peak_and_lets_go_after_two_seconds_without_a_reading() {
+        let (hub, host) = fake();
+        hub.latch.store(true, Ordering::Relaxed);
+        pad_at(&host, PadState { left_trigger: 0.4, ..Default::default() });
+        hub.poll();
+        let r = read_aged(hub);
+        assert_eq!(pad(r).left_trigger, 0.4);
+        release(r);
+
+        // A higher peak between readings shows once, then the current value.
+        pad_at(&host, PadState { left_trigger: 1.0, ..Default::default() });
+        hub.poll();
+        pad_at(&host, PadState { left_trigger: 0.2, ..Default::default() });
+        hub.poll();
+        let r = read_aged(hub);
+        assert_eq!(pad(r).left_trigger, 1.0, "the peak since the last reading");
+        release(r);
+        let r = read_aged(hub);
+        assert_eq!(pad(r).left_trigger, 0.2, "then the current value");
+        release(r);
+
+        // No reading for over the timeout: the latch lets go at the next poll.
+        pad_at(&host, PadState { buttons: B, ..Default::default() });
+        hub.poll();
+        pad_at(&host, PadState::default());
+        hub.poll();
+        age_last_handout(hub, LATCH_TIMEOUT_US + 1); // as if the last reading was over the timeout ago
+        hub.poll(); // this poll clears the stale latch
+        let r = read_aged(hub);
+        assert_eq!(pad(r).buttons, 0, "the stale tap is not shown");
+        release(r);
+        pad_at(&host, PadState { buttons: X, ..Default::default() });
+        hub.poll();
+        pad_at(&host, PadState::default());
+        hub.poll();
+        let r = read_aged(hub);
+        assert_eq!(pad(r).buttons, X, "a fresh tap is seen at the next reading");
+        release(r);
+    }
+
+    #[test]
+    fn input_latch_off_by_default_leaves_taps_unseen() {
+        let (hub, host) = fake();
+        pad_at(&host, PadState::default());
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        release(r);
+        pad_at(&host, PadState { buttons: A, ..Default::default() });
+        hub.poll();
+        pad_at(&host, PadState::default());
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).buttons, 0, "without the latch the tap is lost");
+        release(r);
+    }
+
+    #[test]
+    fn stick_dead_zone_rounds_and_rescales() {
+        // Inside the zone: zero.
+        assert_eq!(dead_zone(PadState { left_x: 0.1, ..Default::default() }, 0.2).left_x, 0.0);
+        assert_eq!(dead_zone(PadState { left_x: -0.19, ..Default::default() }, 0.2).left_x, 0.0);
+        // Past it: the rest of the travel spread over 0..1.
+        assert!((dead_zone(PadState { left_x: 0.6, ..Default::default() }, 0.2).left_x - 0.5).abs() < 1e-6);
+        assert_eq!(dead_zone(PadState { left_x: -1.0, ..Default::default() }, 0.2).left_x, -1.0);
+        assert_eq!(dead_zone(PadState { left_x: 1.0, ..Default::default() }, 0.2).left_x, 1.0);
+        // No zone: raw values.
+        assert_eq!(dead_zone(PadState { left_x: 0.05, ..Default::default() }, 0.0).left_x, 0.05);
+        // Buttons and triggers are untouched.
+        let p = PadState { buttons: A, right_trigger: 1.0, right_y: 0.1, ..Default::default() };
+        let d = dead_zone(p, 0.2);
+        assert_eq!(d.buttons, A);
+        assert_eq!(d.right_trigger, 1.0);
+        assert_eq!(d.right_y, 0.0);
+    }
+
+    #[test]
+    fn stick_dead_zone_applies_to_host_pads_at_poll() {
+        let (hub, host) = fake();
+        hub.dead_zone.store(0.25f32.to_bits(), Ordering::Relaxed);
+        pad_at(&host, PadState { left_x: 0.1, left_y: -1.0, right_x: 0.5, ..Default::default() });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        let p = pad(r);
+        assert_eq!(p.left_x, 0.0, "inside the zone");
+        assert_eq!(p.left_y, -1.0);
+        assert!((p.right_x - (0.5f32 - 0.25) / 0.75).abs() < 1e-6, "rescaled: {}", p.right_x);
         release(r);
     }
 }

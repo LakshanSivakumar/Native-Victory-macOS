@@ -359,6 +359,13 @@ VICTORY_DXC_DYLIB=<D3DMetal.framework>/Versions/A/Resources/libdxcompiler.dylib 
   target/x86_64-apple-darwin/debug/victory-metal --dxc in.hlsl out.dxil cs_6_0
 ```
 
+On Windows, the shader tests validate every emitted DXIL container with `dxil.dll`
+(`emit/validator.rs`, `Validator::load`): point `VICTORY_DXIL` at it, e.g. the one in the
+Microsoft GDK-X package (`Microsoft GDK/bin/dxil.dll` inside
+`2026.10-GDKX-10.0.26100.9661`'s `ExtractedforBuildSystems` ZIP; without the variable the newest
+Windows SDK's `bin/<version>/x64/dxil.dll` is used). GDK files are used locally only, never
+committed (`cargo xtask policy` enforces that).
+
 No title shader or title code is used anywhere.
 
 ### Descriptor heaps

@@ -555,6 +555,30 @@ struct Watch {
     /// Bumped whenever a submission begins or applies a whole read of a watched texture, so an
     /// in-flight scanner round that started earlier discards its older (possibly torn) hash.
     epoch: HashMap<usize, u64>,
+    /// What the scanner last read whole of a texture it found changed, for the submission to
+    /// detile without reading the memory again: bytes, their hash, and whether some of it was
+    /// unreadable. Bounded ([`stash_max_total`]); a texture evicted from here is read again by
+    /// the submission as before.
+    stashed: HashMap<usize, Stashed>,
+    /// Bytes held in `stashed`.
+    stashed_bytes: usize,
+}
+
+/// A scanner-read texture's memory ([`Watch::stashed`]).
+struct Stashed {
+    bytes: Vec<u8>,
+    hash: blake3::Hash,
+    unreadable: bool,
+}
+
+/// Most texture memory the scanner keeps for submissions to detile. Smaller under `cfg(test)`.
+fn stash_max_total() -> usize {
+    if cfg!(test) { 4096 } else { 512 << 20 }
+}
+
+/// Largest single texture the scanner keeps. Larger ones are read again by the submission.
+fn stash_max_texture() -> usize {
+    if cfg!(test) { 1024 } else { 64 << 20 }
 }
 
 impl Watch {
@@ -568,6 +592,9 @@ impl Watch {
         self.seen.remove(&key);
         self.partial.remove(&key);
         self.epoch.remove(&key);
+        if let Some(s) = self.stashed.remove(&key) {
+            self.stashed_bytes -= s.bytes.len();
+        }
     }
 }
 
@@ -587,11 +614,13 @@ fn watch_in<R>(watched: &Watched, f: impl FnOnce(&mut Watch) -> R) -> R {
 /// it, and marks those that changed since they were last read whole.
 fn scan_round(watched: &Watched, buf: &mut [u8]) {
     let list: Vec<(usize, (usize, usize, bool, u64))> = watch_in(watched, |w| {
-        let Watch { entries, pools, seen, partial, epoch, .. } = w;
+        let Watch { entries, pools, seen, partial, epoch, stashed, stashed_bytes, .. } = w;
         pools.retain(|k, _| entries.contains_key(k));
         seen.retain(|k, _| entries.contains_key(k));
         partial.retain(|k| entries.contains_key(k));
         epoch.retain(|k, _| entries.contains_key(k));
+        stashed.retain(|k, _| entries.contains_key(k));
+        *stashed_bytes = stashed.values().map(|s| s.bytes.len()).sum();
         entries.iter().map(|(&k, &v)| (k, v)).collect()
     });
     for &(key, entry) in &list {
@@ -608,10 +637,20 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
         };
         let mut h = blake3::Hasher::new();
         let mut unreadable = false;
+        // Keep the bytes when the texture is small enough to hand to the submission, so it
+        // detiles them without reading the memory again (the whole read is the sync's main cost).
+        let keep = size > 0 && size <= stash_max_texture();
+        let mut whole: Vec<u8> = Vec::new();
+        if keep {
+            whole.reserve(size);
+        }
         for off in (0..size).step_by(buf.len()) {
             let n = buf.len().min(size - off);
             unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
             h.update(&buf[..n]);
+            if keep {
+                whole.extend_from_slice(&buf[..n]);
+            }
         }
         let h = h.finalize();
         watch_in(watched, |w| {
@@ -628,6 +667,21 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
             w.seen.insert(key, h);
             if before != Some(h) && !(target && before.is_none()) {
                 w.dirty.insert(key);
+                if keep {
+                    // shortcut: these bytes may be torn (the title wrote while the scanner read);
+                    // the next round's hash then differs again and the submission reads whole.
+                    if let Some(old) = w.stashed.remove(&key) {
+                        w.stashed_bytes -= old.bytes.len();
+                    }
+                    while w.stashed_bytes + size > stash_max_total() && !w.stashed.is_empty() {
+                        let victim = *w.stashed.keys().next().expect("non-empty");
+                        if let Some(old) = w.stashed.remove(&victim) {
+                            w.stashed_bytes -= old.bytes.len();
+                        }
+                    }
+                    w.stashed_bytes += size;
+                    w.stashed.insert(key, Stashed { bytes: whole, hash: h, unreadable });
+                }
             }
         });
     }
@@ -1649,6 +1703,21 @@ impl<B: PresentBackend> Title<B> {
 
     pub(super) fn jobs(&self, keys: Vec<usize>) -> Vec<Job> {
         let pools = self.host.memory();
+        // What the scanner kept of these textures' memory, where the watched entry still names
+        // the same texture (a key is an address; another texture may have taken it).
+        let mut stashed: HashMap<usize, Stashed> = HashMap::new();
+        watch(|w| {
+            for &key in &keys {
+                let Some(t) = self.textures.get(&key) else { continue };
+                let entry = (t.info.memory as usize, t.info.size, t.info.render_target(), t.serial);
+                if w.entries.get(&key) == Some(&entry)
+                    && let Some(s) = w.stashed.remove(&key)
+                {
+                    w.stashed_bytes -= s.bytes.len();
+                    stashed.insert(key, s);
+                }
+            }
+        });
         let job = |key| {
             let t = self.textures.get(&key)?;
             // Depth-stencil memory is not laid out as the host's texels are (`realize`).
@@ -1668,6 +1737,7 @@ impl<B: PresentBackend> Title<B> {
                 uploaded_mips: t.uploaded_mips,
                 partial: t.partial,
                 skip: t.info.dropped_levels(),
+                stashed: stashed.remove(&key),
             })
         };
         let out: Vec<Job> = keys.into_iter().filter_map(job).collect();
@@ -1824,6 +1894,10 @@ pub(super) struct Job {
     partial: bool,
     /// Top levels the host texture was made without ([`TextureInfo::dropped_levels`]).
     skip: usize,
+    /// What the scanner read of this memory when it found it changed: the submission detiles
+    /// these instead of reading the memory whole again. `None` when the scanner kept nothing
+    /// (a probe found the change, or the texture is too large or the stash full).
+    stashed: Option<Stashed>,
 }
 
 /// What a [`Job`]'s memory held when [`prepare`] read it.
@@ -1851,8 +1925,14 @@ pub(super) struct Prepared {
     took: std::time::Duration,
 }
 
-/// Threads a submission's textures are read on (the submitting thread is one of them).
-const SYNC_THREADS: usize = 6;
+/// Threads a submission's textures are read on (the submitting thread is one of them): all the
+/// host's cores but a few for the title's own threads.
+fn sync_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .saturating_sub(2)
+        .clamp(2, 16)
+}
 /// Texture memory read at a time: its detiled copy is held until it is uploaded.
 const SYNC_BATCH: usize = 256 << 20;
 
@@ -1873,7 +1953,8 @@ pub(super) fn batches(jobs: Vec<Job>) -> Vec<Vec<Job>> {
 
 impl Job {
     /// Reads its memory into `tiled` (kept from job to job: a fresh buffer each time maps and
-    /// faults in new pages) and detiles it unless it is what the host texture holds.
+    /// faults in new pages) and detiles it unless it is what the host texture holds. Memory the
+    /// scanner already read whole ([`Job::stashed`]) is used instead of reading again.
     fn read(&self, tiled: &mut Vec<u8>) -> Ready {
         let started = std::time::Instant::now();
         // Sampled before the whole read: a write between the two is then a change to the next
@@ -1891,9 +1972,19 @@ impl Job {
             tiled.resize(self.size, 0);
         }
         let tiled = &mut tiled[..self.size];
-        let unreadable = read_into(Some(&self.pools), self.memory, tiled, self.partial);
-        let read = started.elapsed();
-        let hash = blake3::hash(tiled);
+        // The scanner's read of a change it reported, when it kept the bytes and they are whole.
+        let from_stash = self
+            .stashed
+            .as_ref()
+            .filter(|s| s.bytes.len() == self.size && !s.unreadable);
+        let (unreadable, read) = if let Some(s) = from_stash {
+            tiled.copy_from_slice(&s.bytes);
+            (false, started.elapsed())
+        } else {
+            let unreadable = read_into(Some(&self.pools), self.memory, tiled, self.partial);
+            (unreadable, started.elapsed())
+        };
+        let hash = from_stash.map_or_else(|| blake3::hash(tiled), |s| s.hash);
         let hashed = started.elapsed();
         let changed = self.last != Some(hash);
         let addressable = self.layout.addressable();
@@ -1938,7 +2029,7 @@ pub(super) fn prepare(jobs: &[Job]) -> Prepared {
         }
     };
     std::thread::scope(|s| {
-        for _ in 1..SYNC_THREADS.min(jobs.len()) {
+        for _ in 1..sync_threads().min(jobs.len()) {
             // Without the thread, the others (this one at least) read its share.
             let _ = std::thread::Builder::new().name("victory texture read".into()).spawn_scoped(s, work);
         }
@@ -2997,6 +3088,135 @@ mod tests {
         );
         assert_eq!(keys.len(), 0);
     }
+
+    #[test]
+    fn scanner_stashes_what_it_read_of_a_changed_texture_for_the_submission() {
+        let bytes = [7u8, 1, 2, 3, 4, 5, 6, 8];
+        let entry = (bytes.as_ptr() as usize, bytes.len(), false, 0);
+        let w = watched([(1, entry)]);
+
+        // First round reports the texture and keeps the bytes it read.
+        assert_eq!(dirty_this_round(&w), [1].into());
+        let (bytes_out, hash, unreadable) = watch_in(&w, |w| {
+            let s = w.stashed.remove(&1).expect("stashed");
+            w.stashed_bytes -= s.bytes.len();
+            (s.bytes, s.hash, s.unreadable)
+        });
+        assert_eq!(bytes_out, bytes);
+        assert_eq!(hash, blake3::hash(&bytes));
+        assert!(!unreadable);
+        assert_eq!(watch_in(&w, |w| w.stashed_bytes), 0);
+
+        // The scanner's hash is the baseline now: a second round reports nothing, and once the
+        // stash is taken nothing is kept again.
+        assert!(dirty_this_round(&w).is_empty());
+        assert!(watch_in(&w, |w| w.stashed.is_empty()));
+    }
+
+    #[test]
+    fn scanner_evicts_the_stash_past_its_cap() {
+        // Test caps: 4096 bytes total, 1024 per texture. Five 1024-byte textures: four fit.
+        let bufs: Vec<Vec<u8>> = (0..5).map(|i| vec![i as u8 + 1; 1024]).collect();
+        let w = watched(
+            bufs.iter()
+                .enumerate()
+                .map(|(i, b)| (i + 1, (b.as_ptr() as usize, b.len(), false, 0)))
+                .collect::<HashMap<_, _>>(),
+        );
+        assert_eq!(dirty_this_round(&w).len(), 5);
+        let (keys, total) = watch_in(&w, |w| (w.stashed.len(), w.stashed_bytes));
+        assert_eq!(keys, 4, "one had to go");
+        assert_eq!(total, 4096, "at the cap, not over it");
+    }
+
+    #[test]
+    fn scanner_keeps_nothing_of_a_texture_larger_than_the_per_texture_cap() {
+        let bytes = vec![9u8; 2000]; // over the 1024 test cap
+        let w = watched([(1, (bytes.as_ptr() as usize, bytes.len(), false, 0))]);
+        assert_eq!(dirty_this_round(&w), [1].into());
+        assert!(watch_in(&w, |w| w.stashed.is_empty()));
+    }
+
+    fn linear_layout() -> Layout {
+        use victory_formats::texture::{Desc, Swizzle};
+        Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 4,
+            height: 4,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap()
+    }
+
+    fn job_with(memory: usize, size: usize, last: Option<blake3::Hash>, stashed: Option<Stashed>) -> Job {
+        Job {
+            key: 1,
+            serial: 0,
+            pools: std::sync::Arc::new(PoolTable::default()),
+            memory,
+            size,
+            format: 28, // R8G8B8A8_UNORM
+            dimension: Dimension::Tex2d,
+            layout: linear_layout(),
+            last,
+            uploaded_mips: 0,
+            partial: false,
+            skip: 0,
+            stashed,
+        }
+    }
+
+    #[test]
+    fn a_job_with_stashed_bytes_detiles_them_without_reading_memory() {
+        // The memory address is bogus: any read would fail, so getting the stashed content's
+        // hash out proves no read happened.
+        let bytes = vec![0xABu8; 64];
+        let hash = blake3::hash(&bytes);
+        let job = job_with(0xdead_beef, bytes.len(), None, Some(Stashed { bytes, hash, unreadable: false }));
+        let mut tiled = Vec::new();
+        let r = job.read(&mut tiled);
+        assert_eq!(r.hash, hash);
+        assert!(!r.unreadable);
+        assert_eq!(tiled[..r.bytes], [0xABu8; 64][..]);
+        // Changed (last is None) and not blank: detiled.
+        assert!(r.levels.is_some());
+    }
+
+    #[test]
+    fn a_job_with_unreadable_stash_reads_memory_instead() {
+        let bytes = vec![1u8; 64];
+        let job = job_with(0xdead_beef, bytes.len(), None, Some(Stashed { bytes, hash: blake3::hash(&[1u8; 64]), unreadable: true }));
+        let mut tiled = Vec::new();
+        let r = job.read(&mut tiled);
+        // The bogus address read fails: unreadable, zeros counted.
+        assert!(r.unreadable);
+    }
+
+    #[test]
+    fn a_blank_stashed_texture_needs_no_detile() {
+        let bytes = vec![0u8; 64];
+        let hash = blake3::hash(&bytes);
+        let job = job_with(0xdead_beef, bytes.len(), None, Some(Stashed { bytes, hash, unreadable: false }));
+        let mut tiled = Vec::new();
+        let r = job.read(&mut tiled);
+        assert!(r.blank);
+        // Never uploaded and blank: no levels to upload.
+        let (levels, mips, result) = r.levels.expect("detiled");
+        assert!(levels.is_empty() && mips == 0 && result.is_ok());
+    }
+
+    #[test]
+    fn sync_threads_use_the_hosts_cores_but_leave_some_for_the_title() {
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let want = n.saturating_sub(2).clamp(2, 16);
+        assert_eq!(sync_threads(), want);
+        assert!(sync_threads() >= 2);
+    }
 }
 
 #[cfg(test)]
@@ -3043,4 +3263,5 @@ mod drop_top_mip_tests {
         assert_eq!(host_mip_range(1, 1, 2, 11), (0, 1));
         assert_eq!(host_mip_range(4, 3, 2, 11), (2, 3));
     }
+
 }
