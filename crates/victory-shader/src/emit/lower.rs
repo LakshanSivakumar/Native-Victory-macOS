@@ -6717,7 +6717,11 @@ impl<'a> Lower<'a> {
                     || un.starts_with("buffer_store_format")
                 {
                     (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                } else if *idxen
+                    && (format.is_none() || !self.x.res.unstrided.contains(&at))
+                    && stride >= 4
+                    && stride.is_multiple_of(4)
+                {
                     (12 | u, stride)
                 } else {
                     (11 | u, 0)
@@ -7653,26 +7657,39 @@ impl<'a> Lower<'a> {
         x
     }
 
-    /// `channels` channels of the element at byte `off` of raw buffer `h`,
-    /// converted from the GFX10 buffer format `format` as the hardware's
-    /// typed loads do (channels past the format's read 0, 0, 0, 1).
+    /// `channels` channels of the element at byte `off` of raw or structured
+    /// buffer `h` (`index` is `Some` for structured handles), converted from
+    /// the GFX10 buffer format `format` as the hardware's typed loads do
+    /// (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
     // bytes or more as dword-aligned.
-    fn format_load(&mut self, h: V, off: V, tail: Option<Tail>, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    fn format_load(
+        &mut self,
+        h: V,
+        index: Option<V>,
+        off: V,
+        tail: Option<Tail>,
+        format: u8,
+        channels: u32,
+    ) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
             let mask = l.s.m.i8((1u8 << n) - 1);
+            let (c0, c1) = match index {
+                Some(ix) => (ix, at),
+                None => (at, u),
+            };
             let r = l.s.op(
                 c,
                 "rawBufferLoad.f32",
                 Attr::ReadOnly,
                 l.s.t.res_ret,
                 139,
-                &[h, at, u, mask, align],
+                &[h, c0, c1, mask, align],
             );
             (0..n)
                 .map(|k| {
@@ -13463,7 +13480,7 @@ impl<'a> Lower<'a> {
                     words,
                 },
                 Some(ix),
-            ) if address.param < self.x.native.layout.len() && !typed => {
+            ) if address.param < self.x.native.layout.len() && (!typed || format.is_some()) => {
                 if bits >> 30 != 0 || words[0] != u32::MAX {
                     return Err("a root view indexed with swizzling or a record limit");
                 }
@@ -13531,7 +13548,7 @@ impl<'a> Lower<'a> {
         // stride) names none: the view's heap index is its table offset plus
         // the load's, in the same heap.
         let index = match index {
-            Some(i) if used.is_none_or(|u| u.stride == 0) && !typed => {
+            Some(i) if used.is_none_or(|u| u.stride == 0) && (!typed || format.is_some()) => {
                 let stride = self.view_stride(src)?;
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, rows, off);
@@ -13611,9 +13628,6 @@ impl<'a> Lower<'a> {
             // The field of the dword holding it, by two atomics on that dword
             // (clear, then set): other lanes' fields in it are left alone.
             // shortcut: the field is taken not to cross a dword.
-            if index.is_some() {
-                return Err("a byte or half buffer store by index");
-            }
             let d = data.as_ref().ok_or("buffer store data")?;
             let x = self.vgprs(inst, d, 1)?[0];
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
@@ -13626,15 +13640,31 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
+            let (h, coords, mark) = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    let h = self.handle(site, src, false, (12 | 0x1000, stride))?;
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                    let mark = self.s.m.bin(self.cur, Bin::Add, row, at);
+                    (h, [index, at, iu], mark)
+                }
+                None => {
+                    let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
+                    (h, [at, iu, iu], at)
+                }
+            };
             let begin = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
-                let args = [h, self.s.m.i32(op), at, iu, iu, v];
+                let args = [h, self.s.m.i32(op), coords[0], coords[1], coords[2], v];
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
             }
-            self.mark_view_write(h, at, 4, None);
+            self.mark_view_write(h, mark, 4, None);
             self.end_guarded(begin, &[]);
             return Ok(());
         }
@@ -13756,16 +13786,27 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(f) = *format {
-            if index.is_some() {
-                return Err("a typed-format load by index");
-            }
             let bytes = buffer_format(f).map_or(4, |(bits, _)| bits.iter().sum::<u32>() / 8);
-            let tail = self.raw_view_tail(src, off, bytes, false);
-            let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
+            let (h, coord0, off, tail) = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < bytes.max(4) || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    (h, Some(index), off, None)
+                }
+                None => {
+                    let tail = self.raw_view_tail(src, off, bytes, false);
+                    let (h, off) =
+                        self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
+                    (h, None, off, tail)
+                }
+            };
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let mut xs = self.format_load(h, off, tail, f, count)?;
+            let mut xs = self.format_load(h, coord0, off, tail, f, count)?;
             if d16 {
                 xs = self.d16_channels(f, xs)?;
             }
@@ -13777,8 +13818,40 @@ impl<'a> Lower<'a> {
         if let Some((width, signed)) = sub {
             // The dword holding the field, as `global_load_ubyte` and kin.
             // shortcut: the field is taken not to cross a dword.
-            if index.is_some() {
-                return Err("a byte or half buffer load by index");
+            if let Some(index) = index {
+                let stride = used.map_or(0, |u| u.stride);
+                if stride < 4 || !stride.is_multiple_of(4) {
+                    return Err("a structured buffer of unknown stride");
+                }
+                let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+                let at = self.s.m.bin(c, Bin::And, off, not3);
+                let h = self.handle(site, src, false, (12 | u, stride))?;
+                let c = self.cur;
+                let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, index, at, mask, align],
+                );
+                let w = self.s.m.extract(c, r, 0);
+                let w = self.as_int(w);
+                let byte = self.s.m.bin(c, Bin::And, off, three);
+                let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+                let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                let left = self.s.m.i32(32 - width);
+                let x = self.s.m.bin(c, Bin::Shl, x, left);
+                let x = self
+                    .s
+                    .m
+                    .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
+                let Some(Operand::Vector { reg, .. }) = *data else {
+                    return Err("a buffer result");
+                };
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
             }
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
