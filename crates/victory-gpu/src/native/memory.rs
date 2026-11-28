@@ -245,6 +245,79 @@ impl PoolTable {
         std::mem::take(&mut self.lock().released)
     }
 
+    /// Mapped `(pool.id, offset, len)` chunks covering `[addr, addr + len)`, coalescing adjacent
+    /// contiguous chunks in the same pool. Unmapped gaps are skipped cleanly.
+    pub fn pool_ranges(&self, addr: u64, len: u64) -> Vec<(usize, u64, u64)> {
+        let Ok(addr) = usize::try_from(addr) else {
+            return Vec::new();
+        };
+        let Ok(len) = usize::try_from(len) else {
+            return Vec::new();
+        };
+        let Some(end) = addr.checked_add(len) else {
+            return Vec::new();
+        };
+        if len == 0 {
+            return Vec::new();
+        }
+        let g = self.lock();
+        let start_map = g
+            .maps
+            .range(..addr)
+            .next_back()
+            .filter(|&(&a, m)| a + m.len > addr)
+            .map(|(&a, _)| a)
+            .unwrap_or(addr);
+        let mut out: Vec<(usize, u64, u64)> = Vec::new();
+        for (&a, m) in g.maps.range(start_map..end) {
+            if !g.pools.contains_key(&m.pool) {
+                continue;
+            }
+            let lo = addr.max(a);
+            let hi = end.min(a + m.len);
+            if lo < hi {
+                let off = (m.offset + (lo - a)) as u64;
+                let clen = (hi - lo) as u64;
+                if let Some((pid, last_off, last_len)) = out.last_mut()
+                    && *pid == m.pool
+                    && *last_off + *last_len == off
+                {
+                    *last_len += clen;
+                } else {
+                    out.push((m.pool, off, clen));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether any byte in `[addr, addr + len)` is currently mapped in a pool.
+    pub fn any_mapped(&self, addr: u64, len: u64) -> bool {
+        let Ok(addr) = usize::try_from(addr) else {
+            return false;
+        };
+        let Ok(len) = usize::try_from(len) else {
+            return false;
+        };
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        if len == 0 {
+            return false;
+        }
+        let g = self.lock();
+        if g.maps
+            .range(..addr)
+            .next_back()
+            .is_some_and(|(&a, m)| a + m.len > addr && g.pools.contains_key(&m.pool))
+        {
+            return true;
+        }
+        g.maps
+            .range(addr..end)
+            .any(|(_, m)| g.pools.contains_key(&m.pool))
+    }
+
     /// Reads `[addr, addr + out.len())` across the title-address spans mapped in this table,
     /// coalescing adjacent mappings (even across different pools or out-of-order physical pages)
     /// into one `read_span` call each and zeroing unmapped gaps without calling `read_span` or

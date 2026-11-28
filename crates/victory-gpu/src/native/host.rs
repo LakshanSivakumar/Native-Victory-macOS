@@ -1092,6 +1092,29 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
+    /// Number of leading title mip levels left off `key`'s host texture.
+    pub fn dropped_count(&self, key: usize) -> usize {
+        self.dropped.borrow().get(&key).map_or(0, |&(d, _)| d)
+    }
+
+    /// Replaces `key`'s host texture and dropped mip range (for example when unmapped fine mips
+    /// become mapped), re-mirroring every heap entry currently showing `key`.
+    pub fn upgrade_texture(&self, key: usize, texture: &Rc<B::Texture>, dropped: usize, host_mips: usize) {
+        self.set_dropped_levels(key, dropped, host_mips);
+        self.register_texture(key, texture);
+        let mut handles = Vec::new();
+        for heap in self.heaps.borrow().iter() {
+            let step = Self::step(heap.kind);
+            for index in heap.take_entries(key) {
+                heap.shows(index, None);
+                handles.push(heap.start + (index as u64 * step));
+            }
+        }
+        for handle in handles {
+            let _ = self.mirror(handle);
+        }
+    }
+
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
         self.evicted.borrow_mut().remove(&key);
         self.resources

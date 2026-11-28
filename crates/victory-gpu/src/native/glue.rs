@@ -2409,8 +2409,8 @@ fn subresource_mip_slice(info: &super::textures::TextureInfo, subresource: u32) 
 /// made without (`VICTORY_TEXTURE_DROP_TOP_MIP`). Host level `mip - dropped` has the title level's
 /// size. Shortcut: a copy to or from a dropped level is skipped, not scaled; the switch is off by
 /// default.
-fn host_mip(info: &super::textures::TextureInfo, mip: usize) -> Option<usize> {
-    mip.checked_sub(info.dropped_levels())
+fn host_mip(dropped: usize, mip: usize) -> Option<usize> {
+    mip.checked_sub(dropped)
 }
 
 fn mip_dims(info: &super::textures::TextureInfo, mip: usize) -> [usize; 3] {
@@ -2569,9 +2569,10 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
         if !copy_formats(sf, df) {
             return false;
         }
+        let (src_drop, dst_drop) = (t.host.dropped_count(src as usize), t.host.dropped_count(dst as usize));
         for slice in 0..slices {
             for mip in 0..mips {
-                let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, mip), host_mip(&dst_info, mip)) else {
+                let (Some(src_mip), Some(dst_mip)) = (host_mip(src_drop, mip), host_mip(dst_drop, mip)) else {
                     continue;
                 };
                 let s = mip_dims(&src_info, mip);
@@ -2641,14 +2642,17 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
-            let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, src_mip), host_mip(&dst_info, dst_mip)) else {
-                return true;
-            };
             with_list(this, |t, l| {
                 let (Some(src_tex), Some(dst_tex)) =
                     (t.texture_of(src.resource as usize), t.texture_of(dst.resource as usize))
                 else {
                     return false;
+                };
+                let (Some(src_mip), Some(dst_mip)) = (
+                    host_mip(t.host.dropped_count(src.resource as usize), src_mip),
+                    host_mip(t.host.dropped_count(dst.resource as usize), dst_mip),
+                ) else {
+                    return true;
                 };
                 l.list.copy_texture_region(
                     &src_tex,
@@ -2694,9 +2698,6 @@ pub(crate) fn copy_texture_region(
             if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
                 return false;
             }
-            let Some(dst_mip) = host_mip(&dst_info, dst_mip) else {
-                return true;
-            };
             let Some((src_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(src.resource, &src.footprint, src_at, size_u32)
             else {
@@ -2705,6 +2706,9 @@ pub(crate) fn copy_texture_region(
             with_list(this, |t, l| {
                 let Some(dst_tex) = t.texture_of(dst.resource as usize) else {
                     return false;
+                };
+                let Some(dst_mip) = host_mip(t.host.dropped_count(dst.resource as usize), dst_mip) else {
+                    return true;
                 };
                 l.list.copy_buffer_to_texture(
                     src_addr,
@@ -2738,9 +2742,6 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
-            let Some(src_mip) = host_mip(&src_info, src_mip) else {
-                return true;
-            };
             let size_u32 = size.map(|v| v as u32);
             let Some((dst_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(dst.resource, &dst.footprint, origin, size_u32)
@@ -2750,6 +2751,9 @@ pub(crate) fn copy_texture_region(
             with_list(this, |t, l| {
                 let Some(src_tex) = t.texture_of(src.resource as usize) else {
                     return false;
+                };
+                let Some(src_mip) = host_mip(t.host.dropped_count(src.resource as usize), src_mip) else {
+                    return true;
                 };
                 l.list.copy_texture_to_buffer(
                     &src_tex,

@@ -2775,7 +2775,7 @@ fn textures_over_one_memory_each_hold_a_copy_of_their_own() {
     let id = crate::resource::texture_info(d).unwrap();
     t.texture_created(d as usize, id.clone());
     assert!(t.realize(d as usize));
-    assert_eq!(t.budget.live, counted + id.size as u64);
+    assert_eq!(t.budget.live, counted, "VA alias over same pool offset shares one host texture");
     assert_eq!(t.memory_under_copies(), (under, 0), "one memory at two addresses");
 }
 
@@ -2873,7 +2873,7 @@ fn a_texture_sharing_a_released_copy_takes_it_over() {
 fn a_sync_checks_covered_copies_a_share_at_a_time() {
     let Some((mut t, _pool)) = budget_title() else { return };
     // Keys with no copy any more: a check drops them from the set.
-    t.covered.extend(1..=1000);
+    t.covered.extend((1..=1000).map(|k| (k, 0)));
     t.give_up_covered();
     assert_eq!(t.covered.len(), 1000 - crate::native::textures::COVERED_CHECKS, "one share checked");
     t.give_up_covered();
@@ -2917,7 +2917,7 @@ fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
     assert!(t.host.knows(shown), "an entry still shows it");
     assert!(t.host.knows(new) && t.host.knows(apart));
     assert!(t.host.knows(written), "the GPU's copy stays");
-    assert!(!t.covered.contains(&written), "and is not even marked");
+    assert!(!t.covered.contains_key(&written), "and is not even marked");
     show(&mut t, &views, apart);
     let _ = t.sync_jobs();
     assert!(!t.host.knows(shown), "given up once its entry shows another");
@@ -2930,4 +2930,195 @@ fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
     assert!(t.host.knows(new), "a copy coming back covers nothing anew");
     assert_eq!(draw_sampling(&mut t, &pool, old, 4), [0x44, 0, 0, 0x44]);
     drop(views);
+}
+
+/// Over the texture budget, a covered placed copy whose stale heap entry was never overwritten
+/// stays while GPU work queued before it was covered is still in flight, and is evicted once that
+/// work finishes (clearing the stale heap entry). If a later draw's table names it, it comes back.
+#[test]
+fn covered_placed_copy_shown_by_heap_is_evicted_over_budget_after_gpu_retires() {
+    use std::rc::Rc;
+    use victory_backend::backend::ComputeBackend;
+    let Some((mut t, pool)) = budget_title() else { return };
+    t.set_texture_budget(1);
+    let shown = budget_placed(&mut t, &pool, 0x4000, 32, 0x33);
+    let views = vec![0u32; 8];
+    show(&mut t, &views, shown);
+    t.sync_textures();
+
+    // Simulate an in-flight GPU submission before `shown` is covered.
+    let fence = Rc::new(t.host.backend.create_fence(0).unwrap());
+    t.gpu_epoch = 1;
+    t.queue_fences.insert(1, (fence.clone(), 1));
+
+    let _ = budget_placed(&mut t, &pool, 0x4800, 16, 0x33);
+    let _ = t.sync_jobs();
+    assert!(t.host.knows(shown), "kept while prior GPU work is still in flight");
+
+    // Once that epoch finishes on the GPU, the stale heap entry is cleared and the copy goes.
+    t.host.backend.signal(&fence, 1);
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(shown) && t.host.is_evicted(shown), "evicted once prior GPU work retires");
+    assert!(t.host.cleared() > 0, "stale heap entry was cleared");
+    assert_eq!(draw_sampling(&mut t, &pool, shown, 4), [0x33, 0, 0, 0x33]);
+    drop(views);
+}
+
+/// A placed copy covered by another placement at a different title virtual address mapped to the
+/// same physical pool pages is marked covered and evicted once unused (or retired under budget).
+#[test]
+fn a_placed_copy_covered_at_another_va_in_same_pool_is_evicted() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let info = PoolInfo {
+        id: 9141,
+        base: pool.mem.primary as usize,
+        len: pool.mem.len,
+        memory_entry: None,
+    };
+    let alias2 = pool.mem.primary as u64;
+    t.host.memory().mapped(alias2 as usize, pool.mem.len, &info, 0);
+
+    let old = budget_placed(&mut t, &pool, 0, 32, 0x44);
+    assert!(t.host.knows(old));
+
+    let res = crate::resource::test_texture_at(alias2 + 0x800, (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
+    let words = crate::resource::texture_desc(res).unwrap();
+    let tex_info = crate::resource::placed_info(alias2 + 0x800, &words).unwrap();
+    let new = crate::native::textures::placed_key(alias2 + 0x800, &words);
+    t.texture_placed(alias2 + 0x800, new, 9141, tex_info.size);
+    t.texture_created(new, tex_info);
+    assert!(t.realize(new));
+
+    let _ = t.sync_jobs();
+    assert!(
+        !t.host.knows(old) && t.host.is_evicted(old),
+        "covered across VAs in the same pool: given up"
+    );
+    assert!(t.host.knows(new));
+}
+
+/// If a covered placed copy that was evicted is re-realized later (for example via a descriptor
+/// mirror) while an overlapping placement is still live, it is marked covered again and evicted
+/// once its epoch retires rather than staying resident alongside the replacement.
+#[test]
+fn revived_covered_placed_copy_is_re_covered_and_evicted() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    t.set_texture_budget(1);
+    let old = budget_placed(&mut t, &pool, 0, 32, 0x44);
+    let new = budget_placed(&mut t, &pool, 0x800, 16, 0x44);
+    let views = vec![0u32; 8];
+    show(&mut t, &views, new);
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(old) && t.host.is_evicted(old), "initially covered and evicted");
+    assert!(t.host.knows(new));
+
+    // Re-realize `old` (simulating a stale descriptor mirror or table naming it again).
+    assert!(t.realize(old));
+    assert!(t.host.knows(old));
+    assert!(t.covered.contains_key(&old), "marked covered again while `new` is live");
+
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(old) && t.host.is_evicted(old), "evicted again after epoch");
+    assert!(t.host.knows(new));
+    drop(views);
+}
+
+/// Sampled 2D textures whose leading fine mips are unmapped in the pool table omit those unmapped
+/// levels from the host texture, and upgrade in place once those mips become mapped.
+#[test]
+fn unmapped_leading_mips_are_trimmed_until_mapped() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 9, 28, Swizzle::SW_64KB_D.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let mip0_off = info.layout.mips[0].offset as usize;
+    let slice_size = info.layout.slice_size as usize;
+    assert!(mip0_off < slice_size && mip0_off > 0);
+    let page = page_size().max(4096);
+    let tail_va = pool.va(0) as usize;
+    let pool_info = PoolInfo {
+        id: 9141,
+        base: pool.mem.primary as usize,
+        len: pool.mem.len,
+        memory_entry: None,
+    };
+    // Keep only the coarse tail mapped (`[0..mip0_off)` rounded down to a page), leaving mip 0 unmapped.
+    let mapped_tail = (mip0_off / page).max(1) * page;
+    assert!(mapped_tail <= mip0_off, "need coarse tail to fit before mip 0");
+    t.host.memory().unmapped(tail_va, pool.mem.len);
+    t.host.memory().mapped(tail_va, mapped_tail, &pool_info, 0);
+
+    let key = res as usize;
+    t.texture_created(key, info.clone());
+    assert!(t.realize(key));
+    assert!(t.trimmed.contains(&key), "trimmed while fine mip pages are unmapped");
+    let small = t.texture_of(key).unwrap();
+    assert!(t.host.dropped_count(key) >= 1, "host texture drops unmapped leading mip(s)");
+
+    // Map the whole texture range into the pool: the next sync upgrades the host texture in place.
+    t.host.memory().mapped(tail_va, slice_size.max(pool.mem.len), &pool_info, 0);
+    let _ = t.sync_jobs();
+    let full = t.texture_of(key).unwrap();
+    assert!(!std::rc::Rc::ptr_eq(&small, &full), "texture upgraded after fine mips mapped");
+    assert_eq!(t.host.dropped_count(key), info.dropped_levels());
+    assert!(!t.trimmed.contains(&key));
+    let expected_live = if info.dropped_levels() > 0 {
+        crate::native::textures::host_texture_bytes(&info.host_desc().unwrap())
+    } else {
+        info.size as u64
+    };
+    assert_eq!(t.budget.live, expected_live);
+}
+
+#[test]
+fn identical_textures_across_va_aliases_share_one_host_texture() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let key1 = budget_texture(&mut t, &pool, 0, 0, 0x31);
+    let info1 = t.textures[&key1].info.clone();
+    let va1 = pool.va(0) as usize;
+    let (pool_info, _) = t.host.memory().resolve(va1 as u64, 1).unwrap();
+    let va2 = 0x2_0000_0000usize;
+    t.host.memory().mapped(va2, pool.mem.len, &pool_info, 0);
+
+    let mut info2 = info1.clone();
+    info2.memory = va2 as *const u8;
+    let key2 = 0xDEAD_BEEFusize;
+    t.texture_created(key2, info2);
+    assert!(t.realize(key2));
+
+    let tex1 = t.texture_of(key1).unwrap();
+    let tex2 = t.texture_of(key2).unwrap();
+    assert!(std::rc::Rc::ptr_eq(&tex1, &tex2), "VA alias over same pool offset shares host texture");
+    assert_eq!(t.copies_of.len(), 1);
+    assert_eq!(t.budget.live, t.textures[&key1].host_bytes);
+}
+
+#[test]
+fn cold_retired_heap_shown_texture_is_evicted_under_budget_and_realized_again() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let cold = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let active = budget_texture(&mut t, &pool, 0x4000, 0, 0x22);
+    t.sync_textures();
+
+    let records = [0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let _heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), cold as _, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    crate::descriptor::create_srv(std::ptr::null(), active as _, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+
+    // Advance retired_epoch past `cold`, while `active` is stamped at the newer epoch.
+    t.gpu_epoch = 2;
+    t.retired_epoch = 2;
+    t.textures.get_mut(&active).unwrap().last_named_epoch = 2;
+    t.textures.get_mut(&cold).unwrap().last_named_epoch = 1;
+
+    t.set_texture_budget(t.textures[&active].host_bytes);
+    t.keep_to_budget();
+    assert!(!t.host.knows(cold), "cold retired heap-shown texture is evicted");
+    assert!(t.host.knows(active), "active heap-shown texture stays resident");
+
+    assert!(t.realize(cold), "evicted cold texture can be realized again");
 }
