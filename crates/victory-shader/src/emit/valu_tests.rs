@@ -2025,3 +2025,33 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[test]
+fn cvt_f32_f64_converts_doubles_on_the_gpu() {
+    // v2:v3 hold root constants s1:s2, i.e. the double's (lo, hi) bits.
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(2))]); // v_cvt_f32_f64 v0, v2
+    let cases: [[u32; 4]; 10] = [
+        [0, 0, 0x3FF0_0000, 0],              // 1.0
+        [0, 0, 0xBFF0_0000, 0],              // -1.0
+        [0, 0x0000_0001, 0x3FF0_0000, 0],    // 1.0 + 2^-52 (rounds to 1.0)
+        [0, 0xFFFF_FFFF, 0x3FF0_0000, 0],    // just below 1.0
+        [0, 0, 0x7F80_0000, 0],              // +inf
+        [0, 0, 0xFF80_0000, 0],              // -inf
+        [0, 0xFFFF_FFFF, 0x7F7F_FFFF, 0],    // max float exactly
+        [0, 0xFFFF_FFFF, 0x7F80_0000 - 1, 0],// max double (overflows to inf)
+        [0, 0x0000_0001, 0x0000_0000, 0],    // min subnormal double -> 0
+        [0, 0x0000_0000, 0x8010_0000, 0],    // -min normal double -> -2^-126
+    ];
+    run_cases(&shader, &cases, |backend, i, input, got| {
+        let bits = u64::from(input[2]) << 32 | u64::from(input[1]);
+        let want = (f64::from_bits(bits) as f32).to_bits();
+        let dexp = (bits >> 52) & 0x7FF;
+        let mant = bits & ((1u64 << 52) - 1);
+        if dexp == 0x7FF && mant != 0 {
+            assert_eq!(got & 0x7F80_0000, 0x7F80_0000, "{backend} case {i}: nan");
+            assert_ne!(got & 0x7F_FFFF, 0, "{backend} case {i}: nan");
+        } else {
+            assert_eq!(got, want, "{backend} case {i}: bits {bits:#x}");
+        }
+    });
+}

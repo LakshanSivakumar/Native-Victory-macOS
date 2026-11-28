@@ -3268,3 +3268,33 @@ fn a_saved_exec_mask_joined_with_data_names_the_host_lanes_case() {
         "{what}"
     );
 }
+
+// =========================================================================
+// v_cvt_f32_f64 lowers (emulated in 64-bit integer ops; see lower.rs)
+// =========================================================================
+
+/// VOP1 `op vdst, src0` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
+const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
+    0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+#[test]
+fn cvt_f32_f64_lowers_in_pixel_shader() {
+    // v_mov_b32 v1, 0.5
+    // v_mov_b32 v2, 1.0
+    // v_cvt_f32_f64 v0, v1   (reads the v1:v2 pair as a double)
+    // exp mrt0 v0, v0, v0, v0 done vm
+    // s_endpgm
+    let code = [
+        0x7E02_02F0,
+        0x7E04_02F2,
+        vop1(0x00F, 0, 256 + 1), // v_cvt_f32_f64 v0, v1
+        0xF800_180F,
+        0x0000_0000,
+        0xBF81_0000,
+    ];
+    for wave32_host in [false, true] {
+        lower_ps(&code, false, vec![], vec![], 0, 0, vec![], wave32_host)
+            .unwrap_or_else(|e| panic!("v_cvt_f32_f64, wave32_host={wave32_host}: {e}"));
+    }
+}

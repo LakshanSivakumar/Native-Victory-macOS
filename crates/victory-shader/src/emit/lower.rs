@@ -9611,6 +9611,115 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
             }
+            "v_cvt_f32_f64" if v.opsel == 0 => {
+                // No f64 in the IR or in Metal: emulate in 64-bit integer ops.
+                // The source is a register pair holding IEEE-754 double bits;
+                // the result is the f32 bits, round-to-nearest-even (MODE's
+                // default). The steps mirror `cvt_f32_f64_reference`, pinned
+                // against `f64 as f32` by `cvt_f64_tests` at the end of this file.
+                let x = self.src64(inst, 0)?;
+                let i64t = self.s.m.int(64);
+                let m = &mut self.s.m;
+                let k63 = m.int_const(i64t, 63);
+                let sign = m.bin(c, Bin::LShr, x, k63);
+                let k52 = m.int_const(i64t, 52);
+                let t52 = m.bin(c, Bin::LShr, x, k52);
+                let k7ff = m.int_const(i64t, 0x7FF);
+                let dexp = m.bin(c, Bin::And, t52, k7ff);
+                let kmant = m.int_const(i64t, (1i64 << 52) - 1);
+                let mant = m.bin(c, Bin::And, x, kmant);
+                let is_special = m.cmp(c, pred::EQ, dexp, k7ff);
+                let zero = m.int_const(i64t, 0);
+                let mant_zero = m.cmp(c, pred::EQ, mant, zero);
+                let is_inf = m.bin(c, Bin::And, is_special, mant_zero);
+                let mant_nz = m.cmp(c, pred::NE, mant, zero);
+                let is_nan = m.bin(c, Bin::And, is_special, mant_nz);
+                let k31 = m.int_const(i64t, 31);
+                let sign31 = m.bin(c, Bin::Shl, sign, k31);
+                let kinf = m.int_const(i64t, 0x7F80_0000);
+                let inf_bits = m.bin(c, Bin::Or, sign31, kinf);
+                // NaN payload is unspecified: keep the top mantissa bits, quiet.
+                let k29 = m.int_const(i64t, 29);
+                let mtop = m.bin(c, Bin::LShr, mant, k29);
+                let k7fffff = m.int_const(i64t, 0x7F_FFFF);
+                let mtop = m.bin(c, Bin::And, mtop, k7fffff);
+                let kquiet = m.int_const(i64t, 0x40_0000);
+                let payload = m.bin(c, Bin::Or, mtop, kquiet);
+                let nan_bits = m.bin(c, Bin::Or, inf_bits, payload);
+                // dexp == 0: zero or a double subnormal, which is below half
+                // the smallest float subnormal and rounds to signed zero.
+                let is_zero = m.cmp(c, pred::EQ, dexp, zero);
+                // Normal double: 53-bit significand sig, float exponent fe = dexp - 896.
+                let k1 = m.int_const(i64t, 1);
+                let lead = m.bin(c, Bin::Shl, k1, k52);
+                let sig = m.bin(c, Bin::Or, lead, mant);
+                let k896 = m.int_const(i64t, 896);
+                let fe = m.bin(c, Bin::Sub, dexp, k896);
+                let k255 = m.int_const(i64t, 255);
+                let overflow = m.cmp(c, pred::SGE, fe, k255);
+                // Normal float (fe >= 1): 24-bit q = round(sig >> 29), low 23 kept.
+                let q = m.bin(c, Bin::LShr, sig, k29);
+                let k29m = m.int_const(i64t, (1i64 << 29) - 1);
+                let rem = m.bin(c, Bin::And, sig, k29m);
+                let half = m.int_const(i64t, 1i64 << 28);
+                let rem_gt = m.cmp(c, pred::IUGT, rem, half);
+                let rem_eq = m.cmp(c, pred::EQ, rem, half);
+                let qodd = m.bin(c, Bin::And, q, k1);
+                let qodd = m.cmp(c, pred::NE, qodd, zero);
+                let tie = m.bin(c, Bin::And, rem_eq, qodd);
+                let round = m.bin(c, Bin::Or, rem_gt, tie);
+                let round = m.cast(c, Cast::ZExt, round, i64t);
+                let q = m.bin(c, Bin::Add, q, round);
+                let k1_24 = m.int_const(i64t, 1 << 24);
+                let carry = m.cmp(c, pred::EQ, q, k1_24);
+                let carry64 = m.cast(c, Cast::ZExt, carry, i64t);
+                let fe_n = m.bin(c, Bin::Add, fe, carry64);
+                let qmask = m.bin(c, Bin::And, q, k7fffff);
+                let q_n = m.select(c, carry, zero, qmask);
+                let k23 = m.int_const(i64t, 23);
+                let fe_sh = m.bin(c, Bin::Shl, fe_n, k23);
+                let fe_q = m.bin(c, Bin::Or, fe_sh, q_n);
+                let normal_bits = m.bin(c, Bin::Or, sign31, fe_q);
+                let overflow_n = m.cmp(c, pred::SGE, fe_n, k255);
+                // Subnormal float (fe <= 0): q = round(sig >> s), s = 926 - dexp,
+                // clamped below 64 so the shift is defined; q <= 2^23 and bit 23
+                // spilling into the exponent field is the minimum normal.
+                let k926 = m.int_const(i64t, 926);
+                let s = m.bin(c, Bin::Sub, k926, dexp);
+                let k64 = m.int_const(i64t, 64);
+                let s_lt64 = m.cmp(c, pred::IULT, s, k64);
+                let k63v = m.int_const(i64t, 63);
+                let s = m.select(c, s_lt64, s, k63v);
+                let qs = m.bin(c, Bin::LShr, sig, s);
+                let sh1 = m.bin(c, Bin::Shl, k1, s);
+                let smask = m.bin(c, Bin::Sub, sh1, k1);
+                let rems = m.bin(c, Bin::And, sig, smask);
+                let k1m = m.int_const(i64t, 1);
+                let sm1 = m.bin(c, Bin::Sub, s, k1m);
+                let halfs = m.bin(c, Bin::Shl, k1, sm1);
+                let rems_gt = m.cmp(c, pred::IUGT, rems, halfs);
+                let rems_eq = m.cmp(c, pred::EQ, rems, halfs);
+                let qsodd = m.bin(c, Bin::And, qs, k1);
+                let qsodd = m.cmp(c, pred::NE, qsodd, zero);
+                let tie_s = m.bin(c, Bin::And, rems_eq, qsodd);
+                let round_s = m.bin(c, Bin::Or, rems_gt, tie_s);
+                let round_s = m.cast(c, Cast::ZExt, round_s, i64t);
+                let qs = m.bin(c, Bin::Add, qs, round_s);
+                let sub_bits = m.bin(c, Bin::Or, sign31, qs);
+                let k1f = m.int_const(i64t, 1);
+                let is_normal = m.cmp(c, pred::SGE, fe, k1f);
+                let body = m.select(c, is_normal, normal_bits, sub_bits);
+                let any_overflow = m.bin(c, Bin::Or, overflow, overflow_n);
+                let body = m.select(c, any_overflow, inf_bits, body);
+                let body = m.select(c, is_zero, sign31, body);
+                let body = m.select(c, is_inf, inf_bits, body);
+                let body = m.select(c, is_nan, nan_bits, body);
+                let i32t = self.s.t.i32;
+                let r = m.cast(c, Cast::Trunc, body, i32t);
+                let f32t = self.s.t.f32;
+                let f = m.cast(c, Cast::Bitcast, r, f32t);
+                float(self, f)
+            }
             "v_cvt_f32_f16" if v.opsel == 0 => {
                 let a = s(self, 0)?;
                 let r = self
@@ -17639,5 +17748,96 @@ mod tests {
             "deep SGPR phi chain took {:?}",
             started.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod cvt_f64_tests {
+    /// The reference for the `v_cvt_f32_f64` arm in `valu_op`: the double's
+    /// bits as u64 in, the f32 bits out, round-to-nearest-even. The arm emits
+    /// exactly these steps as 64-bit integer ops. Pinned against `f64 as f32`.
+    fn cvt_f32_f64_reference(x: u64) -> u32 {
+        let sign = x >> 63;
+        let dexp = (x >> 52) & 0x7FF;
+        let mant = x & ((1u64 << 52) - 1);
+        if dexp == 0x7FF {
+            if mant == 0 {
+                return ((sign << 31) | 0x7F80_0000) as u32;
+            }
+            let payload = (((mant >> 29) & 0x7F_FFFF) | 0x40_0000) as u32;
+            return ((sign << 31) | 0x7F80_0000 | u64::from(payload)) as u32;
+        }
+        if dexp == 0 {
+            return (sign << 31) as u32;
+        }
+        let sig = (1u64 << 52) | mant;
+        let fe = dexp as i64 - 896;
+        if fe >= 255 {
+            return ((sign << 31) | 0x7F80_0000) as u32;
+        }
+        if fe >= 1 {
+            let mut q = sig >> 29;
+            let rem = sig & ((1u64 << 29) - 1);
+            let half = 1u64 << 28;
+            if rem > half || (rem == half && q & 1 != 0) {
+                q += 1;
+            }
+            let (q, fe) = if q == 1 << 24 { (0, fe + 1) } else { (q & 0x7F_FFFF, fe) };
+            if fe >= 255 {
+                return ((sign << 31) | 0x7F80_0000) as u32;
+            }
+            return ((sign << 31) | ((fe as u64) << 23) | q) as u32;
+        }
+        let s = (926 - dexp) as u32;
+        if s > 53 {
+            return (sign << 31) as u32;
+        }
+        let mut q = sig >> s;
+        let rem = sig & ((1u64 << s) - 1);
+        let half = 1u64 << (s - 1);
+        if rem > half || (rem == half && q & 1 != 0) {
+            q += 1;
+        }
+        ((sign << 31) | q) as u32
+    }
+
+    fn check(bits: u64) {
+        let want = (f64::from_bits(bits) as f32).to_bits();
+        let got = cvt_f32_f64_reference(bits);
+        let dexp = (bits >> 52) & 0x7FF;
+        let mant = bits & ((1u64 << 52) - 1);
+        if dexp == 0x7FF && mant != 0 {
+            // NaN payload is unspecified.
+            assert_eq!(got & 0x7F80_0000, 0x7F80_0000, "nan {bits:#x}");
+            assert_ne!(got & 0x7F_FFFF, 0, "nan {bits:#x}");
+            assert_eq!(got >> 31, want >> 31, "nan sign {bits:#x}");
+        } else {
+            assert_eq!(got, want, "bits={bits:#x}: got {got:#x} want {want:#x}");
+        }
+    }
+
+    #[test]
+    fn cvt_f32_f64_reference_matches_f64_as_f32() {
+        let mut x: u64 = 0x1234_5678_9abc_def0;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2_000_000u64 {
+            check(next());
+        }
+        // Every exponent with random mantissas, plus boundary exponents.
+        for dexp in 0..0x800u64 {
+            for _ in 0..200 {
+                check((dexp << 52) | (next() & ((1u64 << 52) - 1)));
+            }
+        }
+        for dexp in [1u64, 2, 0x37F, 0x380, 0x381, 0x3FE, 0x3FF, 0x400, 0x46F, 0x470, 0x471, 0x7FD, 0x7FE] {
+            for _ in 0..20_000 {
+                check((dexp << 52) | (next() & ((1u64 << 52) - 1)));
+            }
+        }
     }
 }
