@@ -194,8 +194,8 @@ pub(crate) fn track_graphics(
     computed_buffers: bool,
 ) -> Result<Resources, ShaderError> {
     let mut t = Tracer::new(p, layout, stage, lanes)?;
-    t.computed_buffers =
-        computed_buffers && matches!(stage, HwStage::Vs | HwStage::Ps | HwStage::Cs);
+    t.computed_buffers = computed_buffers
+        && matches!(stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms);
     let mut out = Resources {
         params: p
             .inputs
@@ -1273,10 +1273,7 @@ impl<'a> Tracer<'a> {
         }
         if let Some(consts) = words
             .iter()
-            .map(|w| match *w {
-                Term::Const(c) => Some(c),
-                Term::Value(_) => None,
-            })
+            .map(|&w| self.const_u32(w, 8))
             .collect::<Option<Vec<_>>>()
         {
             return Ok(Source::Constant(consts));
@@ -1284,33 +1281,46 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
-        if let [lo, hi, w2, Term::Const(w3)] = *words
-            && (self.computed_buffers || matches!(w2, Term::Const(_)))
+        if let [lo, hi, w2, w3] = *words
+            && let Some(w3) = self.const_u32(w3, 8)
         {
-            let descriptor_hi = hi;
-            let (mut hi, mut bits) = (hi, 0);
-            while let Term::Value(v) = hi
-                && let Some((x, more)) = self.set_bits(v)
-            {
-                (hi, bits) = (x, bits | more);
-            }
-            let address = self.address(
-                lo,
-                hi,
-                Sum {
-                    base: None,
-                    offset: 0,
-                    dynamic: None,
-                },
-            )?;
-            if self.computed_buffers && address.param == MEMORY {
-                return Ok(Source::BuiltMemory {
-                    control: w3,
-                    swizzled: self.possible_bits(descriptor_hi, 8) >> 30 != 0,
+            let const_w2 = self.const_u32(w2, 8);
+            if self.computed_buffers || const_w2.is_some() {
+                let descriptor_hi = hi;
+                let (mut hi, mut bits) = (hi, 0);
+                while let Term::Value(v) = hi
+                    && let Some((x, more)) = self.set_bits(v)
+                {
+                    (hi, bits) = (x, bits | more);
+                }
+                let address = self.address(
+                    lo,
+                    hi,
+                    Sum {
+                        base: None,
+                        offset: 0,
+                        dynamic: None,
+                    },
+                )?;
+                let root_mem_desc = self.layout.get(address.param).is_some_and(|r| {
+                    r.root == RootType::Descriptor
+                        && r.slot != crate::emit::graphics::VERTEX_TABLE
                 });
-            }
-            if let Term::Const(w2) = w2 {
-                return Ok(Source::Built { address, bits, words: [w2, w3] });
+                if self.computed_buffers
+                    && (address.param == MEMORY || root_mem_desc && const_w2.is_none())
+                {
+                    return Ok(Source::BuiltMemory {
+                        control: w3,
+                        swizzled: self.possible_bits(descriptor_hi, 8) >> 30 != 0,
+                    });
+                }
+                if let Some(w2) = const_w2 {
+                    return Ok(Source::Built {
+                        address,
+                        bits,
+                        words: [w2, w3],
+                    });
+                }
             }
         }
         let loaded = |w: &Term| {
@@ -1450,44 +1460,192 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// Evaluates `term` when it is a compile-time 32-bit constant formed by scalar ALU operations.
+    fn const_u32(&self, term: Term, depth: u8) -> Option<u32> {
+        let v = match term {
+            Term::Const(c) => return Some(c),
+            Term::Value(v) => v,
+        };
+        if depth == 0 {
+            return None;
+        }
+        let inst = self.def(v)?;
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            return None;
+        };
+        let k = inst.writes.iter().position(|&(r, w)| w == v && matches!(r, Reg::S(_)))? as u8;
+        let op64 = |op: &Operand| match *op {
+            Operand::Scalar { code: NULL, .. } => Some(0),
+            Operand::Scalar { code, .. } => {
+                self.const_u32(self.origin(inst.read(Reg::S(code + k))?), depth - 1)
+            }
+            Operand::Const(c @ 128..=208) => {
+                let low = inline(c)?;
+                Some(if k == 0 { low } else { ((low as i32) >> 31) as u32 })
+            }
+            Operand::Literal(x) if x >> 31 == 0 => Some(if k == 0 { x } else { 0 }),
+            _ => None,
+        };
+        match inst.name() {
+            "s_and_b64" if k < 2 => return Some(op64(src.first()?)? & op64(src.get(1)?)?),
+            "s_or_b64" if k < 2 => return Some(op64(src.first()?)? | op64(src.get(1)?)?),
+            "s_xor_b64" if k < 2 => return Some(op64(src.first()?)? ^ op64(src.get(1)?)?),
+            "s_andn2_b64" if k < 2 => return Some(op64(src.first()?)? & !op64(src.get(1)?)?),
+            "s_orn2_b64" if k < 2 => return Some(op64(src.first()?)? | !op64(src.get(1)?)?),
+            "s_not_b64" if k < 2 => return Some(!op64(src.first()?)?),
+            _ if k != 0 => return None,
+            _ => {}
+        }
+        let op32 = |op: &Operand| self.const_u32(self.term(inst, op)?, depth - 1);
+        match inst.name() {
+            "s_and_b32" => Some(op32(src.first()?)? & op32(src.get(1)?)?),
+            "s_or_b32" => Some(op32(src.first()?)? | op32(src.get(1)?)?),
+            "s_xor_b32" => Some(op32(src.first()?)? ^ op32(src.get(1)?)?),
+            "s_andn2_b32" => Some(op32(src.first()?)? & !op32(src.get(1)?)?),
+            "s_orn2_b32" => Some(op32(src.first()?)? | !op32(src.get(1)?)?),
+            "s_nand_b32" => Some(!(op32(src.first()?)? & op32(src.get(1)?)?)),
+            "s_nor_b32" => Some(!(op32(src.first()?)? | op32(src.get(1)?)?)),
+            "s_xnor_b32" => Some(!(op32(src.first()?)? ^ op32(src.get(1)?)?)),
+            "s_not_b32" => Some(!op32(src.first()?)?),
+            "s_brev_b32" => Some(op32(src.first()?)?.reverse_bits()),
+            "s_lshl_b32" => Some(op32(src.first()?)? << (op32(src.get(1)?)? & 31)),
+            "s_lshr_b32" => Some(op32(src.first()?)? >> (op32(src.get(1)?)? & 31)),
+            "s_ashr_i32" => {
+                Some(((op32(src.first()?)? as i32) >> (op32(src.get(1)?)? & 31)) as u32)
+            }
+            "s_add_u32" | "s_add_i32" => {
+                Some(op32(src.first()?)?.wrapping_add(op32(src.get(1)?)?))
+            }
+            "s_sub_u32" | "s_sub_i32" => {
+                Some(op32(src.first()?)?.wrapping_sub(op32(src.get(1)?)?))
+            }
+            "s_mul_i32" => Some(op32(src.first()?)?.wrapping_mul(op32(src.get(1)?)?)),
+            "s_bfm_b32" => {
+                let (w, at) = (op32(src.first()?)? & 31, op32(src.get(1)?)? & 31);
+                Some(((1u32 << w) - 1) << at)
+            }
+            "s_bitset0_b32" | "s_bitset1_b32" => {
+                let old = op32(dst.as_ref()?)?;
+                let bit = 1u32 << (op32(src.first()?)? & 31);
+                Some(if inst.name() == "s_bitset1_b32" { old | bit } else { old & !bit })
+            }
+            "s_pack_ll_b32_b16" => {
+                Some((op32(src.first()?)? & 0xFFFF) | (op32(src.get(1)?)? << 16))
+            }
+            "s_pack_lh_b32_b16" => {
+                Some((op32(src.first()?)? & 0xFFFF) | (op32(src.get(1)?)? & 0xFFFF_0000))
+            }
+            "s_pack_hh_b32_b16" => {
+                Some((op32(src.first()?)? >> 16) | (op32(src.get(1)?)? & 0xFFFF_0000))
+            }
+            "s_bfe_u32" | "s_bfe_i32" => {
+                let (a, b) = (op32(src.first()?)?, op32(src.get(1)?)?);
+                let (off, width) = (b & 31, (b >> 16) & 0x7F);
+                if width == 0 {
+                    Some(0)
+                } else if inst.name() == "s_bfe_i32" {
+                    let sh = 32u32.saturating_sub(width);
+                    let shifted = if off + width >= 32 {
+                        (a as i32) >> off
+                    } else {
+                        ((a << (32 - off - width)) as i32) >> sh
+                    };
+                    Some(shifted as u32)
+                } else if width >= 32 {
+                    Some(a >> off)
+                } else {
+                    Some((a >> off) & ((1u32 << width) - 1))
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Words that phis of one block join, traced per predecessor (words
-    /// defined before the join hold on every edge).
+    /// defined before the join hold on every edge), including dwords spilled
+    /// to constant VGPR lanes before the join and restored by `v_readlane_b32`.
     fn phi(
         &self,
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
-        let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
+        #[derive(Clone, Copy)]
+        enum JoinWord {
+            Sgpr(usize, usize),
+            Spill(usize, usize, u32),
+        }
+        impl JoinWord {
+            fn block(self) -> usize {
+                match self {
+                    JoinWord::Sgpr(b, _) | JoinWord::Spill(b, _, _) => b,
+                }
+            }
+        }
+        let join_of = |w: &Term| match *w {
+            Term::Value(v) => self
+                .phis[v.0 as usize]
+                .map(|(b, i)| JoinWord::Sgpr(b, i))
+                .or_else(|| self.spilled_phi_of(v).map(|(b, i, l)| JoinWord::Spill(b, i, l))),
             Term::Const(_) => None,
         };
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+        let jwords: Vec<Option<JoinWord>> = words.iter().map(join_of).collect();
+        let Some(first_jw) = jwords.iter().find_map(|&jw| jw) else {
             return Ok(None);
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
+        let block = first_jw.block();
+        if jwords.iter().flatten().any(|jw| jw.block() != block) {
             return Err("a descriptor joined in several blocks");
         }
         if joins.contains(&block) {
             return Err("a descriptor that changes in a loop");
         }
+        let has_spill = jwords.iter().any(|jw| matches!(jw, Some(JoinWord::Spill(..))));
+        if has_spill {
+            for (&w, jw) in words.iter().zip(&jwords) {
+                if let (Term::Value(v), None) = (w, jw)
+                    && let Some((d, _)) = self.defs[v.0 as usize]
+                    && (d == block || self.reaches(block, d))
+                {
+                    return Err("a descriptor partly joined by control flow");
+                }
+            }
+        }
         // Each level multiplies the sources by the predecessor count.
         if joins.len() >= MAX_JOINS {
             return Err("a descriptor joined too often");
         }
-        joins.push(block);
         let phis = &self.p.blocks[block].phis;
         let preds = &self.p.blocks[block].preds;
         // An edge no lane takes (a skip only helper lanes would take, say)
         // brings nothing a lane reads: it takes a taken edge's source, and
         // lowering joins no value there (`never_taken`).
         let taken: Vec<bool> = preds.iter().map(|&q| self.edge_taken(q, block)).collect();
+        if has_spill {
+            for (j, &is_taken) in taken.iter().enumerate() {
+                if !is_taken {
+                    continue;
+                }
+                for jw in jwords.iter().flatten() {
+                    if let JoinWord::Spill(_, i, lane) = *jw
+                        && self.spilled_origin(phis[i].args[j], lane).is_none()
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        joins.push(block);
         let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
             let edge: Vec<Term> = words
                 .iter()
-                .map(|w| match phi_of(w) {
-                    Some((_, i)) => self.origin(phis[i].args[j]),
-                    None => *w,
+                .zip(&jwords)
+                .map(|(&w, &jw)| match jw {
+                    Some(JoinWord::Sgpr(_, i)) => self.origin(phis[i].args[j]),
+                    Some(JoinWord::Spill(_, i, lane)) => {
+                        self.spilled_origin(phis[i].args[j], lane).unwrap_or(w)
+                    }
+                    None => w,
                 })
                 .collect();
             self.classify(&edge, joins, known)
@@ -2683,6 +2841,13 @@ impl Tracer<'_> {
                     .map(|&a| self.origin(a))
                     .collect();
                 self.collect_descriptor_loads(&args, seen, out);
+            } else if let Some((b, i, lane)) = self.spilled_phi_of(v) {
+                let args: Vec<Term> = self.p.blocks[b].phis[i]
+                    .args
+                    .iter()
+                    .filter_map(|&a| self.spilled_origin(a, lane))
+                    .collect();
+                self.collect_descriptor_loads(&args, seen, out);
             } else if let Some((_, a, b)) = self.picked(v) {
                 self.collect_descriptor_loads(&[a, b], seen, out);
             } else if let Some(lane_v) = self.first_lane_source(v) {
@@ -2886,7 +3051,8 @@ impl Tracer<'_> {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, o, seen);
         }
         match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
+            Operand::Scalar { code: NULL, .. } => Some(Some(Term::Const(0))),
+            Operand::Scalar { code, .. } => {
                 inst.read(Reg::S(code)).map(|s| o[s.0 as usize])
             }
             Operand::Literal(x) => Some(Some(Term::Const(x))),
@@ -2894,6 +3060,93 @@ impl Tracer<'_> {
             _ => None,
         }
         .ok_or(())
+    }
+
+    /// For a `v_readlane_b32` of a constant lane whose VGPR value comes from a VGPR `phi`
+    /// (possibly past `v_writelane_b32` spills to other lanes): `(block, phi_index, lane)`.
+    fn spilled_phi_of(&self, v: Value) -> Option<(usize, usize, u32)> {
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_readlane_b32" || f.sdwa.is_some() || f.dpp.is_some() {
+            return None;
+        }
+        let [Operand::Vector { reg, .. }, lane_op] = f.src[..] else {
+            return None;
+        };
+        let lane = lane_of(lane_op)?;
+        let mut cur = inst.read(Reg::V(reg))?;
+        for _ in 0..64 {
+            if let Some((b, i)) = self.phis[cur.0 as usize] {
+                return Some((b, i, lane));
+            }
+            let wi = self.def(cur)?;
+            let Fields::Valu(wf) = &wi.fields else {
+                return None;
+            };
+            let (Some(Operand::Vector { reg: wreg, .. }), [_, at]) = (wf.dst, &wf.src[..]) else {
+                return None;
+            };
+            if wi.name() != "v_writelane_b32"
+                || wf.sdwa.is_some()
+                || wf.dpp.is_some()
+                || lane_of(*at)? == lane
+            {
+                return None;
+            }
+            cur = wi.read(Reg::V(wreg))?;
+        }
+        None
+    }
+
+    /// What constant lane `lane` of VGPR value `v` holds, using settled [`Self::origin`] terms.
+    fn spilled_origin(&self, v: Value, lane: u32) -> Option<Term> {
+        self.spilled_origin_inner(v, lane, &mut Vec::new()).ok().flatten()
+    }
+
+    fn spilled_origin_inner(
+        &self,
+        v: Value,
+        lane: u32,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Term>, ()> {
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(m) = self.spilled_origin_inner(a, lane, seen)? {
+                    if found.is_some_and(|f| f != m) {
+                        return Err(());
+                    }
+                    found = Some(m);
+                }
+            }
+            return Ok(found);
+        }
+        let inst = self.def(v).ok_or(())?;
+        let Fields::Valu(w) = &inst.fields else {
+            return Err(());
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" || w.sdwa.is_some() || w.dpp.is_some() {
+            return Err(());
+        }
+        if lane_of(*at).ok_or(())? != lane {
+            return self.spilled_origin_inner(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code: NULL, .. } => Ok(Some(Term::Const(0))),
+            Operand::Scalar { code, .. } => inst.read(Reg::S(code)).map(|s| Some(self.origin(s))).ok_or(()),
+            Operand::Literal(x) => Ok(Some(Term::Const(x))),
+            Operand::Const(c) => inline(c).map(|c| Some(Term::Const(c))).ok_or(()),
+            _ => Err(()),
+        }
     }
 }
 
@@ -4871,5 +5124,115 @@ pub(crate) mod tests {
         let inf2 = infer_roots(&p2, &[], HwStage::Vs).unwrap();
         assert!(inf2.heaps.is_empty());
         assert_eq!(inf2.vertex_table, None);
+    }
+
+    #[test]
+    fn mesh_and_root_descriptor_computed_buffers_and_const_alu_words_trace() {
+        // Mesh program (`HwStage::Ms`): root SRV descriptor at user_data 0 (`s8, s9`, slot 0) +
+        // dynamic byte count in user_data 2 (`s10`, slot 1), control word assembled by `s_or_b32`.
+        let ms_words: &[u32] = &[
+            0x8010_9008, // s_add_u32 s16, s8, 16
+            0x8211_8009, // s_addc_u32 s17, s9, 0
+            0x8711_FF11,
+            0x0000_FFFF, // s_and_b32 s17, s17, 0xffff
+            0xBE92_030A, // s_mov_b32 s18, s10
+            0xBE93_03FF,
+            0x1101_4FAC, // s_mov_b32 s19, 0x11014fac
+            0x8813_FF13,
+            0x2000_0000, // s_or_b32 s19, s19, 0x20000000
+            0xE030_1000,
+            0x8004_0201, // buffer_load_dword v2, v1, s[16:19], 0 offen
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = ms_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 16).unwrap();
+        let layout = [
+            RootParam {
+                root: Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ];
+        let r = track_graphics(&p, &layout, HwStage::Ms, None, true).unwrap();
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::BuiltMemory {
+                control: 0x3101_4FAC,
+                swizzled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn descriptors_spilled_to_vgpr_lanes_across_if_else_are_traced_as_phi() {
+        // Uniform branch (`s_cmp_eq_u32 s1, 0`): arm A loads table+0x0 and spills to v0 lanes 3-6,
+        // arm B loads table+0x20 and spills to v0 lanes 3-6; after the join `v_readlane_b32`
+        // restores s[16:19] for `s_buffer_load_dword`.
+        let r = track_words(
+            &[
+                0xBE82_0309, // 0x00 s_mov_b32 s2, s9
+                0xBE83_0380, // 0x04 s_mov_b32 s3, 0
+                0xBF06_8001, // 0x08 s_cmp_eq_u32 s1, 0
+                0xBF84_000B, // 0x0c s_cbranch_scc0 -> 0x3c (arm B)
+                0xF408_0101,
+                0xFA00_0000, // 0x10 s_load_dwordx4 s[4:7], s[2:3], 0x0
+                0xD761_0000,
+                0x0001_0604, // 0x18 v_writelane_b32 v0, s4, 3
+                0xD761_0000,
+                0x0001_0805, // 0x20 v_writelane_b32 v0, s5, 4
+                0xD761_0000,
+                0x0001_0A06, // 0x28 v_writelane_b32 v0, s6, 5
+                0xD761_0000,
+                0x0001_0C07, // 0x30 v_writelane_b32 v0, s7, 6
+                0xBF82_000A, // 0x38 s_branch -> 0x64 (join)
+                0xF408_0201,
+                0xFA00_0020, // 0x3c s_load_dwordx4 s[8:11], s[2:3], 0x20
+                0xD761_0000,
+                0x0001_0608, // 0x44 v_writelane_b32 v0, s8, 3
+                0xD761_0000,
+                0x0001_0809, // 0x4c v_writelane_b32 v0, s9, 4
+                0xD761_0000,
+                0x0001_0A0A, // 0x54 v_writelane_b32 v0, s10, 5
+                0xD761_0000,
+                0x0001_0C0B, // 0x5c v_writelane_b32 v0, s11, 6
+                0xD760_0010,
+                0x0001_0700, // 0x64 v_readlane_b32 s16, v0, 3
+                0xD760_0011,
+                0x0001_0900, // 0x6c v_readlane_b32 s17, v0, 4
+                0xD760_0012,
+                0x0001_0B00, // 0x74 v_readlane_b32 s18, v0, 5
+                0xD760_0013,
+                0x0001_0D00, // 0x7c v_readlane_b32 s19, v0, 6
+                0xF420_0508,
+                0xFA00_0000, // 0x84 s_buffer_load_dword s20, s[16:19], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 1, 1), param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let Source::Phi { args, .. } = &r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors);
+        };
+        let offsets: Vec<u32> = args
+            .iter()
+            .map(|a| match *a {
+                Source::Loaded { load, first: 0 } => {
+                    r.scalar.iter().find(|&&(s, _)| s == load).unwrap().1.offset
+                }
+                ref other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(offsets, [0x0, 0x20]);
     }
 }
