@@ -737,6 +737,20 @@ pub enum Cmd<B: GraphicsBackend> {
         /// `ExecuteIndirect` with a count buffer: its title address and this record's index.
         count: Option<(u64, u32)>,
     },
+    /// One upscaling through the host's MetalFX temporal scaler (#375, M2): the
+    /// context handle owns the scaler (`metalfx`'s cache), the textures are the
+    /// FidelityFX dispatch's in its own order (colour, depth, motion vectors,
+    /// exposure, output).
+    MetalFXUpscale {
+        context: usize,
+        colour: Option<Rc<B::Texture>>,
+        depth: Option<Rc<B::Texture>>,
+        motion: Option<Rc<B::Texture>>,
+        exposure: Option<Rc<B::Texture>>,
+        output: Rc<B::Texture>,
+        reset: bool,
+        jitter: [f32; 2],
+    },
 }
 
 impl<B: GraphicsBackend> Clone for Cmd<B> {
@@ -758,6 +772,25 @@ impl<B: GraphicsBackend> Clone for Cmd<B> {
                 threads: *threads,
                 indirect: *indirect,
                 count: *count,
+            },
+            Cmd::MetalFXUpscale {
+                context,
+                colour,
+                depth,
+                motion,
+                exposure,
+                output,
+                reset,
+                jitter,
+            } => Cmd::MetalFXUpscale {
+                context: *context,
+                colour: colour.clone(),
+                depth: depth.clone(),
+                motion: motion.clone(),
+                exposure: exposure.clone(),
+                output: output.clone(),
+                reset: *reset,
+                jitter: *jitter,
             },
             Cmd::Copy { dst, src, len } => Cmd::Copy {
                 dst: *dst,
@@ -945,6 +978,32 @@ impl<B: GraphicsBackend> NativeList<B> {
 
     /// What was recorded so far as a list of its own, leaving this one empty with its state kept
     /// (the title goes on recording after a wait with the pipeline and root arguments it had set).
+    /// The title's FidelityFX upscaling through the host's MetalFX temporal
+    /// scaler (#375, M2): each dispatch is its own command (never folded into
+    /// another pass).
+    pub fn metalfx_upscale(
+        &mut self,
+        context: usize,
+        colour: Option<Rc<B::Texture>>,
+        depth: Option<Rc<B::Texture>>,
+        motion: Option<Rc<B::Texture>>,
+        exposure: Option<Rc<B::Texture>>,
+        output: Rc<B::Texture>,
+        reset: bool,
+        jitter: [f32; 2],
+    ) {
+        self.cmds.push(Cmd::MetalFXUpscale {
+            context,
+            colour,
+            depth,
+            motion,
+            exposure,
+            output,
+            reset,
+            jitter,
+        });
+    }
+
     pub fn cut(&mut self) -> NativeList<B> {
         NativeList {
             cmds: std::mem::take(&mut self.cmds),

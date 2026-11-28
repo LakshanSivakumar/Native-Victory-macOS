@@ -169,6 +169,7 @@ enum Group {
     Blit(usize, usize),
     Render(usize, usize),
     Clear(usize),
+    MetalFX(usize, usize),
 }
 
 type HeapPair<B> = (Option<Rc<NativeHeap<B>>>, Option<Rc<NativeHeap<B>>>);
@@ -2230,6 +2231,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
         };
         self.forget_released();
         match cmd {
+            // The MetalFXUpscale's textures were resolved when it was recorded;
+            // nothing to prepare (the pass carries the command's own textures).
+            Cmd::MetalFXUpscale { .. } => {}
             Cmd::Dispatch {
                 root,
                 pso,
@@ -2518,6 +2522,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     j = i + 1;
                     Group::Clear(i)
                 }
+                // The upscale never folds into another pass: the scaler's own
+                // encoder is the point (M2).
+                Cmd::MetalFXUpscale { .. } => {
+                    j = i + 1;
+                    Group::MetalFX(i, j)
+                }
             });
             i = j;
         }
@@ -2582,6 +2592,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 // A render pass has one depth target, its first draw's.
                 Group::Render(a, _) | Group::Clear(a) => self.twin_copies(false, &self.twin_uses(&cmds[a..a + 1])),
                 Group::Blit(a, b) => self.twin_copies(false, &self.twin_uses(&cmds[a..b])),
+                Group::MetalFX(..) => self.twin_copies(false, &[]),
             })
             .collect();
         let mut passes: Vec<Pass<'_, B>> = vec![];
@@ -2591,6 +2602,28 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             passes.push(match g {
                 Group::Compute(..) => Pass::Compute(&compute[n]),
+                Group::MetalFX(a, _) => match cmds[*a] {
+                    Cmd::MetalFXUpscale {
+                        context,
+                        colour,
+                        depth,
+                        motion,
+                        exposure,
+                        output,
+                        reset,
+                        jitter,
+                    } => Pass::MetalFX(MetalFXPass {
+                        context: *context,
+                        colour: colour.as_deref(),
+                        depth: depth.as_deref(),
+                        motion: motion.as_deref(),
+                        exposure: exposure.as_deref(),
+                        output,
+                        reset: *reset,
+                        jitter: *jitter,
+                    }),
+                    _ => unreachable!("a MetalFX group holds exactly one MetalFX command"),
+                },
                 Group::Blit(a, b) => Pass::Blit(
                     (*a..*b)
                         .map(|k| match cmds[k] {

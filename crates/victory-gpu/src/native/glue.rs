@@ -171,6 +171,55 @@ pub(crate) fn with_list<R>(
 
 // --- queues and fences ---
 
+/// Records one FidelityFX upscaling (M2) into the title list `list`: the
+/// dispatch's textures (console objects, in the FidelityFX order colour, depth,
+/// motion vectors, exposure, output; reactive and transparency masks are not
+/// temporal-scaler inputs) resolve here, and the pass itself encodes at
+/// submission. `false` when the list is unknown or a texture does not resolve
+/// (the upscaling is dropped; the rest of the list goes on).
+pub fn metalfx_record(
+    list: This,
+    context: usize,
+    textures: &[This],
+    reset: bool,
+    jitter: [f32; 2],
+) -> bool {
+    with_list(list, |t, tl| {
+        let mut resolved: Vec<Option<Rc<<Metal as victory_backend::resources::ResourceBackend>::Texture>>> = Vec::with_capacity(textures.len());
+        for &tex in textures {
+            if tex.is_null() {
+                resolved.push(None);
+                continue;
+            }
+            let Some(mtl) = t.texture_of(tex as usize) else {
+                return false;
+            };
+            resolved.push(Some(mtl));
+        }
+        // The FidelityFX order is colour, depth, motion vectors, exposure,
+        // reactive, transparency, output; the temporal scaler takes colour,
+        // depth, motion vectors, exposure, output.
+        let [colour, depth, motion, exposure, .., output] = resolved.as_slice() else {
+            return false;
+        };
+        let (Some(colour), Some(output)) = (colour.clone(), output.clone()) else {
+            return false;
+        };
+        tl.list.metalfx_upscale(
+            context,
+            Some(colour.clone()),
+            depth.clone(),
+            motion.clone(),
+            exposure.clone(),
+            output.clone(),
+            reset,
+            jitter,
+        );
+        true
+    })
+    .unwrap_or(false)
+}
+
 /// `ExecuteCommandLists`.
 pub(crate) fn submit(queue: This, lists: &[This]) {
     if env_set!("VICTORY_TRACE_WRITES") {

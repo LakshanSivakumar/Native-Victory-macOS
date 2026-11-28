@@ -715,6 +715,25 @@ pub enum Pass<'a, B: GraphicsBackend + ?Sized> {
         color: [f32; 4],
         rects: &'a [ClearRect],
     },
+    /// One upscaling through the host's MetalFX temporal scaler (#375, M2): the
+    /// context owns the scaler, the textures are the dispatch's, in the FidelityFX
+    /// order colour, depth, motion vectors, exposure, output (reactive and
+    /// transparency masks are not temporal-scaler inputs).
+    MetalFX(MetalFXPass<'a, B>),
+}
+
+/// One MetalFX temporal-scaler pass: the context handle (`METALFX_CONTEXTS`'s key,
+/// which owns the scaler and the sizes it was created with), the dispatch's
+/// textures, and the per-dispatch parameters.
+pub struct MetalFXPass<'a, B: GraphicsBackend + ?Sized> {
+    pub context: usize,
+    pub colour: Option<&'a B::Texture>,
+    pub depth: Option<&'a B::Texture>,
+    pub motion: Option<&'a B::Texture>,
+    pub exposure: Option<&'a B::Texture>,
+    pub output: &'a B::Texture,
+    pub reset: bool,
+    pub jitter: [f32; 2],
 }
 
 /// Like `Submission`, with render passes among the dispatches, run in order.

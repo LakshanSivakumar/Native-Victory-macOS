@@ -505,3 +505,84 @@ mod tests {
         );
     }
 }
+
+
+// ===== The M2 dispatch: the per-context temporal scaler, encoded as a pass =====
+
+use std::collections::BTreeMap;
+use std::sync::Mutex as SyncMutex;
+
+/// The temporal scaler of one MetalFX context, by the context handle
+/// (`METALFX_CONTEXTS`'s key). Created from the first dispatch's textures
+/// (their formats and sizes), reused when a later dispatch matches.
+struct ScalerEntry(Retained<ProtocolObject<dyn MTLFXTemporalScaler>>);
+// SAFETY: Metal objects may be used from any thread (Metal does its own
+// synchronization; a scaler is not a command buffer).
+unsafe impl Send for ScalerEntry {}
+unsafe impl Sync for ScalerEntry {}
+static SCALERS: SyncMutex<BTreeMap<usize, ScalerEntry>> = SyncMutex::new(BTreeMap::new());
+
+/// Encodes one FidelityFX upscaling through the context's temporal scaler,
+/// creating the scaler from this dispatch's textures on first use. `Ok` has
+/// encoded into `cb`.
+pub(crate) fn encode_temporal(
+    context: usize,
+    device: &ProtocolObject<dyn MTLDevice>,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    colour: Option<&ProtocolObject<dyn MTLTexture>>,
+    depth: Option<&ProtocolObject<dyn MTLTexture>>,
+    motion: Option<&ProtocolObject<dyn MTLTexture>>,
+    exposure: Option<&ProtocolObject<dyn MTLTexture>>,
+    output: &ProtocolObject<dyn MTLTexture>,
+    reset: bool,
+    jitter: [f32; 2],
+) -> Result<(), String> {
+    let scaler: Retained<ProtocolObject<dyn MTLFXTemporalScaler>> = {
+        let mut cache = SCALERS.lock().unwrap_or_else(|e| e.into_inner());
+        match cache.get(&context) {
+            Some(entry) => entry.0.clone(),
+            None => {
+                let Some(colour) = colour else {
+                    return Err("the upscaling has no colour texture".into());
+                };
+                let desc = unsafe {
+                    let d = MTLFXTemporalScalerDescriptor::new();
+                    d.setInputWidth(colour.width());
+                    d.setInputHeight(colour.height());
+                    d.setOutputWidth(output.width());
+                    d.setOutputHeight(output.height());
+                    d.setColorTextureFormat(colour.pixelFormat());
+                    if let Some(d32) = depth {
+                        d.setDepthTextureFormat(d32.pixelFormat());
+                    }
+                    if let Some(mv) = motion {
+                        d.setMotionTextureFormat(mv.pixelFormat());
+                    }
+                    d.setOutputTextureFormat(output.pixelFormat());
+                    d
+                };
+                let Some(scaler) = (unsafe { desc.newTemporalScalerWithDevice(device) }) else {
+                    return Err("the device refused a temporal scaler".into());
+                };
+                cache.insert(context, ScalerEntry(scaler.clone()));
+                scaler
+            }
+        }
+    };
+    unsafe {
+        scaler.setColorTexture(colour);
+        scaler.setDepthTexture(depth);
+        scaler.setMotionTexture(motion);
+        if let Some(exposure) = exposure {
+            scaler.setExposureTexture(Some(exposure));
+        }
+        scaler.setOutputTexture(Some(output));
+        scaler.setInputContentWidth(colour.map_or(0, |t| t.width()));
+        scaler.setInputContentHeight(colour.map_or(0, |t| t.height()));
+        scaler.setJitterOffsetX(jitter[0]);
+        scaler.setJitterOffsetY(jitter[1]);
+        scaler.setReset(reset);
+        scaler.encodeToCommandBuffer(cb);
+    }
+    Ok(())
+}

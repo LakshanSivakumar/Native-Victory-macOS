@@ -112,6 +112,12 @@ fn transfer_fits(what: &str, t: &Texture, mip: usize, dims: [usize; 3], row_pitc
 }
 
 impl Texture {
+    /// The underlying Metal texture, for passes the backend encodes itself
+    /// (the FidelityFX upscaling's temporal scaler, #375).
+    pub(crate) fn mtl_texture(&self) -> &ProtocolObject<dyn MTLTexture> {
+        &self.tex
+    }
+
     /// The texture as the bytes it holds when it is sRGB (a view in the plain format), else itself.
     pub(crate) fn view_without_srgb(&self, _m: &Metal) -> Retained<ProtocolObject<dyn MTLTexture>> {
         let plain = match self.tex.pixelFormat() {
@@ -1363,6 +1369,29 @@ impl GraphicsBackend for Metal {
                 Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
                 Pass::ClearColorRects { target, color, rects } => {
                     self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps)
+                }
+                Pass::MetalFX(mfx) => {
+                    // MetalFX opens its own encoder; the pass runs in encoder
+                    // order within this command buffer (the intra-encoder
+                    // residency fence does not reach it — adjacent-pass
+                    // hazards around the upscale are untracked, #375).
+                    let colour = mfx.colour.as_deref().map(|t| t.mtl_texture());
+                    let depth = mfx.depth.as_deref().map(|t| t.mtl_texture());
+                    let motion = mfx.motion.as_deref().map(|t| t.mtl_texture());
+                    let exposure = mfx.exposure.as_deref().map(|t| t.mtl_texture());
+                    let out = mfx.output.mtl_texture();
+                    crate::metalfx::encode_temporal(
+                        mfx.context,
+                        &self.dev,
+                        &cb,
+                        colour.as_deref(),
+                        depth.as_deref(),
+                        motion.as_deref(),
+                        exposure.as_deref(),
+                        out,
+                        mfx.reset,
+                        mfx.jitter,
+                    )
                 }
             };
             if let Err(e) = encoded {
