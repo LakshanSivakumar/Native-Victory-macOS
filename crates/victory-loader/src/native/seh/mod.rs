@@ -41,7 +41,7 @@ pub mod signal;
 #[cfg(target_arch = "x86_64")]
 pub use dispatch::{
     backtrace,
-    Handler, add_vectored_handler, remove_vectored_handler, set_unhandled_filter,
+    Handler, add_vectored_handler, remove_vectored_handler, set_fatal_hook, set_unhandled_filter,
 };
 #[cfg(target_arch = "x86_64")]
 pub use signal::install;

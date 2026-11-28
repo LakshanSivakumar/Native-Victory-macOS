@@ -151,7 +151,7 @@ enum Console {
     SeriesS,
 }
 
-/// SIGTERM, SIGINT and SIGHUP stop the process after its GPU work is woken and drained
+/// SIGTERM, SIGINT and SIGHUP (and a fatal fault of the title) stop the process after its GPU work is woken and drained
 /// (`victory_gpu::stop_gpu`), not in the middle of it: a process killed while its command buffers
 /// sleep on events can leave the GPU memory they hold allocated until a reboot. The signals are
 /// blocked here, before any other thread starts (threads inherit the mask), and taken by a thread
@@ -171,6 +171,13 @@ fn stop_gpu_on_signals() {
     if unsafe { pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut()) } != 0 {
         return;
     }
+    // A fatal fault of the title (its watchdog's, say) stops the GPU's work the same way.
+    #[cfg(target_arch = "x86_64")]
+    victory_loader::native::seh::set_fatal_hook(|| {
+        tracing::warn!("stopping on a fatal fault: waking and draining the GPU's queued work first");
+        let (in_flight, left) = victory_gpu::stop_gpu(std::time::Duration::from_secs(3), std::time::Duration::from_secs(20));
+        tracing::warn!(in_flight, left, "stopped the GPU's work");
+    });
     let spawned = std::thread::Builder::new().name("stop-on-signal".into()).spawn(move || {
         let mut sig = 0;
         // SAFETY: as above; `sig` receives the signal taken.
