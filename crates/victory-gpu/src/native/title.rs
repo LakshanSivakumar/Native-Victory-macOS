@@ -610,6 +610,8 @@ mod scheduling_tests {
 
     #[test]
     fn signalling_a_fence_releases_all_its_queued_wait_tokens() {
+        #[cfg(target_os = "macos")]
+        let _one = super::super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(metal) = Metal::new() else {
             eprintln!("skipping fence test: no Metal device");
             return;
@@ -633,6 +635,8 @@ mod scheduling_tests {
 
     #[test]
     fn a_wait_retains_its_fence_across_release_and_address_reuse() {
+        #[cfg(target_os = "macos")]
+        let _one = super::super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(metal) = Metal::new() else { return };
         let mut title = Title::new(metal, Arc::new(PoolTable::default()));
         title.ensure_queue(1).unwrap();
@@ -652,6 +656,8 @@ mod scheduling_tests {
 
     #[test]
     fn a_committed_producer_does_not_put_an_unsatisfied_wait_on_metal() {
+        #[cfg(target_os = "macos")]
+        let _one = super::super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(metal) = Metal::new() else { return };
         let mut title = Title::new(metal, Arc::new(PoolTable::default()));
         let producer = title.queue(1).unwrap();

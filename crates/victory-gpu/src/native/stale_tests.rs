@@ -58,6 +58,7 @@ fn run(words: &[u32], flag: u32) -> Vec<u32> {
 
 #[test]
 fn a_stale_register_behind_a_flag_mask_of_0_is_never_read() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let w = program(true);
     let got = run(&w, 1);
     if got.is_empty() {
@@ -70,6 +71,7 @@ fn a_stale_register_behind_a_flag_mask_of_0_is_never_read() {
 /// Without the flag in the branch, the stale value decides it: still refused, naming it.
 #[test]
 fn a_stale_register_that_decides_a_branch_stays_refused() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let why = try_translate_wave(&program(false), 5, 0, 64, true, shaders::options())
         .err()
         .map(|e| e.to_string());

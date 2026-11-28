@@ -48,6 +48,7 @@ fn vertex(format: u32, count: u32, rect: bool) -> victory_shader::emit::HostShad
 
 #[test]
 fn scaled_vertex_loads_reach_float_render_targets() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 1);
     let memory = h.memory();
@@ -145,6 +146,7 @@ fn scaled_vertex_loads_reach_float_render_targets() {
 
 #[test]
 fn scaled_vertex_rectangles_match_explicit_float_corners() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 1);
     let memory = h.memory();

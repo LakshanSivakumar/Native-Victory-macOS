@@ -68,6 +68,7 @@ fn group_sizes_come_from_the_converted_container() {
 /// object with the same container) is served from the library cache.
 #[test]
 fn compute_pipelines_are_cached_by_the_content_of_their_dxil() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let cs = host_shader(HwStage::Cs, read("tests/affine.dxil"));
     let first = t.compute_pipe(&cs, "a");
@@ -87,6 +88,7 @@ fn compute_pipelines_are_cached_by_the_content_of_their_dxil() {
 /// later use picks it up, and each miss is counted.
 #[test]
 fn a_compute_pipeline_put_off_is_made_by_a_later_use() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let cs = host_shader(HwStage::Cs, read("tests/affine.dxil"));
     t.compile_wait = std::time::Duration::ZERO;
@@ -103,6 +105,7 @@ fn a_compute_pipeline_put_off_is_made_by_a_later_use() {
 /// fails.
 #[test]
 fn shaders_the_host_cannot_run_are_refused_and_counted() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let dxil = read("tests/affine.dxil");
     let mut paged = host_shader(HwStage::Cs, dxil.clone());
@@ -131,6 +134,7 @@ fn shaders_the_host_cannot_run_are_refused_and_counted() {
 /// the input layout in the shader's signature order, formats, blend, depth, stencil and raster.
 #[test]
 fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let vs = host_shader(HwStage::Vs, read("tests/fixtures/tri_vs.dxil"));
     let ps = host_shader(HwStage::Ps, read("tests/fixtures/tri_ps.dxil"));

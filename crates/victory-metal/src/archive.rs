@@ -388,6 +388,7 @@ mod tests {
     /// A mesh pipeline is compiled once: a later run finds it in the archive's file.
     #[test]
     fn a_mesh_pipeline_is_kept_in_the_archive() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Some(dev) = MTLCreateSystemDefaultDevice() else { return };
         let dir = tempfile::tempdir().unwrap();
         let first = Archive::open_in(&dev, dir.path()).unwrap();
@@ -402,6 +403,7 @@ mod tests {
 
     #[test]
     fn compute_archive_hits_after_flush_across_reloaded_libraries() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = crate::metal::Metal::new().ok() else { return };
         let Some(msc) = m.msc().ok() else { return };
         let affine = include_bytes!("../tests/affine.dxil");

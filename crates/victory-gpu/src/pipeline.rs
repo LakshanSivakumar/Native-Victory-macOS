@@ -1457,6 +1457,8 @@ mod tests {
 
     #[test]
     fn pipelines_keep_their_shaders() {
+        #[cfg(target_os = "macos")]
+        let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
         let none = || Bytecode {
             code: std::ptr::null(),
@@ -1784,6 +1786,8 @@ mod pieces_tests {
     /// it is read again where the title held it, and only if it still is the shader.
     #[test]
     fn a_compute_shader_is_translated_again_for_thread_counts() {
+        #[cfg(target_os = "macos")]
+        let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let counts = |h: &victory_shader::emit::HostShader| {
             h.user_data.iter().filter(|u| u.slot == victory_shader::emit::DISPATCH_THREADS).count()
         };

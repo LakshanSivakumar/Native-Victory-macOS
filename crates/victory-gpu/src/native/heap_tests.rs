@@ -104,6 +104,7 @@ const COVER: &[u32] = &[
 /// copy then overwrote `HALF6` with `HALF2` (green 64).
 #[test]
 fn an_extra_parameter_beside_a_half_of_its_index_links_with_its_own_values() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut vs_words = COVER.to_vec();
     let at = vs_words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
     vs_words.splice(
@@ -171,6 +172,7 @@ const PS_HEAP: &[u32] = &[
 /// A pixel shader indexing the heap itself is not refused, and reads the entry it names.
 #[test]
 fn a_pixel_shader_loads_a_texture_by_heap_index() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (vs, ps) = (translate(HwStage::Vs, COVER), translate(HwStage::Ps, PS_HEAP));
     assert!(ps.heap && !vs.heap);
     let Some(mut t) = title() else { return };
@@ -181,6 +183,7 @@ fn a_pixel_shader_loads_a_texture_by_heap_index() {
 
 #[test]
 fn a_pixel_shader_reads_the_heap_entry_after_masking_the_address_carry() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Address entry 1 explicitly, then run the same image load and export as PS_HEAP.
     let mut words = vec![
         0x8002_A002, // s_add_u32 s2, s2, 32
@@ -235,6 +238,7 @@ const RED: &[u32] = &[
 /// A vertex shader indexing the heap itself (base in s2) reads the entry it names.
 #[test]
 fn a_vertex_shader_loads_a_texture_by_heap_index() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let vs = translate(HwStage::Vs, &with_heap_scale(COVER, 2));
     let ps = translate(HwStage::Ps, RED);
     assert!(vs.heap && vs.stage == HwStage::Vs);
@@ -248,6 +252,7 @@ fn a_vertex_shader_loads_a_texture_by_heap_index() {
 /// entry it names: the heap is bound for the mesh stage.
 #[test]
 fn a_mesh_shader_loads_a_texture_by_heap_index() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let ms = translate(HwStage::Vs, &with_heap_scale(super::mesh_tests::TRIANGLE, 10));
     let ps = translate(HwStage::Ps, RED);
     assert!(ms.heap && ms.stage == HwStage::Ms);
@@ -263,6 +268,7 @@ fn a_mesh_shader_loads_a_texture_by_heap_index() {
 /// its address) keeps its entries.
 #[test]
 fn a_released_texture_leaves_the_heap() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(t) = title() else { return };
     let heap = Heap::new(&t);
     let (red, green) = (0x4EA9_0000, 0x4EA9_0001);
@@ -305,6 +311,7 @@ const CS_HEAP: &[u32] = &[
 /// that SGPR as the heap, is not refused, and reads the entry it names.
 #[test]
 fn a_compute_shader_loads_a_texture_by_heap_index() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // A raw UAV (kind 3) in a table (root type 3) at user data 4, slot 0.
     let mut uav = [0u8; 32];
     uav[0] = 0x41;
@@ -628,6 +635,7 @@ const CS_HEAP_BUFFER: &[u32] = &[
 /// and the stores land.
 #[test]
 fn a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut uav = [0u8; 32];
     uav[0] = 0x41;
     uav[4..6].copy_from_slice(&[3, 3]);
@@ -672,6 +680,7 @@ fn a_compute_shader_stores_through_a_buffer_view_it_takes_from_the_heap() {
 /// view-stride dword goes to 0 and the shader reads the null view, not the old buffer.
 #[test]
 fn a_heap_record_the_title_zeroes_with_plain_stores_reads_the_null_view_at_the_next_dispatch() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut uav = [0u8; 32];
     uav[0] = 0x41;
     uav[4..6].copy_from_slice(&[3, 3]);
@@ -754,6 +763,7 @@ const CS_UAV_SIZE: &[u32] = &[
 /// tiles: halfwave50/VIctory-macOS-halfwave50 0f3ed38.)
 #[test]
 fn a_size_query_of_a_writable_image_reads_its_size() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut uav = [0u8; 32];
     uav[0] = 0x41;
     uav[4..6].copy_from_slice(&[3, 3]);
@@ -809,6 +819,7 @@ fn a_size_query_of_a_writable_image_reads_its_size() {
 /// through the same heap entry that `buffer_store_dwordx4` writes (`#255`).
 #[test]
 fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Table at s4: entry 0 (dwords 0..4) is the tested UAV, entry 1 (dwords 4..8) is a raw output UAV.
     // Lane 0 stores `[v1..v4]` to element 1 of entry 0 with `buffer_store_format_xyzw ... idxen`,
     // loads element 1 back with `buffer_load_format_xyzw ... idxen` into `v[6:9]`, and writes
@@ -1156,6 +1167,7 @@ fn formatted_buffer_stores_and_loads_through_structured_and_typed_uavs() {
 /// both on a fresh heap slot and after overwriting a previously promoted slot.
 #[test]
 fn wrong_typed_buffer_scan_reads_zero_without_crashing() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Entry 0 (dwords 0..4) is a read-only SRV `Buffer<float4>`, entry 1 (dwords 8..12) is a raw output UAV.
     const CS_FMT_SRV_LOAD: &[u32] = &[
         0xBE8A_0304, // s_mov_b32 s10, s4
@@ -1335,6 +1347,7 @@ fn wrong_typed_buffer_scan_reads_zero_without_crashing() {
 #[test]
 #[ignore = "benchmark: cargo test -p victory-gpu world_heap_mirror_lazy_benchmark -- --ignored --nocapture"]
 fn world_heap_mirror_lazy_benchmark() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     fn phys_footprint() -> usize {
         const TASK_VM_INFO: i32 = 22;
         unsafe extern "C" {
@@ -1425,6 +1438,7 @@ fn world_heap_mirror_lazy_benchmark() {
 #[test]
 #[ignore = "benchmark: cargo test -p victory-gpu long_resource_heap_cost_benchmark -- --ignored --nocapture"]
 fn long_resource_heap_cost_benchmark() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use victory_backend::backend::ComputeBackend;
     let Some(mut t) = title() else { return };
     let f = super::addr_tests::Fixture::new(&t);
@@ -1503,6 +1517,7 @@ const CS_TABLE_SCC_CARRY: &[u32] = &[
 
 #[test]
 fn a_compute_shader_loads_a_texture_with_scc_carry() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // SRV range (kind 2) of 2 textures at dwords 0..16, and raw UAV (kind 3) at dword 16, in
     // table (root type 3) at user data 4, slot 0.
     let mut srv = [0u8; 32];
@@ -1563,6 +1578,7 @@ const CS_VIEW_ADDRESS: &[u32] = &[
 /// ("needs view addresses or write marks"), as it did 7 compute programs of the world.
 #[test]
 fn a_compute_shader_reads_title_memory_at_a_heap_views_address() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // A raw UAV and a raw SRV (kinds 3 and 0) in a table (root type 3) at user data 4.
     let record = |kind: u8, offset: u8, register: u8| {
         let mut r = [0u8; 32];

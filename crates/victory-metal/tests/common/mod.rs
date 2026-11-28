@@ -5,6 +5,8 @@ use victory_metal::backend::{ComputeBackend, Dispatch, Submission};
 use victory_metal::mem::{Region, page_size};
 use victory_metal::metal::{Buffer, Metal};
 
+pub static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `None` (and a note on stderr) when Apple's Metal Shader Converter is not installed.
 pub fn backend() -> Option<Metal> {
     if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()

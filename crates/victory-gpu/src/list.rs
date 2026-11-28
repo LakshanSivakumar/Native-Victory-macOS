@@ -2367,6 +2367,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn native_dsv_clear_rejects_rectangles_and_unrepresented_views() {
+        let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         if !std::path::Path::new(victory_metal::msc::DEFAULT_DYLIB).exists()
             && std::env::var_os("VICTORY_MSC_DYLIB").is_none()
         {
@@ -2450,6 +2451,8 @@ mod tests {
 
     #[test]
     fn lists_bind_the_initial_pipeline_on_creation() {
+        #[cfg(target_os = "macos")]
+        let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use crate::pipeline::{ComputeHead, create_compute};
 
         // A synthetic compute description matching the public ABI.

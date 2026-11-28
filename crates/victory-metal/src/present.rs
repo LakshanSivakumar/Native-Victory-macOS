@@ -440,7 +440,9 @@ mod tests {
     /// it by its alpha: clear where alpha is 0, its own colour where alpha is 1.
     #[test]
     fn a_second_plane_is_blended_over_the_first_by_its_alpha() {
-        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::metal::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::backend::Submission;
         let Ok(metal) = Metal::new() else { return };
         let layer = metal.create_layer(4, 4);
@@ -465,12 +467,11 @@ mod tests {
         }
     }
 
-    /// [`HIDDEN`] is the process's: the tests that present take turns.
-    static PRESENTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn a_hidden_window_presents_without_a_drawable() {
-        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::metal::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Ok(metal) = Metal::new() else { return };
         let layer = metal.create_layer(4, 4);
         let mut surface = metal.create_surface(layer.as_ptr()).unwrap();
@@ -493,7 +494,9 @@ mod tests {
 
     #[test]
     fn blocking_present_times_out_when_acquisition_never_returns() {
-        let _turn = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::metal::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Ok(metal) = Metal::new() else { return };
         let layer = metal.create_layer(4, 4);
         let mut surface = metal.create_surface(layer.as_ptr()).unwrap();

@@ -189,6 +189,7 @@ fn pipeline() -> This {
 /// address as a title does), and a CPU wait on it returns.
 #[test]
 fn a_submitted_list_runs_and_its_fence_is_signalled() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if !available() {
         return;
     }
@@ -216,6 +217,7 @@ fn a_submitted_list_runs_and_its_fence_is_signalled() {
 /// list has written the value, and the queue's Signal comes after both.
 #[test]
 fn a_wait_on_a_memory_value_cuts_the_list_and_holds_the_rest() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if !available() {
         return;
     }
@@ -264,6 +266,7 @@ fn a_wait_on_a_memory_value_cuts_the_list_and_holds_the_rest() {
 /// `MTLSharedEvent` wait), and the CPU's Signal lets it go.
 #[test]
 fn a_queue_waits_for_a_fence_the_cpu_signals() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if !available() {
         return;
     }
@@ -291,6 +294,7 @@ fn a_queue_waits_for_a_fence_the_cpu_signals() {
 /// on the GPU before its signal exists loses the queue's later work and leaves its fence behind.
 #[test]
 fn a_queue_wait_longer_than_metals_event_wait_limit_still_runs_the_work() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if !available() {
         return;
     }
@@ -316,6 +320,7 @@ fn a_queue_wait_longer_than_metals_event_wait_limit_still_runs_the_work() {
 /// waiting queue's list reads what the signalling queue's list wrote.
 #[test]
 fn a_queue_waits_for_another_queues_signal() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if !available() {
         return;
     }
@@ -348,6 +353,7 @@ fn a_queue_waits_for_another_queues_signal() {
 /// through `SetDescriptorHeaps` and a root descriptor table.
 #[test]
 fn buffer_views_in_a_descriptor_heap_reach_the_shader() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if !available() {
         return;
     }
@@ -393,6 +399,7 @@ fn buffer_views_in_a_descriptor_heap_reach_the_shader() {
 /// (the copy feeds it).
 #[test]
 fn a_copy_runs_in_order_with_the_dispatch_it_feeds() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if !available() {
         return;
     }
@@ -427,6 +434,7 @@ fn a_copy_runs_in_order_with_the_dispatch_it_feeds() {
 /// that uses it and counts the refusal; the submission, the list's other work and the fence go on.
 #[test]
 fn a_refused_pipeline_drops_its_work_and_nothing_else() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if !available() {
         return;
     }

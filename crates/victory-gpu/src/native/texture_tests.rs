@@ -76,6 +76,7 @@ fn read_mip(key: usize, mip: usize, w: usize, h: usize) -> Vec<u8> {
 /// submitted, again only when its memory changed.
 #[test]
 fn a_tiled_title_texture_is_detiled_into_the_host_texture() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9101, 8) else { return };
     // The XOR modes (`_X`, `_T`) too: their equations come from the pipe configuration, not a
     // fixed pattern, and a texture of theirs is no longer left empty.
@@ -188,6 +189,7 @@ static AGING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// next submission, not a scanner round later (a round is seconds long once the title streams).
 #[test]
 fn a_texture_uploaded_blank_is_probed_at_each_submission() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     // 256 KiB: 64 pages, more than a sampling probe reads.
     let Some(pool) = pool(9105, (256 << 10) / page_size() + 1) else { return };
@@ -234,6 +236,7 @@ fn a_texture_uploaded_blank_is_probed_at_each_submission() {
 /// their first frames waited seconds for the scanner (green).
 #[test]
 fn a_texture_blank_for_thousands_of_submissions_is_still_probed() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9123, (256 << 10) / page_size() + 1) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
@@ -295,6 +298,7 @@ fn a_blank_texture_leaving_after_the_wrap_does_not_skip_another() {
 /// on at the next one (a glyph atlas).
 #[test]
 fn a_texture_rewritten_whole_is_read_whole_only_now_and_then() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9124, (256 << 10) / page_size() + 1) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
@@ -333,6 +337,7 @@ fn a_texture_rewritten_whole_is_read_whole_only_now_and_then() {
 /// a whole read finds nothing changed instead of reading whole at every probe until it cools.
 #[test]
 fn a_missed_write_not_followed_by_another_backs_off_whole_reads() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9131, (256 << 10) / page_size() + 1) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
@@ -378,6 +383,7 @@ fn a_missed_write_not_followed_by_another_backs_off_whole_reads() {
 /// (Every texture is written, so which one a limited probe reaches first does not matter.)
 #[test]
 fn a_hot_texture_is_probed_at_each_submission_among_hundreds() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     const N: usize = 200;
     const STRIDE: usize = 64 << 10;
@@ -409,6 +415,7 @@ fn a_hot_texture_is_probed_at_each_submission_among_hundreds() {
 /// can visit only `MIN_SYNC_HOT` of them, while a texture written again inside the window stays hot.
 #[test]
 fn hot_textures_cool_by_submissions_even_when_probe_round_is_capped() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     const N: usize = 128;
     const STRIDE: usize = 64 << 10;
@@ -460,6 +467,7 @@ fn hot_textures_cool_by_submissions_even_when_probe_round_is_capped() {
 /// own memory's texels, once.
 #[test]
 fn textures_read_on_several_threads_get_their_own_texels() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     const N: usize = 48;
     const STRIDE: usize = 64 << 10;
     let Some(pool) = pool(9125, N * STRIDE / page_size() + 1) else { return };
@@ -490,6 +498,7 @@ fn textures_read_on_several_threads_get_their_own_texels() {
 /// is not uploaded into the texture that has its key by then.
 #[test]
 fn memory_read_for_a_texture_released_meanwhile_is_dropped() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9126, 8) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
@@ -515,6 +524,7 @@ fn memory_read_for_a_texture_released_meanwhile_is_dropped() {
 /// lock): the texture is the GPU's by then, and what was read is not uploaded over it.
 #[test]
 fn memory_read_for_a_texture_a_copy_writes_meanwhile_is_dropped() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9128, 8) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
@@ -539,6 +549,7 @@ fn memory_read_for_a_texture_a_copy_writes_meanwhile_is_dropped() {
 /// probe as a hot texture nor the scanner's next round reports what the submission read.
 #[test]
 fn a_texture_just_uploaded_is_not_read_again_until_it_changes() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
     // 8 MiB: more than a probe reads whole.
     let Some(pool) = pool(9127, (8 << 20) / page_size() + 1) else { return };
@@ -609,6 +620,7 @@ fn a_page_that_becomes_readable_after_the_upload_is_uploaded() {
 /// A block-compressed texture: 16 bytes a 4x4 block, in the console's layout, detiled as blocks.
 #[test]
 fn a_block_compressed_title_texture_is_detiled_as_blocks() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9102, 4) else { return };
     // BC7 (98): a 32x16 texture is 8x4 blocks.
     let res = crate::resource::test_texture_at(pool.va(0), (32, 16), 1, 98, Swizzle::SW_64KB_D.0, 0);
@@ -636,6 +648,7 @@ fn a_block_compressed_title_texture_is_detiled_as_blocks() {
 /// console's `CreateShaderResourceViewPlaced`): the host makes it when the view is written.
 #[test]
 fn a_placed_texture_view_makes_and_fills_its_texture() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9103, 4) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (32, 32), 1, 28, Swizzle::SW_64KB_S.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
@@ -661,6 +674,7 @@ fn a_placed_texture_view_makes_and_fills_its_texture() {
 /// at its address, and when its pool is released.
 #[test]
 fn a_placed_texture_goes_when_replaced_and_with_its_pool() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9107, 4) else { return };
     let heap = crate::descriptor::test_heap(false, 4);
     let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
@@ -699,6 +713,7 @@ fn a_placed_texture_goes_when_replaced_and_with_its_pool() {
 /// filled from memory.
 #[test]
 fn a_render_target_is_cleared_through_the_titles_view() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9104, 4) else { return };
     let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
     pool.write(0, &[0x7Fu8; 64]);
@@ -748,6 +763,7 @@ fn a_render_target_is_cleared_through_the_titles_view() {
 /// through an sRGB view of a plain texture it is encoded.
 #[test]
 fn a_render_target_view_stores_in_the_format_it_names() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9120, 16) else { return };
     // The texture's format, the view's (0: none described), and the byte half grey is stored as.
     for (i, (own, named, stored)) in [(29, 28, 128), (28, 29, 188), (29, 0, 188), (28, 28, 128)]
@@ -819,6 +835,7 @@ fn a_render_target_view_stores_in_the_format_it_names() {
 /// an error that stops the submission.
 #[test]
 fn an_undetilable_layout_is_counted_not_fatal() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9105, 4) else { return };
     let res = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::SW_4KB_R_X.0, 0);
     let before = with_title(|t| t.stats.undetilable).unwrap();
@@ -835,6 +852,7 @@ fn an_undetilable_layout_is_counted_not_fatal() {
 /// window; its last drawable is read back.
 #[test]
 fn present_draws_the_back_buffer_over_the_apps_layer() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     check_present_order(false);
     check_present_order(true);
 }
@@ -936,6 +954,7 @@ fn check_present_order(held: bool) {
 /// and the draws that follow are refused.
 #[test]
 fn a_target_the_host_cannot_make_does_not_shift_the_ones_after_it() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9201, 4) else { return };
     // 12 (R16G16B16A16_UINT) has no host texture; 28 is R8G8B8A8_UNORM.
     let gone = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 12, Swizzle::SW_64KB_R_X.0, 1);
@@ -1042,6 +1061,7 @@ fn a_table_running_into_an_unreadable_page_is_noted_without_a_fault() {
 /// title's own memory holds the texels, in the texture's layout (the ocean maps' path, #46).
 #[test]
 fn a_texture_compute_writes_is_copied_back_into_title_memory() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Skips without the Shader Converter.
     if super::host().is_none() {
         return;
@@ -1128,6 +1148,7 @@ fn a_texture_compute_writes_is_copied_back_into_title_memory() {
 /// or uploaded from CPU memory even when placed/typeless (not marked as a render target).
 #[test]
 fn depth_textures_are_not_watched_or_uploaded_from_cpu_memory() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9202, (512 << 10) / page_size() + 1) else { return };
     // DXGI formats: 20 (D32_FLOAT_S8X24_UINT), 40 (D32_FLOAT), 55 (D16_UNORM),
     // and typeless 19 (R32G8X24_TYPELESS) with flags = 0 (not marked ALLOW_RENDER_TARGET).
@@ -1158,6 +1179,7 @@ fn depth_textures_are_not_watched_or_uploaded_from_cpu_memory() {
 /// A described RTV binds and clears its selected subresource in the named format.
 #[test]
 fn a_render_target_view_selects_its_mip_and_slice() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use std::rc::Rc;
     use victory_backend::backend::ComputeBackend;
 
@@ -1276,6 +1298,7 @@ fn a_render_target_view_selects_its_mip_and_slice() {
 /// 4-vertex instanced strips designed for `Options::rect_list`.
 #[test]
 fn described_rectangle_list_draw_uses_supplied_triangles() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9204, 4) else { return };
     let rt = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
     let pso = with_title(|t| {
@@ -1344,6 +1367,7 @@ fn described_rectangle_list_draw_uses_supplied_triangles() {
 /// group colours the target; a record of zero groups draws nothing.
 #[test]
 fn an_indirect_dispatch_mesh_x_draws_the_groups_its_record_holds() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use super::mesh_tests::{RED, TRIANGLE, translate};
     use victory_backend::backend::ComputeBackend;
     use victory_shader::native::HwStage;
@@ -1449,6 +1473,7 @@ fn a_direct_dispatch_mesh_draws_its_groups() {
 /// under it, the next submission does not upload that memory over what was drawn.
 #[test]
 fn a_drawn_target_is_not_filled_from_title_memory_again() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use super::mesh_tests::{RED, TRIANGLE, translate};
     use victory_backend::backend::ComputeBackend;
     use victory_shader::native::HwStage;
@@ -1492,6 +1517,7 @@ fn a_drawn_target_is_not_filled_from_title_memory_again() {
 /// footprint-to/from-subresource) execute on Metal without dropping to `dropped_op`.
 #[test]
 fn copy_resource_and_copy_texture_region_run_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9203, (512 << 10) / page_size() + 1) else { return };
     let tex_a = crate::resource::test_texture_at(
         pool.va(0),
@@ -1600,6 +1626,7 @@ fn copy_resource_and_copy_texture_region_run_on_the_gpu() {
 
 #[test]
 fn a_rectangular_color_clear_preserves_texels_outside_the_selected_regions() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (storage_format, view_format, color, pixel) in [
         (28, 28, [1.0, 0.0, 0.0, 1.0], [255, 0, 0, 255]),
         (28, 29, [0.5, 0.5, 0.5, 1.0], [188, 188, 188, 255]),
@@ -1712,6 +1739,7 @@ type CopyRegion = extern "system" fn(This, *const crate::list::CopyLocation, u32
 /// later sync does not fill it from its title memory.
 #[test]
 fn copy_resource_copies_a_texture_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9211, 8) else { return };
     let src = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
     let dst = crate::resource::test_texture_at(pool.va(65536), (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
@@ -1731,6 +1759,7 @@ fn copy_resource_copies_a_texture_on_the_gpu() {
 /// output), which no view joins: through a buffer, one texel a block.
 #[test]
 fn copy_texture_region_moves_plain_texels_into_compressed_blocks() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9213, 8) else { return };
     // DXGI 3 (R32G32B32A32_UINT) 2x2 into DXGI 77 (BC3) 8x8.
     let src = crate::resource::test_texture_at(pool.va(0), (2, 2), 1, 3, Swizzle::LINEAR.0, 0);
@@ -1757,6 +1786,7 @@ fn copy_texture_region_moves_plain_texels_into_compressed_blocks() {
 /// larger source is clipped to the destination).
 #[test]
 fn resolve_subresource_copies_what_both_hold() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9214, 8) else { return };
     let src = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
     let dst = crate::resource::test_texture_at(pool.va(65536), (8, 8), 1, 28, Swizzle::LINEAR.0, 0);
@@ -1772,6 +1802,7 @@ fn resolve_subresource_copies_what_both_hold() {
 /// a region of them out again into other rows.
 #[test]
 fn depth_stencil_rows_go_in_and_out_as_the_depth_plane() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use crate::list::CopyLocation;
     use crate::resource::PlacedFootprint;
     let Some(pool) = pool(9215, 8) else { return };
@@ -1801,6 +1832,7 @@ fn depth_stencil_rows_go_in_and_out_as_the_depth_plane() {
 /// one that differs in size gets its own, as before; the shared one goes with the object.
 #[test]
 fn a_placed_rgb9e5_view_over_an_r32_uint_object_shares_its_texture() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(pool) = pool(9109, 4) else { return };
     // Flags 4: unordered access. DXGI 42: R32_UINT; 67: R9G9B9E5.
     let object = crate::resource::test_texture_at(pool.va(0), (32, 32), 1, 42, Swizzle::SW_64KB_S.0, 4);

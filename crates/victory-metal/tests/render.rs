@@ -184,6 +184,7 @@ fn px(p: &[[u8; 4]], x: usize, y: usize) -> [u8; 4] {
 
 #[test]
 fn triangle_offscreen() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let s = Scene::new(&m, Some((true, Compare::Less)));
     s.arena.write(
@@ -219,6 +220,7 @@ fn triangle_offscreen() {
 
 #[test]
 fn indexed_draw_with_depth_test_and_depth_sampling() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let s = Scene::new(&m, Some((true, Compare::Less)));
     // Left half: an indexed quad (4 vertices, 6 u16 indices) at z 0.25, green. Drawn second, a
@@ -318,6 +320,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
 
 #[test]
 fn depth_test_rejects_a_draw_behind() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let s = Scene::new(&m, Some((true, Compare::Less)));
     // The same full-screen triangle twice: green at z 0.25 first, red at z 0.75 second. Red fails.
@@ -346,6 +349,7 @@ fn depth_test_rejects_a_draw_behind() {
 
 #[test]
 fn switching_to_disabled_depth_clears_the_previous_test() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let s = Scene::new(&m, Some((true, Compare::Never)));
     let disabled = Scene::pipeline(&m, None);
@@ -390,6 +394,7 @@ fn switching_to_disabled_depth_clears_the_previous_test() {
 
 #[test]
 fn a_count_buffer_limits_the_indirect_draws_that_run() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     for (count, red) in [(1u32, false), (2, true), (0, false)] {
         let s = Scene::new(&m, Some((true, Compare::Less)));
@@ -452,6 +457,7 @@ fn a_count_buffer_limits_the_indirect_draws_that_run() {
 
 #[test]
 fn indirect_draws_read_their_records_from_title_memory() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let s = Scene::new(&m, Some((true, Compare::Less)));
     // As `indexed_draw_with_depth_test_and_depth_sampling`, with the counts in D3D12 argument
@@ -527,6 +533,7 @@ fn an_indirect_draw_past_the_most_instances_draws_nothing() {
 
 #[test]
 fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // The submission commits even when a pass cannot be encoded (its fence signals and the value
     // writes other queues wait on must still go out), and the passes after it still run.
     let Some(m) = backend() else { return };
@@ -579,6 +586,7 @@ fn a_refused_pass_keeps_its_fence_signal_and_the_passes_after_it() {
 
 #[test]
 fn a_pass_refused_mid_encoding_closes_its_encoder() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // An indexed record without an index buffer is refused after the render encoder is open; the
     // encoder must still be ended, or the next pass cannot open its own.
     let Some(m) = backend() else { return };
@@ -625,6 +633,7 @@ fn a_pass_refused_mid_encoding_closes_its_encoder() {
 /// the pixel shader of the next pass, in the same submission (both residency modes).
 #[test]
 fn a_target_drawn_in_one_pass_is_sampled_by_the_next() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for m in backends() {
         let s = Scene::new(&m, None);
         const WHITE: [f32; 4] = [1.0; 4];
@@ -806,6 +815,7 @@ fn heap_sampled(m: &Metal, ps: &str, index: usize, sampler: [u32; 10]) -> [u8; 4
 /// the shader): without it the sample read zeros on M1 and M2 GPUs, the title's black window.
 #[test]
 fn a_static_sampler_samples_a_heap_texture() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Point and clamp; anisotropic 4x with wrap and LOD 0 to 12, as the title's present pass.
     let point = [0, 3, 3, 3, 0, 1, 1, 0, 0, f32::MAX.to_bits()];
     let aniso = [0x55, 1, 1, 1, 0, 4, 1, 0, 0, 12.0f32.to_bits()];
@@ -825,6 +835,7 @@ fn a_static_sampler_samples_a_heap_texture() {
 /// Where the converter puts the static sampler table: one pointer after the root parameters.
 #[test]
 fn the_static_sampler_table_follows_the_root_parameters() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use victory_metal::backend::{RootLayout, RootParam};
     if backend().is_none() {
         return;
@@ -868,6 +879,7 @@ fn the_static_sampler_table_follows_the_root_parameters() {
 
 #[test]
 fn zero_count_draws_do_not_fail_validation() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for m in backends() {
         let s = Scene::new(&m, None);
         let d1 = s.draw(
