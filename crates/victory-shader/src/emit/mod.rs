@@ -497,6 +497,10 @@ pub struct Options {
     /// are declared uint and store the exported dwords' bits as they are. D3D12 wants a target's
     /// output type to match its format, and the console exports integer bits in float registers.
     pub integer_targets: u8,
+    /// For mesh shaders paired with a pixel shader: `Some((texcoords, halves))` trims `OSG1`
+    /// generic outputs to only `TEXCOORD` `< 32` in `texcoords` and `HALF` `< 64` in `halves`
+    /// so unused interpolants do not count against Metal's 32 KiB mesh output limit.
+    pub trim_outputs: Option<(u32, u64)>,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -621,6 +625,17 @@ fn emit_fast(
             });
             row += 1;
         }
+    }
+    if native.stage == HwStage::Ms
+        && let Some((texcoords_mask, halves_mask)) = options.trim_outputs
+    {
+        outputs.retain(|e| match e.name.as_str() {
+            "TEXCOORD" if e.kind == 0 && e.index < 32 => (texcoords_mask >> e.index) & 1 != 0,
+            name if name == graphics::HALF && e.kind == 0 && e.index < 64 => {
+                (halves_mask >> e.index) & 1 != 0
+            }
+            _ => true,
+        });
     }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.

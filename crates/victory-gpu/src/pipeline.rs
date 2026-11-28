@@ -299,6 +299,17 @@ impl Shader {
         crate::native::shaders::translate_extra(&container, rect, extra, copy).map(Arc::new)
     }
 
+    /// Whether [`Self::translate_trim_mesh`] would find its translation on disk.
+    pub(crate) fn trim_mesh_cached(&self, trim: (u32, u64)) -> bool {
+        self.container_again().is_ok_and(|c| crate::native::shaders::trim_mesh_cached(&c, trim))
+    }
+
+    /// A mesh translation with generic outputs trimmed to `(texcoords, halves)`.
+    pub(crate) fn translate_trim_mesh(&self, trim: (u32, u64)) -> Result<Arc<victory_shader::emit::HostShader>, String> {
+        let container = self.container_again()?;
+        crate::native::shaders::translate_trim_mesh(&container, trim).map(Arc::new)
+    }
+
     /// The translation for rectangle-list draws, made on first use.
     pub(crate) fn native_rect(&self) -> Result<&Arc<victory_shader::emit::HostShader>, &str> {
         self.rect

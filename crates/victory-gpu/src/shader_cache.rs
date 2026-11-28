@@ -313,6 +313,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         extra_params: 0,
         // `DispatchX` runs thread counts as group counts here (`list::dispatch_x`).
         thread_counts: false,
+        trim_outputs: None,
         // shortcut: this key has no options; integer targets are made on the native host only.
         integer_targets: 0,
     };

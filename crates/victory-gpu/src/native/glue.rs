@@ -1685,12 +1685,55 @@ fn make_host_pipe(
             None => Pipe::Refused,
         },
         Some(g) => match find("vertex") {
-            Some(vs) => t.render_pipe(vs, find("pixel"), &g, &name),
+            Some(vs) => {
+                let vs_source = &stages.iter().find(|s| s.0 == "vertex").expect("a vertex stage").1;
+                let ps = find("pixel");
+                let Ok(trimmed) = trim_mesh_if_needed(t, vs_source, vs, ps, &name) else {
+                    return Pipe::Refused;
+                };
+                t.render_pipe(trimmed.as_deref().unwrap_or(vs), ps, &g, &name)
+            }
             None => {
                 t.refused_translation(&name, "a graphics pipeline without a vertex shader".into());
                 Pipe::Refused
             }
         },
+    }
+}
+
+/// When a mesh shader's output signature exceeds 12 rows and exports generic `TEXCOORD`/`HALF`
+/// slots the paired pixel shader does not read, re-translate it with only the read outputs so
+/// unused interpolants do not push the mesh past Metal's 32 KiB limit (issue #528).
+fn trim_mesh_if_needed(
+    t: &mut MetalTitle,
+    vs_source: &Arc<crate::pipeline::Shader>,
+    vs: &victory_shader::emit::HostShader,
+    ps: Option<&victory_shader::emit::HostShader>,
+    name: &str,
+) -> Result<Option<Arc<victory_shader::emit::HostShader>>, ()> {
+    use victory_shader::{FourCC, HwStage};
+    let Some(ps) = ps.filter(|_| vs.stage == HwStage::Ms) else {
+        return Ok(None);
+    };
+    if super::state::osg1_count(&vs.dxil) <= 12 {
+        return Ok(None);
+    }
+    let (tc, halves) = super::state::pixel_reads(&ps.dxil);
+    let (vs_tc, vs_halves, _) = super::state::sig_masks(&vs.dxil, FourCC::OSG1);
+    if (vs_tc & !tc) == 0 && (vs_halves & !halves) == 0 {
+        return Ok(None);
+    }
+    if frame_left().is_zero() && !vs_source.trim_mesh_cached((tc, halves)) {
+        let s = vs_source.clone();
+        put_off(format!("{} trim {tc} {halves}", s.hash), move || drop(s.translate_trim_mesh((tc, halves))));
+        return Err(());
+    }
+    match vs_source.translate_trim_mesh((tc, halves)) {
+        Ok(h) => Ok(Some(h)),
+        Err(e) => {
+            t.refused_translation(name, format!("trim mesh outputs: {e}"));
+            Err(())
+        }
     }
 }
 
@@ -1944,7 +1987,16 @@ fn guess(t: &mut MetalTitle, l: &MetalList, g: &Guessed<Metal>, rect: bool) -> P
     } else {
         None
     };
-    let vs = widened.as_deref().unwrap_or(base_vs);
+    let base_vs = widened.as_deref().unwrap_or(base_vs);
+    let trimmed = if widened.is_none() && !rect {
+        let Ok(t_vs) = trim_mesh_if_needed(t, &g.vs_source, base_vs, g.ps.as_deref(), &g.name) else {
+            return Pipe::Refused;
+        };
+        t_vs
+    } else {
+        None
+    };
+    let vs = trimmed.as_deref().unwrap_or(base_vs);
     let reads = super::state::vertex_inputs(&vs.dxil).unwrap_or_default();
     let state = g.state.for_draw(l.targets.color.clone(), l.targets.depth, l.strides.clone(), &reads, rect);
     t.compile_wait = compile_wait(t);
