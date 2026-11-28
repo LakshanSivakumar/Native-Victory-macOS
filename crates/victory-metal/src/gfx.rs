@@ -1556,18 +1556,24 @@ impl GraphicsBackend for Metal {
         // command buffer starts after the previous one finished, and each encoder after the one
         // before.
         let set_on_queue = queue.1.get();
-        let order = set_on_queue.then(|| {
+        if set_on_queue {
             let n = queue.3.get();
             queue.3.set(n + 1);
             if n > 0 {
                 cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*queue.2), n);
             }
-            Order {
+        }
+        // Each piece command buffer gets its own `MTLFence` for intra-piece encoder ordering
+        // (#404): inter-piece ordering already goes through `piece_event` (`MTLSharedEvent`),
+        // which `Owed::recover` raises on the CPU if an earlier piece fails or times out, whereas
+        // sharing one `MTLFence` across pieces wedged the next piece on an unsignalled GPU fence.
+        let make_order = || {
+            set_on_queue.then(|| Order {
                 fence: self.dev.newFence(),
                 started: Cell::new(false),
-            }
-        });
-        let order = order.as_ref().and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
+            })
+        };
+        let mut piece_order = make_order();
         // A pass that cannot be encoded must not take the submission's fence signals and
         // bottom-of-pipe value writes with it: the title's compute queues wait for those writes,
         // and a lost one is `Unsignaled CrossQueueBarrier` (the title then dies). The failing pass
@@ -1611,6 +1617,9 @@ impl GraphicsBackend for Metal {
         let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
         let mut first = 0;
         for (n, pass) in work.passes.iter().enumerate() {
+            let order = piece_order
+                .as_ref()
+                .and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
             let encoded = match pass {
                 Pass::Compute(dispatches) => {
                     self.encode_compute(&cb, dispatches, set_on_queue, order, &mut attached_heaps)
@@ -1656,13 +1665,16 @@ impl GraphicsBackend for Metal {
                 let piece_owed = self.commit_piece(queue, &cb, owed, piece, tinfo);
                 first = n + 1;
                 cb = match self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece))) {
-                    Ok(cb) => cb,
+                    Ok(cb) => {
+                        piece_order = make_order();
+                        cb
+                    }
                     Err(e) => {
                         // The current piece never started: every pass from `first` on was lost,
-                        // and the earlier pieces did commit. Their fills are paid once the last
-                        // committed piece's passes have run on the GPU (#80): the console's
-                        // order kept, where paying at submit time would let a waiter go on
-                        // before those passes ran. They count as refused for the caller's log.
+                        // and the earlier pieces did commit. Their fills, the queue's order event
+                        // and the submission's fence signals are paid once the last committed
+                        // piece's passes have run on the GPU (#80, #404): the console's order
+                        // kept, without stranding `queue.2` or cross-queue waiters.
                         let mut lost: Vec<usize> = refused.iter().copied().collect();
                         lost.extend(first..work.passes.len());
                         let mut refund = std::mem::take(&mut refused_fills);
@@ -1671,7 +1683,16 @@ impl GraphicsBackend for Metal {
                                 refund.extend(take_fills(ops));
                             }
                         }
-                        piece_owed.attach_refund(refund);
+                        let mut tail_events = Vec::with_capacity(work.signals.len() + 1);
+                        if set_on_queue {
+                            tail_events.push((queue.2.clone(), queue.3.get()));
+                        }
+                        for (f, v) in work.signals {
+                            if let Ok(pairs) = f.encode_signal(&self.dev, *v) {
+                                tail_events.extend(pairs);
+                            }
+                        }
+                        piece_owed.attach_refund_and_events(refund, tail_events);
                         refused = lost;
                         return Err(SubmitFailure {
                             committed: true,
@@ -1693,6 +1714,9 @@ impl GraphicsBackend for Metal {
         // fence above orders each encoder after the one before), before this command buffer's
         // fence signals, which encode after this.
         if !refused_fills.is_empty() {
+            let order = piece_order
+                .as_ref()
+                .and_then(|o| o.fence.as_ref().map(|f| (&**f, &o.started)));
             let _ = self.encode_blit(&cb, &refused_fills, order);
         }
         let mut events = Vec::with_capacity(work.signals.len() + 1);
@@ -2132,6 +2156,8 @@ pub(crate) struct Owed {
     /// an attach after the completion pays what is there at once, which is that order kept.
     #[allow(clippy::type_complexity)]
     refund: std::sync::Mutex<Vec<(Retained<ProtocolObject<dyn MTLBuffer>>, usize, usize, u8)>>,
+    #[allow(clippy::type_complexity)]
+    refund_events: std::sync::Mutex<Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>>,
     /// Set by the completion handler before it pays a refund: an attach past it pays at once.
     completed: std::sync::atomic::AtomicBool,
 }
@@ -2173,6 +2199,7 @@ impl Owed {
             fills,
             signals,
             refund: std::sync::Mutex::default(),
+            refund_events: std::sync::Mutex::default(),
             completed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -2180,10 +2207,17 @@ impl Owed {
     /// What later passes owe if a piece boundary stopped them from ever being encoded: paid once
     /// the GPU has run this command buffer ([`Self::pay_refund`]). A completion that already ran
     /// pays at once — its passes have run, so that is the order kept.
+    #[cfg(test)]
     #[allow(clippy::type_complexity)]
-    pub(crate) fn attach_refund(
+    pub(crate) fn attach_refund(&self, refund: Vec<BlitOp<'_, Metal>>) {
+        self.attach_refund_and_events(refund, Vec::new());
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn attach_refund_and_events(
         &self,
         refund: Vec<BlitOp<'_, Metal>>,
+        events: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>,
     ) {
         let fills = refund
             .iter()
@@ -2194,10 +2228,15 @@ impl Owed {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if fills.is_empty() {
+        if fills.is_empty() && events.is_empty() {
             return;
         }
-        self.refund.lock().unwrap_or_else(|e| e.into_inner()).extend(fills);
+        if !fills.is_empty() {
+            self.refund.lock().unwrap_or_else(|e| e.into_inner()).extend(fills);
+        }
+        if !events.is_empty() {
+            self.refund_events.lock().unwrap_or_else(|e| e.into_inner()).extend(events);
+        }
         // The completion handler already ran (the command buffer was done before this call): its
         // passes have run, so paying at once is the console's order. Else the handler pays.
         if self.completed.load(std::sync::atomic::Ordering::Acquire) {
@@ -2205,13 +2244,14 @@ impl Owed {
         }
     }
 
-    /// Writes each refunded fill, in order. Called from the completion handler, so a waiter sees
-    /// the writes only after this command buffer's passes have run — the order the console kept.
-    /// The fills are taken out under the lock, so the handler and a racing attach never both pay
-    /// them (a second payment could overwrite a newer value the title wrote in between).
+    /// Writes each refunded fill, in order, then raises any refunded events. Called from the
+    /// completion handler, so a waiter sees the writes only after this command buffer's passes have
+    /// run — the order the console kept. The fills and events are taken out under their locks, so
+    /// the handler and a racing attach never both pay them.
     fn pay_refund(&self) {
         let refund = std::mem::take(&mut *self.refund.lock().unwrap_or_else(|e| e.into_inner()));
-        if refund.is_empty() {
+        let events = std::mem::take(&mut *self.refund_events.lock().unwrap_or_else(|e| e.into_inner()));
+        if refund.is_empty() && events.is_empty() {
             return;
         }
         for (buf, off, len, value) in refund.iter() {
@@ -2219,12 +2259,19 @@ impl Owed {
             unsafe { std::ptr::write_bytes(buf.contents().as_ptr().cast::<u8>().add(*off), *value, *len) };
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
-            tracing::warn!(
-                "metal: paid {} value writes of passes a piece boundary stopped from encoding, after the GPU's earlier passes",
-                refund.len()
-            );
+        for (e, v) in &events {
+            if e.signaledValue() < *v {
+                e.setSignaledValue(*v);
+            }
+        }
+        if !refund.is_empty() {
+            static WARNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if WARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                tracing::warn!(
+                    "metal: paid {} value writes of passes a piece boundary stopped from encoding, after the GPU's earlier passes",
+                    refund.len()
+                );
+            }
         }
     }
 
@@ -2280,6 +2327,13 @@ pub(crate) static FLIGHTS_IN_TESTS: std::sync::RwLock<()> = std::sync::RwLock::n
 static FLIGHTS: std::sync::Mutex<std::collections::VecDeque<Flight>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 static FAILURES: std::sync::Mutex<Vec<(usize, u64, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+static HAD_FAILURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Returns true if Metal reported a failed command buffer since the last check, so the host timer
+/// can immediately pump recovered fences and check for swept sibling command buffers (#404).
+pub fn take_had_failure() -> bool {
+    HAD_FAILURE.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
 
 fn flights() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Flight>> {
     FLIGHTS.lock().unwrap_or_else(|e| e.into_inner())
@@ -2289,44 +2343,57 @@ fn flights() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Flight
 fn landed(serial: u64, queue: usize, failed: bool) {
     flights().retain(|f| f.serial != serial);
     if failed {
+        let now = std::time::Instant::now();
         let mut failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner());
         match failures.iter_mut().find(|(q, ..)| *q == queue) {
-            Some(f) if f.1 < serial => *f = (queue, serial, std::time::Instant::now()),
-            Some(_) => {}
-            None => failures.push((queue, serial, std::time::Instant::now())),
+            Some(f) => *f = (queue, f.1.max(serial), now),
+            None => failures.push((queue, serial, now)),
         }
+        HAD_FAILURE.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
-/// How long after Metal failed a command buffer the ones committed before it on its queue, and
-/// still not reported on, count as lost; and how long any command buffer may go unreported.
-const LOST_BEHIND_A_FAILURE: std::time::Duration = std::time::Duration::from_secs(5);
-const LOST_ANYWAY: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long after Metal failed a command buffer on `queue` earlier command buffers (`f.serial < s`)
+/// on the same FIFO queue count as lost, how long command buffers already committed on `queue` when
+/// the failure hit (`f.since <= failed_at`, including followers swept by the reset, #404) count as
+/// lost, and how long any unreported command buffer may stay in flight (well below the title's 30 s
+/// fatal watchdog).
+const LOST_BEHIND_A_FAILURE: std::time::Duration = std::time::Duration::from_millis(500);
+const LOST_WITH_A_FAILURE: std::time::Duration = std::time::Duration::from_secs(3);
+const LOST_ANYWAY: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Pays what lost command buffers owe (fence signals, the order event, value writes) from the CPU
-/// and returns how many were lost. The host calls it while work stays held.
+/// and returns how many were lost. The host calls it periodically and after GPU failures.
 ///
-/// Observed with memory running out (two games at once on a 48 GB Mac, 41 GB wired): Metal fails
-/// some command buffers of a queue with `kIOGPUCommandBufferCallbackErrorTimeout` and never
-/// reports on others committed before them, neither completed nor failed. Their value writes
-/// never land, so every title queue stays held on its barrier word and the title spins for good.
+/// Observed with GPU timeouts and memory exhaustion (#79, #404, #521): Metal fails some command
+/// buffers of a queue with `kIOGPUCommandBufferCallbackErrorTimeout` and never reports on others
+/// committed before or alongside them in the same queue reset. Their value writes and residency
+/// order events never land, so title queues stay held on cross-queue barrier words until the
+/// title's 30 s watchdog terminates the process.
 ///
-/// Guess: a command buffer older than one Metal failed on the same queue and unreported 5 s
-/// later, or unreported for 30 s, will never run. If one does run after all, its draws land late
-/// and its signals and writes repeat what was paid. The console has no lost command buffers, so
-/// this is our recovery, not console behaviour: the title goes on and the lost frames' draws are
-/// missing.
+/// Guess: on a FIFO `MTLCommandQueue`, an unreported command buffer older than a failed serial
+/// after 0.5 s, or already committed when the queue failed and still unreported 3 s later, or
+/// unreported for 15 s on any queue, will never complete. If one does run after all, its draws
+/// land late and its signals and writes repeat what was paid.
 pub fn recover_lost() -> usize {
-    recover_lost_after(LOST_BEHIND_A_FAILURE, LOST_ANYWAY)
+    recover_lost_after(LOST_BEHIND_A_FAILURE, LOST_WITH_A_FAILURE, LOST_ANYWAY)
 }
 
-fn recover_lost_after(behind_a_failure: std::time::Duration, anyway: std::time::Duration) -> usize {
+fn recover_lost_after(
+    behind_a_failure: std::time::Duration,
+    with_a_failure: std::time::Duration,
+    anyway: std::time::Duration,
+) -> usize {
     let failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let lost: Vec<Flight> = {
         let mut flying = flights();
         let is_lost = |f: &Flight| {
             f.since.elapsed() >= anyway
-                || failures.iter().any(|(q, s, at)| *q == f.queue && f.serial < *s && at.elapsed() >= behind_a_failure)
+                || failures.iter().any(|(q, s, at)| {
+                    *q == f.queue
+                        && ((f.serial < *s && at.elapsed() >= behind_a_failure)
+                            || (f.since <= *at && at.elapsed() >= with_a_failure))
+                })
         };
         let (lost, kept): (Vec<Flight>, Vec<Flight>) = flying.drain(..).partition(is_lost);
         *flying = kept.into();
@@ -4107,12 +4174,12 @@ mod owed_tests {
         let passes = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x5A }])];
         let (waits, signals) = ([(&never, 1)], [(&fence, 3)]);
         m.submit_passes(&q, &PassSubmission { waits: &waits, passes: &passes, signals: &signals }).unwrap();
-        // Not old enough by either rule: nothing is lost.
+        // Not old enough by any rule: nothing is lost.
         let (long, zero) = (std::time::Duration::from_secs(3600), std::time::Duration::ZERO);
-        assert_eq!(recover_lost_after(long, long), 0);
+        assert_eq!(recover_lost_after(long, long, long), 0);
         assert_eq!(m.completed(&fence), 0);
         // Other tests' command buffers may be in flight too (those that do not mind): at least ours.
-        assert!(recover_lost_after(long, zero) >= 1);
+        assert!(recover_lost_after(long, long, zero) >= 1);
         // SAFETY: inside the region.
         assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, [0x5A; 8]);
         assert_eq!(m.completed(&fence), 3);
@@ -4332,6 +4399,105 @@ mod owed_tests {
         let last = unsafe { std::ptr::read_volatile(region.ptr.add(len - 1)) };
         t.join().unwrap();
         assert_eq!(last, 1, "the fence was reached before the fill it covers was written");
+    }
+
+    /// When a queue failure hits (`kIOGPUCommandBufferCallbackErrorTimeout`), both earlier
+    /// unreported buffers (`serial < failed_serial`) and sibling followers already committed on
+    /// that queue before the failure (`since <= failed_at`, `serial > failed_serial`) are
+    /// recovered within their short horizons, while a fresh submission committed after the failure
+    /// stays in flight (#404).
+    #[test]
+    fn queue_failure_recovers_earlier_and_swept_followers_without_touching_fresh_work() {
+        let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        let at = |o: usize| unsafe { region.ptr.add(o) as *const u8 };
+        let q = m.create_queue().unwrap();
+        let q_id = Retained::as_ptr(&q.0) as *const u8 as usize;
+        let (hold, f_before, f_swept, f_fresh) = (
+            m.create_fence(0).unwrap(),
+            m.create_fence(0).unwrap(),
+            m.create_fence(0).unwrap(),
+            m.create_fence(0).unwrap(),
+        );
+
+        let p_before = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(0)), len: 8, value: 0xAA }])];
+        let p_swept = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(8)), len: 8, value: 0xBB }])];
+        let p_fresh = [Pass::Blit(vec![BlitOp::Fill { dst: (&buf, at(16)), len: 8, value: 0xCC }])];
+
+        m.submit_passes(&q, &PassSubmission { waits: &[(&hold, 1)], passes: &p_before, signals: &[(&f_before, 1)] }).unwrap();
+        let failed_serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        m.submit_passes(&q, &PassSubmission { waits: &[(&hold, 1)], passes: &p_swept, signals: &[(&f_swept, 2)] }).unwrap();
+
+        // Simulate the GPU watchdog failing `failed_serial` right after `p_swept` was already queued.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = take_had_failure();
+        landed(failed_serial, q_id, true);
+        assert!(take_had_failure(), "landed(..., true) flags HAD_FAILURE for immediate host wakeup");
+        assert!(!take_had_failure(), "take_had_failure clears the flag");
+
+        // A fresh submission committed *after* the failure must not be treated as swept by it.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        m.submit_passes(&q, &PassSubmission { waits: &[(&hold, 1)], passes: &p_fresh, signals: &[(&f_fresh, 3)] }).unwrap();
+
+        let (zero, long) = (std::time::Duration::ZERO, std::time::Duration::from_secs(3600));
+        // Step 1: `behind_a_failure` recovers `p_before` (`serial < failed_serial`) first.
+        assert_eq!(recover_lost_after(zero, long, long), 1);
+        assert_eq!(m.completed(&f_before), 1);
+        assert_eq!(m.completed(&f_swept), 0);
+        assert_eq!(m.completed(&f_fresh), 0);
+
+        // Step 2: `with_a_failure` recovers `p_swept` (`since <= failed_at`), leaving `p_fresh` untouched.
+        assert_eq!(recover_lost_after(zero, zero, long), 1);
+        assert_eq!(m.completed(&f_swept), 2);
+        assert_eq!(m.completed(&f_fresh), 0, "fresh post-failure work must stay in flight");
+
+        // SAFETY: inside the region; `p_before` and `p_swept` were paid, `p_fresh` has not run yet.
+        let bytes = unsafe { std::slice::from_raw_parts(region.ptr, 24) };
+        assert_eq!(&bytes[0..8], &[0xAA; 8]);
+        assert_eq!(&bytes[8..16], &[0xBB; 8]);
+        assert_eq!(&bytes[16..24], &[0; 8]);
+
+        // Release `hold` so `p_fresh` completes cleanly on the GPU.
+        hold.0.setSignaledValue(1);
+        assert!(m.wait(&f_fresh, 3, 5000));
+        // SAFETY: inside the region; `p_fresh` finished on the GPU.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr.add(16), 8) }, &[0xCC; 8]);
+        FAILURES.lock().unwrap_or_else(|e| e.into_inner()).retain(|(fq, ..)| *fq != q_id);
+    }
+
+    /// Attached refund events (queue order event + submission signals when `next_piece` fails) are
+    /// raised only after the committed piece completes and its refunded fills are written (#404).
+    #[test]
+    fn attached_refund_events_signal_after_committed_piece_and_fills() {
+        let m = Metal::new().unwrap();
+        let region = Region::new(page_size(), None).unwrap();
+        let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
+        // SAFETY: inside the region; the GPU is idle.
+        unsafe { std::ptr::write_bytes(region.ptr, 0, 16) };
+        let q = m.create_queue().unwrap();
+        q.1.set(true);
+        q.3.set(1);
+        let fence = m.create_fence(0).unwrap();
+        let cb = m.new_command_buffer(&q).unwrap();
+        let owed = m.commit_piece(&q, &cb, Owed::of(vec![], &[], 0), 1, None);
+        let pairs = fence.encode_signal(&m.dev, 9).unwrap();
+        let mut events = vec![(q.2.clone(), q.3.get())];
+        events.extend(pairs);
+        owed.attach_refund_and_events(
+            vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x77 }],
+            events,
+        );
+        assert!(m.wait(&fence, 9, 5000), "attached fence signal never fired");
+        assert_eq!(q.2.signaledValue(), 1, "queue order event was not advanced");
+        // SAFETY: inside the region; read after the fence signal that ordered after the fill.
+        assert_eq!(unsafe { std::slice::from_raw_parts(region.ptr, 8) }, &[0x77; 8]);
+        // Subsequent submission on `q` is not wedged behind `q.2`.
+        let next = [(&fence, 10)];
+        m.submit_passes(&q, &PassSubmission { waits: &[], passes: &[], signals: &next }).unwrap();
+        assert!(m.wait(&fence, 10, 5000), "queue wedged after refunded piece failure");
     }
 }
 
