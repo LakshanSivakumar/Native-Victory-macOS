@@ -133,7 +133,21 @@ unsafe fn metalfx_create(
         tracing::error!("FidelityFX MetalFX: refused the upscaler: {why}");
         return PARAMETER;
     }
-    let handle = Box::into_raw(Box::new(config));
+    // A real provider's context is a large structure and the title reads fields of
+    // it past the description it gave us (a bare 24-byte config read past its end
+    // faulted the run right after the first dispatch, image+0x55e56f8). Hand out a
+    // zero-padded block of the same scale instead: reads past the config land on
+    // zeros, the way the PC build's unused fields do.
+    const CONTEXT_BYTES: usize = 0x1000;
+    // SAFETY: a valid layout, and the block is freed in `metalfx_destroy` with the
+    // same one.
+    let handle = unsafe {
+        std::alloc::alloc_zeroed(
+            std::alloc::Layout::from_size_align(CONTEXT_BYTES, 16).unwrap(),
+        )
+    } as *mut UpscalerConfig;
+    // SAFETY: the block is at least as large as the config.
+    unsafe { handle.write(config) };
     // SAFETY: the title's out-slot.
     unsafe { context.write(handle.cast()) };
     METALFX_CONTEXTS
@@ -169,8 +183,14 @@ unsafe fn metalfx_destroy(context: *mut *mut c_void) -> Option<u32> {
         .unwrap_or_else(|e| e.into_inner())
         .remove(&handle);
     if removed {
-        // SAFETY: the handle came from `metalfx_create`.
-        unsafe { drop(Box::from_raw(handle as *mut UpscalerConfig)) };
+        // SAFETY: the handle came from `metalfx_create`, which allocated it with this
+        // layout.
+        unsafe {
+            std::alloc::dealloc(
+                handle as *mut u8,
+                std::alloc::Layout::from_size_align(0x1000, 16).unwrap(),
+            )
+        };
         Some(OK)
     } else {
         None
