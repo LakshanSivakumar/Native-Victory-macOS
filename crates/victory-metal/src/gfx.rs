@@ -3825,9 +3825,9 @@ impl crate::metal::Compiler {
             return Err("debug: mesh pipelines with a pixel stage are off".into());
         }
         let has_stencil = d.depth == Some(Format::D32FloatS8);
-        use victory_shader::emit::{metal_mesh_bytes, METAL_MESH_OUTPUT_BYTES};
+        use victory_shader::emit::{mesh_guard_on, mesh_over_limit, metal_mesh_bytes, METAL_MESH_OUTPUT_BYTES};
         let bytes = metal_mesh_bytes(ms.mesh).ok_or("mesh output footprint is unknown")?;
-        if bytes > METAL_MESH_OUTPUT_BYTES {
+        if mesh_over_limit(bytes, mesh_guard_on()) {
             return Err(format!("mesh outputs {bytes} exceed {METAL_MESH_OUTPUT_BYTES} bytes"));
         }
         let (mf, info) = self.mesh_function(ms.mesh, ms.layout, false)?;

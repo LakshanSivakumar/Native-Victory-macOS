@@ -224,7 +224,7 @@ pub(crate) use container::{SigElement as TestSigElement, signature as test_signa
 mod container_tests;
 pub mod graphics;
 mod mesh;
-pub use mesh::{METAL_MESH_OUTPUT_BYTES, metal_mesh_bytes};
+pub use mesh::{METAL_MESH_OUTPUT_BYTES, mesh_guard_on, mesh_over_limit, metal_mesh_bytes};
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]

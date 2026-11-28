@@ -5,6 +5,19 @@ use crate::{Container, FourCC};
 
 pub const METAL_MESH_OUTPUT_BYTES: u32 = 32_768;
 
+/// Whether the 32 KiB mesh output guard is on: `VICTORY_MESH_OVER_LIMIT=1` turns it off, for
+/// every check (#528: on an M5 Max with macOS 26.5, Metal made and ran pipelines of 33,792 to
+/// 38,400 declared bytes).
+pub fn mesh_guard_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MESH_OVER_LIMIT").as_deref() != Ok("1"))
+}
+
+/// Whether a mesh program declaring `bytes` of outputs is refused for size, with the guard `on`.
+pub fn mesh_over_limit(bytes: u32, on: bool) -> bool {
+    on && bytes > METAL_MESH_OUTPUT_BYTES
+}
+
 /// Same layout rule as the Wine host's `metal_mesh_bytes`: distance scalars, position,
 /// then signature order, each field aligned to its own size. Counts are declared maxima,
 /// not the number of vertices a particular dispatch happens to emit. Fail closed on bad DXIL.
@@ -137,5 +150,13 @@ mod tests {
         let at = u32_at(&b, 32).unwrap() as usize;
         b[at + 36] = 1;
         assert_eq!(metal_mesh_bytes(&b), None);
+    }
+
+    /// The guard refuses only over 32 KiB and only while it is on; every check asks this (#528).
+    #[test]
+    fn the_mesh_output_guard_refuses_over_32_kib_only_while_on() {
+        assert!(mesh_over_limit(33_792, true));
+        assert!(!mesh_over_limit(32_768, true));
+        assert!(!mesh_over_limit(38_400, false));
     }
 }

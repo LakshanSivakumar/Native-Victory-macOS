@@ -265,16 +265,16 @@ pub(crate) fn metal_mesh_bytes(dxil: &[u8]) -> Option<u32> {
 /// Default on for the native Metal host. The override only bypasses this
 /// size guard; it does not add the missing native mesh dispatch support.
 fn refuse_over_limit_mesh() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_MESH_OVER_LIMIT").as_deref() != Ok("1"))
+    victory_shader::emit::mesh_guard_on()
 }
 
 /// Whether a mesh program declaring `bytes` of outputs is refused for size: over Metal's
-/// documented 32 KiB, unless the guard is off (`refuse`: [`refuse_over_limit_mesh`]). Both checks
-/// ask this one (before conversion, `refuse_mesh`, and when the pipeline is made, `make_render`),
-/// so `VICTORY_MESH_OVER_LIMIT=1` lets such a program through both.
+/// documented 32 KiB, unless the guard is off (`refuse`: [`refuse_over_limit_mesh`]). All three checks
+/// ask the same rule (before conversion, `refuse_mesh`; when the pipeline is made, `make_render`;
+/// and the Metal backend's `mesh_pipeline`), so `VICTORY_MESH_OVER_LIMIT=1` lets such a program
+/// through all of them.
 pub(super) fn over_limit(bytes: u32, refuse: bool) -> bool {
-    refuse && bytes > METAL_MESH_OUTPUT_BYTES
+    victory_shader::emit::mesh_over_limit(bytes, refuse)
 }
 
 /// Counts of what the shader path did, and why it refused what it did.
