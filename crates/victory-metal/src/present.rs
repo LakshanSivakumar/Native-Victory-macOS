@@ -328,6 +328,10 @@ impl PresentBackend for Metal {
         // A hidden window shows nothing; a drawable asked for already is still taken below.
         if HIDDEN.load(std::sync::atomic::Ordering::Relaxed) && !surface.acquiring.get() {
             surface.frames.set(surface.frames.get() + 1);
+            // `VICTORY_PASS_TIMING`: a frame's boundary — log the passes timed since the last.
+            if let Some(t) = &self.pass_timing {
+                crate::pass_timing::frame_boundary(t.top, |pipe| self.pipe_names.borrow().get(&pipe).cloned());
+            }
             if counting_green() {
                 surface.green.borrow_mut().presented();
             }
@@ -383,6 +387,10 @@ impl PresentBackend for Metal {
             }
             *surface.last.borrow_mut() = Some(target);
             surface.frames.set(surface.frames.get() + 1);
+            // `VICTORY_PASS_TIMING`: a frame's boundary — log the passes timed since the last.
+            if let Some(t) = &self.pass_timing {
+                crate::pass_timing::frame_boundary(t.top, |pipe| self.pipe_names.borrow().get(&pipe).cloned());
+            }
             Ok(true)
         })
     }

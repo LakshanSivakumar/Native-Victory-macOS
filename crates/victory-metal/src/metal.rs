@@ -42,6 +42,9 @@ pub struct Metal {
     /// command buffers that use it (`requestResidency` after each commit), instead of being made
     /// resident again for each one.
     pub(crate) request_residency: bool,
+    /// `VICTORY_PASS_TIMING`: GPU time per pass, sampled at each encoder's stage boundary
+    /// (`pass_timing.rs`); `None` when unset or unsupported.
+    pub(crate) pass_timing: Option<crate::pass_timing::PassTimer>,
     /// Command buffers `submit_passes` committed.
     pub(crate) committed: std::cell::Cell<u64>,
     /// Pipeline state pointer to name, kept only when tracing.
@@ -438,6 +441,7 @@ impl Metal {
         if dev.respondsToSelector(objc2::sel!(setShouldMaximizeConcurrentCompilation:)) {
             dev.setShouldMaximizeConcurrentCompilation(true);
         }
+        let pass_timing = crate::pass_timing::PassTimer::asked(&dev);
         Ok(Metal {
             dev,
             msc: Msc::try_open_default().map(std::sync::Arc::new),
@@ -457,6 +461,7 @@ impl Metal {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(PASSES_PER_BUFFER),
             request_residency: std::env::var("VICTORY_METAL_REQUEST_RESIDENCY").is_ok_and(|v| v.trim() == "1"),
+            pass_timing,
             committed: Default::default(),
             pipe_names: Default::default(),
             trace_enc: Default::default(),
@@ -509,6 +514,12 @@ impl Metal {
     pub fn with_heap_sets(mut self) -> Metal {
         self.residency_sets = sets_supported(&self.dev);
         self.pool_sets = false;
+        self
+    }
+
+    /// GPU time per pass (`VICTORY_PASS_TIMING`; the tests force it on a device that supports it).
+    pub fn with_pass_timing(mut self, on: bool) -> Metal {
+        self.pass_timing = on.then(|| crate::pass_timing::PassTimer::supported(&self.dev, 10)).flatten();
         self
     }
 
@@ -735,10 +746,9 @@ impl ComputeBackend for Metal {
     }
 
     fn name_pipeline(&self, p: &Pipeline, name: &str) {
-        if self.trace_fails {
-            let key = Retained::as_ptr(&p.0) as *const u8 as usize;
-            self.pipe_names.borrow_mut().insert(key, name.to_string());
-        }
+        // Kept always, not only when tracing: `VICTORY_PASS_TIMING` logs passes by this name.
+        let key = Retained::as_ptr(&p.0) as *const u8 as usize;
+        self.pipe_names.borrow_mut().insert(key, name.to_string());
     }
 
     fn create_compute_pipeline(&self, dxil: &[u8]) -> Result<Pipeline, String> {

@@ -7,6 +7,7 @@
 
 use crate::backend::{ComputeBackend, HeapAccess, Heaps, RootArgs, STAGE_FIRST, STAGE_FRAGMENT};
 use crate::metal::{Buffer, Metal, Queue};
+use crate::pass_timing::{sample, PassTiming};
 use crate::resources::*;
 use objc2::Message;
 use objc2::rc::Retained;
@@ -1519,10 +1520,9 @@ impl GraphicsBackend for Metal {
     }
 
     fn name_render_pipeline(&self, p: &RenderPipeline, name: &str) {
-        if self.trace_fails {
-            let key = Retained::as_ptr(&p.pso) as *const u8 as usize;
-            self.pipe_names.borrow_mut().insert(key, name.to_string());
-        }
+        // Kept always, not only when tracing: `VICTORY_PASS_TIMING` logs passes by this name.
+        let key = Retained::as_ptr(&p.pso) as *const u8 as usize;
+        self.pipe_names.borrow_mut().insert(key, name.to_string());
     }
 
     fn submit_passes(&self, queue: &Queue, work: &PassSubmission<'_, Self>) -> Result<(), SubmitFailure> {
@@ -1576,6 +1576,9 @@ impl GraphicsBackend for Metal {
         let mut refused: Vec<usize> = Vec::new();
         let mut first_error: Option<String> = None;
         let mut attached_heaps = Vec::new();
+        // `VICTORY_PASS_TIMING`: one sample buffer for this command buffer, sampled at each
+        // pass encoder's start and end; resolved when the buffer completes (`completed`).
+        let mut timing = self.pass_timing.as_ref().and_then(|t| t.begin(work.passes.len()));
         // Fills of passes refused at encode time, re-encoded below as one blit pass of the same
         // command buffer (#80): on the console a refused pass's value write ran in the GPU's
         // order — after the submission's earlier passes, before its fence signals — and a queue
@@ -1613,14 +1616,14 @@ impl GraphicsBackend for Metal {
         for (n, pass) in work.passes.iter().enumerate() {
             let encoded = match pass {
                 Pass::Compute(dispatches) => {
-                    self.encode_compute(&cb, dispatches, set_on_queue, order, &mut attached_heaps)
+                    self.encode_compute(&cb, dispatches, set_on_queue, order, &mut attached_heaps, timing.as_mut())
                 }
                 Pass::Render(rp) => {
-                    self.encode_render(&cb, rp, set_on_queue, order, &mut attached_heaps)
+                    self.encode_render(&cb, rp, set_on_queue, order, &mut attached_heaps, timing.as_mut())
                 }
-                Pass::Blit(ops) => self.encode_blit(&cb, ops, order),
+                Pass::Blit(ops) => self.encode_blit(&cb, ops, order, timing.as_mut()),
                 Pass::ClearColorRects { target, color, rects } => {
-                    self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps)
+                    self.encode_color_clear_rects(&cb, target, *color, rects, set_on_queue, order, &mut attached_heaps, timing.as_mut())
                 }
             };
             if let Err(e) = encoded {
@@ -1643,7 +1646,7 @@ impl GraphicsBackend for Metal {
                 let piece = ((n + 1) / per) as u64;
                 // This piece's refused fills first, then its piece event (#80, GPU order).
                 if !refused_fills.is_empty() {
-                    let _ = self.encode_blit(&cb, &refused_fills, order);
+                    let _ = self.encode_blit(&cb, &refused_fills, order, timing.as_mut());
                     refused_fills.clear();
                 }
                 cb.encodeSignalEvent_value(ProtocolObject::from_ref(&**event), piece);
@@ -1653,8 +1656,9 @@ impl GraphicsBackend for Metal {
                     let enc = std::mem::take(&mut *self.trace_enc.borrow_mut()).join(" | ");
                     (format!("{label} piece {piece} | {enc}"), std::mem::take(&mut *self.trace_args.borrow_mut()))
                 });
-                let piece_owed = self.commit_piece(queue, &cb, owed, piece, tinfo);
+                let piece_owed = self.commit_piece(queue, &cb, owed, piece, tinfo, timing.take());
                 first = n + 1;
+                timing = self.pass_timing.as_ref().and_then(|t| t.begin(work.passes.len() - first));
                 cb = match self.next_piece(queue, work.waits, &mut attached_heaps, Some((&**event, piece))) {
                     Ok(cb) => cb,
                     Err(e) => {
@@ -1693,7 +1697,10 @@ impl GraphicsBackend for Metal {
         // fence above orders each encoder after the one before), before this command buffer's
         // fence signals, which encode after this.
         if !refused_fills.is_empty() {
-            let _ = self.encode_blit(&cb, &refused_fills, order);
+            let _ = self.encode_blit(&cb, &refused_fills, order, timing.as_mut());
+        }
+        if let Some(t) = timing.take() {
+            crate::pass_timing::register(serial, t);
         }
         let mut events = Vec::with_capacity(work.signals.len() + 1);
         if set_on_queue {
@@ -1727,6 +1734,7 @@ impl GraphicsBackend for Metal {
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
             trace_done(serial, done);
+            crate::pass_timing::completed(serial);
             landed(serial, queue_id, done.error().is_some());
             if let Some((s, l, enc)) = &tinfo {
                 let started = IN_FLIGHT.lock().unwrap().remove(s).map(|(t, _)| t);
@@ -1824,9 +1832,13 @@ impl Metal {
         owed: Owed,
         piece: u64,
         tinfo: Option<(String, Vec<(String, usize, usize)>)>,
+        timing: Option<PassTiming>,
     ) -> std::sync::Arc<Owed> {
         let owed = std::sync::Arc::new(owed);
         let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = timing {
+            crate::pass_timing::register(serial, t);
+        }
         let queue_id = Retained::as_ptr(&queue.0) as *const u8 as usize;
         // Tests: a piece the GPU drops, as one it fails (its passes and its event signal not run).
         #[cfg(test)]
@@ -1858,6 +1870,7 @@ impl Metal {
             // SAFETY: Metal passes the command buffer that completed.
             let done = unsafe { done.as_ref() };
             trace_done(serial, done);
+            crate::pass_timing::completed(serial);
             let error = done.error();
             landed(serial, queue_id, dropped || error.is_some());
             // A piece is traced as a whole command buffer is: slow ones, and what a failed one held
@@ -2643,6 +2656,7 @@ impl Metal {
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
         ops: &[BlitOp<'_, Metal>],
         order: Ordering<'_>,
+        mut timing: Option<&mut PassTiming>,
     ) -> Result<(), String> {
         let nonzero = |op: &BlitOp<'_, Metal>| match op {
             BlitOp::Copy { len, .. } | BlitOp::Fill { len, .. } => *len > 0,
@@ -2654,6 +2668,16 @@ impl Metal {
             return Ok(());
         }
         let e = cb.blitCommandEncoder().ok_or("no blit encoder")?;
+        let t0 = match timing.as_mut() {
+            Some(t) => match t.begin_pass("blit", 0, ops.iter().filter(|op| nonzero(op)).count() as u64) {
+                Some(i) => {
+                    sample!(e, t, i);
+                    Some(i)
+                }
+                None => None,
+            },
+            None => None,
+        };
         if let Some((f, started)) = order
             && started.get()
         {
@@ -2900,6 +2924,9 @@ impl Metal {
             let fills = ops.iter().filter(|o| matches!(o, BlitOp::Fill { .. })).count();
             e.setLabel(Some(&self.cap_label(format!("blit: {} ops ({fills} fills)", ops.len()))));
         }
+        if let (Some(t), Some(i)) = (timing.as_mut(), t0) {
+            sample!(e, t, i + 1);
+        }
         e.endEncoding();
         Ok(())
     }
@@ -3066,6 +3093,7 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
         attached_heaps: &mut Vec<*const Heap>,
+        mut timing: Option<&mut PassTiming>,
     ) -> Result<(), String> {
         let runs = |d: &crate::backend::Dispatch<'_, Metal>| {
             d.indirect.is_some() || !d.groups.contains(&0)
@@ -3074,6 +3102,21 @@ impl Metal {
             return Ok(());
         }
         let e = cb.computeCommandEncoder().ok_or("no compute encoder")?;
+        let t0 = match timing.as_mut() {
+            Some(t) => {
+                let ds: Vec<_> = dispatches.iter().filter(|d| runs(d)).collect();
+                let pipe = ds.first().map_or(0, |d| Retained::as_ptr(&d.pipeline.0) as *const u8 as usize);
+                let work = ds.iter().map(|d| d.groups[0] as u64 * d.groups[1] as u64 * d.groups[2] as u64).sum();
+                match t.begin_pass("compute", pipe, work) {
+                    Some(i) => {
+                        sample!(e, t, i);
+                        Some(i)
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         if let Some((f, started)) = order
             && started.get()
         {
@@ -3157,10 +3200,14 @@ impl Metal {
             }
             e.setLabel(Some(&self.cap_label(l)));
         }
+        if let (Some(t), Some(i)) = (timing.as_mut(), t0) {
+            sample!(e, t, i + 1);
+        }
         e.endEncoding();
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_color_clear_rects(
         &self,
         cb: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -3170,6 +3217,7 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
         attached_heaps: &mut Vec<*const Heap>,
+        mut timing: Option<&mut PassTiming>,
     ) -> Result<(), String> {
         let clip = |p, limit| usize::try_from(p).unwrap_or_default().min(limit);
         let (width, height) = (target.tex.width(), target.tex.height());
@@ -3223,6 +3271,7 @@ impl Metal {
             set_on_queue,
             order,
             attached_heaps,
+            timing.as_mut().map(|t| &mut **t),
         )?;
         let copies: Vec<_> = regions
             .into_iter()
@@ -3238,7 +3287,7 @@ impl Metal {
                 dst_origin,
             })
             .collect();
-        self.encode_blit(cb, &copies, order)
+        self.encode_blit(cb, &copies, order, timing)
     }
 
     fn encode_render(
@@ -3248,6 +3297,7 @@ impl Metal {
         set_on_queue: bool,
         order: Ordering<'_>,
         attached_heaps: &mut Vec<*const Heap>,
+        mut timing: Option<&mut PassTiming>,
     ) -> Result<(), String> {
         // Attachments must agree in sample count. Their sizes may differ (a 1920x1080 colour
         // target over a 3840x2160 depth target in GTA VI's story load): the console draws into
@@ -3306,6 +3356,11 @@ impl Metal {
         // Indirect draws are gated first, in a compute pass of their own: the count buffer's
         // limit, a rectangle list's record, and the most a record may ask for.
         let gated = |d: &Draw<'_, Metal>| d.indirect.is_some();
+        // `VICTORY_PASS_TIMING`: the pass's sample pair starts at its first encoder (the gate,
+        // when there is one) and ends at the render encoder's end, so the gate's time is in.
+        let render_pipe =
+            |rp: &RenderPass<'_, Metal>| rp.draws.first().map_or(0, |d| Retained::as_ptr(&d.pipeline.pso) as *const u8 as usize);
+        let mut t0 = None;
         let mut gates = Vec::new();
         if rp.draws.iter().any(gated) {
             let c = cb.computeCommandEncoder().ok_or("no compute encoder")?;
@@ -3313,6 +3368,16 @@ impl Metal {
                 && started.get()
             {
                 c.waitForFence(f);
+            }
+            // The start sample goes on the gate encoder when the device samples compute
+            // boundaries too, so the gate's time is inside the pass's.
+            if let Some(t) = timing.as_mut()
+                && t.kind_ok("render")
+                && t.kind_ok("compute")
+                && let Some(i) = t.begin_pass("render", render_pipe(rp), rp.draws.len() as u64)
+            {
+                sample!(c, t, i);
+                t0 = Some(i);
             }
             for d in &rp.draws {
                 let words = match d.call {
@@ -3386,6 +3451,13 @@ impl Metal {
             && started.get()
         {
             e.waitForFence_beforeStages(f, MTLRenderStages::Vertex | MTLRenderStages::Object | MTLRenderStages::Mesh);
+        }
+        if t0.is_none()
+            && let Some(t) = timing.as_mut()
+            && let Some(i) = t.begin_pass("render", render_pipe(rp), rp.draws.len() as u64)
+        {
+            sample!(e, t, i);
+            t0 = Some(i);
         }
         let active_draw = |d: &Draw<'_, Metal>| -> Option<u8> {
             let first_bit = match (d.pipeline.mesh, d.call) {
@@ -3739,6 +3811,9 @@ impl Metal {
             }
             drop(names);
             e.setLabel(Some(&self.cap_label(l)));
+        }
+        if let (Some(t), Some(i)) = (timing.as_mut(), t0) {
+            sample!(e, t, i + 1);
         }
         e.endEncoding();
         Ok(())
@@ -4285,7 +4360,7 @@ mod owed_tests {
         unsafe { std::ptr::write_bytes(region.ptr, 0xEE, 16) };
         let q = m.create_queue().unwrap();
         let cb = m.new_command_buffer(&q).unwrap();
-        let owed = m.commit_piece(&q, &cb, Owed::of(vec![], &[], 0), 1, None);
+        let owed = m.commit_piece(&q, &cb, Owed::of(vec![], &[], 0), 1, None, None);
         owed.attach_refund(vec![BlitOp::Fill { dst: (&buf, region.ptr as *const u8), len: 8, value: 0x11 }]);
         cb.waitUntilCompleted();
         // The handler raises the flag before it pays: wait for the bytes.
