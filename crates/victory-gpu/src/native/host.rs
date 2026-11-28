@@ -1473,6 +1473,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             Decoded::Image {
                 resource,
+                dim,
                 mips,
                 slices,
                 format,
@@ -1507,6 +1508,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                             tex,
                             &ViewDesc {
                                 format,
+                                dim,
                                 mips,
                                 slices: slices.map_or((0, usize::MAX), |(first, count)| {
                                     (first as usize, count as usize)

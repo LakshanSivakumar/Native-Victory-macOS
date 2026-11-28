@@ -2102,8 +2102,8 @@ mod tests {
         // Its whole chain from level 1.
         (view[4], view[5]) = (1, u32::MAX);
         assert_eq!(image_words(&texture, Some(&view), false)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
-        // An unordered view of level 3: that level alone.
-        let uav = [0, 4, 0, 0, 3, 0, 0, 0, 0, 0];
+        // An unordered view of level 3: that level alone (`MipSlice` is word 2 of `D3D12_UNORDERED_ACCESS_VIEW_DESC`).
+        let uav = [0, 4, 3, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(image_words(&texture, Some(&uav), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);

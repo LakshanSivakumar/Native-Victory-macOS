@@ -16,6 +16,8 @@ use victory_metal::metal::Metal;
 
 #[path = "addr_tests.rs"]
 mod addr_tests;
+#[path = "cube_tests.rs"]
+mod cube_tests;
 #[path = "heap_tests.rs"]
 mod heap_tests;
 #[path = "legacy_fma_tests.rs"]
@@ -83,6 +85,7 @@ fn array_texture_ranges_reach_the_backend_for_object_and_placed_views() {
                 host.backend.views.borrow_mut().pop(),
                 Some(ViewDesc {
                     format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::D2Array),
                     mips: (1, if unordered { 1 } else { 3 }),
                     slices: (2, if unordered { 1 } else { 4 }),
                 })

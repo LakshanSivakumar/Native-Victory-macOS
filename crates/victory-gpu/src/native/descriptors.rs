@@ -9,7 +9,9 @@
 
 use crate::descriptor::View;
 use std::collections::HashMap;
-use victory_backend::resources::{Address, BorderColor, Filter, Format, SamplerDesc};
+use victory_backend::resources::{
+    Address, BorderColor, Compare, Filter, Format, SamplerDesc, ViewDim,
+};
 
 /// A registered resource: title address and size for buffers, the native texture for images.
 pub(super) enum Res<T> {
@@ -32,6 +34,7 @@ pub enum Decoded {
     /// clamp in its own mips ([`min_lod`]; 0 for none).
     Image {
         resource: usize,
+        dim: Option<ViewDim>,
         mips: Option<(u32, u32)>,
         slices: Option<(u32, u32)>,
         format: Option<Format>,
@@ -45,9 +48,16 @@ pub enum Decoded {
 
 /// SRV and UAV `ViewDimension` of a buffer.
 const BUFFER: u32 = 1;
+const TEXTURE_1D: u32 = 2;
+const TEXTURE_1D_ARRAY: u32 = 3;
 /// SRV `ViewDimension` of `Texture2D`; UAV's numbering is the same up to 3D.
 const TEXTURE_2D: u32 = 4;
 const TEXTURE_2D_ARRAY: u32 = 5;
+const TEXTURE_2D_MS: u32 = 6;
+const TEXTURE_2D_MS_ARRAY: u32 = 7;
+const TEXTURE_3D: u32 = 8;
+const TEXTURE_CUBE: u32 = 9;
+const TEXTURE_CUBE_ARRAY: u32 = 10;
 const FLAG_RAW: u32 = 1;
 
 /// Bytes per element of a buffer view and the range it covers from `base`.
@@ -201,23 +211,57 @@ pub(super) fn min_lod_word<T>(view: &View, resources: &HashMap<usize, Res<T>>) -
 
 /// Object and placed views have the same SRV/UAV union layout.
 fn texture_view(resource: usize, unordered: bool, d: &[u32; 10]) -> Option<Decoded> {
-    let (mips, layers) = if unordered {
-        ((d[2], 1), (d[3], d[4]))
-    } else {
-        ((d[4], d[5]), (d[6], d[7]))
-    };
     let format = format(d[0]);
-    let slices = if d[1] == TEXTURE_2D_ARRAY {
-        // An empty or unrepresentable array view must not fall back to the whole texture.
-        if layers.1 == 0 || mips.1 == 0 || format.is_none() {
-            return None;
+    let std_mips = if unordered { (d[2], 1) } else { (d[4], d[5]) };
+    let std_layers = if unordered { (d[3], d[4]) } else { (d[6], d[7]) };
+    let (dim, mips, slices) = match (unordered, d[1]) {
+        (_, TEXTURE_1D) => (Some(ViewDim::D2), std_mips, Some((0, 1))),
+        (_, TEXTURE_1D_ARRAY) => {
+            if std_layers.1 == 0 || std_mips.1 == 0 || format.is_none() {
+                return None;
+            }
+            (Some(ViewDim::D2Array), std_mips, Some(std_layers))
         }
-        Some(layers)
-    } else {
-        None
+        (_, TEXTURE_2D) => (Some(ViewDim::D2), std_mips, Some((0, 1))),
+        (_, TEXTURE_2D_ARRAY) => {
+            // An empty or unrepresentable array view must not fall back to the whole texture.
+            if std_layers.1 == 0 || std_mips.1 == 0 || format.is_none() {
+                return None;
+            }
+            (Some(ViewDim::D2Array), std_mips, Some(std_layers))
+        }
+        (_, TEXTURE_2D_MS) => (Some(ViewDim::D2), (0, 1), Some((0, 1))),
+        (_, TEXTURE_2D_MS_ARRAY) => {
+            let layers = if unordered { (d[2], d[3]) } else { (d[4], d[5]) };
+            if layers.1 == 0 || format.is_none() {
+                return None;
+            }
+            (Some(ViewDim::D2Array), (0, 1), Some(layers))
+        }
+        (_, TEXTURE_3D) => (Some(ViewDim::D3), std_mips, None),
+        (false, TEXTURE_CUBE) => {
+            if std_mips.1 == 0 || format.is_none() {
+                return None;
+            }
+            (Some(ViewDim::Cube), std_mips, Some((0, 6)))
+        }
+        (false, TEXTURE_CUBE_ARRAY) => {
+            let (first_face, num_cubes) = (d[6], d[7]);
+            if num_cubes == 0 || std_mips.1 == 0 || format.is_none() {
+                return None;
+            }
+            let faces = if num_cubes == u32::MAX {
+                u32::MAX
+            } else {
+                num_cubes.saturating_mul(6)
+            };
+            (Some(ViewDim::CubeArray), std_mips, Some((first_face, faces)))
+        }
+        _ => return None,
     };
     Some(Decoded::Image {
         resource,
+        dim,
         mips: Some(mips),
         slices,
         format,
@@ -277,6 +321,7 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
             }),
             Res::Texture(_) if matches!(view, View::Shader(..)) => Some(Decoded::Image {
                 resource: *r,
+                dim: None,
                 mips: None,
                 slices: None,
                 format: None,
@@ -284,14 +329,15 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
             }),
             Res::Texture(_) => None,
         },
-        View::Shader(r, Some(d)) if matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY) => {
+        View::Shader(r, Some(d)) if (TEXTURE_1D..=TEXTURE_CUBE_ARRAY).contains(&d[1]) => {
             texture_view(*r, false, d)
         }
-        View::Unordered(r, _, Some(d)) if matches!(d[1], TEXTURE_2D | TEXTURE_2D_ARRAY) => {
+        View::Unordered(r, _, Some(d)) if (TEXTURE_1D..=TEXTURE_3D).contains(&d[1]) => {
             texture_view(*r, true, d)
         }
         View::Shader(r, Some(d)) | View::Unordered(r, _, Some(d)) => Some(Decoded::Image {
             resource: *r,
+            dim: None,
             mips: None,
             slices: None,
             format: format(d[0]),
@@ -299,9 +345,8 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
             min_lod: if matches!(view, View::Shader(..)) { min_lod(d, 0) } else { 0.0 },
         }),
         View::ConsoleSampler(w) => Some(sampler(&crate::sampler::console_fields(w))),
-        // shortcut: the plain D3D12 sampler description (13 words) is not decoded; titles on this
-        // console use `CreateSamplerX`.
-        View::Sampler(_) | View::Placed(..) => None,
+        View::Sampler(w) => Some(sampler(&crate::sampler::d3d12_fields(w))),
+        View::Placed(..) => None,
     }
 }
 
@@ -329,7 +374,33 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
         1 => Address::Wrap,
         2 => Address::Mirror,
         4 if border_color.is_some() => Address::Border,
+        5 => Address::MirrorOnce,
         _ => Address::Clamp,
+    };
+    let compare = if f.mode == 0 {
+        match f.compare {
+            1 => Some(Compare::Never),
+            2 => Some(Compare::Less),
+            3 => Some(Compare::Equal),
+            4 => Some(Compare::LessEqual),
+            5 => Some(Compare::Greater),
+            6 => Some(Compare::NotEqual),
+            7 => Some(Compare::GreaterEqual),
+            8 => Some(Compare::Always),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let lod_min = if f.min_lod.is_nan() {
+        0.0
+    } else {
+        f.min_lod.clamp(0.0, f32::MAX)
+    };
+    let lod_max = if f.mip == 0 || f.max_lod.is_nan() {
+        lod_min
+    } else {
+        f.max_lod.clamp(lod_min, f32::MAX)
     };
     Decoded::Sampler {
         desc: SamplerDesc {
@@ -347,6 +418,9 @@ fn sampler(f: &crate::sampler::Fields) -> Decoded {
             } else {
                 1
             },
+            compare,
+            lod_min,
+            lod_max,
         },
         lod_bias: if f.bias.is_nan() {
             0.0
@@ -576,7 +650,7 @@ mod tests {
         let resources = Resources::from([(7, Res::Texture(())), (8, Res::Buffer(0x1000, 256))]);
         assert_eq!(
             decode(&View::Shader(7, None), &resources),
-            Some(Decoded::Image { resource: 7, mips: None, slices: None, format: None, min_lod: 0.0 })
+            Some(Decoded::Image { resource: 7, dim: None, mips: None, slices: None, format: None, min_lod: 0.0 })
         );
         assert_eq!(
             decode(&View::Shader(8, None), &resources),
@@ -828,5 +902,89 @@ mod tests {
             let (bytes, block) = crate::resource::element(dxgi).expect("title element");
             assert_eq!(fmt.block(), (block as usize, bytes as usize), "DXGI {dxgi}");
         }
+    }
+
+    #[test]
+    fn cube_cube_array_and_3d_views_carry_explicit_dimensions_mips_and_slices() {
+        let mut cube = [0u32; 10];
+        (cube[0], cube[1], cube[4], cube[5], cube[6]) = (28, TEXTURE_CUBE, 1, 3, 2.5f32.to_bits());
+        assert_eq!(
+            decode(&View::Shader(7, Some(cube)), &Resources::new()),
+            Some(Decoded::Image {
+                resource: 7,
+                dim: Some(ViewDim::Cube),
+                mips: Some((1, 3)),
+                slices: Some((0, 6)),
+                format: Some(Format::Rgba8Unorm),
+                min_lod: 1.5,
+            })
+        );
+
+        let mut cube_arr = [0u32; 10];
+        (cube_arr[0], cube_arr[1], cube_arr[4], cube_arr[5], cube_arr[6], cube_arr[7], cube_arr[8]) =
+            (28, TEXTURE_CUBE_ARRAY, 2, u32::MAX, 6, 2, 3.0f32.to_bits());
+        assert_eq!(
+            decode(&View::Shader(7, Some(cube_arr)), &Resources::new()),
+            Some(Decoded::Image {
+                resource: 7,
+                dim: Some(ViewDim::CubeArray),
+                mips: Some((2, u32::MAX)),
+                slices: Some((6, 12)),
+                format: Some(Format::Rgba8Unorm),
+                min_lod: 1.0,
+            })
+        );
+        cube_arr[7] = 0;
+        assert_eq!(decode(&View::Shader(7, Some(cube_arr)), &Resources::new()), None);
+
+        let mut uav3d = [0u32; 10];
+        (uav3d[0], uav3d[1], uav3d[2], uav3d[4]) = (28, TEXTURE_3D, 2, u32::MAX);
+        assert_eq!(
+            decode(&View::Unordered(7, 0, Some(uav3d)), &Resources::new()),
+            Some(Decoded::Image {
+                resource: 7,
+                dim: Some(ViewDim::D3),
+                mips: Some((2, 1)),
+                slices: None,
+                format: Some(Format::Rgba8Unorm),
+                min_lod: 0.0,
+            })
+        );
+    }
+
+    #[test]
+    fn d3d12_samplers_decode_filters_comparison_addressing_and_border() {
+        // D3D12_FILTER_COMPARISON_MIN_LINEAR_MAG_POINT_MIP_LINEAR = 0x91;
+        // AddressU = WRAP (1), AddressV = MIRROR (2), AddressW = BORDER (4);
+        // ComparisonFunc = LESS_EQUAL (4); MaxAnisotropy = 1; BorderColor = OpaqueWhite.
+        let mut w = [0u32; 13];
+        w[0] = 0x91;
+        w[1..4].copy_from_slice(&[1, 2, 4]);
+        w[4] = (-0.5f32).to_bits();
+        w[5] = 1;
+        w[6] = 4;
+        w[7..11].copy_from_slice(&[1.0f32; 4].map(f32::to_bits));
+        w[11] = 0.25f32.to_bits();
+        w[12] = 8.0f32.to_bits();
+        let Some(Decoded::Sampler { desc, lod_bias }) = decode(&View::Sampler(w), &Resources::new())
+        else {
+            panic!("expected a decoded D3D12 sampler");
+        };
+        assert_eq!((desc.min, desc.mag, desc.mip), (Filter::Linear, Filter::Nearest, Filter::Linear));
+        assert_eq!(desc.address, [Address::Wrap, Address::Mirror, Address::Border]);
+        assert_eq!(desc.border_color, BorderColor::OpaqueWhite);
+        assert_eq!(desc.compare, Some(Compare::LessEqual));
+        assert_eq!(desc.max_anisotropy, 1);
+        assert_eq!((desc.lod_min, desc.lod_max, lod_bias), (0.25, 8.0, -0.5));
+
+        // D3D12_FILTER_ANISOTROPIC = 0x55 with MaxAnisotropy = 8.
+        w[0] = 0x55;
+        w[5] = 8;
+        let Some(Decoded::Sampler { desc: aniso, .. }) = decode(&View::Sampler(w), &Resources::new())
+        else {
+            panic!("expected anisotropic D3D12 sampler");
+        };
+        assert_eq!((aniso.min, aniso.mag, aniso.mip), (Filter::Linear, Filter::Linear, Filter::Linear));
+        assert_eq!((aniso.compare, aniso.max_anisotropy), (None, 8));
     }
 }

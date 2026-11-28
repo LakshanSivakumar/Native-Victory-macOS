@@ -373,6 +373,7 @@ fn address(a: Address) -> MTLSamplerAddressMode {
         Address::Mirror => MTLSamplerAddressMode::MirrorRepeat,
         Address::Clamp => MTLSamplerAddressMode::ClampToEdge,
         Address::Border => MTLSamplerAddressMode::ClampToBorderColor,
+        Address::MirrorOnce => MTLSamplerAddressMode::MirrorClampToEdge,
     }
 }
 
@@ -400,6 +401,12 @@ fn dynamic_sampler_descriptor(d: &SamplerDesc) -> Retained<MTLSamplerDescriptor>
         BorderColor::OpaqueWhite => MTLSamplerBorderColor::OpaqueWhite,
     });
     sd.setMaxAnisotropy(d.max_anisotropy.max(1));
+    if let Some(c) = d.compare {
+        sd.setCompareFunction(compare(c));
+    }
+    let lo = if d.lod_min.is_nan() { 0.0 } else { d.lod_min.max(0.0) };
+    sd.setLodMinClamp(lo);
+    sd.setLodMaxClamp(if d.lod_max.is_nan() { f32::MAX } else { d.lod_max.max(lo) });
     // Heap entries store resource IDs, which exist only for argument-buffer samplers.
     sd.setSupportArgumentBuffers(true);
     sd
@@ -1077,6 +1084,17 @@ fn emit_scoped_ranges(
     distinct
 }
 
+fn mtl_texture_slices(t: &ProtocolObject<dyn MTLTexture>) -> usize {
+    match t.textureType() {
+        MTLTextureType::Type1DArray
+        | MTLTextureType::Type2DArray
+        | MTLTextureType::Type2DMultisampleArray => t.arrayLength(),
+        MTLTextureType::TypeCube => 6,
+        MTLTextureType::TypeCubeArray => t.arrayLength() * 6,
+        _ => 1,
+    }
+}
+
 impl ResourceBackend for Metal {
     type Texture = Texture;
     type Sampler = Sampler;
@@ -1321,7 +1339,7 @@ impl ResourceBackend for Metal {
     }
 
     fn create_texture_view(&self, t: &Texture, v: &ViewDesc) -> Result<Texture, String> {
-        let ty = t.tex.textureType();
+        let src_ty = t.tex.textureType();
         // A depth texture cannot be viewed as a color format (D3D's R32_FLOAT
         // over a depth buffer): it keeps its own, and shaders read it as the
         // float it holds.
@@ -1341,14 +1359,10 @@ impl ResourceBackend for Metal {
         // title view asks for over a texture we made with fewer levels or layers (one
         // over title memory has one level): the range is cut to what is there.
         let fit = |(start, len): (usize, usize), count: usize| {
-            (start < count).then(|| NSRange::new(start, len.min(count - start)))
+            (len > 0 && start < count).then(|| NSRange::new(start, len.min(count - start)))
         };
-        let slices = if ty == MTLTextureType::Type2DArray {
-            t.tex.arrayLength()
-        } else {
-            1
-        };
-        let (Some(levels), Some(layers)) =
+        let slices = mtl_texture_slices(&t.tex);
+        let (Some(levels), Some(mut layers)) =
             (fit(v.mips, t.tex.mipmapLevelCount()), fit(v.slices, slices))
         else {
             return Err(format!(
@@ -1356,7 +1370,85 @@ impl ResourceBackend for Metal {
                 v.mips, v.slices
             ));
         };
-        // SAFETY: the ranges are inside the texture.
+        let ty = if t.tex.buffer().is_some() {
+            match v.dim {
+                None | Some(ViewDim::D2) if src_ty == MTLTextureType::Type2D => src_ty,
+                Some(dim) => {
+                    return Err(format!("{dim:?} view over a buffer-backed {src_ty:?} texture"));
+                }
+                None => src_ty,
+            }
+        } else if src_ty == MTLTextureType::Type3D {
+            match v.dim {
+                None | Some(ViewDim::D3) => {
+                    layers = NSRange::new(0, 1);
+                    MTLTextureType::Type3D
+                }
+                Some(dim) => return Err(format!("{dim:?} view over a 3D texture")),
+            }
+        } else if t.tex.sampleCount() > 1 {
+            match v.dim {
+                None => src_ty,
+                Some(ViewDim::D2) => {
+                    layers.length = 1;
+                    MTLTextureType::Type2DMultisample
+                }
+                Some(ViewDim::D2Array) => MTLTextureType::Type2DMultisampleArray,
+                Some(dim) => return Err(format!("{dim:?} view over a multisampled texture")),
+            }
+        } else if matches!(
+            src_ty,
+            MTLTextureType::Type2D
+                | MTLTextureType::Type2DArray
+                | MTLTextureType::TypeCube
+                | MTLTextureType::TypeCubeArray
+        ) {
+            match v.dim {
+                Some(ViewDim::D2) => {
+                    layers.length = 1;
+                    MTLTextureType::Type2D
+                }
+                Some(ViewDim::D2Array) => MTLTextureType::Type2DArray,
+                Some(ViewDim::Cube) => {
+                    if t.tex.width() != t.tex.height() || layers.length < 6 {
+                        return Err(format!(
+                            "cube view over {}x{} ({} slices)",
+                            t.tex.width(),
+                            t.tex.height(),
+                            layers.length
+                        ));
+                    }
+                    layers.length = 6;
+                    MTLTextureType::TypeCube
+                }
+                Some(ViewDim::CubeArray) => {
+                    if t.tex.width() != t.tex.height() || layers.length < 6 {
+                        return Err(format!(
+                            "cube array view over {}x{} ({} slices)",
+                            t.tex.width(),
+                            t.tex.height(),
+                            layers.length
+                        ));
+                    }
+                    layers.length = (layers.length / 6) * 6;
+                    MTLTextureType::TypeCubeArray
+                }
+                Some(ViewDim::D3) => return Err(format!("3D view over a {src_ty:?} texture")),
+                None => {
+                    if (src_ty == MTLTextureType::TypeCube && layers.length != 6)
+                        || (src_ty == MTLTextureType::TypeCubeArray
+                            && !layers.length.is_multiple_of(6))
+                    {
+                        MTLTextureType::Type2DArray
+                    } else {
+                        src_ty
+                    }
+                }
+            }
+        } else {
+            src_ty
+        };
+        // SAFETY: the ranges and reinterpreted texture type are validated against `t.tex`.
         let tex = unsafe {
             t.tex
                 .newTextureViewWithPixelFormat_textureType_levels_slices(format, ty, levels, layers)
@@ -2664,7 +2756,7 @@ impl Metal {
             [(t.width() >> mip).max(1), (t.height() >> mip).max(1), (t.depth() >> mip).max(1)]
         };
         let tex_slices = |t: &ProtocolObject<dyn MTLTexture>| {
-            if t.textureType() == MTLTextureType::Type2DArray { t.arrayLength() } else { 1 }
+            mtl_texture_slices(t)
         };
         let fits_region = |t: &ProtocolObject<dyn MTLTexture>, mip: usize, slice: usize, at: [usize; 3], sz: [usize; 3]| {
             if sz.contains(&0) || mip >= t.mipmapLevelCount() || slice >= tex_slices(t) {
@@ -3900,6 +3992,7 @@ mod render_target_tests {
         }
         let target = metal.create_texture_view(&texture, &ViewDesc {
             format: Format::Rgba8Unorm,
+            dim: None,
             mips: (1, 1),
             slices: (1, 1),
         }).expect("narrowed render target");
@@ -4347,12 +4440,9 @@ mod sampler_tests {
             (BorderColor::OpaqueWhite, MTLSamplerBorderColor::OpaqueWhite),
         ] {
             let desc = dynamic_sampler_descriptor(&SamplerDesc {
-                min: Filter::Nearest,
-                mag: Filter::Nearest,
-                mip: Filter::Nearest,
                 address: [Address::Border, Address::Clamp, Address::Mirror],
                 border_color: color,
-                max_anisotropy: 1,
+                ..SamplerDesc::default()
             });
             assert_eq!(desc.sAddressMode(), MTLSamplerAddressMode::ClampToBorderColor);
             assert_eq!(desc.tAddressMode(), MTLSamplerAddressMode::ClampToEdge);
@@ -4454,12 +4544,9 @@ mod sampler_tests {
         let mut ids = std::collections::HashSet::new();
         for (mode, border_color, outside) in cases {
             let key = SamplerDesc {
-                min: Filter::Nearest,
-                mag: Filter::Nearest,
-                mip: Filter::Nearest,
                 address: [mode, Address::Clamp, Address::Clamp],
                 border_color,
-                max_anisotropy: 1,
+                ..SamplerDesc::default()
             };
             let sampler = metal.create_sampler(&key).unwrap();
             let id = resource_id(sampler.0.gpuResourceID());
@@ -4479,14 +4566,7 @@ mod sampler_tests {
         use MTLSamplerMinMagFilter as MetalFilter;
 
         let m = Metal::new().unwrap();
-        let nearest = SamplerDesc {
-            min: Filter::Nearest,
-            mag: Filter::Nearest,
-            mip: Filter::Nearest,
-            address: [Address::Clamp; 3],
-            border_color: BorderColor::TransparentBlack,
-            max_anisotropy: 1,
-        };
+        let nearest = SamplerDesc::default();
         let cases = [
             (nearest, (MetalFilter::Nearest, MetalFilter::Nearest)),
             (SamplerDesc { min: Filter::Linear, ..nearest }, (MetalFilter::Linear, MetalFilter::Nearest)),
@@ -4793,7 +4873,7 @@ mod heap_usage_tests {
         m.write_texture(&heap, 2, &b, 0.0);
         m.write_texture(&heap, 3, &c, 0.0);
         // A view of `c` is `c`'s memory: one allocation, its latest use theirs.
-        let view = m.create_texture_view(&c, &ViewDesc { format: Format::Rgba8Unorm, mips: (0, 1), slices: (0, 1) }).unwrap();
+        let view = m.create_texture_view(&c, &ViewDesc { format: Format::Rgba8Unorm, dim: None, mips: (0, 1), slices: (0, 1) }).unwrap();
         m.write_texture(&heap, 4, &view, 0.0);
         // `a` is named by entries last used at frames 10 and 50, `b` at 20, `c` never, its view at 5.
         let mut all = m.heap_allocations(&heap, &[10, 50, 20, 0, 5, 0, 0, 0]).unwrap();
@@ -4804,5 +4884,128 @@ mod heap_usage_tests {
         m.residency_sets = false;
         let plain = m.create_heap(HeapKind::Resource, 1).unwrap();
         assert_eq!(m.heap_allocations(&plain, &[0]), None);
+    }
+
+    #[test]
+    fn texture_views_reinterpret_cube_and_array_dimensions_and_refuse_invalid_shapes() {
+        let Ok(m) = Metal::new() else { return };
+        let mut cube_backing = TextureDesc::d2(Format::Rgba8Unorm, 4, 4);
+        cube_backing.dim = TexDim::D2Array;
+        cube_backing.depth_or_layers = 12;
+        cube_backing.mips = 2;
+        let arr12 = m.create_texture(&cube_backing).unwrap();
+        assert_eq!(arr12.tex.textureType(), MTLTextureType::Type2DArray);
+
+        let cube = m
+            .create_texture_view(
+                &arr12,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::Cube),
+                    mips: (0, 2),
+                    slices: (0, 6),
+                },
+            )
+            .expect("cube view over 6 faces");
+        assert_eq!(cube.tex.textureType(), MTLTextureType::TypeCube);
+
+        let cube_arr = m
+            .create_texture_view(
+                &arr12,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::CubeArray),
+                    mips: (0, 2),
+                    slices: (0, 12),
+                },
+            )
+            .expect("cube-array view over 12 faces");
+        assert_eq!(cube_arr.tex.textureType(), MTLTextureType::TypeCubeArray);
+        assert_eq!(cube_arr.tex.arrayLength(), 2);
+
+        let single_2d = m
+            .create_texture_view(
+                &arr12,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::D2),
+                    mips: (1, 1),
+                    slices: (3, 1),
+                },
+            )
+            .expect("2D view over a single array slice");
+        assert_eq!(single_2d.tex.textureType(), MTLTextureType::Type2D);
+
+        // Non-square or <6-slice textures refuse Cube/CubeArray views instead of tripping Metal's assertion.
+        let mut rect_desc = cube_backing;
+        rect_desc.height = 2;
+        let rect = m.create_texture(&rect_desc).unwrap();
+        assert!(
+            m.create_texture_view(
+                &rect,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::Cube),
+                    mips: (0, 1),
+                    slices: (0, 6),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            m.create_texture_view(
+                &arr12,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::Cube),
+                    mips: (0, 1),
+                    slices: (9, 6),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            m.create_texture_view(
+                &arr12,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::D3),
+                    mips: (0, 1),
+                    slices: (0, 1),
+                },
+            )
+            .is_err()
+        );
+
+        let mut d3_desc = TextureDesc::d2(Format::Rgba8Unorm, 4, 4);
+        d3_desc.dim = TexDim::D3;
+        d3_desc.depth_or_layers = 4;
+        d3_desc.mips = 2;
+        let d3 = m.create_texture(&d3_desc).unwrap();
+        let d3_mip1 = m
+            .create_texture_view(
+                &d3,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::D3),
+                    mips: (1, 1),
+                    slices: (0, usize::MAX),
+                },
+            )
+            .expect("3D mip slice view");
+        assert_eq!(d3_mip1.tex.textureType(), MTLTextureType::Type3D);
+        assert_eq!((d3_mip1.tex.width(), d3_mip1.tex.depth()), (2, 2));
+        assert!(
+            m.create_texture_view(
+                &d3,
+                &ViewDesc {
+                    format: Format::Rgba8Unorm,
+                    dim: Some(ViewDim::D2),
+                    mips: (0, 1),
+                    slices: (0, 1),
+                },
+            )
+            .is_err()
+        );
     }
 }

@@ -106,10 +106,7 @@ impl Grid<'_> {
             .create_sampler(&SamplerDesc {
                 min: self.filter,
                 mag: self.filter,
-                mip: Filter::Nearest,
-                address: [Address::Clamp; 3],
-                border_color: BorderColor::TransparentBlack,
-                max_anisotropy: 1,
+                ..SamplerDesc::default()
             })
             .unwrap();
         m.write_sampler(&smp, 0, &s, lod_bias);
@@ -491,6 +488,7 @@ fn texture_views_and_sampler_filters() {
             &t,
             &ViewDesc {
                 format: Format::Rgba8Unorm,
+                dim: None,
                 mips: (1, 1),
                 slices: (0, 1),
             },
@@ -516,6 +514,7 @@ fn texture_views_and_sampler_filters() {
             &t,
             &ViewDesc {
                 format: Format::Rgba8UnormSrgb,
+                dim: None,
                 mips: (0, 1),
                 slices: (0, 1),
             },
@@ -526,7 +525,7 @@ fn texture_views_and_sampler_filters() {
 
     // A format Metal cannot cast the texture to is an error, not Metal's assertion (a title view
     // left over a resource object the title made anew); one of the same texel size is a view.
-    let view = |format| m.create_texture_view(&t, &ViewDesc { format, mips: (0, 1), slices: (0, 1) });
+    let view = |format| m.create_texture_view(&t, &ViewDesc { format, dim: None, mips: (0, 1), slices: (0, 1) });
     for format in [Format::R8Unorm, Format::Bc1, Format::Rgba16Float, Format::D32Float] {
         assert!(view(format).is_err(), "{format:?}");
     }
@@ -534,7 +533,7 @@ fn texture_views_and_sampler_filters() {
         assert!(view(format).is_ok(), "{format:?}");
     }
     let bc = m.create_texture(&d2(Format::Bc7, 4, 4)).unwrap();
-    let view = |format| m.create_texture_view(&bc, &ViewDesc { format, mips: (0, 1), slices: (0, 1) });
+    let view = |format| m.create_texture_view(&bc, &ViewDesc { format, dim: None, mips: (0, 1), slices: (0, 1) });
     assert!(view(Format::Bc7Srgb).is_ok() && view(Format::Bc3).is_err() && view(Format::Rgba32Float).is_err());
 
     // Filters: a 2x2 texture, red 0 | 255 (both rows), sampled on a 4x4 grid. Nearest only ever
@@ -935,7 +934,7 @@ fn an_rgb9e5_view_reads_what_compute_stored_as_r32_uint() {
     let k = 256 | 128 << 9 | 64 << 18 | 16 << 27;
     fill(&m, &fixture("uint_fill"), &t, &[k], [4, 4, 1], 4, 4);
     let view = m
-        .create_texture_view(&t, &ViewDesc { format: Format::Rgb9e5Float, mips: (0, 1), slices: (0, 1) })
+        .create_texture_view(&t, &ViewDesc { format: Format::Rgb9e5Float, dim: None, mips: (0, 1), slices: (0, 1) })
         .expect("an RGB9E5 view of an R32Uint texture");
     let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [4, 4], z: 1, filter: Filter::Nearest };
     for (i, c) in g.run(&view).iter().enumerate() {

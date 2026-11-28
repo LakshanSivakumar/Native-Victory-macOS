@@ -127,8 +127,34 @@ pub(crate) fn console_fields(words: &[u32; 27]) -> Fields {
         max_lod: f(10),
         bias: f(11),
         anisotropy: words[13],
-        compare: words[16],
+        compare: if (2..=8).contains(&words[16]) { words[16] } else { 0 },
         border: [f(17), f(18), f(19), f(20)],
+    }
+}
+
+/// The fields of a standard 13-dword `D3D12_SAMPLER_DESC` (`CreateSampler`).
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn d3d12_fields(words: &[u32; 13]) -> Fields {
+    let f = |i: usize| f32::from_bits(words[i]);
+    let filter = words[0];
+    let aniso = (filter & 0x40) != 0;
+    let reduction = (filter >> 7) & 3;
+    Fields {
+        mag: if aniso { 3 } else { (filter >> 2) & 1 },
+        min: if aniso { 3 } else { (filter >> 4) & 1 },
+        mip: if aniso || (filter & 1) != 0 { 2 } else { 1 },
+        mode: match reduction {
+            2 => 1,
+            3 => 2,
+            _ => 0,
+        },
+        address: [words[1], words[2], words[3]],
+        bias: f(4),
+        anisotropy: words[5],
+        compare: if reduction == 1 { words[6].clamp(1, 8) } else { 0 },
+        border: [f(7), f(8), f(9), f(10)],
+        min_lod: f(11),
+        max_lod: f(12),
     }
 }
 

@@ -87,16 +87,7 @@ impl<'a> Scene<'a> {
             .create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 1, 1))
             .unwrap();
         m.upload_texture(&white, 0, 0, &[255; 4], 4, 0);
-        let s = m
-            .create_sampler(&SamplerDesc {
-                min: Filter::Nearest,
-                mag: Filter::Nearest,
-                mip: Filter::Nearest,
-                address: [Address::Clamp; 3],
-                border_color: BorderColor::TransparentBlack,
-                max_anisotropy: 1,
-            })
-            .unwrap();
+        let s = m.create_sampler(&SamplerDesc::default()).unwrap();
         let res = m.create_heap(HeapKind::Resource, 8).unwrap();
         let smp = m.create_heap(HeapKind::Sampler, 2).unwrap();
         m.write_texture(&res, 0, &white, 0.0);
@@ -270,16 +261,7 @@ fn indexed_draw_with_depth_test_and_depth_sampling() {
     let res = m.create_heap(HeapKind::Resource, 2).unwrap();
     m.write_texture(&res, 0, &s.depth, 0.0);
     m.write_buffer(&res, 1, &out.buf, out.at(0), (cells * 16) as u32);
-    let sm = m
-        .create_sampler(&SamplerDesc {
-            min: Filter::Nearest,
-            mag: Filter::Nearest,
-            mip: Filter::Nearest,
-            address: [Address::Clamp; 3],
-            border_color: BorderColor::TransparentBlack,
-            max_anisotropy: 1,
-        })
-        .unwrap();
+    let sm = m.create_sampler(&SamplerDesc::default()).unwrap();
     m.write_sampler(&s.smp, 1, &sm, 0.0);
     let sample = [Dispatch {
         pipeline: &p,
