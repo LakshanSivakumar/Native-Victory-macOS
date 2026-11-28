@@ -24,6 +24,8 @@ pub mod bridge;
 #[cfg(target_arch = "x86_64")]
 pub mod dump;
 #[cfg(target_arch = "x86_64")]
+mod lookup_exit;
+#[cfg(target_arch = "x86_64")]
 mod run;
 #[cfg(target_arch = "x86_64")]
 pub mod teb;

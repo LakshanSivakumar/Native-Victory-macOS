@@ -211,6 +211,8 @@ pub unsafe fn run_entry_with(
         .unwrap_or(usize::MAX)
         .max(1 << 20);
     teb::set_image_base(image.base());
+    // Before any title code runs.
+    super::lookup_exit::arm(image.base(), image.len());
     victory_platform::watch::set_image(image.base(), image.len());
     super::dump::start();
     super::dump::start_mem_watch();
