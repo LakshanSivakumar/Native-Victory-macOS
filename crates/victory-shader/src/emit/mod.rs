@@ -2014,6 +2014,61 @@ mod tests {
         emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap();
     }
 
+    /// Pull-model barycentrics (`SPI_PS_INPUT_ADDR` bit 3: `<I/W, J/W, 1/W>`) and `POS_W_FLOAT`
+    /// (bit 11: `1/W`) emit valid DXIL containers: reading `<I/W, J/W, 1/W>` without an existing
+    /// `SV_Position` declares both `SV_Position` and `SV_Barycentrics`, while reading only `1/W`
+    /// (pull-model index 2 or `POS_W_FLOAT`) declares no `SV_Barycentrics` (#557).
+    #[test]
+    fn pull_model_barycentrics_and_pos_w_emit_with_or_without_sv_position() {
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let empty_isg1 = container::signature(&[], true);
+        let has = |s: &HostShader, name: &[u8]| s.dxil.windows(name.len()).any(|w| w == name);
+
+        let all_three = [
+            0x7E06_02F2u32, // v_mov_b32 v3, 1.0
+            0xF800_180F,
+            0x0302_0100, // exp mrt0 v0, v1, v2, v3 done vm
+            0xBF81_0000,
+        ];
+        let out = emit_pixel(&all_three, vec![], 1 << 3, &empty_isg1, &osg1).unwrap();
+        assert!(has(&out, b"SV_Position") && has(&out, b"SV_Barycentrics"));
+
+        let narrow_pos = container::signature(
+            &[SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 4,
+                row: Some(0),
+                col: 0,
+                cols: 2,
+                usage: 0,
+                half: false,
+            }],
+            true,
+        );
+        let out_narrow = emit_pixel(&all_three, vec![], 1 << 3, &narrow_pos, &osg1).unwrap();
+        assert!(has(&out_narrow, b"SV_Position") && has(&out_narrow, b"SV_Barycentrics"));
+
+        let rcp_w_only = [
+            0xF800_180F,
+            0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let out_rcp = emit_pixel(&rcp_w_only, vec![], 1 << 3, &empty_isg1, &osg1).unwrap();
+        assert!(has(&out_rcp, b"SV_Position") && !has(&out_rcp, b"SV_Barycentrics"));
+
+        let pos_w = [
+            0x7E02_5500, // v_rcp_f32 v1, v0
+            0xF800_180F,
+            0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000,
+        ];
+        let out_pos_w = emit_pixel(&pos_w, vec![], 1 << 11, &narrow_pos, &osg1).unwrap();
+        assert!(has(&out_pos_w, b"SV_Position") && !has(&out_pos_w, b"SV_Barycentrics"));
+    }
+
     /// An unread float input packed beside the front face (as console
     /// signatures have it when the float was `nointerpolation`) takes the
     /// row's constant mode: DXIL wants one mode per row.

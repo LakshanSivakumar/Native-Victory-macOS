@@ -529,7 +529,11 @@ host needs their value.
 They now come from `SV_Barycentrics`. RDNA2 interpolates P0 + i·(P1 − P0) + j·(P2 − P0), so `i`
 and `j` are the weights of the second and third vertices: channels y and z.
 - **Element.** One element per interpolation mode the program reads (DXIL 2 to 7: perspective or
-  linear; centre, centroid or sample; D3D allows two). The pull model stays refused.
+  linear; centre, centroid or sample; D3D allows two). Pull-model barycentrics (`SPI_PS_INPUT_ADDR`
+  bit 3, `<I / W, J / W, 1 / W>`) divide perspective-centre `SV_Barycentrics.yz` and `1.0` by
+  `SV_Position.w` (`W`, declaring `SV_Position` in `ISG1` when absent); `POS_W_FLOAT` (bit 11)
+  likewise supplies `1.0 / SV_Position.w` (`1 / W`), matching the hardware value console shaders
+  invert with `v_rcp_f32` (#557).
 - **Flags.** ShaderFlags bit 22 and `SFI0` 0x20000 are set.
 - **When.** Only in a second lowering pass, for a program the first pass refused for a barycentric
   read (`lower_graphics`; joins the first pass gave up on for that reason are retried). The

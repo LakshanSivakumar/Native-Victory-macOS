@@ -884,6 +884,99 @@ fn a_pixel_program_reads_a_zero_line_stipple_coordinate_on_a_triangle() {
     assert_eq!(words, vec![0; 64]);
 }
 
+/// Over a perspective triangle whose corners have `w = 1, 2, 4` at NDC `(-1, -1)`, `(3, -1)`,
+/// `(-1, 3)`, pull-model barycentrics (`SPI_PS_INPUT_ENA` bit 3) read `<I / W, J / W, 1 / W>` even
+/// when `SV_Position` was not otherwise enabled, and `POS_W_FLOAT` (bit 11) supplies `1 / W` so a
+/// console pixel shader's `v_rcp_f32` recovers `W` (#557).
+#[test]
+fn pull_model_barycentrics_and_pixel_pos_w_match_perspective_weights() {
+    let mut ms_words = TRIANGLE.to_vec();
+    let at = ms_words.iter().position(|&w| w == 0xF800_08CF).unwrap();
+    ms_words.splice(
+        at..at,
+        [
+            0x7E10_02F4, // v_mov_b32 v8, 2.0
+            0x7E12_02F6, // v_mov_b32 v9, 4.0
+            0x7D84_0281, // v_cmp_eq_u32 vcc, 1, v1
+            0x020C_1106, // v_cndmask_b32 v6, v6, v8, vcc
+            0x7D84_0282, // v_cmp_eq_u32 vcc, 2, v1
+            0x020C_1306, // v_cndmask_b32 v6, v6, v9, vcc
+            0x1004_0506, // v_mul_f32 v2, v6, v2
+            0x1006_0706, // v_mul_f32 v3, v6, v3
+        ],
+    );
+    let ms = translate(HwStage::Vs, &ms_words);
+    let Some(mut t) = title() else { return };
+
+    let mut meta = [0; 0x10];
+    meta[12] = 0x40;
+    for (ena, code) in [
+        (
+            1u32 << 3,
+            vec![
+                0x7E06_5502u32, // v_rcp_f32 v3, v2 (recover W from pull-model 1/W)
+                0xF800_180F,
+                0x0302_0100, // exp mrt0 v0, v1, v2, v3 done vm
+                0xBF81_0000,
+            ],
+        ),
+        (
+            (1u32 << 3) | (1u32 << 11),
+            vec![
+                0x7E06_5503u32, // v_rcp_f32 v3, v3 (recover W from POS_W_FLOAT)
+                0xF800_180F,
+                0x0302_0100, // exp mrt0 v0, v1, v2, v3 done vm
+                0xBF81_0000,
+            ],
+        ),
+    ] {
+        let bytes: Vec<_> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let c = victory_shader::emit::graphics::container_with_inputs(
+            HwStage::Ps,
+            &bytes,
+            &meta,
+            Some(ena),
+            None,
+        )
+        .unwrap();
+        let ps = shaders::translate(&c).unwrap();
+        let state =
+            Graphics::guess_base().for_draw(vec![Format::Rgba32Float], None, vec![], &[], false);
+        let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "pull model") else {
+            panic!("ena={ena:#x}: {:?}", t.shaders);
+        };
+        let mut desc = TextureDesc::d2(Format::Rgba32Float, 8, 8);
+        desc.render_target = true;
+        let out = t.host.texture(&desc).unwrap();
+        let mut list = NativeList::default();
+        list.set_render_targets(std::slice::from_ref(&out), None);
+        list.clear_render_target(&out, [0.0; 4]);
+        list.set_graphics_pipeline(&pso, Topology::Triangles);
+        list.set_graphics_binding(binding);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        let mut raw = [0u8; 8 * 8 * 16];
+        t.host.backend.read_texture(&out, 0, 0, &mut raw, 8 * 16, 0);
+        for (n, texel) in raw.chunks_exact(16).enumerate() {
+            let got: [f32; 4] = std::array::from_fn(|k| {
+                f32::from_le_bytes(texel[k * 4..k * 4 + 4].try_into().unwrap())
+            });
+            let (px, py) = ((n % 8) as f32 + 0.5, (n / 8) as f32 + 0.5);
+            let (x, y) = (px / 4.0 - 1.0, 1.0 - py / 4.0);
+            let (l1, l2) = ((x + 1.0) / 4.0, (y + 1.0) / 4.0);
+            let l0 = 1.0 - l1 - l2;
+            let rcp_w = l0 + l1 / 2.0 + l2 / 4.0;
+            let want = [l1 / 2.0, l2 / 4.0, rcp_w, 1.0 / rcp_w];
+            for k in 0..4 {
+                assert!(
+                    (got[k] - want[k]).abs() <= 1e-3,
+                    "ena={ena:#x} texel {n} ch {k}: got {got:?}, want {want:?}"
+                );
+            }
+        }
+    }
+}
+
 /// A pixel program that packs its colour as the title's do. It interpolates param0 with the
 /// barycentric inputs v0 and v1. Then `v_fma_mixlo_f16` writes the low half of v1 and keeps the
 /// high half, which still holds the barycentric, and `v_fma_mixhi_f16` replaces that high half
