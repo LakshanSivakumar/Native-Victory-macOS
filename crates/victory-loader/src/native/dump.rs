@@ -423,6 +423,35 @@ pub fn caller_chain() -> Vec<usize> {
     chain.iter().map(|&pc| pc.wrapping_sub(base)).collect()
 }
 
+/// The calling thread's title call chain formatted as `<module>+<rva:#x>` entries while inside a
+/// host call (matching Windows `kernel::host::callers`).
+pub fn caller_locations() -> Vec<String> {
+    let teb = super::teb::current() as usize;
+    if teb == 0 || read(teb, OFF_IN_HOST) == 0 {
+        return Vec::new();
+    }
+    let rbp = read(teb, OFF_IN_HOST_RBP);
+    let Some(saved_rbp) = (rbp != 0).then(|| read_checked(rbp)).flatten() else {
+        return Vec::new();
+    };
+    let mut ctx = Context::zeroed();
+    ctx.rip = read(teb, OFF_IN_HOST_RET) as u64;
+    ctx.gpr[RSP] = (rbp + 16) as u64;
+    ctx.gpr[RBP] = saved_rbp as u64;
+    let bounds = Some((read(teb, OFF_STACK_LIMIT), read(teb, OFF_STACK_BASE)));
+    super::seh::backtrace(ctx, bounds)
+        .into_iter()
+        .take(12)
+        .map(|pc| match unwind::image_base_of(pc) {
+            Some(base) => {
+                let name = super::dll::find_base(base).map_or("image", |d| d.name.as_str());
+                format!("{name}+{:#x}", pc.wrapping_sub(base))
+            }
+            None => format!("{pc:#x}"),
+        })
+        .collect()
+}
+
 /// Whether the chain is not the main wait loop's (the stack dump is for one thread).
 fn read_all_bases(chain: &[usize]) -> bool {
     let base = chain.first().and_then(|&pc| unwind::image_base_of(pc)).unwrap_or(0);

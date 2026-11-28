@@ -80,7 +80,8 @@ fn title_path(module: *mut c_void) -> Option<String> {
     } else {
         module as usize
     };
-    Some(runtime::image_path(base)?.to_string_lossy().into_owned())
+    let path = runtime::image_path(base)?;
+    Some(host::format_title_path(&path))
 }
 
 /// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
@@ -476,6 +477,10 @@ mod host {
         unsafe { GetModuleFileNameA(module, out, size) }
     }
 
+    pub(super) fn format_title_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
     pub(super) fn set_last_error(code: u32) {
         // SAFETY: see above.
         unsafe { SetLastError(code) }
@@ -648,10 +653,20 @@ mod host {
         None
     }
 
+    pub(super) fn format_title_path(path: &std::path::Path) -> String {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return crate::host_posix::files::win32_path(path);
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+        path.to_string_lossy().replace('/', "\\")
+    }
+
     pub(super) fn get_module_file_name_w(module: *mut c_void, out: *mut u16, size: u32) -> u32 {
         match system_path(module) {
             Some(path) => super::copy_truncated(&path, super::title_buffer(out, size)),
-            None => 0,
+            None => {
+                set_last_error(super::ERROR_MOD_NOT_FOUND);
+                0
+            }
         }
     }
 
@@ -661,7 +676,10 @@ mod host {
                 let path: Vec<u8> = String::from_utf16_lossy(&path).into_bytes();
                 super::copy_truncated(&path, super::title_buffer(out, size))
             }
-            None => 0,
+            None => {
+                set_last_error(super::ERROR_MOD_NOT_FOUND);
+                0
+            }
         }
     }
 
@@ -670,7 +688,7 @@ mod host {
         crate::host_posix::SetLastError(_code);
     }
 
-    /// Exports of the title's own DLLs (the native host maps them itself).
+    /// Exports of the title's own images (main executable and title DLLs) and fake system DLLs.
     pub(super) fn get_proc_address(_module: *mut c_void, _name: *const u8) -> *mut c_void {
         #[cfg(target_os = "macos")]
         {
@@ -682,10 +700,14 @@ mod host {
                     name: super::narrow(_name),
                 }
             };
-            if let Some(dll) = victory_loader::native::dll::find_base(_module as usize) {
+            let resolver = crate::runtime::NATIVE_TITLE_RESOLVER.get_or_init(Default::default);
+            if let Some(res) = victory_loader::native::dll::resolve_mapped_export(
+                _module as usize,
+                &symbol,
+                resolver,
+            ) {
                 use victory_loader::{Provenance, Resolution};
-                let resolver = crate::runtime::NATIVE_TITLE_RESOLVER.get_or_init(Default::default);
-                return match dll.resolve_export(&symbol, resolver) {
+                return match res {
                     Resolution::Found {
                         address,
                         provenance: Provenance::Title,
@@ -702,6 +724,7 @@ mod host {
                 return found;
             }
         }
+        set_last_error(super::ERROR_MOD_NOT_FOUND);
         std::ptr::null_mut()
     }
 
@@ -715,8 +738,20 @@ mod host {
     pub(super) fn disable_thread_library_calls(_module: *mut c_void) -> i32 {
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         {
-            victory_loader::native::disable_thread_calls(_module as usize);
-            1
+            const ERROR_INVALID_HANDLE: u32 = 6;
+            const ERROR_RING2_STACK_IN_USE: u32 = 207;
+            match victory_loader::native::disable_thread_calls(_module as usize) {
+                Some(true) => 1,
+                Some(false) => {
+                    set_last_error(ERROR_RING2_STACK_IN_USE);
+                    0
+                }
+                None if crate::host_posix::fake_dll::is_fake(_module) => 1,
+                None => {
+                    set_last_error(ERROR_INVALID_HANDLE);
+                    0
+                }
+            }
         }
         #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         0
@@ -743,6 +778,9 @@ mod host {
     pub(super) fn note_title_output(_: &str) {}
 
     pub(super) fn callers() -> String {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return victory_loader::native::dump::caller_locations().join(" < ");
+        #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
         String::new()
     }
 
@@ -781,7 +819,6 @@ mod tests {
 
     #[test]
     // The title names its images with Windows paths.
-    #[cfg(windows)]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
         runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
@@ -944,5 +981,150 @@ mod tests {
         assert!(GetProcAddress(gameinput, std::ptr::null()).is_null());
         assert!(!GetProcAddress(gameinput, std::ptr::without_provenance(1)).is_null());
         assert!(GetProcAddress(gameinput, std::ptr::without_provenance(2)).is_null());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[test]
+    fn native_module_paths_main_exports_dbghelp_and_callers() {
+        use victory_loader::native::{NativeImage, bridge};
+        use victory_pe::layout::dir;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = std::path::absolute(dir.path()).unwrap();
+        crate::host_posix::files::mount_at('W', &pkg);
+
+        // Build a minimal relocatable PE32+ executable exporting `D3D12SDKVersion` (ordinal 1)
+        // at RVA 0x1050 (`614u32`) and a tiny win64 function at RVA 0x1000 that calls its `rcx`
+        // callback through `sub rsp, 0x28; call rcx; add rsp, 0x28; ret` (with unwind info at 0x1100).
+        let mut pe = vec![0u8; 0x600];
+        let put16 = |d: &mut [u8], at: usize, v: u16| d[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 = |d: &mut [u8], at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |d: &mut [u8], at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        pe[0..2].copy_from_slice(b"MZ");
+        put32(&mut pe, 0x3C, 0x40);
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        put16(&mut pe, 0x44, victory_pe::MACHINE_AMD64);
+        put16(&mut pe, 0x46, 1);
+        put16(&mut pe, 0x54, 240);
+        put16(&mut pe, 0x56, 0x0022); // executable (not DLL)
+        let opt = 0x58;
+        put16(&mut pe, opt, 0x20B);
+        put32(&mut pe, opt + 16, 0x1000);
+        put64(&mut pe, opt + 24, 0x1_4000_0000);
+        put32(&mut pe, opt + 32, 0x1000);
+        put32(&mut pe, opt + 36, 0x200);
+        put32(&mut pe, opt + 56, 0x2000);
+        put32(&mut pe, opt + 60, 0x200);
+        put32(&mut pe, opt + 108, 16);
+        put32(&mut pe, opt + 112, 0x1080); // IMAGE_DIRECTORY_ENTRY_EXPORT (0)
+        put32(&mut pe, opt + 112 + 4, 0x60);
+        put32(&mut pe, opt + 112 + dir::EXCEPTION * 8, 0x1100);
+        put32(&mut pe, opt + 112 + dir::EXCEPTION * 8 + 4, 12);
+        put32(&mut pe, opt + 112 + dir::BASERELOC * 8, 0x1140);
+        put32(&mut pe, opt + 112 + dir::BASERELOC * 8 + 4, 8);
+        let sec = opt + 240;
+        pe[sec..sec + 5].copy_from_slice(b".text");
+        put32(&mut pe, sec + 8, 0x400);
+        put32(&mut pe, sec + 12, 0x1000);
+        put32(&mut pe, sec + 16, 0x400);
+        put32(&mut pe, sec + 20, 0x200);
+        put32(&mut pe, sec + 36, 0x6000_0020); // READ | EXECUTE
+
+        // RVA 0x1000 (file 0x200): `sub rsp, 0x28; call rcx; add rsp, 0x28; ret`
+        pe[0x200..0x20B].copy_from_slice(&[0x48, 0x83, 0xEC, 0x28, 0xFF, 0xD1, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+        put32(&mut pe, 0x250, 614); // D3D12SDKVersion at RVA 0x1050
+
+        // Export directory at RVA 0x1080 (file 0x280): 1 export `D3D12SDKVersion` -> RVA 0x1050.
+        put32(&mut pe, 0x28C, 0x10C0); // Name RVA
+        put32(&mut pe, 0x290, 1); // OrdinalBase = 1
+        put32(&mut pe, 0x294, 1); // NumberOfFunctions = 1
+        put32(&mut pe, 0x298, 1); // NumberOfNames = 1
+        put32(&mut pe, 0x29C, 0x10AC); // AddressOfFunctions
+        put32(&mut pe, 0x2A0, 0x10B0); // AddressOfNames
+        put32(&mut pe, 0x2A4, 0x10B4); // AddressOfNameOrdinals
+        put32(&mut pe, 0x2AC, 0x1050); // functions[0] = 0x1050
+        put32(&mut pe, 0x2B0, 0x10CA); // names[0] = "D3D12SDKVersion"
+        put16(&mut pe, 0x2B4, 0); // ordinals[0] = 0
+        pe[0x2C0..0x2C9].copy_from_slice(b"Game.exe\0");
+        pe[0x2CA..0x2DA].copy_from_slice(b"D3D12SDKVersion\0");
+
+        // RUNTIME_FUNCTION at RVA 0x1100 (file 0x300), UNWIND_INFO at RVA 0x1110 (file 0x310)
+        // for `sub rsp, 0x28` (UWOP_ALLOC_SMALL, info = 4 -> (4+1)*8 = 0x28).
+        put32(&mut pe, 0x300, 0x1000);
+        put32(&mut pe, 0x304, 0x100B);
+        put32(&mut pe, 0x308, 0x1110);
+        pe[0x310..0x316].copy_from_slice(&[0x01, 0x04, 0x01, 0x00, 0x04, 0x42]);
+        put32(&mut pe, 0x340, 0x1000);
+        put32(&mut pe, 0x344, 8);
+
+        let image = NativeImage::map(&pe, None).unwrap();
+        image.finalize().unwrap();
+        let prev_main = runtime::main_image();
+        runtime::set_main_image(image.base());
+        runtime::set_image_path(image.base(), &pkg.join("Game.exe"));
+
+        // 1. `GetModuleFileNameW(NULL)` / `GetModuleFileNameA(NULL)` translate through mounted `W:`.
+        let mut wbuf = [0u16; 64];
+        crate::host_posix::SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        let len = GetModuleFileNameW(std::ptr::null_mut(), wbuf.as_mut_ptr(), wbuf.len() as u32);
+        assert_eq!(String::from_utf16_lossy(&wbuf[..len as usize]), r"W:\Game.exe");
+        assert_eq!(crate::host_posix::GetLastError(), 0);
+        let mut abuf = [0u8; 64];
+        let len_a = GetModuleFileNameA(image.base() as *mut c_void, abuf.as_mut_ptr(), abuf.len() as u32);
+        assert_eq!(&abuf[..len_a as usize], br"W:\Game.exe");
+
+        // Invalid module handle sets ERROR_MOD_NOT_FOUND (126).
+        crate::host_posix::SetLastError(0);
+        assert_eq!(GetModuleFileNameW(0xDEAD as *mut c_void, wbuf.as_mut_ptr(), 64), 0);
+        assert_eq!(crate::host_posix::GetLastError(), ERROR_MOD_NOT_FOUND);
+
+        // 2. `GetProcAddress` resolves exports of the main executable (`NULL` or `GetModuleHandleW(NULL)`).
+        let sdk_ver = GetProcAddress(std::ptr::null_mut(), c"D3D12SDKVersion".as_ptr().cast());
+        assert_eq!(sdk_ver as usize, image.base() + 0x1050);
+        assert_eq!(unsafe { *(sdk_ver as *const u32) }, 614);
+        assert_eq!(
+            GetProcAddress(GetModuleHandleW(std::ptr::null()), std::ptr::without_provenance(1)),
+            sdk_ver
+        );
+        crate::host_posix::SetLastError(0);
+        assert!(GetProcAddress(std::ptr::null_mut(), c"NoSuchExport".as_ptr().cast()).is_null());
+        assert_eq!(crate::host_posix::GetLastError(), ERROR_PROC_NOT_FOUND);
+        crate::host_posix::SetLastError(0);
+        assert!(GetProcAddress(0xDEAD as *mut c_void, c"Anything".as_ptr().cast()).is_null());
+        assert_eq!(crate::host_posix::GetLastError(), ERROR_MOD_NOT_FOUND);
+
+        // 3. `dbghelp.dll!MiniDumpWriteDump` resolves without warning and sets ERROR_NOT_SUPPORTED (50).
+        let dbghelp = LoadLibraryW(w("dbghelp.dll").as_ptr());
+        assert!(!dbghelp.is_null());
+        let minidump = GetProcAddress(dbghelp, c"MiniDumpWriteDump".as_ptr().cast());
+        assert!(!minidump.is_null());
+        crate::host_posix::SetLastError(0);
+        let ret = unsafe { bridge::call_win64(minidump as usize, &[0, 0, 0, 0, 0, 0, 0]) };
+        assert_eq!(ret as u32, 0);
+        assert_eq!(crate::host_posix::GetLastError(), 50);
+
+        // 4. `DisableThreadLibraryCalls` accepts fake DLLs and TLS-free images, rejects invalid handles.
+        assert_eq!(DisableThreadLibraryCalls(dbghelp), 1);
+        assert_eq!(DisableThreadLibraryCalls(image.base() as *mut c_void), 1);
+        crate::host_posix::SetLastError(0);
+        assert_eq!(DisableThreadLibraryCalls(0xDEAD as *mut c_void), 0);
+        assert_eq!(crate::host_posix::GetLastError(), 6);
+
+        // 5. `host::callers()` unwinds back to `image+0x1006` while inside a bridged host call.
+        static SEEN_CALLERS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+        extern "C" fn capture_callers() -> u64 {
+            *SEEN_CALLERS.lock().unwrap() = super::host::callers();
+            0x99
+        }
+        let stub = bridge::host_callbacks(&[(capture_callers as *const () as usize, false)]).unwrap()[0];
+        let r = unsafe { bridge::call_win64(image.base() + 0x1000, &[stub as u64]) };
+        assert_eq!(r, 0x99);
+        let chain = SEEN_CALLERS.lock().unwrap().clone();
+        assert!(chain.contains("image+0x1006"), "unexpected caller chain: {chain}");
+
+        runtime::forget_image(image.base());
+        runtime::set_main_image(prev_main.unwrap_or(0));
+        // SAFETY: no title code remains running in `image`.
+        unsafe { image.unmap() };
     }
 }

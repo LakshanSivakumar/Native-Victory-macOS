@@ -26,7 +26,15 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
-    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let has_drive = path.to_str().is_some_and(|s| {
+        let b = s.as_bytes();
+        (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':') || s.starts_with(r"\\")
+    });
+    let path = if has_drive {
+        path.to_owned()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+    };
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
     paths.push((base, path));

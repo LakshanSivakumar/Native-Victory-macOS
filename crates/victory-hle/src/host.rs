@@ -236,10 +236,31 @@ mod imp {
 /// `host_posix`'s, elsewhere there is no pass-through.
 #[cfg(not(windows))]
 mod imp {
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    extern "system" fn mini_dump_write_dump(
+        _process: *mut std::ffi::c_void,
+        _pid: u32,
+        _file: *mut std::ffi::c_void,
+        _dump_type: u32,
+        _exception: *const std::ffi::c_void,
+        _user_streams: *const std::ffi::c_void,
+        _callback: *const std::ffi::c_void,
+    ) -> i32 {
+        const ERROR_NOT_SUPPORTED: u32 = 50;
+        crate::host_posix::SetLastError(ERROR_NOT_SUPPORTED);
+        0
+    }
+
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         // Ordinals look up `#n`, as in the HLE registry.
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
         {
+            if _dll.eq_ignore_ascii_case("dbghelp.dll")
+                && matches!(_symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "MiniDumpWriteDump")
+            {
+                return Some(mini_dump_write_dump as *const () as usize);
+            }
             crate::host_posix::lookup(_dll, &_symbol.to_string())
         }
         #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]

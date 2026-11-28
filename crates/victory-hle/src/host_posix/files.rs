@@ -120,6 +120,29 @@ pub(crate) fn translate(path: &[u16]) -> Option<PathBuf> {
     Some(PathBuf::from(text.replace('\\', "/")))
 }
 
+/// Formats `path` as a Win32 path for title code (`GetModuleFileName`,
+/// `GetFullPathName`): a host path inside a mounted drive uses that drive's
+/// letter (preferring the longest matching root, e.g. `G:\Game.exe`), and any
+/// remaining `/` separators become `\`.
+pub(crate) fn win32_path(path: &Path) -> String {
+    let best = drives()
+        .iter()
+        .filter_map(|&(letter, ref root)| {
+            let rel = path.strip_prefix(root).ok()?;
+            Some((root.as_os_str().len(), letter, rel.to_path_buf()))
+        })
+        .max_by_key(|(len, _, _)| *len);
+    if let Some((_, letter, rel)) = best {
+        let tail = rel.to_string_lossy().replace('/', "\\");
+        return if tail.is_empty() {
+            format!("{}:\\", char::from(letter))
+        } else {
+            format!("{}:\\{tail}", char::from(letter))
+        };
+    }
+    path.to_string_lossy().replace('/', "\\")
+}
+
 /// A NUL-terminated wide string.
 pub(super) fn wide_str(p: *const u16) -> Vec<u16> {
     // SAFETY: the title passes a NUL-terminated path.
@@ -640,7 +663,15 @@ pub extern "system" fn GetFileAttributesExW(path: *const u16, _level: u32, data:
 }
 
 pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
-    let Some(path) = wide_path(path) else {
+    delete_file(wide_path(path))
+}
+
+pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
+    delete_file(narrow_path(path))
+}
+
+fn delete_file(path: Option<PathBuf>) -> i32 {
+    let Some(path) = path else {
         set_error(ERROR_PATH_NOT_FOUND);
         return 0;
     };
@@ -654,7 +685,15 @@ pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
 }
 
 pub extern "system" fn CreateDirectoryW(path: *const u16, _security: *const c_void) -> i32 {
-    let Some(path) = wide_path(path) else {
+    create_directory(wide_path(path))
+}
+
+pub extern "system" fn CreateDirectoryA(path: *const c_char, _security: *const c_void) -> i32 {
+    create_directory(narrow_path(path))
+}
+
+fn create_directory(path: Option<PathBuf>) -> i32 {
+    let Some(path) = path else {
         set_error(ERROR_PATH_NOT_FOUND);
         return 0;
     };
@@ -672,7 +711,15 @@ pub extern "system" fn CreateDirectoryW(path: *const u16, _security: *const c_vo
 }
 
 pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
-    let Some(path) = wide_path(path) else {
+    remove_directory(wide_path(path))
+}
+
+pub extern "system" fn RemoveDirectoryA(path: *const c_char) -> i32 {
+    remove_directory(narrow_path(path))
+}
+
+fn remove_directory(path: Option<PathBuf>) -> i32 {
+    let Some(path) = path else {
         set_error(ERROR_PATH_NOT_FOUND);
         return 0;
     };
@@ -683,6 +730,137 @@ pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
             0
         }
     }
+}
+
+pub extern "system" fn GetDiskFreeSpaceW(
+    _root: *const u16,
+    sectors_per_cluster: *mut u32,
+    bytes_per_sector: *mut u32,
+    free_clusters: *mut u32,
+    total_clusters: *mut u32,
+) -> i32 {
+    // 8 * 4096 B = 32 KiB clusters: 512 GiB free of 1 TiB total (matches GetDiskFreeSpaceExW).
+    for (out, value) in [
+        (sectors_per_cluster, 8u32),
+        (bytes_per_sector, 4096),
+        (free_clusters, 16 * 1024 * 1024),
+        (total_clusters, 32 * 1024 * 1024),
+    ] {
+        if !out.is_null() {
+            // SAFETY: caller's output dword or null.
+            unsafe { out.write_unaligned(value) };
+        }
+    }
+    1
+}
+
+fn clean_host_path(path: PathBuf) -> PathBuf {
+    let abs = std::path::absolute(&path).unwrap_or(path);
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !matches!(out.components().next_back(), Some(std::path::Component::RootDir)) {
+                    out.pop();
+                }
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+pub extern "system" fn GetFullPathNameW(
+    name: *const u16,
+    size: u32,
+    out: *mut u16,
+    file_part: *mut *mut u16,
+) -> u32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let raw = wide_str(name);
+    if raw.is_empty() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(host) = translate(&raw) else {
+        set_error(ERROR_PATH_NOT_FOUND);
+        return 0;
+    };
+    let full = win32_path(&clean_host_path(host));
+    let units: Vec<u16> = full.encode_utf16().collect();
+    if (size as usize) <= units.len() || out.is_null() {
+        if out.is_null() && size != 0 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        return (units.len() + 1) as u32;
+    }
+    // SAFETY: `out` has room for `units.len() + 1` UTF-16 code units.
+    unsafe {
+        std::ptr::copy_nonoverlapping(units.as_ptr(), out, units.len());
+        out.add(units.len()).write(0);
+        if !file_part.is_null() {
+            let slash = units.iter().rposition(|&c| c == u16::from(b'\\'));
+            let ptr = match slash {
+                Some(idx) if idx + 1 < units.len() => out.add(idx + 1),
+                Some(_) => std::ptr::null_mut(),
+                None => out,
+            };
+            file_part.write_unaligned(ptr);
+        }
+    }
+    units.len() as u32
+}
+
+pub extern "system" fn GetFullPathNameA(
+    name: *const c_char,
+    size: u32,
+    out: *mut u8,
+    file_part: *mut *mut u8,
+) -> u32 {
+    if name.is_null() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: NUL-terminated narrow path from the caller.
+    let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+    if bytes.is_empty() {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let wide: Vec<u16> = String::from_utf8_lossy(bytes).encode_utf16().collect();
+    let Some(host) = translate(&wide) else {
+        set_error(ERROR_PATH_NOT_FOUND);
+        return 0;
+    };
+    let full = win32_path(&clean_host_path(host));
+    let text = full.as_bytes();
+    if (size as usize) <= text.len() || out.is_null() {
+        if out.is_null() && size != 0 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        return (text.len() + 1) as u32;
+    }
+    // SAFETY: `out` has room for `text.len() + 1` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(text.as_ptr(), out, text.len());
+        out.add(text.len()).write(0);
+        if !file_part.is_null() {
+            let slash = text.iter().rposition(|&c| c == b'\\');
+            let ptr = match slash {
+                Some(idx) if idx + 1 < text.len() => out.add(idx + 1),
+                Some(_) => std::ptr::null_mut(),
+                None => out,
+            };
+            file_part.write_unaligned(ptr);
+        }
+    }
+    text.len() as u32
 }
 
 // Directory searches.
@@ -958,8 +1136,14 @@ pub(super) fn lookup(name: &str) -> Option<usize> {
         GetFileAttributesA,
         GetFileAttributesExW,
         DeleteFileW,
+        DeleteFileA,
         CreateDirectoryW,
+        CreateDirectoryA,
         RemoveDirectoryW,
+        RemoveDirectoryA,
+        GetDiskFreeSpaceW,
+        GetFullPathNameW,
+        GetFullPathNameA,
         FindFirstFileW,
         FindFirstFileExW,
         FindNextFileW,
@@ -1388,6 +1572,78 @@ mod tests {
         // FindClose on an invalid handle sets ERROR_INVALID_HANDLE.
         assert_eq!(FindClose(invalid_handle()), 0);
         assert_eq!(super::super::GetLastError(), ERROR_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn win32_path_get_full_path_name_and_narrow_dir_ops_match_win32() {
+        let outer = tempfile::tempdir().unwrap();
+        let inner = outer.path().join("nested");
+        std::fs::create_dir(&inner).unwrap();
+        let outer_abs = std::path::absolute(outer.path()).unwrap();
+        let inner_abs = std::path::absolute(&inner).unwrap();
+        mount_at('Q', &outer_abs);
+        mount_at('R', &inner_abs);
+
+        assert_eq!(win32_path(&outer_abs), r"Q:\");
+        assert_eq!(win32_path(&outer_abs.join("Game.exe")), r"Q:\Game.exe");
+        // Longest mounted root wins when nested.
+        assert_eq!(win32_path(&inner_abs.join("pak0.bin")), r"R:\pak0.bin");
+
+        let mut wide_out = [0u16; 260];
+        let mut wide_part: *mut u16 = std::ptr::null_mut();
+        let query = wide("Q:/sub/./deep/../data.bin");
+        // Too-small buffer returns required length including NUL.
+        assert_eq!(
+            GetFullPathNameW(query.as_ptr(), 4, wide_out.as_mut_ptr(), &mut wide_part),
+            16
+        );
+        let n = GetFullPathNameW(
+            query.as_ptr(),
+            wide_out.len() as u32,
+            wide_out.as_mut_ptr(),
+            &mut wide_part,
+        );
+        assert_eq!(String::from_utf16_lossy(&wide_out[..n as usize]), r"Q:\sub\data.bin");
+        assert!(!wide_part.is_null());
+        // SAFETY: `wide_part` points inside `wide_out`.
+        let part_len = (0..).take_while(|&i| unsafe { *wide_part.add(i) } != 0).count();
+        assert_eq!(
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide_part, part_len) }),
+            "data.bin"
+        );
+
+        // Drive root sets `file_part` to null.
+        let root_q = wide("Q:\\");
+        assert_eq!(
+            GetFullPathNameW(root_q.as_ptr(), wide_out.len() as u32, wide_out.as_mut_ptr(), &mut wide_part),
+            3
+        );
+        assert!(wide_part.is_null());
+
+        // Narrow `GetFullPathNameA`, `CreateDirectoryA`, `DeleteFileA`, `RemoveDirectoryA`, `GetDiskFreeSpaceW`.
+        let mut narrow_out = [0u8; 260];
+        let mut narrow_part: *mut u8 = std::ptr::null_mut();
+        let n_a = GetFullPathNameA(
+            c"Q:/dir_a/./file.tmp".as_ptr(),
+            narrow_out.len() as u32,
+            narrow_out.as_mut_ptr(),
+            &mut narrow_part,
+        );
+        assert_eq!(&narrow_out[..n_a as usize], br"Q:\dir_a\file.tmp");
+        assert!(!narrow_part.is_null());
+
+        assert_eq!(CreateDirectoryA(c"Q:\\dir_a".as_ptr(), std::ptr::null()), 1);
+        std::fs::write(outer_abs.join("dir_a/file.tmp"), b"abc").unwrap();
+        assert_eq!(DeleteFileA(c"Q:\\dir_a\\file.tmp".as_ptr()), 1);
+        assert_eq!(RemoveDirectoryA(c"Q:\\dir_a".as_ptr()), 1);
+        assert!(!outer_abs.join("dir_a").exists());
+
+        let (mut spc, mut bps, mut free_c, mut total_c) = (0u32, 0u32, 0u32, 0u32);
+        assert_eq!(
+            GetDiskFreeSpaceW(root_q.as_ptr(), &mut spc, &mut bps, &mut free_c, &mut total_c),
+            1
+        );
+        assert!(spc > 0 && bps > 0 && free_c > 0 && total_c >= free_c);
     }
 }
 
