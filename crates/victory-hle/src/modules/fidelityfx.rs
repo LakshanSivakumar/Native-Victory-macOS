@@ -18,111 +18,32 @@
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{CStr, c_char, c_void};
+use std::collections::BTreeSet;
+use std::ffi::{c_char, c_void};
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
+use super::fidelityfx_common::{host_state, link};
+use super::fidelityfx_common::*;
+
+use std::ffi::CStr;
+#[cfg(windows)]
+use std::sync::OnceLock;
+#[cfg(windows)]
 use victory_gpu::object::Object;
+#[cfg(windows)]
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+#[cfg(windows)]
 use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
 
 /// The PC build's upscaler, which has the five functions itself.
+#[cfg(windows)]
 const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
 
-// Return codes.
-const OK: u32 = 0;
-const UNKNOWN_TYPE: u32 = 2;
-const NO_PROVIDER: u32 = 4;
-const PARAMETER: u32 = 6;
-
-// Description types.
-const CREATE_UPSCALE: u64 = 0x1_0000;
-const DISPATCH_UPSCALE: u64 = 0x1_0001;
-const CONSOLE_BACKEND: u64 = 0x100_0002;
-const HOST_BACKEND: u64 = 2;
-const GET_VERSIONS: u64 = 4;
-const GET_PROVIDER_VERSION: u64 = 6;
-const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Header {
-    kind: u64,
-    next: *mut Header,
-}
-
-/// An upscaler context: flags, largest render and output sizes, a message
-/// callback.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CreateUpscale {
-    header: Header,
-    flags: u32,
-    max_render: [u32; 2],
-    max_output: [u32; 2],
-    message: usize,
-}
-
-/// The backend description: a device.
-#[repr(C)]
-struct Backend {
-    header: Header,
-    device: *mut c_void,
-}
-
-/// A resource, its description (type, format, sizes, mips, flags, usage)
-/// and the state it is in.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Resource {
-    resource: *mut c_void,
-    description: [u32; 8],
-    state: u32,
-}
-
-/// One upscaling: the command list, then colour, depth, motion vectors,
-/// exposure, reactive mask, transparency mask and output; then jitter,
-/// motion-vector scale, sizes, sharpening, frame time, pre-exposure, reset,
-/// camera and flags, which pass through.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct DispatchUpscale {
-    header: Header,
-    list: *mut c_void,
-    resources: [Resource; 7],
-    rest: [u32; 18],
-}
-
-const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
-const _: () = assert!(size_of::<Resource>() == 0x30);
-const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
-
-/// The versions a backend offers: count in and out, ids, names.
-#[repr(C)]
-struct GetVersions {
-    header: Header,
-    create_kind: u64,
-    device: *mut c_void,
-    count: *mut u64,
-    ids: *mut u64,
-    names: *mut *const c_char,
-}
-
-#[repr(C)]
-struct ProviderVersion {
-    header: Header,
-    id: u64,
-    name: *const c_char,
-}
-
-type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
-type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
-/// Configure, query and dispatch.
-type Call = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> u32;
-
+#[cfg(windows)]
 struct Host {
     create: Create,
     destroy: Destroy,
@@ -133,23 +54,216 @@ struct Host {
 }
 
 // SAFETY: D3D12 devices are free-threaded; the rest is code.
+#[cfg(windows)]
 unsafe impl Send for Host {}
 // SAFETY: as above.
+#[cfg(windows)]
 unsafe impl Sync for Host {}
 
+#[cfg(windows)]
 static HOST: OnceLock<Host> = OnceLock::new();
 
-macro_rules! once {
-    ($level:ident, $($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::$level!($($arg)*));
-    }};
+
+/// The title's upscaler context under `VICTORY_METALFX=1`: what the create
+/// description carries, before the scaler itself exists (M2 builds it from
+/// the first dispatch, where the formats show up).
+struct UpscalerConfig {
+    render: [u32; 2],
+    output: [u32; 2],
+    flags: u32,
+}
+
+impl UpscalerConfig {
+    /// What MetalFX requires before a scaler can be built at all. The
+    /// device's own scale bounds are checked at creation (M2).
+    fn validate(&self) -> Result<(), String> {
+        let [rw, rh] = self.render;
+        let [ow, oh] = self.output;
+        if rw == 0 || rh == 0 || ow == 0 || oh == 0 {
+            return Err("a size is zero".into());
+        }
+        if ow < rw {
+            return Err("output smaller than render: MetalFX upscales".into());
+        }
+        let scale = ow as f64 / rw.max(1) as f64;
+        if scale > 4.0 {
+            return Err(format!("scale {scale:.2}x is beyond MetalFX's range"));
+        }
+        Ok(())
+    }
+}
+
+/// The MetalFX contexts we handed the title, by address. The handles are
+/// `Box<UpscalerConfig>` until M2 turns them into scalers.
+static METALFX_CONTEXTS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+
+/// Whether the title's upscaler is served with MetalFX (`VICTORY_METALFX=1`).
+fn metalfx_enabled() -> bool {
+    std::env::var_os("VICTORY_METALFX").is_some_and(|v| v != "0")
+}
+
+fn metalfx_holds(context: *mut *mut c_void) -> bool {
+    if context.is_null() {
+        return false;
+    }
+    // SAFETY: the caller's context points at our handle.
+    let handle = unsafe { *context } as usize;
+    METALFX_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&handle)
+}
+
+/// Creates the MetalFX context from the title's upscaler description.
+///
+/// # Safety
+/// `desc` names an upscaler description; `context` is the title's out-slot.
+unsafe fn metalfx_create(
+    context: *mut *mut c_void,
+    desc: *mut Header,
+) -> u32 {
+    // SAFETY: an upscaler description, by its type.
+    let upscale = unsafe { desc.cast::<CreateUpscale>().read() };
+    let config = UpscalerConfig {
+        render: upscale.max_render,
+        output: upscale.max_output,
+        flags: upscale.flags,
+    };
+    if let Err(why) = config.validate() {
+        tracing::error!("FidelityFX MetalFX: refused the upscaler: {why}");
+        return PARAMETER;
+    }
+    let handle = Box::into_raw(Box::new(config));
+    // SAFETY: the title's out-slot.
+    unsafe { context.write(handle.cast()) };
+    METALFX_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(handle as usize);
+    let (render, output, flags) = unsafe {
+        // SAFETY: the handle was just boxed from a valid config.
+        let c = handle.as_ref().unwrap();
+        (c.render, c.output, c.flags)
+    };
+    tracing::info!(
+        render = ?render,
+        output = ?output,
+        flags = format_args!("{flags:#x}"),
+        "FidelityFX: MetalFX upscaler context created (the scaler itself lands at the first dispatch, M2)"
+    );
+    OK
+}
+
+/// Destroys a MetalFX context; `None` when the handle is not ours.
+///
+/// # Safety
+/// `context` points at a handle this module handed out or the title's own.
+unsafe fn metalfx_destroy(context: *mut *mut c_void) -> Option<u32> {
+    if context.is_null() {
+        return None;
+    }
+    // SAFETY: as above.
+    let handle = unsafe { *context } as usize;
+    let removed = METALFX_CONTEXTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&handle);
+    if removed {
+        // SAFETY: the handle came from `metalfx_create`.
+        unsafe { drop(Box::from_raw(handle as *mut UpscalerConfig)) };
+        Some(OK)
+    } else {
+        None
+    }
+}
+
+/// The M1 dispatch path: a MetalFX context's upscaling is refused until the
+/// scaler itself is built (M2). `None` when the dispatch is not ours.
+///
+/// # Safety
+/// `context` and `desc` are the title's pointers; `desc` names a dispatch.
+unsafe fn metalfx_dispatch_refusal(
+    context: *mut *mut c_void,
+    desc: *mut Header,
+) -> Option<u32> {
+    // SAFETY: the title passes a description.
+    let kind = unsafe { (*desc).kind };
+    if kind == DISPATCH_UPSCALE && metalfx_holds(context) {
+        once!(
+            warn,
+            "FidelityFX MetalFX: the scaler build lands at the first dispatch (M2); the upscaling did not run"
+        );
+        return Some(PARAMETER);
+    }
+    None
+}
+
+/// The provider the MetalFX path reports in version queries. Our own id:
+/// create ignores the requested provider, and the real DLL's values should
+/// be dumped on Windows (the PC `versions()` helper logs them) if the title
+/// ever cross-checks.
+const METALFX_PROVIDER_ID: u64 = 0x6d65_7461; // "meta"
+const METALFX_PROVIDER_NAME: &CStr = c"MetalFX (victory)";
+
+/// Answers the version negotiation the PC build answers on Windows. Without
+/// this the title concludes there is no provider and never creates a
+/// context. `None` when the query is not one of the version kinds.
+///
+/// # Safety
+/// `desc` names a GetVersions or ProviderVersion description whose buffers
+/// the title owns.
+unsafe fn metalfx_query(desc: *mut Header) -> Option<u32> {
+    // SAFETY: the title passes a description.
+    let kind = unsafe { (*desc).kind };
+    match kind {
+        GET_VERSIONS => {
+            // SAFETY: a GetVersions description, by its type.
+            let gv = unsafe { desc.cast::<GetVersions>().read() };
+            if gv.create_kind != CREATE_UPSCALE || gv.count.is_null() {
+                return Some(PARAMETER);
+            }
+            // SAFETY: the title owns the count slot.
+            unsafe { *gv.count = 1 };
+            if !gv.ids.is_null() {
+                // SAFETY: the title owns the ids array.
+                unsafe { *gv.ids = METALFX_PROVIDER_ID };
+            }
+            if !gv.names.is_null() {
+                // SAFETY: the title owns the names array.
+                unsafe { *gv.names = METALFX_PROVIDER_NAME.as_ptr().cast() };
+            }
+            once!(
+                info,
+                id = format_args!("{METALFX_PROVIDER_ID:#x}"),
+                "FidelityFX MetalFX: version query answered with one provider"
+            );
+            Some(OK)
+        }
+        GET_PROVIDER_VERSION => {
+            // SAFETY: a ProviderVersion description, by its type.
+            unsafe {
+                (*desc.cast::<ProviderVersion>()).id = METALFX_PROVIDER_ID;
+                (*desc.cast::<ProviderVersion>()).name = METALFX_PROVIDER_NAME.as_ptr().cast();
+            }
+            once!(info, "FidelityFX MetalFX: provider version answered");
+            Some(OK)
+        }
+        _ => None,
+    }
+}
+
+/// MetalFX path's configure: settings and debug callbacks are accepted and
+/// ignored (the PC build forwards them to the DLL, which only logs).
+fn metalfx_configure() -> u32 {
+    once!(info, "FidelityFX MetalFX: configure accepted and ignored");
+    OK
 }
 
 /// Serves the title's FidelityFX calls with the PC upscaler in `dir`
 /// (`VICTORY_FIDELITYFX_DIR`) if it offers one for the host GPU; else the
 /// title's own DLLs run. Call once, before the import registry is first
 /// used: it holds this module only when serving.
+#[cfg(windows)]
 pub fn use_host_dir(dir: Option<&Path>) {
     let Some(dir) = dir else {
         tracing::info!(
@@ -169,11 +283,24 @@ pub fn use_host_dir(dir: Option<&Path>) {
     }
 }
 
-/// Whether the host's FidelityFX serves the title's.
-pub(crate) fn serving() -> bool {
-    HOST.get().is_some()
+/// Off-Windows hosts have no PC FidelityFX build to load; MetalFX
+/// (`VICTORY_METALFX=1`) serves instead when it lands.
+#[cfg(not(windows))]
+pub fn use_host_dir(_dir: Option<&Path>) {
+    tracing::info!("FidelityFX: no PC build on this host; MetalFX serves when VICTORY_METALFX=1");
 }
 
+/// Whether the host's FidelityFX serves the title's: with the PC build on
+/// Windows, or with MetalFX where `VICTORY_METALFX=1` (macOS).
+pub(crate) fn serving() -> bool {
+    #[cfg(windows)]
+    if HOST.get().is_some() {
+        return true;
+    }
+    metalfx_enabled()
+}
+
+#[cfg(windows)]
 fn load(dir: &Path) -> Result<(Host, String), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::LibraryLoader::{
@@ -220,6 +347,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
 
 /// The upscaler versions the host DLL offers for the host GPU, by name; an
 /// error if none.
+#[cfg(windows)]
 fn versions(host: &Host) -> Result<String, String> {
     let mut count = 0u64;
     let mut query = GetVersions {
@@ -257,48 +385,20 @@ fn versions(host: &Host) -> Result<String, String> {
 /// of the console's backend that follows it (where the title puts it);
 /// anywhere else the console's is left for the host DLL to ignore, ours
 /// coming first.
-fn link(upscale: &mut CreateUpscale, backend: &mut Backend) {
-    let after = upscale.header.next;
-    // SAFETY: the title's chain.
-    backend.header.next = match unsafe { after.as_ref() } {
-        Some(h) if h.kind == CONSOLE_BACKEND => h.next,
-        _ => after,
-    };
-    backend.header.kind = HOST_BACKEND;
-    upscale.header.next = &raw mut backend.header;
-}
-
-/// A FidelityFX resource state as the host resource state it means (as the
-/// PC backend reads it); `None` for generic read and indirect arguments,
-/// which a host texture cannot be in.
-fn host_state(state: u32) -> Option<u32> {
-    Some(match state {
-        0x1 | 0x80 => 0,  // common, present
-        0x2 => 0x8,       // unordered access
-        0x4 => 0x40,      // compute read
-        0x8 => 0x80,      // pixel read
-        0xc => 0xc0,      // both
-        0x10 => 0x800,    // copy source
-        0x20 => 0x400,    // copy destination
-        0x100 => 0x4,     // render target
-        0x200 => 0x10,    // depth write
-        _ => return None, // generic read, indirect arguments
-    })
-}
-
 extern "C" fn ffxCreateContext(
     context: *mut *mut c_void,
     desc: *mut Header,
     memory: *const c_void,
 ) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if context.is_null() || desc.is_null() {
         return PARAMETER;
     }
     // SAFETY: the title passes a chain of descriptions.
     let kind = unsafe { (*desc).kind };
+    if metalfx_enabled() && kind == CREATE_UPSCALE {
+        // SAFETY: the kind was just read from `desc`.
+        return unsafe { metalfx_create(context, desc) };
+    }
     if kind != CREATE_UPSCALE {
         once!(
             warn,
@@ -307,6 +407,28 @@ extern "C" fn ffxCreateContext(
         );
         return NO_PROVIDER;
     }
+    #[cfg(windows)]
+    {
+        // SAFETY: the title's pointers; `desc` names an upscaler description.
+        if let Some(code) = unsafe { pc_create(context, desc, memory) } {
+            return code;
+        }
+    }
+    NO_PROVIDER
+}
+
+/// Forwards the title's upscaler to the host's PC FidelityFX build
+/// (Windows only; the macOS provider is MetalFX).
+///
+/// # Safety
+/// The title's pointers; `desc` names an upscaler description.
+#[cfg(windows)]
+unsafe fn pc_create(
+    context: *mut *mut c_void,
+    desc: *mut Header,
+    memory: *const c_void,
+) -> Option<u32> {
+    let host = HOST.get()?;
     // SAFETY: an upscaler description, by its type.
     let mut upscale = unsafe { desc.cast::<CreateUpscale>().read() };
     let mut backend = Backend {
@@ -321,7 +443,7 @@ extern "C" fn ffxCreateContext(
     let code = unsafe { (host.create)(context, &mut upscale.header, memory) };
     if code != OK {
         tracing::error!(code, render = ?upscale.max_render, output = ?upscale.max_output, flags = format_args!("{:#x}", upscale.flags), "FidelityFX: the host refused the title's upscaler");
-        return code;
+        return Some(code);
     }
     let mut version = ProviderVersion {
         header: Header {
@@ -344,31 +466,73 @@ extern "C" fn ffxCreateContext(
         flags = format_args!("{:#x}", upscale.flags),
         "FidelityFX: upscaler context on the host"
     );
-    OK
+    Some(OK)
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
+    if metalfx_enabled() {
+        // SAFETY: the title passes its context.
+        if let Some(code) = unsafe { metalfx_destroy(context) } {
+            return code;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes its context.
+        if let Some(code) = unsafe { pc_destroy(context, memory) } {
+            return code;
+        }
+    }
+    NO_PROVIDER
+}
+
+/// Forwards to the host's PC build (Windows only).
+///
+/// # Safety
+/// The title's pointers.
+#[cfg(windows)]
+unsafe fn pc_destroy(context: *mut *mut c_void, memory: *const c_void) -> Option<u32> {
     // SAFETY: the title passes its context.
-    HOST.get()
-        .map_or(NO_PROVIDER, |h| unsafe { (h.destroy)(context, memory) })
+    HOST.get().map(|h| unsafe { (h.destroy)(context, memory) })
 }
 
 /// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    if metalfx_enabled() {
+        return metalfx_configure();
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes its context and descriptions.
+        if let Some(code) = unsafe { pc_configure(context, desc) } {
+            return code;
+        }
+    }
+    NO_PROVIDER
+}
+
+/// Forwards to the host's PC build (Windows only).
+///
+/// # Safety
+/// The title's pointers.
+#[cfg(windows)]
+unsafe fn pc_configure(context: *mut *mut c_void, desc: *mut Header) -> Option<u32> {
     // SAFETY: the title passes its context and descriptions.
-    HOST.get()
-        .map_or(NO_PROVIDER, |h| unsafe { (h.configure)(context, desc) })
+    HOST.get().map(|h| unsafe { (h.configure)(context, desc) })
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if desc.is_null() {
         return PARAMETER;
     }
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
+    if metalfx_enabled() {
+        // SAFETY: the title's pointers.
+        if let Some(code) = unsafe { metalfx_query(desc) } {
+            return code;
+        }
+    }
     // These carry the console device.
     if kind == GET_VERSIONS || kind == MEMORY_USAGE_WITH_DEVICE {
         once!(
@@ -378,19 +542,39 @@ extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         );
         return PARAMETER;
     }
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes its pointers.
+        if let Some(code) = unsafe { pc_query(context, desc) } {
+            return code;
+        }
+    }
+    NO_PROVIDER
+}
+
+/// Forwards to the host's PC build (Windows only).
+///
+/// # Safety
+/// The title's pointers.
+#[cfg(windows)]
+unsafe fn pc_query(context: *mut *mut c_void, desc: *mut Header) -> Option<u32> {
+    let host = HOST.get()?;
     // SAFETY: as above.
-    unsafe { (host.query)(context, desc) }
+    Some(unsafe { (host.query)(context, desc) })
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
     if desc.is_null() {
         return PARAMETER;
     }
     // SAFETY: the title passes a description.
     let kind = unsafe { (*desc).kind };
+    if metalfx_enabled() {
+        // SAFETY: the title's pointers; the kind was just read.
+        if let Some(code) = unsafe { metalfx_dispatch_refusal(context, desc) } {
+            return code;
+        }
+    }
     if kind != DISPATCH_UPSCALE {
         once!(
             warn,
@@ -399,6 +583,23 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         );
         return UNKNOWN_TYPE;
     }
+    #[cfg(windows)]
+    {
+        // SAFETY: the title's pointers; `desc` names an upscaling description.
+        if let Some(code) = unsafe { pc_dispatch(context, desc) } {
+            return code;
+        }
+    }
+    NO_PROVIDER
+}
+
+/// Forwards the upscaling to the host's PC FidelityFX build (Windows only).
+///
+/// # Safety
+/// The title's pointers; `desc` names an upscaling description.
+#[cfg(windows)]
+unsafe fn pc_dispatch(context: *mut *mut c_void, desc: *mut Header) -> Option<u32> {
+    let host = HOST.get()?;
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
     let list = dispatch.list.cast::<Object>().cast_const();
@@ -420,7 +621,7 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
                 state = r.state,
                 "FidelityFX: a resource has no host texture in its state; the upscaling did not run"
             );
-            return PARAMETER;
+            return Some(PARAMETER);
         };
         r.resource = texture.as_raw();
         textures.push(texture);
@@ -429,12 +630,14 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         // SAFETY: a live texture.
         unsafe { t.GetDesc() }.Format.0
     }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    victory_gpu::external::record(list, |host_list| {
-        dispatch.list = host_list.as_raw();
-        // SAFETY: the PC dispatch on host objects; the context is the host's.
-        unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
-    })
-    .unwrap_or(PARAMETER)
+    Some(
+        victory_gpu::external::record(list, |host_list| {
+            dispatch.list = host_list.as_raw();
+            // SAFETY: the PC dispatch on host objects; the context is the host's.
+            unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
+        })
+        .unwrap_or(PARAMETER),
+    )
 }
 
 pub(crate) fn module() -> HleModule {
@@ -454,6 +657,7 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::fidelityfx_common::{host_state, link};
 
     fn header(kind: u64, next: *mut Header) -> Header {
         Header { kind, next }
@@ -493,6 +697,7 @@ mod tests {
     }
 
     /// Without the PC build the title's own DLL serves its imports.
+    #[cfg(windows)]
     #[test]
     fn without_the_dll_the_titles_own_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -517,3 +722,107 @@ mod tests {
         assert_eq!(host_state(0x14), None);
     }
 }
+
+#[cfg(test)]
+mod metalfx_tests {
+    use super::*;
+
+    #[test]
+    fn context_roundtrip_and_dispatch_refusal() {
+        let mut ctx: *mut c_void = null_mut();
+        let mut upscale = CreateUpscale {
+            header: Header {
+                kind: CREATE_UPSCALE,
+                next: null_mut(),
+            },
+            flags: 1,
+            max_render: [1280, 720],
+            max_output: [2560, 1440],
+            message: 0,
+        };
+        // SAFETY: a fabricated description and our own out-slot.
+        assert_eq!(unsafe { metalfx_create(&mut ctx, &mut upscale.header) }, OK);
+        let handle = ctx as usize;
+        assert!(METALFX_CONTEXTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&handle));
+
+        let mut dispatch = DispatchUpscale {
+            header: Header {
+                kind: DISPATCH_UPSCALE,
+                next: null_mut(),
+            },
+            list: null_mut(),
+            resources: [Resource {
+                resource: null_mut(),
+                description: [0; 8],
+                state: 0,
+            }; 7],
+            rest: [0; 18],
+        };
+        let mut dc: *mut c_void = ctx;
+        // SAFETY: our own context and description.
+        assert_eq!(unsafe { metalfx_dispatch_refusal(&mut dc, &mut dispatch.header) }.unwrap(), PARAMETER);
+
+        // SAFETY: our own context.
+        assert_eq!(unsafe { metalfx_destroy(&mut ctx) }, Some(OK));
+        assert!(!METALFX_CONTEXTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&handle));
+    }
+
+    #[test]
+    fn zero_sizes_are_refused() {
+        let cfg = UpscalerConfig {
+            render: [0, 0],
+            output: [0, 0],
+            flags: 0,
+        };
+        assert!(cfg.validate().is_err());
+        let cfg = UpscalerConfig {
+            render: [1280, 720],
+            output: [640, 360],
+            flags: 0,
+        };
+        assert!(cfg.validate().is_err());
+    }
+}
+
+    #[test]
+    fn metalfx_query_negotiates_one_provider() {
+        let mut count = 0u64;
+        let mut id = 0u64;
+        let mut names: [*const c_char; 1] = [null_mut()];
+        let mut gv = GetVersions {
+            header: Header {
+                kind: GET_VERSIONS,
+                next: null_mut(),
+            },
+            create_kind: CREATE_UPSCALE,
+            device: null_mut(),
+            count: &raw mut count,
+            ids: &raw mut id,
+            names: names.as_mut_ptr(),
+        };
+        // SAFETY: our own description and buffers.
+        assert_eq!(unsafe { metalfx_query(&raw mut gv.header) }.unwrap(), OK);
+        assert_eq!(count, 1);
+        assert_eq!(id, METALFX_PROVIDER_ID);
+        assert!(!names[0].is_null());
+
+        // A provider-version query gets the same id back.
+        let mut pv = ProviderVersion {
+            header: Header {
+                kind: GET_PROVIDER_VERSION,
+                next: null_mut(),
+            },
+            id: 0,
+            name: null(),
+        };
+        // SAFETY: our own description.
+        assert_eq!(unsafe { metalfx_query(&raw mut pv.header) }.unwrap(), OK);
+        assert_eq!(pv.id, METALFX_PROVIDER_ID);
+        assert!(!pv.name.is_null());
+    }

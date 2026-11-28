@@ -18,8 +18,15 @@ pub mod dsp;
 pub mod dstorage;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 mod read_cache;
-#[cfg(windows)]
+// The interception serves the title's x86-64 code under Rosetta, so the
+// Apple half of the gate is the vendor plus that architecture (Hayyan612's
+// requirement; iOS/iPadOS stay out). fidelityfx_common is pure repr(C)
+// parsing - c_void/c_char/usize, no x86_64 assumptions - so a wider
+// vendor-only gate would also be safe if the iPad builds ever want it.
+#[cfg(any(windows, all(target_vendor = "apple", target_arch = "x86_64")))]
 pub mod fidelityfx;
+#[cfg(any(windows, all(target_vendor = "apple", target_arch = "x86_64")))]
+pub mod fidelityfx_common;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;

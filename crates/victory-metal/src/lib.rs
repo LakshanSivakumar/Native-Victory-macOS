@@ -16,6 +16,8 @@ pub mod mem;
 #[cfg(target_os = "macos")]
 pub mod metal;
 #[cfg(target_os = "macos")]
+pub mod metalfx;
+#[cfg(target_os = "macos")]
 pub mod msc;
 #[cfg(target_os = "macos")]
 pub mod present;
