@@ -416,18 +416,12 @@ fn a_barrier_block_behind_a_branch_on_an_lds_word_read_after_a_barrier() {
     let earlier = [OR_WORD_0[0], OR_WORD_0[1], 0xBF8C_C07F, BARRIER];
     assert!(accepted(program(&earlier, &[], &[], false)));
     // In the read's phase, a write to the word between the barrier and the read, after the
-    // read, or as an atomic: the halves may read apart.
-    for in_block in [WORD_0, OR_WORD_0] {
+    // read, as an atomic, or via `ds_append` (its address is M0's, so it counts as a write to
+    // any word): the halves may read apart.
+    for in_block in [WORD_0, OR_WORD_0, APPEND] {
         assert!(refused(program(&in_block, &[], &[], false)));
         assert!(refused(program(&[], &in_block, &[], false)));
     }
-    // `ds_append` (its address is M0's) counts as a write to any word, but a console wave the
-    // host splits refuses it first.
-    let append = |r: Result<Lowered, crate::ShaderError>| match r {
-        Err(crate::ShaderError::Unsupported { what, .. }) => what.starts_with("ds_append"),
-        _ => false,
-    };
-    assert!(append(program(&APPEND, &[], &[], false)));
     // Another wave that passes the barrier on a path without the read, or a barrier instruction
     // of its own, writes the word and ends early.
     assert!(refused(program(&[], &[], &WORD_0, false)));

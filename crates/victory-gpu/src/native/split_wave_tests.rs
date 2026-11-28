@@ -2038,3 +2038,97 @@ fn integer_pairs_pack_to_16_bits_with_saturation() {
         (0..32i32).map(|i| s((i << 12) - 0x10000) | s(0x10002 - i) << 16).collect();
     assert_eq!(got, want, "signed");
 }
+
+#[test]
+fn ds_append_and_consume_across_split_host_waves() {
+    // 1. Single 64-lane console wave with divergent `if (v0 < 40)` (32 active lanes in lower half
+    // + 8 in upper half): `ds_append` increments `LDS[8]` from 100 to 140 once, returning 100 to
+    // all 40 active lanes across both host halves while lanes 40..63 keep 777.
+    let one_wave = [
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0x7E04_02FF, 100, // v_mov_b32 v2, 100
+        0x7E08_0288, // v_mov_b32 v4, 8
+        0xD834_0000, 0x0000_0204, // ds_write_b32 v4, v2
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+        0x7E04_02FF, 777, // v_mov_b32 v2, 777
+        0x7E08_0288, // v_mov_b32 v4, 8
+        0xBEFC_0388, // s_mov_b32 m0, 8
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        skip_execz(3),
+        0xD8F8_0000, 0x0200_0000, // ds_append v2
+        S_WAITCNT_LGKM,
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000, 0x0300_0004, // ds_read_b32 v3, v4
+        S_WAITCNT_LGKM,
+        0x3406_0690, // v_lshlrev_b32 v3, 16, v3
+        0x3804_0503, // v_or_b32 v2, v3, v2
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run_io(&one_wave, 1 << 15, 64, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..40], [(140 << 16) | 100; 40]);
+    assert_eq!(got[40..], [(140 << 16) | 777; 24]);
+
+    // 2. Two 64-lane console waves (128 threads = four 32-lane host waves) with odd lanes active
+    // (`(v0 & 1) == 1`, so console lane 0 is inactive in both waves; 32 active lanes per console
+    // wave): `ds_append` at `LDS[0]` (initially 10) and `ds_consume` at `LDS[4]` (initially 200).
+    let two_waves = [
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0x7E04_028A, // v_mov_b32 v2, 10
+        0x7E06_02FF, 200, // v_mov_b32 v3, 200
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xD834_0000, 0x0000_0204, // ds_write_b32 v4, v2
+        0xD834_0004, 0x0000_0304, // ds_write_b32 v4, v3 offset:4
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+        0x7E04_02FF, 555, // v_mov_b32 v2, 555
+        0x7E0A_02FF, 666, // v_mov_b32 v5, 666
+        0xBEFC_0380, // s_mov_b32 m0, 0
+        0x360C_0081, // v_and_b32 v6, 1, v0
+        0x7D84_0C81, // v_cmp_eq_u32 vcc, 1, v6
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xD8F8_0000, 0x0200_0000, // ds_append v2
+        0xD8F4_0004, 0x0500_0000, // ds_consume v5 offset:4
+        S_WAITCNT_LGKM,
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0x340A_0A90, // v_lshlrev_b32 v5, 16, v5
+        0x3804_0505, // v_or_b32 v2, v5, v2
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    try_translate_wave(&two_waves, 5, 1 << 15, 128, true, shaders::options()).unwrap();
+    let got = run_io(&two_waves, 1 << 15, 128, 0);
+    for (i, &w) in got.iter().enumerate() {
+        if i % 2 == 0 {
+            assert_eq!(w, (666 << 16) | 555, "even lane {i} must stay untouched");
+        }
+    }
+    let w0_app = got[1] & 0xFFFF;
+    let w1_app = got[65] & 0xFFFF;
+    let w0_con = got[1] >> 16;
+    let w1_con = got[65] >> 16;
+    for k in (1..64).step_by(2) {
+        assert_eq!(got[k], (w0_con << 16) | w0_app, "wave 0 lane {k} across both host halves");
+        assert_eq!(got[64 + k], (w1_con << 16) | w1_app, "wave 1 lane {} across both host halves", 64 + k);
+    }
+    let mut apps = [w0_app, w1_app];
+    apps.sort_unstable();
+    assert_eq!(apps, [10, 42]);
+    let mut cons = [w0_con, w1_con];
+    cons.sort_unstable();
+    assert_eq!(cons, [168, 200]);
+}

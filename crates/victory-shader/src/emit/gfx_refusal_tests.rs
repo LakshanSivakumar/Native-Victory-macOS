@@ -1046,19 +1046,48 @@ fn lds_instructions_addressed_by_m0_translate() {
         crate::dxbc::build(&[(FourCC::ACCC, &part)])
     };
     let append = [0xD8F8_0000, 0x0100_0000]; // ds_append v1
+    let consume = [0xD8F4_0004, 0x0100_0000]; // ds_consume v1 offset:4
     for ds in [
         append,
-        [0xD8F4_0004, 0x0100_0000], // ds_consume v1 offset:4
+        consume,
         [0xDAC4_0000, 0x0100_0000], // ds_read_addtid_b32 v1
     ] {
         translate_with(&program(ds, true, 32), Options::default()).unwrap();
     }
     let host32 = Options { wave32_host: true, ..Options::default() };
-    translate_with(&program(append, false, 32), host32).unwrap();
-    let err = translate_with(&program(append, false, 64), host32).err();
+    for (ds, threads) in [(append, 32), (append, 64), (consume, 64), (append, 128)] {
+        translate_with(&program(ds, false, threads), host32).unwrap();
+    }
+    // Divergent `ds_append` in a 2-wave (128-thread) group where wave 1 skips the branch cannot
+    // meet at a group barrier and stays refused with `DIVERGENT_EXCHANGE`, while the 1-wave
+    // (64-thread) version lowers via lockstep.
+    let div_code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBEFC_0380, // s_mov_b32 m0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz +2
+        append[0],
+        append[1],
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let div_prog = |threads: u16| {
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0)];
+        let rsrc2 = 1 << 15 | 5 << 1;
+        let part = fspx(&bytes_of(&div_code), rsrc2, [threads, 1, 1], false, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    translate_with(&div_prog(64), host32).unwrap();
+    let err = translate_with(&div_prog(128), host32).err();
     assert!(
-        matches!(err, Some(ShaderError::Unsupported { what, .. })
-            if what == "ds_append or ds_consume in a console wave the host splits"),
+        matches!(err, Some(ShaderError::Unsupported { what: super::lower::DIVERGENT_EXCHANGE, .. })),
         "{err:?}"
     );
 }
