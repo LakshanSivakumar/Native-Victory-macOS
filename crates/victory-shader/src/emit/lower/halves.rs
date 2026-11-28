@@ -57,11 +57,17 @@ impl Lower<'_> {
         if self.pair_sync {
             return self.pair_barrier(at);
         }
+        self.group_xchg_barrier(at);
+        Ok(at)
+    }
+
+    /// The group barrier with a shared-memory fence, always (mesh programs, which lockstep never
+    /// takes).
+    fn group_xchg_barrier(&mut self, at: usize) {
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        Ok(at)
     }
 
     /// The pair counters start at 0: every thread writes its console wave's, then one group
@@ -243,7 +249,7 @@ impl Lower<'_> {
         let mine = self.s.m.select(at, is_flag, any, value);
         let slot = self.xchg_slot(at, f);
         self.s.m.store(at, slot, mine);
-        self.xchg_barrier(at);
+        self.group_xchg_barrier(at);
         let k = self.s.m.i32(!63);
         let base = self.s.m.bin(at, Bin::And, f, k);
         let k32 = self.s.m.i32(32);
@@ -251,7 +257,7 @@ impl Lower<'_> {
         let base1 = self.s.m.bin(at, Bin::Add, base, one);
         let (lv, lf, uv) = (self.xchg_slot(at, base), self.xchg_slot(at, base1), self.xchg_slot(at, upper));
         let (lv, lf, uv) = (self.s.m.load(at, lv), self.s.m.load(at, lf), self.s.m.load(at, uv));
-        self.xchg_barrier(at);
+        self.group_xchg_barrier(at);
         self.s.flags |= flags::WAVE_OPS;
         let lower_on = self.s.m.cmp(at, pred::NE, lf, z);
         self.s.m.select(at, lower_on, lv, uv)
