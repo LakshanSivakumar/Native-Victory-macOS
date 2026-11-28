@@ -6746,12 +6746,39 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, &src, false, props)?;
         // Dword 0 is the view's address in title memory, which the view address table holds
         // (a buffer's own readers follow it there, so an image's is the same kind of value).
-        let views = self.s.view_addresses_handle();
-        let index = self.heap_index(site, first, false)?;
-        let c0 = self.cur;
-        let five = self.s.m.i32(5);
-        let at = self.s.m.bin(c0, Bin::Shl, index, five);
-        let d0 = self.raw_dword(views, at);
+        // Both address words are only built where the program reads them, so a load of a
+        // descriptor for its size fields alone keeps its old code.
+        let read = |slot: u8| {
+            self.x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.reads.iter().any(|r| r.0 == Reg::S(slot)))
+        };
+        let (d0, d1) = ((first == 0 && read(code)), (first + 1 == 1 && read(code + 1)));
+        let mut words: Vec<(u32, V)> = Vec::new();
+        if d0 || d1 {
+            let views = self.s.view_addresses_handle();
+            let index = self.heap_index(site, first, false)?;
+            let c0 = self.cur;
+            let five = self.s.m.i32(5);
+            let at = self.s.m.bin(c0, Bin::Shl, index, five);
+            if d0 {
+                words.push((0, self.raw_dword(views, at)));
+            }
+            if image.is_none() && d1 {
+                // A buffer's dword 1: its address high (the table's) and the stride of the
+                // view, which is a property of the binding and not of the descriptor.
+                let four = self.s.m.i32(4);
+                let hi_at = self.s.m.bin(c0, Bin::Add, at, four);
+                let hi = self.raw_dword(views, hi_at);
+                let k16 = self.s.m.i32(16);
+                let st = self.s.m.i32(used.map_or(0, |u| u.stride));
+                let w1 = self.s.m.bin(c0, Bin::Shl, st, k16);
+                words.push((1, self.s.m.bin(c0, Bin::Or, w1, hi)));
+            }
+        }
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -6766,7 +6793,7 @@ impl<'a> Lower<'a> {
             .s
             .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
         let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
+        let words = match image {
             Some(kind) => {
                 let one = self.s.m.i32(1);
                 let w = field(self, 0);
@@ -6827,8 +6854,7 @@ impl<'a> Lower<'a> {
                 let d5 = self.s.m.bin(c, Bin::Or, pitch, mip);
                 let d5 = self.s.m.bin(c, Bin::Or, d5, perf);
                 let d5 = self.s.m.select(c, null, zero, d5);
-                vec![
-                    (0, d0),
+                let mut v = vec![
                     (1, d1),
                     (2, d2),
                     (3, d3),
@@ -6836,19 +6862,14 @@ impl<'a> Lower<'a> {
                     (5, d5),
                     (6, zero),
                     (7, zero),
-                ]
+                ];
+                v.extend(words);
+                v
             }
             None => {
-                // A buffer's dword 1: its address high (the table's) and the stride of the
-                // view, which is a property of the binding and not of the descriptor.
-                let four = self.s.m.i32(4);
-                let hi_at = self.s.m.bin(c0, Bin::Add, at, four);
-                let hi = self.raw_dword(views, hi_at);
-                let k16 = self.s.m.i32(16);
-                let st = self.s.m.i32(used.map_or(0, |u| u.stride));
-                let d1 = self.s.m.bin(c0, Bin::Shl, st, k16);
-                let d1 = self.s.m.bin(c0, Bin::Or, d1, hi);
-                vec![(0, d0), (1, d1), (2, field(self, 0))]
+                let mut v = vec![(2, field(self, 0))];
+                v.extend(words);
+                v
             }
         };
         for k in 0..count {
