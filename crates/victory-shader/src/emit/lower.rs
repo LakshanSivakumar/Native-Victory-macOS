@@ -2361,7 +2361,18 @@ impl<'a> Lower<'a> {
             .unwrap_or(0);
         let id = match self.s.inputs.iter().position(|e| e.kind == kind) {
             Some(id) => {
-                if kind != 3 {
+                if kind == 3 {
+                    let row = self.s.inputs[id].row;
+                    let alone = self
+                        .s
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .all(|(k, x)| k == id || x.row != row);
+                    if alone && self.s.inputs[id].col == 0 && self.s.inputs[id].cols <= col {
+                        self.s.inputs[id].cols = col + 1;
+                    }
+                } else {
                     self.s.inputs[id].row.get_or_insert(free);
                 }
                 id
@@ -2393,7 +2404,20 @@ impl<'a> Lower<'a> {
                 self.s.inputs.len() - 1
             }
         };
-        self.load_input(id, col)
+        let loaded = self.load_input(id, col);
+        // Hardware `POS_W_FLOAT` (`SPI_PS_INPUT_ADDR` bit 11) holds `1 / W` (console shaders
+        // invert it with `v_rcp_f32` to obtain HLSL `SV_Position.w`), whereas DXIL `SV_Position.w`
+        // is `W`.
+        if kind == 3 && col == 3
+            && let Val::I32(w_bits) = loaded
+        {
+            let (entry, i32t, f32t) = (self.s.entry, self.s.t.i32, self.s.t.f32);
+            let w = self.s.m.cast(entry, Cast::Bitcast, w_bits, f32t);
+            let one = self.s.m.f32(1.0f32.to_bits());
+            let rcp_w = self.s.m.bin(entry, Bin::SDiv, one, w);
+            return Val::I32(self.s.m.cast(entry, Cast::Bitcast, rcp_w, i32t));
+        }
+        loaded
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -2477,9 +2501,65 @@ impl<'a> Lower<'a> {
     /// and `j` (1) weigh the triangle's second and third vertices (RDNA2 ISA, "Parameter
     /// interpolation": P0 + i * P10 + j * P20). They are channels y and z of `SV_Barycentrics`,
     /// declared with the interpolation of the console's pair (DXIL modes 2 to 7), one element per
-    /// mode as the program first reads it (D3D allows two). The pull model stays refused.
+    /// mode as the program first reads it (D3D allows two). `PerspectivePullModel` (`SPI_PS_INPUT`
+    /// bit 3) carries pixel-centre `<I / W, J / W, 1 / W>`, formed by dividing perspective-centre
+    /// `(I, J)` and `1.0` by `SV_Position.w` (`W`).
     fn barycentric(&mut self, kind: crate::io::Barycentric, index: u8) -> Val {
         use crate::io::Barycentric as B;
+        if kind == B::PerspectivePullModel {
+            let pos_id = match self.s.inputs.iter().position(|e| e.kind == 3) {
+                Some(id) => {
+                    let row = self.s.inputs[id].row;
+                    let alone = self
+                        .s
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .all(|(k, x)| k == id || x.row != row);
+                    if alone && self.s.inputs[id].col == 0 && self.s.inputs[id].cols < 4 {
+                        self.s.inputs[id].cols = 4;
+                    }
+                    id
+                }
+                None => {
+                    let interp = if self.s.outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
+                        5
+                    } else {
+                        4
+                    };
+                    let row = self.s.inputs.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+                    self.s.inputs.push(super::container::SigElement {
+                        name: "SV_Position".into(),
+                        index: 0,
+                        kind: 3,
+                        comp: 9,
+                        interp,
+                        row: Some(row),
+                        col: 0,
+                        cols: 4,
+                        usage: 0,
+                        half: false,
+                    });
+                    self.s.inputs.len() - 1
+                }
+            };
+            let Val::I32(w_bits) = self.load_input(pos_id, 3) else {
+                return Val::Missing("a pixel system input the signature lacks");
+            };
+            let (entry, i32t, f32t) = (self.s.entry, self.s.t.i32, self.s.t.f32);
+            let w = self.s.m.cast(entry, Cast::Bitcast, w_bits, f32t);
+            if index >= 2 {
+                let one = self.s.m.f32(1.0f32.to_bits());
+                let rcp_w = self.s.m.bin(entry, Bin::SDiv, one, w);
+                return Val::I32(self.s.m.cast(entry, Cast::Bitcast, rcp_w, i32t));
+            }
+            let ij = match self.barycentric(B::PerspectiveCenter, index) {
+                Val::I32(bits) => self.s.m.cast(entry, Cast::Bitcast, bits, f32t),
+                other => return other,
+            };
+            let ij_over_w = self.s.m.bin(entry, Bin::SDiv, ij, w);
+            return Val::I32(self.s.m.cast(entry, Cast::Bitcast, ij_over_w, i32t));
+        }
         let interp = match kind {
             B::PerspectiveCenter => 2,
             B::PerspectiveCentroid => 3,
@@ -2487,23 +2567,29 @@ impl<'a> Lower<'a> {
             B::LinearCentroid => 5,
             B::PerspectiveSample => 6,
             B::LinearSample => 7,
-            B::PerspectivePullModel => return Val::Missing(BARYCENTRICS_READ),
+            B::PerspectivePullModel => unreachable!(),
         };
         let id = match self.s.inputs.iter().position(|e| e.kind == 28 && e.interp == interp) {
             Some(id) => id,
             None => {
                 let n = self.s.inputs.iter().filter(|e| e.kind == 28).count() as u32;
-                if n == 2 {
+                let no_persp = |m: u8| matches!(m, 4 | 5 | 7);
+                if n == 2
+                    || self
+                        .s
+                        .inputs
+                        .iter()
+                        .any(|e| e.kind == 28 && no_persp(e.interp) == no_persp(interp))
+                {
                     return Val::Missing("barycentrics of a third interpolation mode");
                 }
-                let row = self.s.inputs.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
                 self.s.inputs.push(super::container::SigElement {
                     name: "SV_Barycentrics".into(),
                     index: n,
                     kind: 28,
                     comp: 9,
                     interp,
-                    row: Some(row),
+                    row: None,
                     col: 0,
                     cols: 3,
                     usage: 0,
