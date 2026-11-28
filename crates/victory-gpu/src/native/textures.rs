@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::resources::*;
+use rayon::prelude::*;
 use victory_formats::texture::{Dimension, Layout};
 
 /// `D3D12_RESOURCE_FLAGS`.
@@ -327,7 +328,12 @@ struct Level {
 
 fn is_all_zero(bytes: &[u8]) -> bool {
     let (chunks, tail) = bytes.as_chunks::<64>();
-    chunks.iter().all(|&c| c == [0u8; 64]) && tail.iter().all(|&b| b == 0)
+    // Big ranges are checked on the rayon pool, like their hash (see `hash_of`).
+    if bytes.len() >= (1 << 20) {
+        chunks.par_iter().all(|&c| c == [0u8; 64]) && tail.iter().all(|&b| b == 0)
+    } else {
+        chunks.iter().all(|&c| c == [0u8; 64]) && tail.iter().all(|&b| b == 0)
+    }
 }
 
 /// Detiles the mips of `tiled` needed to bring a host texture up to date. Mips whose bit in
@@ -336,6 +342,29 @@ fn is_all_zero(bytes: &[u8]) -> bool {
 /// allocation, CPU detile, and `upload_texture`.
 /// `skip`: top levels the host texture was made without ([`TextureInfo::dropped_levels`]); title
 /// level `m` becomes host level `m - skip` and the skipped ones are not detiled.
+/// Detiles one mip of one slice: the staging bytes [`ResourceBackend::upload_texture`] takes for
+/// that level. Reads `tiled` and writes only its own buffer, so levels detile independently.
+fn detile_level(
+    layout: &Layout,
+    format: u32,
+    tiled: &[u8],
+    mip: u32,
+    slice: u32,
+    skip: usize,
+) -> Result<Level, String> {
+    let m = &layout.mips[mip as usize];
+    let n = layout.desc.element_bytes as usize;
+    let row = m.width as usize * n;
+    let slice_pitch = row * m.height as usize;
+    let depth = layout.subresource_depth(mip).max(1) as usize;
+    let mut texels = vec![0u8; slice_pitch * depth];
+    layout
+        .detile(tiled, mip, slice, &mut texels, row, slice_pitch)
+        .map_err(|e| format!("detile mip {mip} slice {slice}: {e:?}"))?;
+    to_host(format, &mut texels);
+    Ok(Level { mip: mip as usize - skip, slice: slice as usize, texels, row, slice_pitch })
+}
+
 fn detile_changed(
     layout: &Layout,
     dimension: Dimension,
@@ -355,10 +384,11 @@ fn detile_changed(
         );
     }
     let slices = if dimension == Dimension::Tex3d { 1 } else { layout.slices };
-    let n = layout.desc.element_bytes as usize;
     let slice_size = layout.slice_size as usize;
-    let mut levels = Vec::new();
-    let mut detiled_mips = 0u32;
+    // A big texture detile runs on the rayon pool, mip/slice by mip/slice, instead of serializing
+    // on one submission thread while the others idle.
+    let big = tiled.len() >= (1 << 20);
+    let mut work: Vec<(u32, u32)> = Vec::new();
     for mip in skip as u32..layout.mips.len() as u32 {
         let bit = if mip < 32 { 1u32 << mip } else { 0 };
         if bit != 0 && uploaded_mips & bit == 0 && mip < layout.first_tail_mip {
@@ -368,32 +398,50 @@ fn detile_changed(
             } else {
                 slice_size
             };
+            let zero = |s: u32| {
+                let base = s as usize * slice_size;
+                tiled.get(base + mip_start..base + mip_end).is_some_and(is_all_zero)
+            };
             let zero_across_slices = mip_start <= mip_end
-                && (0..layout.slices as usize).all(|s| {
-                    let base = s * slice_size;
-                    tiled
-                        .get(base + mip_start..base + mip_end)
-                        .is_some_and(is_all_zero)
-                });
+                && if big {
+                    (0..layout.slices).into_par_iter().all(zero)
+                } else {
+                    (0..layout.slices).all(zero)
+                };
             if zero_across_slices {
                 continue;
             }
         }
-        let m = &layout.mips[mip as usize];
-        let row = m.width as usize * n;
-        let slice_pitch = row * m.height as usize;
-        let depth = layout.subresource_depth(mip).max(1) as usize;
         for slice in 0..slices {
-            let mut texels = vec![0u8; slice_pitch * depth];
-            if let Err(e) = layout.detile(tiled, mip, slice, &mut texels, row, slice_pitch) {
-                return (levels, detiled_mips, Err(format!("detile mip {mip} slice {slice}: {e:?}")));
-            }
-            to_host(format, &mut texels);
-            levels.push(Level { mip: mip as usize - skip, slice: slice as usize, texels, row, slice_pitch });
+            work.push((mip, slice));
         }
-        detiled_mips |= bit;
     }
-    (levels, detiled_mips, Ok(()))
+    let results: Vec<Result<Level, String>> = if big && work.len() > 1 {
+        work.par_iter().map(|&(mip, slice)| detile_level(layout, format, tiled, mip, slice, skip)).collect()
+    } else {
+        work.iter().map(|&(mip, slice)| detile_level(layout, format, tiled, mip, slice, skip)).collect()
+    };
+    let mut levels = Vec::with_capacity(results.len());
+    let mut detiled_mips = 0u32;
+    let mut error = None;
+    for r in results {
+        match r {
+            Ok(level) => {
+                let title_mip = level.mip + skip;
+                if title_mip < 32 {
+                    detiled_mips |= 1u32 << title_mip;
+                }
+                levels.push(level);
+            }
+            Err(e) => {
+                if error.is_none() {
+                    error = Some(e);
+                }
+            }
+        }
+    }
+    levels.sort_unstable_by_key(|l| (l.mip, l.slice));
+    (levels, detiled_mips, error.map_or(Ok(()), Err))
 }
 
 /// Detiles every mip of every slice of `tiled` (a texture's whole memory): the levels detiled,
@@ -2282,6 +2330,44 @@ mod tests {
         rest.sort_unstable();
         assert!(first.iter().copied().eq(0..20_000));
         assert!(rest.iter().copied().eq(20_000..30_000));
+    }
+
+    #[test]
+    fn detile_changed_parallel_path_matches_serial_level_by_level() {
+        use victory_formats::texture::{Desc, Swizzle};
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth: 4,
+            mips: 11,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S_X,
+        };
+        let layout = Layout::new(&desc).unwrap();
+        assert!(layout.size as usize >= (1 << 20), "the test must take the parallel path");
+        let mut tiled = vec![0u8; layout.size as usize];
+        for (i, b) in tiled.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let (levels, bits, result) = detile_changed(&layout, Dimension::Tex2d, 0, &tiled, u32::MAX, 0);
+        assert!(result.is_ok());
+        let mut expected = Vec::new();
+        for mip in 0..layout.mips.len() as u32 {
+            for slice in 0..layout.slices {
+                expected.push(detile_level(&layout, 0, &tiled, mip, slice, 0).unwrap());
+            }
+        }
+        assert_eq!(levels.len(), expected.len());
+        for (got, want) in levels.iter().zip(&expected) {
+            assert_eq!((got.mip, got.slice), (want.mip, want.slice));
+            assert_eq!((got.row, got.slice_pitch), (want.row, want.slice_pitch));
+            assert_eq!(got.texels, want.texels);
+        }
+        let all_bits = (0..layout.mips.len()).fold(0u32, |a, m| if m < 32 { a | (1u32 << m) } else { a });
+        assert_eq!(bits, all_bits);
     }
 
     fn watched(entries: impl Into<HashMap<usize, (usize, usize, bool, u64)>>) -> Watched {
