@@ -838,6 +838,7 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "victory-backend",
  "victory-formats",
  "victory-metal",

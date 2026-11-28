@@ -22,6 +22,8 @@ mod heap_tests;
 mod legacy_fma_tests;
 #[path = "mesh_tests.rs"]
 mod mesh_tests;
+#[path = "metalfx_e2e_tests.rs"]
+mod metalfx_e2e_tests;
 #[path = "scaled_vertex_tests.rs"]
 mod scaled_vertex_tests;
 #[path = "shader_tests.rs"]
