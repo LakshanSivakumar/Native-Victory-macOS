@@ -973,7 +973,9 @@ pub(crate) fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unorde
             let ty = [0, 0, 8, 12, 9, 13, 14, 15, 10, 11, 11].get(d[1] as usize).copied().unwrap_or(0);
             match (unordered, d[1]) {
                 (_, 6 | 7) => (ty, 0, 1),
-                (true, _) => (ty, d[4], 1),
+                // In `D3D12_UNORDERED_ACCESS_VIEW_DESC`, `MipSlice` is at word 2 (`d[4]` holds
+                // `ArraySize` / `WSize` / 0).
+                (true, _) => (ty, d[2], 1),
                 (false, _) => (ty, d[4], if d[5] == u32::MAX { mips.saturating_sub(d[4]) } else { d[5] }),
             }
         }
@@ -1205,5 +1207,34 @@ pub(crate) mod tests {
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    #[test]
+    fn image_words_encode_uav_mip_slice_from_word_two() {
+        let mut res2d = [0u32; 14];
+        res2d[0] = 3; // TEXTURE2D
+        res2d[4] = 64;
+        res2d[6] = 64;
+        res2d[7] = 6 | (7 << 16);
+
+        // RWTexture2D: d[2] = MipSlice (3), d[3] = PlaneSlice (0), d[4] = 0.
+        let mut uav2d = [0u32; 10];
+        (uav2d[0], uav2d[1], uav2d[2]) = (28, 4, 3);
+        let w2d = super::image_words(&res2d, Some(&uav2d), true);
+        assert_eq!(((w2d[3] >> 12) & 0xF, (w2d[3] >> 16) & 0xF), (3, 3));
+
+        // RWTexture2DArray: d[2] = MipSlice (2), d[3] = FirstArraySlice (0), d[4] = ArraySize (6).
+        let mut uav2d_arr = [0u32; 10];
+        (uav2d_arr[0], uav2d_arr[1], uav2d_arr[2], uav2d_arr[4]) = (28, 5, 2, 6);
+        let w_arr = super::image_words(&res2d, Some(&uav2d_arr), true);
+        assert_eq!(((w_arr[3] >> 12) & 0xF, (w_arr[3] >> 16) & 0xF), (2, 2));
+
+        // RWTexture3D: d[2] = MipSlice (1), d[3] = FirstWSlice (0), d[4] = WSize (u32::MAX).
+        let mut res3d = res2d;
+        res3d[0] = 4; // TEXTURE3D
+        let mut uav3d = [0u32; 10];
+        (uav3d[0], uav3d[1], uav3d[2], uav3d[4]) = (28, 8, 1, u32::MAX);
+        let w3d = super::image_words(&res3d, Some(&uav3d), true);
+        assert_eq!(((w3d[3] >> 12) & 0xF, (w3d[3] >> 16) & 0xF), (1, 1));
     }
 }

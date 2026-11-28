@@ -1336,6 +1336,7 @@ impl<B: PresentBackend> Title<B> {
             }
             let view = ViewDesc {
                 format,
+                dim: None,
                 mips: if base { (0, usize::MAX) } else { (mip, 1) },
                 slices: if base { (0, usize::MAX) } else { (slice, 1) },
             };

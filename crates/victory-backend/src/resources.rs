@@ -162,10 +162,23 @@ impl TextureDesc {
     }
 }
 
-/// A view of part of a texture, possibly in another (size-compatible) format.
+/// Texture dimensionality requested by a shader/unordered view (`D3D12_SRV_DIMENSION` /
+/// `D3D12_UAV_DIMENSION`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewDim {
+    D2,
+    D2Array,
+    D3,
+    Cube,
+    CubeArray,
+}
+
+/// A view of part of a texture, possibly in another (size-compatible) format or dimension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewDesc {
     pub format: Format,
+    /// Explicit view dimension (`None`: preserve the underlying texture's own dimension).
+    pub dim: Option<ViewDim>,
     /// First mip, count.
     pub mips: (usize, usize),
     /// First slice, count.
@@ -184,6 +197,7 @@ pub enum Address {
     Mirror,
     Clamp,
     Border,
+    MirrorOnce,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +215,25 @@ pub struct SamplerDesc {
     pub address: [Address; 3],
     pub border_color: BorderColor,
     pub max_anisotropy: usize,
+    pub compare: Option<Compare>,
+    pub lod_min: f32,
+    pub lod_max: f32,
+}
+
+impl Default for SamplerDesc {
+    fn default() -> Self {
+        Self {
+            min: Filter::Nearest,
+            mag: Filter::Nearest,
+            mip: Filter::Nearest,
+            address: [Address::Clamp; 3],
+            border_color: BorderColor::TransparentBlack,
+            max_anisotropy: 1,
+            compare: None,
+            lod_min: 0.0,
+            lod_max: f32::MAX,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

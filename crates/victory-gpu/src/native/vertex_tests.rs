@@ -147,7 +147,10 @@ impl ResourceBackend for Capture {
     }
     fn create_texture_view(&self, tex: &TextureDesc, view: &ViewDesc) -> Result<TextureDesc, String> {
         self.views.borrow_mut().push(*view);
-        Ok(*tex)
+        Ok(TextureDesc {
+            format: view.format,
+            ..*tex
+        })
     }
     fn create_texture_over_memory(
         &self,
