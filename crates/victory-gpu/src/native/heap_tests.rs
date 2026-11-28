@@ -1696,6 +1696,106 @@ fn a_compute_shader_reads_both_the_view_strides_and_the_view_addresses() {
     drop(records);
 }
 
+/// A texture size query as the console compiler writes it: a waterfall loop over a per-lane index
+/// into the table at user data 4 (v7 = lane & 3) that loads the first four dwords of that view's
+/// descriptor (table dword 8 on) and nothing else of it. Each pass makes the width of the view's
+/// first level from the width's bits (dword 1 bits 30-31, dword 2 bits 0-13) and the first level
+/// (dword 3 bits 12-15), or 0 if dword 1 is 0 (a null view), and its lanes store it at lane * 4
+/// of the raw output UAV (table dwords 0-3).
+const CS_TEXTURE_WIDTHS: &[u32] = &[
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    0x360E_0083, // v_and_b32 v7, 3, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBE97_037E, // s_mov_b32 s23, exec_lo
+    0xBE95_037E, // s_mov_b32 s21, exec_lo
+    0x7E28_0507, // loop: v_readfirstlane_b32 s20, v7
+    0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+    0x8F16_8514, // s_lshl_b32 s22, s20, 5
+    0xF408_0302, 0x2C00_0020, // s_load_dwordx4 s[12:15], s[4:5], s22 offset:0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0x9398_FF0D, 0x0002_001E, // s_bfe_u32 s24, s13, 0x2001e
+    0x8719_FF0E, 0x0000_3FFF, // s_and_b32 s25, s14, 0x3fff
+    0x9798_1819, // s_lshl2_add_u32 s24, s25, s24
+    0x939A_FF0F, 0x0004_000C, // s_bfe_u32 s26, s15, 0x4000c
+    0x8018_8118, // s_add_u32 s24, s24, 1
+    0x9018_1A18, // s_lshr_b32 s24, s24, s26
+    0xBF00_800D, // s_cmp_eq_i32 s13, 0
+    0x8518_1880, // s_cselect_b32 s24, 0, s24
+    0x7E18_0218, // v_mov_b32 v12, s24
+    0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+    0xBF89_FFEC, // s_cbranch_execnz loop
+    0xBEFE_0317, // s_mov_b32 exec_lo, s23
+    0xE070_1000, 0x8002_0C10, // buffer_store_dword v12, v16, s[8:11], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+/// A size query through the first half of an image descriptor reads the view addresses (#407),
+/// which hold a texture view's size fields. They hold dword 1 as the width's low two bits alone:
+/// 0 for a width of 4k + 1, which the program would take for a null view. The translation gives
+/// dword 1 a bit for an entry that holds a view, so textures 5 and 1 wide read as that, one of 24
+/// viewed from its level 1 as 12, and an empty entry as 0.
+#[test]
+fn a_compute_shader_sizes_textures_from_the_first_half_of_their_descriptors() {
+    // A raw UAV and a raw SRV (kinds 3 and 0) in a table (root type 3) at user data 4.
+    let record = |kind: u8, offset: u8, register: u8| {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[kind, 3]);
+        (r[8], r[12], r[16]) = (offset, register, 1);
+        r[20..23].copy_from_slice(&[4, 4, 0]);
+        r
+    };
+    let c = crate::pipeline::test_compute_container(CS_TEXTURE_WIDTHS, &[record(3, 0, 0), record(0, 8, 1)], 5);
+    let cs = shaders::translate(&c).unwrap();
+    assert!(cs.view_addresses, "{cs:?}");
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 5];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 5).unwrap();
+    // Entry 0: the output, 64 raw dwords at `VA_A` (pool offset 0x2_0000).
+    let mut buffer = [0u32; 14];
+    buffer[0] = 1;
+    let mut uav = [0u32; 16];
+    (uav[1], uav[4], uav[8]) = (1, 64, 1);
+    [uav[10], uav[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &buffer, &uav, start);
+    assert!(t.host.mirror(start).unwrap());
+    // Entries 1-3: RGBA8 2D textures 5, 1 and 24 wide, the last of two levels and viewed from
+    // its level 1. Entry 4 stays empty.
+    for (i, (width, levels, first)) in [(5, 1, 0), (1, 1, 0), (24, 2, 1)].into_iter().enumerate() {
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4], resource[6]) = (3, width, 8);
+        (resource[7], resource[8], resource[9]) = (1 | levels << 16, 28, 1);
+        let address = super::addr_tests::VA_A + 0x1_0000 * (1 + i as u64);
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, width as usize, 8);
+        desc.mips = levels as usize;
+        let texture = t.host.texture(&desc).unwrap();
+        t.host.register_texture(crate::native::textures::placed_key(address, &resource), &texture);
+        let mut srv = [0u32; 16];
+        (srv[0], srv[1], srv[4], srv[5]) = (28, 4, first, u32::MAX);
+        [srv[10], srv[11]] = super::addr_tests::halves(address);
+        let slot = start + 32 * (1 + i as u64);
+        crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &srv, slot);
+        assert!(t.host.mirror(slot).unwrap());
+    }
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "texture widths") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    // Lane l queried entry 1 + (l & 3).
+    let mut want = [5, 1, 12, 0].repeat(8);
+    want.push(super::addr_tests::CANARY);
+    assert_eq!(f.get(0x2_0000, 33), want);
+    assert_eq!((t.host.unset_roots(), t.host.failed()), (0, 0));
+    drop(records);
+}
+
 /// [`CS_HEAP`] with a sample at level 0 (`image_sample_lz` at (0.5, 0.5), an immediate sampler
 /// with point mips and no LOD limit in s[24:27]) in place of the load: it stores the sampled
 /// texel's green channel.

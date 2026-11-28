@@ -949,6 +949,236 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
     }
 }
 
+/// A compute program that loads the first `dwords` (4 or 8) dwords of the view at table dword 8
+/// to s[12..] and stores what `read` leaves in s24. Four is the form of the console compiler's
+/// texture size queries, which load only the half of the image descriptor they read.
+fn view_dwords_cs(dwords: u32, read: &[u32]) -> Vec<u8> {
+    use crate::native::tests::{fspx, fspx_resource};
+    let mut code = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        if dwords == 8 { 0xF40C_0302 } else { 0xF408_0302 },
+        0xFA00_0020, // s_load_dwordx4 (x8) s[12:15] (s[12:19]), s[4:5], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    code.extend_from_slice(read);
+    code.extend_from_slice(&[
+        0x7E02_0218, // v_mov_b32 v1, s24
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ]);
+    let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+    let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+    crate::dxbc::build(&[(FourCC::ACCC, &part)])
+}
+
+/// The width of a view's first level from the first half of its image descriptor in s[12:15],
+/// in s24: width - 1 is dword 1 bits 30-31 and dword 2 bits 0-13, the first level dword 3 bits
+/// 12-15; 0 for a null view, which the program takes dword 1 == 0 for.
+const WIDTH_QUERY: [u32; 11] = [
+    0x9398_FF0D,
+    0x0002_001E, // s_bfe_u32 s24, s13, 0x2001e
+    0x8719_FF0E,
+    0x0000_3FFF, // s_and_b32 s25, s14, 0x3fff
+    0x9798_1819, // s_lshl2_add_u32 s24, s25, s24
+    0x939A_FF0F,
+    0x0004_000C, // s_bfe_u32 s26, s15, 0x4000c
+    0x8018_8118, // s_add_u32 s24, s24, 1
+    0x9018_1A18, // s_lshr_b32 s24, s24, s26
+    0xBF00_800D, // s_cmp_eq_i32 s13, 0
+    0x8518_1880, // s_cselect_b32 s24, 0, s24
+];
+
+/// The height of a view's first level in s24, as [`WIDTH_QUERY`] gives the width: height - 1 is
+/// dword 2 bits 14-29. The title has this form too, with no width read.
+const HEIGHT_QUERY: [u32; 8] = [
+    0x939A_FF0F,
+    0x0004_000C, // s_bfe_u32 s26, s15, 0x4000c
+    0x9398_FF0E,
+    0x0010_000E, // s_bfe_u32 s24, s14, 0x10000e
+    0x8018_8118, // s_add_u32 s24, s24, 1
+    0x9018_1A18, // s_lshr_b32 s24, s24, s26
+    0xBF00_800D, // s_cmp_eq_i32 s13, 0
+    0x8518_1880, // s_cselect_b32 s24, 0, s24
+];
+
+/// [`WIDTH_QUERY`] and `extra` after it.
+fn width_query_and(extra: &[u32]) -> Vec<u32> {
+    [&WIDTH_QUERY[..], extra].concat()
+}
+
+/// [`WIDTH_QUERY`] with `compare` for its test of dword 1 against 0.
+fn width_query_testing(compare: u32) -> Vec<u32> {
+    let mut read = WIDTH_QUERY.to_vec();
+    read[9] = compare;
+    read
+}
+
+/// A texture size query through four dwords of an image descriptor translates: every reader
+/// keeps only size fields the view addresses hold, or tests dword 1 against 0. It was refused as
+/// a buffer's "stride or swizzle", the kind of view being taken from the load's size alone. A
+/// whole image descriptor read this way translates too.
+#[test]
+fn a_texture_size_query_through_four_dwords_translates() {
+    let accepted = [
+        ("the width", 4, WIDTH_QUERY.to_vec()),
+        // s_bfe_u32 s27, s14, 0x10000e; s_add_u32 s24, s24, s27: dword 2 bits 14-29.
+        ("the height too", 4, width_query_and(&[0x939B_FF0E, 0x0010_000E, 0x8018_1B18])),
+        ("the height alone", 4, HEIGHT_QUERY.to_vec()),
+        ("s_cmp_lg_i32 s13, 0", 4, width_query_testing(0xBF01_800D)),
+        ("eight dwords", 8, WIDTH_QUERY.to_vec()),
+    ];
+    for (label, dwords, read) in accepted {
+        let shader = translate_with(&view_dwords_cs(dwords, &read), Options::default());
+        assert!(shader.as_ref().is_ok_and(|s| s.view_addresses), "{label}: {:?}", shader.err());
+    }
+}
+
+/// A four-dword load is an image's first half by its readers alone, so each of these stays a
+/// buffer's and keeps its refusal: a reader that can see a field the view addresses give as 0, a
+/// dword that reaches a join and a test that is not of dword 1 against 0.
+#[test]
+fn a_four_dword_load_read_beyond_an_images_size_fields_stays_refused() {
+    let refused = [
+        // s_add_u32 s24, s24, s12
+        ("dword 0", width_query_and(&[0x8018_0C18])),
+        // s_bfe_u32 s27, s13, 0x90014; s_add_u32 s24, s24, s27: dword 1 bits 20-28.
+        ("the format", width_query_and(&[0x939B_FF0D, 0x0009_0014, 0x8018_1B18])),
+        // s_add_u32 s24, s24, s14
+        ("dword 2 whole", width_query_and(&[0x8018_0E18])),
+        // s_bfe_u32 s27, s15, 0x50014; s_add_u32 s24, s24, s27: dword 3 bits 20-24.
+        ("the tiling", width_query_and(&[0x939B_FF0F, 0x0005_0014, 0x8018_1B18])),
+        // s_bfe_u32 s27, s14, 0x20000e; s_add_u32 s24, s24, s27: 32 bits wide, dword 2 bits 14-31.
+        ("a field of 32 bits", width_query_and(&[0x939B_FF0E, 0x0020_000E, 0x8018_1B18])),
+        // s_cbranch_scc1 over s_mov_b32 s14, 0; s_and_b32 s25, s14, 0x3fff; s_add_u32 s24, s24, s25
+        (
+            "a join",
+            width_query_and(&[0xBF85_0001, 0xBE8E_0380, 0x8719_FF0E, 0x0000_3FFF, 0x8018_1918]),
+        ),
+        ("s_cmp_eq_i32 s13, 1", width_query_testing(0xBF00_810D)),
+        ("s_cmp_eq_i32 s14, 0", width_query_testing(0xBF00_800E)),
+    ];
+    for (label, read) in refused {
+        let err = translate_with(&view_dwords_cs(4, &read), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.starts_with("a view address field the table gives as 0: a buffer's ")),
+            "{label}: {err:?}"
+        );
+    }
+}
+
+/// What tells an image's first half from a buffer's four dwords is what a size query reads: a
+/// width or height from dword 2 and the view's first level from dword 3, by which it scales them.
+/// A load that reads less stays a buffer's and keeps the refusal: a buffer's record count read
+/// under a mask would pass, and read 0 from the table.
+#[test]
+fn a_four_dword_load_without_a_size_and_the_first_level_stays_refused() {
+    let refused = [
+        // s_cmp_eq_i32 s13, 0; s_cselect_b32 s24, 0, 1
+        ("no size field", vec![0xBF00_800D, 0x8518_8180]),
+        // s_bfe_u32 s24, s13, 0x2001e; s_and_b32 s25, s14, 0x3fff; s_lshl2_add_u32 s24, s25, s24
+        (
+            "the width without the level",
+            vec![0x9398_FF0D, 0x0002_001E, 0x8719_FF0E, 0x0000_3FFF, 0x9798_1819],
+        ),
+        // s_bfe_u32 s24, s14, 0x10000e: dword 2 bits 14-29.
+        ("the height without the level", vec![0x9398_FF0E, 0x0010_000E]),
+        // s_bfe_u32 s24, s13, 0x2001e; s_bfe_u32 s26, s15, 0x4000c; s_lshr_b32 s24, s24, s26
+        (
+            "the level without a size",
+            vec![0x9398_FF0D, 0x0002_001E, 0x939A_FF0F, 0x0004_000C, 0x9018_1A18],
+        ),
+        // s_and_b32 s24, s14, 0x3fff; s_bfe_u32 s26, s15, 0x40010; s_lshr_b32 s24, s24, s26:
+        // dword 3 bits 16-19.
+        (
+            "a size and the last level",
+            vec![0x8718_FF0E, 0x0000_3FFF, 0x939A_FF0F, 0x0004_0010, 0x9018_1A18],
+        ),
+    ];
+    let mut translated = Vec::new();
+    for (label, read) in refused {
+        let err = translate_with(&view_dwords_cs(4, &read), Options::default()).err();
+        if !matches!(&err, Some(ShaderError::Unsupported { what, .. })
+            if what.starts_with("a view address field the table gives as 0: a buffer's "))
+        {
+            translated.push((label, err));
+        }
+    }
+    assert!(translated.is_empty(), "not refused: {translated:?}");
+}
+
+/// The title's form of the query: a waterfall loop over a per-lane table index (v7 = lane & 1).
+/// Each pass reads the first active lane's index to s20 and narrows EXEC to the lanes that hold
+/// the same one; `load` makes the byte offset from it and loads the first four dwords of that
+/// view (table dword 8 on) to s[12:15]; [`WIDTH_QUERY`] follows, whose result those lanes store
+/// at lane * 4.
+fn indexed_width_query_cs(load: &[u32]) -> Vec<u8> {
+    use crate::native::tests::{fspx, fspx_resource};
+    let mut code = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // loop: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+    ];
+    code.extend_from_slice(load);
+    code.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    code.extend_from_slice(&WIDTH_QUERY);
+    // Back to the loop's first word: the 17 words around `load`, and `load`.
+    let back = 0x1_0000 - (17 + load.len() as u32);
+    code.extend_from_slice(&[
+        0x7E18_0218, // v_mov_b32 v12, s24
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_0000 | back, // s_cbranch_execnz loop
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x8002_0C10, // buffer_store_dword v12, v16, s[8:11], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+    let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+    crate::dxbc::build(&[(FourCC::ACCC, &part)])
+}
+
+/// The query at a computed table offset translates when that offset is whole descriptors by its
+/// form: an index shifted left by 5, as the load's offset register. Another shift could reach
+/// across two descriptors, and an offset added into the base register is not looked into, so
+/// both keep the refusal.
+#[test]
+fn a_texture_size_query_at_an_index_shifted_by_5_translates() {
+    let shifted = [
+        0x8F16_8514, // s_lshl_b32 s22, s20, 5
+        0xF408_0302,
+        0x2C00_0020, // s_load_dwordx4 s[12:15], s[4:5], s22 offset:0x20
+    ];
+    let shader = translate_with(&indexed_width_query_cs(&shifted), Options::default());
+    assert!(shader.as_ref().is_ok_and(|s| s.view_addresses), "{:?}", shader.err());
+    let by_4 = [0x8F16_8414, shifted[1], shifted[2]]; // s_lshl_b32 s22, s20, 4
+    let in_base = [
+        shifted[0],
+        0x8002_1604, // s_add_u32 s2, s4, s22
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0301,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[2:3], 0x20
+    ];
+    for (label, load) in [("shifted by 4", &by_4[..]), ("added into the base", &in_base[..])] {
+        let err = translate_with(&indexed_width_query_cs(load), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.starts_with("a view address field the table gives as 0: ")),
+            "{label}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage

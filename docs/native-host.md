@@ -2030,16 +2030,19 @@ The table gives every field it doesn't hold as 0. The translator refuses a progr
 bit of one of them, rather than let it read 0 (`Lower::view_addresses`, `Lower::seen_bits`).
 Refused fields:
 - a buffer's stride and swizzle (dword 1 bits 16-31) and its dwords 2-3;
-- an image's base address, minimum level and format (dword 0, dword 1 bits 0-29);
+- an image's base address, minimum level and format (dword 0, dword 1 bits 0-29), but for a test
+  of dword 1 against 0 (#407, below);
 - an image's dword 2 bits 30-31, its tiling (dword 3 bits 20-27) and its dwords 4-7.
 
 The message is "a view address field the table gives as 0: " and the field.
 
 The bits a program can see are followed through its readers:
 - `s_and_b32` with a constant keeps that constant's bits;
+- `s_bfe_u32` of a constant field keeps that field (#407);
 - `s_pack_ll_b32_b16` keeps the low half;
 - `s_or_b32` with a constant and `s_lshr_b64` by a constant (of which the dword is the high half)
   are followed into their results, four readers deep, as long as nothing reads their SCC;
+- `s_cmp_eq_i32` and `s_cmp_lg_i32` of an image's dword 1 with 0 keep none (#407);
 - any other reader, or a phi, sees every bit.
 
 Measured offline (27 November, the 4,921-container all-shaders boot set, main 465db23b + #304):
@@ -2059,8 +2062,77 @@ refusal per field class, plus accepted reads of a buffer's address (whole dword 
 to 16 bits, or shifted with `s_lshr_b64` and masked) and of an image's size fields. Without the
 check, a read of a buffer's whole dword 1 translated.
 
-shortcut: the kind of view is the load's (eight dwords at a whole descriptor are an image), and the
-swizzle reads as the identity.
+shortcut: the kind of view is the load's (eight dwords at a whole descriptor are an image; four are
+a buffer unless their readers make them an image's first half, below), and the swizzle reads as
+the identity.
+
+### A texture size query through four dwords (#407)
+
+The console compiler loads only the first four dwords of an image descriptor when a program reads
+nothing past them: a size query. The heap index is shifted left by 5 (`s_lshl_b32`) and given as
+the load's offset register. The width's two low bits come from dword 1 and the rest from dword 2,
+the height from dword 2 and the first level from dword 3, each by `s_bfe_u32` or `s_and_b32` of a
+constant field, and a test of dword 1 against 0 gives a null view the size 0. The 21,608
+containers a run to the world registered hold 815 such loads in 757 programs, in three forms: the
+width alone (705), the width and height (101) and the height alone (9). Every one reads the first
+level and tests dword 1 against 0.
+
+Where the program also loads that descriptor whole and uses the view, the sizing load takes its
+kind from that load and its sizes from the view ("A size-only waterfall loop over a shifted heap
+index", below: 708 of the 723 programs main `b998bb65` refused here). The rest size a view the
+program does not use, and fall to the view addresses. There the load was a buffer's by its size,
+so the program was refused for "a buffer's stride or swizzle", or translated with the size
+missing (below). On main `2f4d81e0` 43 programs do (41 pixel, 2 vertex), each reading the width
+and the height. In 35 the index is a scalar the program loads from a buffer
+(`s_buffer_load_dword*`), in 8 the first lane's in a waterfall loop.
+
+`Lower::image_half` takes a four-dword load as the first half of an image descriptor when all of
+this holds (any other load stays a buffer's and is refused as before):
+- it is at a whole descriptor: the constant offset is a multiple of 32, and the computed part is
+  an index shifted left by 5 (`s_lshl_b32`) given as the load's offset register, or there is none;
+- every reader keeps only bits the table holds of an image, or tests dword 1 against 0;
+- together they read what a size query does: a width or height from dword 2 and the view's first
+  level from dword 3 (bits 12-15), by which the compiler scales them. A buffer has part of its
+  format in those bits. With less, a buffer's record count read under a mask would pass as an
+  image, and read 0 from the table.
+
+The null test has to be exact. The table's dword 1 holds the width's two low bits and nothing
+else, so it is 0 for a texture of width 4k + 1 as well as for no view. Where a program tests an
+image's dword 1 against 0 (in either load form), the translator sets a format bit of the value
+(bit 20, the one `Lower::descriptor_data` sets for a view it knows: "Null tests of image dword 1",
+below), which no other reader sees, when the entry's dword 3 is not 0: a texture view's never is
+(the identity swizzle), every other entry's is.
+
+- guess: the console's dword 1 is 0 for a null view and never for an image (its format field is
+  not 0). The title's own test is the evidence for the first half.
+- guess: an entry read this way holds an image view or nothing. A buffer view there would not read
+  as on the console.
+- shortcut: an entry the table holds zeros for reads as a null view (size 0). That is right for an
+  empty entry, and wrong for a texture view the title copied as bytes outside a bound table until
+  it is mirrored (the shortcut above).
+
+Measured offline (28 November, those 21,608 containers, by output, against main `2f4d81e0`): the
+43 programs change, and no other program's output does.
+- 14 of the 15 that main refuses for "a buffer's stride or swizzle" now translate (12 pixel, 2
+  vertex), 1 of them bound from the first world frame on. The other stops at a later refusal ("a
+  lane mask holding lanes elsewhere read as data: a program input").
+- 28 already translated (pixel, 2 of them bound in the world) and change output. On main their
+  size has no DXIL form and reaches only a join that the lanes outside a guarded write keep, which
+  does not count as a read (`Lower::write_placed`), so the edge that carries the size gets 0 (the
+  shape of #256). Those lanes now keep the size.
+- None is lost.
+
+Tests: `gfx_refusal_tests::a_texture_size_query_through_four_dwords_translates` (the three forms,
+the test as `s_cmp_lg_i32`, the eight-dword form),
+`a_four_dword_load_read_beyond_an_images_size_fields_stays_refused` (one refusal per field class,
+a join, and tests that are not of dword 1 against 0),
+`a_four_dword_load_without_a_size_and_the_first_level_stays_refused` (a size without the level,
+the level without a size, the last level for the first) and
+`a_texture_size_query_at_an_index_shifted_by_5_translates` (the waterfall loop; a shift by 4 and an
+index added into the base stay refused). On Metal (`victory-gpu`):
+`heap_tests::a_compute_shader_sizes_textures_from_the_first_half_of_their_descriptors` reads, per
+lane, the widths of textures 5 and 1 wide, of a view from level 1 of one 24 wide and of an empty
+entry: 5, 1, 12 and 0. Without the mark the first two read 0.
 
 ## Descriptor dwords read as data
 
@@ -2088,10 +2160,11 @@ an integer inline constant and `s_and` with a zero dword (and its SCC), a `v_cmp
 passes the stale value on as scalar arithmetic does, and a result the path fixes (an AND with 0)
 holds nothing of it. Corpus: 651 programs gained (493 pixel, 158 vertex), 0 lost, 0 changed; of
 the world run's 14,508 pixel draws dropped for these two reasons, 12,156 were of pipelines whose
-every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Still refused, rightly
-for now: texture size queries in a waterfall loop that test dword 1 against 0 for a null view
-(the view-address table holds dword 1 as width bits only, so a texture of width 4k + 1 would
-read as null); buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Texture size queries
+that test dword 1 against 0 for a null view were refused here (the view-address table holds dword
+1 as width bits only, so a texture of width 4k + 1 would read as null); they translate since
+#407, which makes that test exact ("A texture size query through four dwords"). Still refused,
+rightly for now: buffer dwords 2-3 and image dwords 5-7, which no host table holds.
 
 **Null tests of image dword 1.** Before it sizes an image from its descriptor the console
 compiler tests dword 1 against 0 (`s_cmp_eq_i32 d1, 0; s_cselect_b32 size, 0, size`): a null
@@ -2104,7 +2177,8 @@ code tests the dword against 0 and otherwise reads only its width bits (`s_bfe_u
 takes it (`Lower::width_bits_or_null_test`), dword 1 is now 0 for a view of size 0 and has
 format bit 20 set otherwise: exact for such code, which sees no other bit. Anything else that
 reads it keeps the old dword. The view-address table path (`view_addresses`, a size read with no
-use of the view) is unchanged. Test (`victory-gpu`, Metal):
+use of the view) answers the same test from its table (#407, "A texture size query through four
+dwords"). Test (`victory-gpu`, Metal):
 `heap_tests::an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor` (a 5x8 image
 read as null before). Corpus (tmi-agent, 21,600): 0 newly translated, 0 regressed, 2,739 outputs
 changed (94 compute, 589 pixel, 2,056 vertex), each a program whose rebuilt dword 1 is tested

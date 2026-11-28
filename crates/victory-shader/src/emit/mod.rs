@@ -157,7 +157,15 @@
 //!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
 //!   and type (bits 28-31) with an identity swizzle; zeros for anything
 //!   else. A program that can see a bit of a field the table gives as 0
-//!   is refused (`Lower::seen_bits`).
+//!   is refused (`Lower::seen_bits`). A texture size query loads only
+//!   the first four dwords of an image descriptor: such a load is an
+//!   image's by its readers, which read a size and the view's first
+//!   level (`Lower::image_half`). A test of an image's dword 1 against 0
+//!   (a null view) gets a format bit where the entry holds a view, the
+//!   table's dword 1 being 0 for a texture of width 4k + 1 too.
+//!   guess: the console's dword 1 is 0 for a null view and never for an
+//!   image (its format field is not 0); an entry read as an image's first
+//!   half holds an image view or nothing.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
