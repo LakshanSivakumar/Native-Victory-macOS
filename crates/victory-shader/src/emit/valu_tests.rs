@@ -2025,3 +2025,54 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[test]
+fn clamped_integer_carry_mad_sad_and_half_packs_lower_while_bitwise_clamp_and_omod_stay_refused() {
+    let ok_ops: &[(&str, &[u32])] = &[
+        ("v_add_nc_i32 clamp", &[0xD77F_8000, 0x0202_0501]),
+        ("v_sub_nc_i32 clamp", &[0xD776_8000, 0x0202_0501]),
+        ("v_add_co_u32 clamp", &[0xD70F_8C00, 0x0202_0501]),
+        ("v_sub_co_u32 clamp", &[0xD710_8C00, 0x0202_0501]),
+        ("v_mad_u32_u24 clamp", &[0xD543_8000, 0x040E_0501]),
+        ("v_mad_i32_i24 clamp", &[0xD542_8000, 0x040E_0501]),
+        ("v_mad_u32_u16 clamp", &[0xD773_8000, 0x040E_0501]),
+        ("v_mad_i32_i16 op_sel clamp", &[0xD775_9800, 0x040E_0501]),
+        ("v_sad_u8 clamp", &[0xD55A_8000, 0x040E_0501]),
+        ("v_cvt_pkrtz_f16_f32 clamp", &[0xD52F_8000, 0x0202_0501]),
+        ("v_cvt_f16_f32 clamp", &[0xD58A_8000, 0x0201_0101]),
+        ("v_cvt_pknorm_u16_f32 clamp", &[0xD769_8000, 0x0202_0501]),
+        ("v_cvt_pknorm_i16_f32 clamp", &[0xD768_8000, 0x0202_0501]),
+        ("v_cvt_pk_u16_u32", &[0xD76A_0000, 0x0202_0501]),
+        ("v_cvt_pk_i16_i32", &[0xD76B_0000, 0x0202_0501]),
+        ("v_add_nc_u16 op_sel clamp", &[0xD703_C000, 0x0202_0501]),
+        ("v_sub_nc_u16 op_sel clamp", &[0xD704_C000, 0x0202_0501]),
+        ("v_pk_add_u16 clamp", &[0xCC0A_C000, 0x1A02_0501]),
+        ("v_pk_sub_u16 clamp", &[0xCC0B_C000, 0x1A02_0501]),
+        ("v_pk_add_i16 clamp", &[0xCC02_C000, 0x1A02_0501]),
+        ("v_pk_sub_i16 clamp", &[0xCC03_C000, 0x1A02_0501]),
+        ("v_pk_mad_i16 clamp", &[0xCC00_C000, 0x1C0E_0501]),
+    ];
+    for &(label, inst) in ok_ops {
+        try_build_valu_cs(inst).unwrap_or_else(|e| panic!("{label}: {e}"));
+    }
+
+    // Bitwise integer ops with `clamp`, `omod != 0`, and shift 16-bit/packed `clamp` stay refused.
+    let refused_ops: &[(&str, &[u32], &str)] = &[
+        // v_and_b32_e64 v0, v1, v2 clamp
+        ("v_and_b32 clamp", &[0xD51B_8000, 0x0202_0501], "integer output modifiers"),
+        // v_add_nc_u32_e64 v0, v1, v2 mul:2
+        ("v_add_nc_u32 omod", &[0xD525_0000, 0x0A02_0501], "integer output modifiers"),
+        // v_lshlrev_b16_e64 v0, v1, v2 op_sel:[0,0,1] clamp
+        ("v_lshlrev_b16 clamp", &[0xD714_C000, 0x0202_0501], "modifiers on a 16-bit integer operation"),
+        // v_pk_lshlrev_b16 v0, v1, v2 clamp
+        ("v_pk_lshlrev_b16 clamp", &[0xCC04_C000, 0x1A02_0501], "modifiers on a packed integer operation"),
+        // v_add_nc_i32 v0, v1, v2 with op_sel != 0
+        ("v_add_nc_i32 opsel", &[0xD77F_0800, 0x0202_0501], "op_sel or modifiers on a 32-bit operand"),
+    ];
+    for &(label, inst, want) in refused_ops {
+        let err = try_build_valu_cs(inst)
+            .err()
+            .unwrap_or_else(|| panic!("{label} should be refused"));
+        assert!(err.to_string().contains(want), "{label}: {err}");
+    }
+}

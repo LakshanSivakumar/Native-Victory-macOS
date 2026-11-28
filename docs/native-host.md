@@ -487,9 +487,17 @@ a sum that wraps gives 0xffffffff, and a difference below zero gives 0 (`Lower::
 `SATURATING`). It was refused for every integer operation as "integer output modifiers": 8
 compute programs in a 12,020-shader corpus (Series S boot to the menus, 27 November), each a
 `v_sub_nc_u32 ... clamp` whose result goes to LDS. Over that corpus the 8 translate and no other
-output changes. Clamp on other integer operations (the signed `_i32` forms, `v_mad_u32_u24` and
-others) and `omod` stay refused. `split_wave_tests::clamped_unsigned_sums_and_differences_saturate`
-(`victory-gpu`) runs both on Metal.
+output changes. `split_wave_tests::clamped_unsigned_sums_and_differences_saturate` (`victory-gpu`)
+runs both on Metal.
+
+Saturating `clamp` is also followed on `v_add_nc_i32`/`v_sub_nc_i32` (`saddsat`/`ssubsat`),
+carry-out `v_add_co_u32`/`v_sub_co_u32`/`v_subrev_co_u32` and `v_*_co_ci_u32` (saturating the
+32-bit destination while keeping the un-clamped carry/borrow mask), `v_mul_{u32_u24,i32_i24}`,
+`v_mad_{u32_u24,i32_i24,u32_u16,i32_i16}`, `v_mad_{u64_u32,i64_i32}`, `v_sad_*`/`v_msad_u8`,
+`v_cvt_pk_{u16_u32,i16_i32}`, 16-bit/packed `v_add_nc_u16`/`v_sub_nc_u16`/`v_subrev_nc_u16`/`v_mul_lo_u16`/`v_pk_{add,sub,mad}_{u16,i16}`/`v_pk_mul_lo_u16`,
+and float-to-half packing `v_cvt_f16_f32`/`v_cvt_pkrtz_f16_f32`/`v_cvt_pknorm_{u16,i16}_f32`
+(`#515`; `addr_tests::clamped_integer_carry_mad_sad_and_half_packs_saturate_on_the_gpu`). Clamp on
+bitwise/shift operations and `omod` stay refused.
 
 ## A half kept by one `v_fma_mix` and replaced by the other
 

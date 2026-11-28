@@ -1487,3 +1487,220 @@ fn a_compute_buffer_descriptor_around_a_computed_address_loads_title_memory() {
         assert_eq!(f.get(0x6_0000, 32), want, "{bytes} bytes");
     }
 }
+
+#[test]
+fn clamped_integer_carry_mad_sad_and_half_packs_saturate_on_the_gpu() {
+    const CLAMPED: &[u32] = &[
+        0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+        0x7E08_02FF,
+        0x7FFF_FFF0, // v_mov_b32_e32 v4, 0x7ffffff0
+        0xD77F_8002,
+        0x0202_0104, // v_add_nc_i32 v2, v4, v0 clamp
+        0xDC70_8000,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] (offset 0)
+        0x7E08_02FF,
+        0x8000_0010, // v_mov_b32_e32 v4, 0x80000010
+        0xD776_8002,
+        0x0202_0104, // v_sub_nc_i32 v2, v4, v0 clamp
+        0xDC70_8080,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:128
+        0x7E08_02D0, // v_mov_b32_e32 v4, -16
+        0xD70F_8A02,
+        0x0202_0104, // v_add_co_u32 v2, s10, v4, v0 clamp
+        0xDC70_8100,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:256
+        0xD501_0003,
+        0x0029_288A, // v_cndmask_b32_e64 v3, 10, 20, s10
+        0xDC70_8180,
+        0x0000_0301, // global_store_dword v1, v3, s[0:1] offset:384
+        0xD710_8A02,
+        0x0201_2900, // v_sub_co_u32 v2, s10, v0, 20 clamp
+        0xDC70_8200,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:512
+        0xD501_0003,
+        0x0029_288A, // v_cndmask_b32_e64 v3, 10, 20, s10
+        0xDC70_8280,
+        0x0000_0301, // global_store_dword v1, v3, s[0:1] offset:640
+        0x7E08_02FF,
+        0x0080_0000, // v_mov_b32_e32 v4, 0x800000
+        0x7E0C_02FF,
+        0xF800_0000, // v_mov_b32_e32 v6, 0xf8000000
+        0xD543_8002,
+        0x041A_0104, // v_mad_u32_u24 v2, v4, v0, v6 clamp
+        0xDC70_8300,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:768
+        0x7E08_02FF,
+        0xFF80_0000, // v_mov_b32_e32 v4, 0xff800000
+        0x7E0C_02FF,
+        0x8800_0000, // v_mov_b32_e32 v6, 0x88000000
+        0xD542_8002,
+        0x041A_0104, // v_mad_i32_i24 v2, v4, v0, v6 clamp
+        0xDC70_8380,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:896
+        0x3408_008C, // v_lshlrev_b32_e32 v4, 12, v0
+        0xD76A_0002,
+        0x0202_0104, // v_cvt_pk_u16_u32 v2, v4, v0
+        0xDC70_8400,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:1024
+        0x7E0A_02FF,
+        0xFFFF_F830, // v_mov_b32_e32 v5, -2000
+        0xD569_0005,
+        0x0202_0105, // v_mul_lo_u32 v5, v5, v0
+        0xD76B_0002,
+        0x0202_0B04, // v_cvt_pk_i16_i32 v2, v4, v5
+        0xDC70_8480,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:1152
+        0x4A08_00CC, // v_add_nc_u32_e32 v4, -12, v0
+        0x7E08_0B04, // v_cvt_f32_i32_e32 v4, v4
+        0x1008_08FF,
+        0x3E00_0000, // v_mul_f32_e32 v4, 0.125, v4
+        0x0A0A_08F2, // v_subrev_f32_e32 v5, 1.0, v4
+        0xD52F_8002,
+        0x0202_0B04, // v_cvt_pkrtz_f16_f32_e64 v2, v4, v5 clamp
+        0xDC70_8500,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:1280
+        0x7E04_02FF,
+        0xABCD_0000, // v_mov_b32_e32 v2, 0xabcd0000
+        0xD58A_8002,
+        0x0201_0104, // v_cvt_f16_f32_e64 v2, v4 clamp
+        0xDC70_8580,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:1408
+        0x7E08_02FF,
+        0x7FF0_FFF0, // v_mov_b32_e32 v4, 0x7ff0fff0
+        0x340A_0090, // v_lshlrev_b32_e32 v5, 16, v0
+        0x380A_0B00, // v_or_b32_e32 v5, v0, v5
+        0xCC0A_C002,
+        0x1A02_0B04, // v_pk_add_u16 v2, v4, v5 clamp
+        0xDC70_8600,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:1536
+        0x7E08_02FF,
+        0x8010_7FF0, // v_mov_b32_e32 v4, 0x80107ff0
+        0xCC03_C002,
+        0x1A02_0B04, // v_pk_sub_i16 v2, v4, v5 clamp
+        0xDC70_8680,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:1664
+        0x7E08_0290, // v_mov_b32_e32 v4, 16
+        0x7E0A_0280, // v_mov_b32_e32 v5, 0
+        0x4A0C_00FF,
+        0xFFFF_FFE8, // v_add_nc_u32_e32 v6, 0xffffffe8, v0
+        0xD55A_8002,
+        0x041A_0B04, // v_sad_u8 v2, v4, v5, v6 clamp
+        0xDC70_8700,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:1792
+        0x7E08_02FF,
+        0x8000_0000, // v_mov_b32_e32 v4, 0x80000000 (-32768 in high half)
+        0x7E0C_02FF,
+        0x7FFF_0010, // v_mov_b32_e32 v6, 0x7fff0010
+        0xD775_9802,
+        0x041A_0904, // v_mad_i32_i16 v2, v4, v4, v6 op_sel:[1,1,0,0] clamp
+        0xDC70_8780,
+        0x0000_0201, // global_store_dword v1, v2, s[0:1] offset:1920
+        0xBF81_0000, // s_endpgm
+    ];
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+    run_with_lds(&mut t, CLAMPED, false, 32);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+
+    let slot = |k: usize| f.get(0x2_0000 + k * 128, 32);
+    assert_eq!(
+        slot(0),
+        (0..32i32).map(|i| 0x7FFF_FFF0i32.saturating_add(i) as u32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(1),
+        (0..32i32).map(|i| (i32::MIN + 16).saturating_sub(i) as u32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(2),
+        (0..32u32).map(|i| 0xFFFF_FFF0u32.saturating_add(i)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(3),
+        (0..32u32).map(|i| if i >= 16 { 20 } else { 10 }).collect::<Vec<_>>(),
+        "v_add_co_u32 clamp must preserve un-clamped carry mask"
+    );
+    assert_eq!(slot(4), (0..32u32).map(|i| i.saturating_sub(20)).collect::<Vec<_>>());
+    assert_eq!(
+        slot(5),
+        (0..32u32).map(|i| if i < 20 { 20 } else { 10 }).collect::<Vec<_>>(),
+        "v_sub_co_u32 clamp must preserve un-clamped borrow mask"
+    );
+    assert_eq!(
+        slot(6),
+        (0..32u64)
+            .map(|i| (i * 0x80_0000 + 0xF800_0000).min(u64::from(u32::MAX)) as u32)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(7),
+        (0..32i64)
+            .map(|i| (-i * 0x80_0000 + (-0x7800_0000i64)).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32 as u32)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(8),
+        (0..32u32).map(|i| ((i * 4096).min(0xFFFF)) | (i << 16)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(9),
+        (0..32i32)
+            .map(|i| {
+                let lo = (i * 4096).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as u32 & 0xFFFF;
+                let hi = (-2000 * i).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as u32 & 0xFFFF;
+                lo | (hi << 16)
+            })
+            .collect::<Vec<_>>()
+    );
+    // Exact powers/multiples of 0.125 clamped to [0.0, 1.0] in f16:
+    let f16_exact = |x: f32| -> u32 {
+        let x = x.clamp(0.0, 1.0);
+        if x == 0.0 {
+            return 0;
+        }
+        let bits = x.to_bits();
+        let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+        let mant = (bits >> 13) & 0x3FF;
+        ((exp as u32) << 10) | mant
+    };
+    assert_eq!(
+        slot(10),
+        (0..32i32)
+            .map(|i| {
+                let v4 = (i - 12) as f32 * 0.125;
+                let v5 = v4 - 1.0;
+                f16_exact(v4) | (f16_exact(v5) << 16)
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(11),
+        (0..32i32)
+            .map(|i| 0xABCD_0000 | f16_exact((i - 12) as f32 * 0.125))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(12),
+        (0..32u32)
+            .map(|i| (0xFFF0u32 + i).min(0xFFFF) | (((0x7FF0u32 + i).min(0xFFFF)) << 16))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(13),
+        (0..32i32)
+            .map(|i| {
+                let lo = (0x7FF0 - i).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as u32 & 0xFFFF;
+                let hi = (i32::from(i16::MIN) + 16 - i).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as u32 & 0xFFFF;
+                lo | (hi << 16)
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        slot(14),
+        (0..32u32)
+            .map(|i| 0xFFFF_FFE8u32.wrapping_add(i).saturating_add(16))
+            .collect::<Vec<_>>()
+    );
+    // (-32768) * (-32768) = +2^30 (0x4000_0000); + 0x7fff0010 overflows i32 -> saturates at 0x7fffffff.
+    assert_eq!(slot(15), vec![i32::MAX as u32; 32]);
+}
