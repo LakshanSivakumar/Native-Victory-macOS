@@ -120,11 +120,7 @@ fn program() -> HostShader {
         w.extend(buffer_store_dword(5, 8, at));
     }
     w.push(S_ENDPGM);
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 10,
-        layout: vec![
+    let layout = vec![
             RootParam {
                 root: RootType::Constants,
                 table_offset_dwords: 0,
@@ -149,8 +145,8 @@ fn program() -> HostShader {
                 user_data: 6,
                 slot: 2,
             },
-        ],
-        used: vec![
+    ];
+    let used = vec![
             UsedResource {
                 kind: ResourceType::Uav,
                 root: RootType::Table,
@@ -171,7 +167,26 @@ fn program() -> HostShader {
                 user_data: 6,
                 slot: 2,
             },
-        ],
+    ];
+    let (shader, memory) = lowered(&w, 10, layout, used);
+    assert_eq!(memory, 11, "every access through the pointer is title memory");
+    shader
+}
+
+/// `w` lowered as a compute program of `vgprs` VGPRs with `layout` and `used`, and the
+/// number of scalar accesses the resource tracker calls title memory.
+fn lowered(
+    w: &[u32],
+    vgprs: u32,
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+) -> (HostShader, usize) {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: vgprs as u16,
+        layout,
+        used,
         io: StageIo::Cs(ComputeIo {
             rsrc2: 8 << 1,
             threads: [1, 1, 1],
@@ -182,7 +197,6 @@ fn program() -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
-    assert_eq!(memory, 11, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -227,7 +241,7 @@ fn program() -> HostShader {
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
     }
-    shader
+    (shader, memory)
 }
 
 /// The page table for one copy of title memory at [`TITLE`] whose views
@@ -885,6 +899,117 @@ fn computed_buffer_subword_loads_preserve_values_and_bounds() {
                         "{label}: op={op} bounds={bounds} base={base:#x} index={index} offset={offset} scalar={scalar}");
                 }
             }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A size query of the view at a descriptor index (#407): the program scales the index to whole
+/// descriptors, loads the four dwords of the entry and keeps only the size fields of dwords 1-3,
+/// guarded by the null test of dword 1. The table's dword 1 bit 0 is always 0, so the translator
+/// carries the answer there: a view whose image words are in the table reads back with the width
+/// in the top bits and a null entry reads as 0, as the console's format field would.
+#[test]
+fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
+    let mut w = vec![s_mov_b32(5, 0)]; // s[4:5]: the table at s4, high half 0
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV (table dword 0)
+    w.extend([0x8F02_8500]); // s_lshl_b32 s2, s0, 5 (the descriptor index, a root constant)
+    w.extend([0x8002_0402]); // s_add_u32 s2, s4, s2
+    w.extend([0x8003_FDFF, 0x0000_0000]); // s_add_u32 s3, scc, 0
+    w.extend(s_load(2, 16, 2, 0)); // s[16:19]: dwords 0-3 of the entry
+    w.push(S_WAITCNT_ALL);
+    w.extend([0xBF00_8011]); // s_cmp_eq_i32 s17, 0 (a null entry)
+    w.extend([0x8514_8011]); // s_cselect_b32 s20, 0, s17
+    w.push(v_mov_b32(1, 20));
+    w.extend(buffer_store_dword(1, 8, 0));
+    w.push(v_mov_b32(1, 18));
+    w.extend(buffer_store_dword(1, 8, 4));
+    w.push(v_mov_b32(1, 19));
+    w.extend(buffer_store_dword(1, 8, 8));
+    w.push(S_ENDPGM);
+    let layout = vec![
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        },
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let used = vec![
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        },
+        UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 32,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let (shader, _memory) = lowered(&w, 4, layout, used);
+    assert!(shader.view_addresses);
+    // Heap index 1 holds a 64x32 image, index 2 a null entry.
+    let texel = [[0.0f32; 4]];
+    let mut view_addresses = vec![0u32; 4 * 3];
+    view_addresses[4..8].copy_from_slice(&[0, 0xC000_0000, 0x0007_C00F, 0x9000_0FAC]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = 0;
+        }
+        for (index, want) in [
+            (1, [0xC000_0001, 0x0007_C00F, 0x9000_0FAC]),
+            (2, [0, 0, 0]),
+        ] {
+            ud[0] = index;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud.clone())),
+                            (1, Root::View { srv: true, data: vec![0; 12] }),
+                            (2, Root::View { srv: true, data: view_addresses.clone() }),
+                        ],
+                        views: &[View::RawUav(9), View::Texture(64, 32, &texel), View::NullPair],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(out[0][..3], want, "{label}: index {index}");
         }
         ran += 1;
     }

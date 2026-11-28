@@ -2088,9 +2088,21 @@ passes the stale value on as scalar arithmetic does, and a result the path fixes
 holds nothing of it. Corpus: 651 programs gained (493 pixel, 158 vertex), 0 lost, 0 changed; of
 the world run's 14,508 pixel draws dropped for these two reasons, 12,156 were of pipelines whose
 every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Still refused, rightly
-for now: texture size queries in a waterfall loop that test dword 1 against 0 for a null view
-(the view-address table holds dword 1 as width bits only, so a texture of width 4k + 1 would
-read as null); buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+for now: buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+
+A texture size query uses the four-dword shape, though, and dword 1 against 0 is what guards it:
+the console's dword 1 has a nonzero format field for every view and is 0 only for a null
+descriptor. The view-address table holds dword 1 as width bits only, so a texture of width
+4k + 1 gives 0 there and read as null. Guessed, since nothing documents the word: bit 0 of the
+table's dword 1 (always 0, the width being in bits 30-31) carries it instead. `Lower::
+image_size_half` takes a four-dword load at an index scaled to whole descriptors (`s_lshl_b32`,
+5) when every reader keeps only a size field (a constant `s_and_b32` or `s_bfe_u32` within width,
+height, first and last level) or tests dword 1 against 0; `view_addresses` sets that bit when the
+entry's dword 0 (a buffer's address) or dword 3 (an image's `0xFAC` and levels) is nonzero. Any
+other reader keeps the buffer reading of the four dwords and its refusals. The 723 programs of the
+corpus refused with "a view address field the table gives as 0: a buffer's stride or swizzle" are
+of this shape. Tests: `gfx_refusal_tests::a_size_query_of_a_view_at_a_descriptor_index_reads_the_table`
+and, on the host, `memory_tests::a_size_query_of_a_view_at_an_index_reads_its_size_fields`.
 
 **Null tests of image dword 1.** Before it sizes an image from its descriptor the console
 compiler tests dword 1 against 0 (`s_cmp_eq_i32 d1, 0; s_cselect_b32 size, 0, size`): a null

@@ -7402,6 +7402,94 @@ impl<'a> Lower<'a> {
         }) && p.blocks.iter().flat_map(|b| &b.insts).filter(reads).any(|i| i.name().starts_with("s_cmp_"))
     }
 
+    /// Whether the four-dword descriptor load `inst` (writing `s[code..]`, address `a`) is a
+    /// texture size query: every reader keeps only size fields the table holds (width, height,
+    /// first and last level), or tests dword 1 against 0, and no dword reaches a join. Returns
+    /// whether the null test is there. The address must be the base of a table or heap plus a
+    /// descriptor index scaled by 5 (or a whole descriptor's immediate offset) and the dwords
+    /// must be 0-3.
+    // shortcut: the readers say the program sizes a view; a buffer query of the same four
+    // dwords reads its record count whole, which the buffer path refuses as a field.
+    fn image_size_half(&self, inst: &Inst, code: u8, count: u32, a: &Address) -> Option<bool> {
+        // The size fields of dwords 1-3 the table holds; dword 0 is the base address.
+        const HELD: [u32; 4] = [0, 0xC000_0001, 0x3FFF_FFFF, 0xF00F_FFFF];
+        if count != 4 || !a.offset.is_multiple_of(4) {
+            return None;
+        }
+        let first = (a.offset / 4) % 8;
+        if first + count > 4 {
+            return None;
+        }
+        match a.dynamic {
+            // The descriptor's index is scaled to whole descriptors.
+            Some(d) => {
+                let shift = self.def_inst(d)?;
+                let Fields::Sop { src, .. } = &shift.fields else { return None };
+                let [_, k] = src[..] else { return None };
+                if shift.name() != "s_lshl_b32" || scalar_constant(k) != Some(5) {
+                    return None;
+                }
+            }
+            // No computed term: the load's immediate offset is a whole number of descriptors.
+            None if a.offset.is_multiple_of(32) => {}
+            None => return None,
+        }
+        let (mut null_test, mut seen) = (false, [0u32; 4]);
+        for dword in 0..count {
+            let v = inst.write(Reg::S(code + dword as u8))?;
+            if self.x.p.blocks.iter().any(|b| b.phis.iter().any(|p| p.args.contains(&v))) {
+                return None;
+            }
+            for i in self.x.p.blocks.iter().flat_map(|b| &b.insts) {
+                if !i.reads.iter().any(|r| r.1 == v) {
+                    continue;
+                }
+                if matches!(i.fields, Fields::Image { .. }) {
+                    continue;
+                }
+                let Fields::Sop { src, .. } = &i.fields else {
+                    seen[dword as usize] = !0;
+                    continue;
+                };
+                let [x, y] = src[..] else {
+                    seen[dword as usize] = !0;
+                    continue;
+                };
+                let other = if sgpr_operand(i, x) == Some(v) {
+                    y
+                } else if sgpr_operand(i, y) == Some(v) {
+                    x
+                } else {
+                    seen[dword as usize] = !0;
+                    continue;
+                };
+                match (i.name(), scalar_constant(other)) {
+                    ("s_and_b32", Some(m)) => seen[dword as usize] |= m,
+                    // `s_bfe_u32` keeps the field its control names, offset and width.
+                    ("s_bfe_u32", Some(c)) if sgpr_operand(i, x) == Some(v) => {
+                        let (offset, width) = (c & 0x1F, (c >> 16) & 0x3F);
+                        seen[dword as usize] |= match width {
+                            0 => !0 << offset,
+                            w => (u32::MAX >> (32 - w)) << offset,
+                        };
+                    }
+                    // The null test the compiler guards a size query with.
+                    ("s_cmp_eq_i32" | "s_cmp_lg_i32" | "s_cmp_eq_u32" | "s_cmp_lg_u32", Some(0))
+                        if first + dword == 1 && sgpr_operand(i, x) == Some(v) =>
+                    {
+                        null_test = true;
+                    }
+                    _ => seen[dword as usize] = !0,
+                }
+            }
+        }
+        // A bit the table gives as 0 keeps the buffer reading of the four dwords.
+        if (0..count).any(|k| seen[k as usize] & !HELD[(first + k) as usize] != 0) {
+            return None;
+        }
+        Some(null_test)
+    }
+
     /// A descriptor load from a table or heap whose dwords the program only
     /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
     /// as a pointer to title memory: the BVH's address in its SRV) or, for
@@ -7459,6 +7547,48 @@ impl<'a> Lower<'a> {
         ) {
             return Err("a descriptor read only as data");
         }
+        // A size query loads the half of the descriptor it needs (dwords 0-3), which is the
+        // shape a buffer also has: the readers tell the two apart.
+        let views = self.s.view_addresses_handle();
+        if let Some(null_test) = self.image_size_half(inst, code, count, &a) {
+            let first = (a.offset / 4) % 8;
+            let mut vals = Vec::with_capacity(count as usize);
+            for k in 0..count {
+                let word = (first + k) % 8;
+                let index = self.heap_index(site, k as u8, false)?;
+                let c = self.cur;
+                let four = self.s.m.i32(4);
+                let at = self.s.m.bin(c, Bin::Shl, index, four);
+                let w = self.s.m.i32(4 * word);
+                let at = self.s.m.bin(c, Bin::Add, at, w);
+                vals.push(self.raw_dword(views, at));
+            }
+            if null_test {
+                // A null entry is all 0 and a view is not: a buffer's dword 0 is its address,
+                // an image's dword 3 the `0xFAC` and levels (`0xFAC` alone when the base address
+                // is not loaded). Bit 0 of the table's dword 1 is always 0, so it can carry the
+                // answer for the null test.
+                let c = self.cur;
+                let at = |dword: u32| (dword - first) as usize;
+                let zero = self.s.m.i32(0);
+                let one = self.s.m.i32(1);
+                let mut seen = vals[at(3)];
+                if first == 0 {
+                    let d0 = vals[at(0)];
+                    seen = self.s.m.bin(c, Bin::Or, seen, d0);
+                }
+                let view = self.s.m.cmp(c, pred::NE, seen, zero);
+                let view = self.s.m.select(c, view, one, zero);
+                let d1 = self.s.m.bin(c, Bin::Or, vals[at(1)], view);
+                vals[at(1)] = d1;
+            }
+            for (k, val) in vals.into_iter().enumerate() {
+                if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                    self.vals.insert(v, Val::I32(val));
+                }
+            }
+            return Ok(());
+        }
         // The compiler loads image descriptors whole, buffer ones as four
         // dwords.
         let (known, rest): (&[(u32, Why)], Why) = if count == 8 && a.offset.is_multiple_of(32) {
@@ -7466,7 +7596,6 @@ impl<'a> Lower<'a> {
         } else {
             (&BUFFER, BUFFER_REST)
         };
-        let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
             let written = inst.write(Reg::S(code + k as u8));
