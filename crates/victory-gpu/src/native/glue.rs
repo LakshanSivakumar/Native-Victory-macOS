@@ -1550,6 +1550,16 @@ pub(crate) fn warn_once(what: &'static str) {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn a_dropped_draw_is_counted_every_time_and_warned_once() {
+    let before = DROPPED.load(Ordering::Relaxed);
+    dropped("a test-only drop reason");
+    dropped("a test-only drop reason");
+    // Every drop counts, so "native draws so far"'s no_pipeline is the true total (#531).
+    assert_eq!(DROPPED.load(Ordering::Relaxed), before + 2);
+}
+
 /// Draws the title recorded, and those that went on to the host list.
 static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ENCODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1610,6 +1620,11 @@ pub(crate) fn log_draw_counts(frame: u64) {
 /// The second result says the pipeline depends on the draw's targets.
 fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<Metal>, bool) {
     let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
+        // Otherwise the draw below is dropped with no reason logged anywhere (#531).
+        t.refused_translation(
+            &format!("pipeline {key:#x}"),
+            "no native stages: the host made no pipeline object of this key".into(),
+        );
         return (Pipe::Refused, false);
     };
     let graphics = graphics.map(|g| {
@@ -1701,7 +1716,10 @@ fn make_host_pipe(
     match graphics {
         None => match find("compute") {
             Some(cs) => t.compute_pipe(cs, &name),
-            None => Pipe::Refused,
+            None => {
+                t.refused_translation(&name, "a compute pipeline whose stages hold no compute shader".into());
+                Pipe::Refused
+            }
         },
         Some(g) if g.is_guessed() => match hosts.iter().find(|h| h.0 == "vertex") {
             Some((_, vs)) => Pipe::Guess(Rc::new(Guessed {
@@ -1712,7 +1730,10 @@ fn make_host_pipe(
                 state: g.clone(),
                 made: Default::default(),
             })),
-            None => Pipe::Refused,
+            None => {
+                t.refused_translation(&name, "a guessed graphics pipeline without a vertex stage".into());
+                Pipe::Refused
+            }
         },
         Some(g) => match find("vertex") {
             Some(vs) => t.render_pipe(vs, find("pixel"), &g, &name),
@@ -2038,8 +2059,9 @@ fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<b
             (p, false)
         }
         Pipe::Skipped => {
-            warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
-            trace_reason("a mesh pipeline");
+            // dropped() warns once, counts the drop in "native draws so far" and keeps the
+            // reason for the pass trace — a bare warn_once left the draw uncounted (#531).
+            dropped("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
             trace_drop(l);
             return None;
         }
