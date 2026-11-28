@@ -91,6 +91,18 @@ struct Port {
     ready: Condvar,
 }
 
+/// Minimum stack for `XTaskQueue` and `XAsync` worker threads: callbacks run
+/// title code (and may trigger guessed Metal pipeline builds), matching
+/// `host_posix::MIN_STACK` (8 MiB).
+const WORKER_STACK: usize = 8 << 20;
+
+fn spawn_worker(name: &str, f: impl FnOnce() + Send + 'static) {
+    let _ = std::thread::Builder::new()
+        .name(name.into())
+        .stack_size(WORKER_STACK)
+        .spawn(f);
+}
+
 impl Port {
     fn new(mode: Mode) -> Arc<Port> {
         let port = Arc::new(Port {
@@ -102,7 +114,7 @@ impl Port {
             // The worker ends once it holds the last reference (every queue
             // using the port is closed) and nothing is left to run.
             let worker = port.clone();
-            std::thread::spawn(move || {
+            spawn_worker("xtask-serial", move || {
                 loop {
                     match worker.take(1000, || false) {
                         Some(task) => task.run(false),
@@ -165,7 +177,7 @@ impl Pool {
         let mut state = lock(&self.state);
         state.0.push_back(task);
         if state.0.len() > state.1 {
-            std::thread::spawn(move || self.work());
+            spawn_worker("xtask-pool", move || self.work());
         } else {
             self.ready.notify_one();
         }
@@ -233,7 +245,7 @@ impl Queue {
             delayed.insert(id, task);
         }
         let queue = self.clone();
-        std::thread::spawn(move || {
+        spawn_worker("xtask-delay", move || {
             std::thread::sleep(Duration::from_millis(delay_ms.into()));
             // Gone if the queue was terminated meanwhile, which canceled it.
             let task = lock(&queue.delayed).remove(&id);
@@ -889,7 +901,7 @@ pub fn pending_with(
                     .0
                     .take();
                 let (block, state) = (data.block as usize, state as usize);
-                std::thread::spawn(move || {
+                spawn_worker("xasync-work", move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
                         Ok(bytes) => (S_OK, bytes.len()),

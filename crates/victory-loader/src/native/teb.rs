@@ -39,6 +39,11 @@ pub const OFF_IN_HOST: usize = 0x1F10;
 pub const OFF_IN_HOST_RET: usize = 0x1F18;
 pub const OFF_IN_HOST_CTX: usize = 0x1F20;
 pub const OFF_IN_HOST_RBP: usize = 0x1F28;
+/// Emergency exception-dispatch stack `[OFF_EMERGENCY_LIMIT, OFF_EMERGENCY_BASE)` used when a
+/// title fault occurs with `rsp` outside `[OFF_STACK_LIMIT, OFF_STACK_BASE)`.
+pub const OFF_EMERGENCY_BASE: usize = 0x1F30;
+pub const OFF_EMERGENCY_LIMIT: usize = 0x1F38;
+const EMERGENCY_STACK_SIZE: usize = 256 << 10;
 /// Modules with static TLS one thread can hold (the array's length).
 pub const MAX_TLS_MODULES: usize = 64;
 const PEB_SIZE: usize = 0x800;
@@ -134,6 +139,7 @@ pub fn set_image_base(base: usize) {
 
 struct ThreadTeb {
     teb: *mut u8,
+    emergency_stack: *mut u8,
     tls_array: Box<[AtomicUsize; MAX_TLS_MODULES]>,
     blocks: Vec<(*mut u8, Layout)>,
 }
@@ -146,6 +152,11 @@ impl ThreadTeb {
         // SAFETY: a non-zero layout.
         let teb = unsafe { alloc_zeroed(layout) };
         assert!(!teb.is_null(), "out of memory for a TEB");
+        let emerg_layout =
+            Layout::from_size_align(EMERGENCY_STACK_SIZE, 0x1000).expect("emergency stack layout");
+        // SAFETY: a non-zero layout.
+        let emergency_stack = unsafe { alloc_zeroed(emerg_layout) };
+        assert!(!emergency_stack.is_null(), "out of memory for an SEH emergency stack");
         let tls_array: Box<[AtomicUsize; MAX_TLS_MODULES]> =
             Box::new(std::array::from_fn(|_| AtomicUsize::new(0)));
         let mut blocks = Vec::new();
@@ -171,6 +182,8 @@ impl ThreadTeb {
         put(OFF_TLS_ARRAY, tls_array.as_ptr() as usize);
         put(OFF_PEB, peb());
         put(OFF_HOST_TSD, host_tsd_base());
+        put(OFF_EMERGENCY_BASE, emergency_stack as usize + EMERGENCY_STACK_SIZE);
+        put(OFF_EMERGENCY_LIMIT, emergency_stack as usize);
         LIVE.lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(LiveThread {
@@ -183,6 +196,7 @@ impl ThreadTeb {
         drop(modules);
         ThreadTeb {
             teb,
+            emergency_stack,
             tls_array,
             blocks,
         }
@@ -208,6 +222,10 @@ impl Drop for ThreadTeb {
             // SAFETY: allocated in `new` with this layout.
             unsafe { dealloc(block, layout) };
         }
+        let emerg_layout =
+            Layout::from_size_align(EMERGENCY_STACK_SIZE, 0x1000).expect("emergency stack layout");
+        // SAFETY: allocated in `new` with `emerg_layout`.
+        unsafe { dealloc(self.emergency_stack, emerg_layout) };
         let layout = Layout::from_size_align(TEB_SIZE, 0x1000).expect("layout");
         // SAFETY: allocated in `new`.
         unsafe { dealloc(self.teb, layout) };
