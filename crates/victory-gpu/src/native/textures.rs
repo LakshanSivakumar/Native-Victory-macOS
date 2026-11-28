@@ -87,7 +87,7 @@ impl TextureInfo {
     /// Top mip levels left off the host texture (0 or 1; see [`drop_top_mip`]).
     pub fn dropped_levels(&self) -> usize {
         dropped_levels(
-            drop_top_mip(),
+            drop_top_mip_levels(),
             self.render_target() || self.flags & UNORDERED_ACCESS != 0,
             self.dimension == Dimension::Tex3d,
             self.layout.mips.len(),
@@ -109,22 +109,38 @@ impl TextureInfo {
 
 /// Largest side (texels) from which a sampled texture loses its top level under [`drop_top_mip`].
 const DROP_TOP_MIP_MIN_SIDE: u32 = 1024;
+/// Largest side (texels) from which, with `VICTORY_TEXTURE_DROP_TOP_MIP=2`, a second level goes too.
+const DROP_SECOND_MIP_MIN_SIDE: u32 = 4096;
 
-/// `VICTORY_TEXTURE_DROP_TOP_MIP=1`: large sampled textures are made on the host without their
-/// top mip (a quarter of the memory of that level, about 75% of the texture's): for hosts whose
-/// unified memory cannot hold the title's full set (an iPad's ~9 GiB before it swaps).
-/// Sampling with implicit LOD then uses the next level, a little blurrier up close. Shortcut, not
-/// console behaviour: explicit-LOD samples come out one level blurrier and integer texel loads
-/// address the smaller texture; render targets, UAV and 3D textures are never touched.
-pub fn drop_top_mip() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURE_DROP_TOP_MIP").is_ok_and(|v| v == "1"))
+/// `VICTORY_TEXTURE_DROP_TOP_MIP=<n>` (off by default): large sampled textures are made on the host
+/// without their top levels, for hosts whose unified memory cannot hold the title's full set (an
+/// iPad's ~9 GiB before it swaps). `1`: the top level of textures whose larger side is at least
+/// 1024 texels (about 75% of each one's memory). `2`: also a second level of those at least 4096
+/// (about 94% of each of those). Sampling with implicit LOD then uses the next level kept, blurrier
+/// up close. Shortcut, not console behaviour: explicit-LOD samples come out that many levels
+/// blurrier and integer texel loads address the smaller texture; render targets, UAV and 3D
+/// textures are never touched.
+pub fn drop_top_mip_levels() -> usize {
+    static LEVELS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LEVELS.get_or_init(|| match std::env::var("VICTORY_TEXTURE_DROP_TOP_MIP").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
 }
 
-/// Levels to leave off: one for a large, sampled-only 2D texture that has a level below its top.
-fn dropped_levels(enabled: bool, written_by_gpu: bool, volume: bool, mips: usize, largest_side: u32) -> usize {
-    let eligible = enabled && !written_by_gpu && !volume && mips >= 2 && largest_side >= DROP_TOP_MIP_MIN_SIDE;
-    usize::from(eligible)
+/// Levels to leave off a sampled-only 2D texture, given the setting (0 to 2): one when it is
+/// large and has a level below its top, two when the setting allows it and it is very large with
+/// two levels below its top. A texture always keeps at least one level.
+fn dropped_levels(setting: usize, written_by_gpu: bool, volume: bool, mips: usize, largest_side: u32) -> usize {
+    if setting == 0 || written_by_gpu || volume {
+        return 0;
+    }
+    if setting >= 2 && mips >= 3 && largest_side >= DROP_SECOND_MIP_MIN_SIDE {
+        2
+    } else {
+        usize::from(mips >= 2 && largest_side >= DROP_TOP_MIP_MIN_SIDE)
+    }
 }
 
 /// A view's title mip range `(first, count)` on a host texture made without its top `dropped`
@@ -1128,6 +1144,32 @@ impl<B: PresentBackend> Title<B> {
         }
         // Through the pool's own mapping; `None` when the title unmapped the memory meanwhile.
         let Ok((_buffer, at)) = self.host.resolve(info.memory as u64, info.size as u64) else { return };
+        // The title may have unmapped the range and remapped it into another pool since the view
+        // was placed: copying back would then write over whatever holds it now, one way a freed
+        // block's link ends up with a garbage offset (#339).
+        let address = info.memory as u64;
+        if let Some(&(_, pool)) = self.placed.get(&address).filter(|&&(k, _)| k == key) {
+            let mapped = self.host.memory().resolve(address, info.size as u64).map(|(p, _)| p.id);
+            if Some(pool) != mapped {
+                if self.back.logged.insert(key) {
+                    tracing::warn!(
+                        texture = key,
+                        ?described,
+                        "a GPU-written texture's title memory is not the pool its view was placed in any more: not copied back (#339)"
+                    );
+                }
+                return;
+            }
+        }
+        // With VICTORY_TRACE_FREED=1, a copy-back into a range the title's allocator freed is
+        // logged and skipped (#339): writing over a freed block corrupts whatever holds it now.
+        if crate::native::freed::overlaps(address, info.size as u64) {
+            crate::native::freed::check(address, info.size as u64, "texture copy-back");
+            if self.back.logged.insert(key) {
+                tracing::warn!(texture = key, ?described, "a GPU-written texture's copy-back was skipped: its title memory is in a freed range (#339)");
+            }
+            return;
+        }
         // SAFETY: `resolve` gives `size` mapped, writable bytes of the pool; the buffer is kept.
         unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), at.cast_mut(), tiled.len()) };
         // What the host texture holds, so the scanner's sighting of this write uploads nothing.
@@ -1280,6 +1322,13 @@ impl<B: PresentBackend> Title<B> {
     pub fn format_of(&self, key: usize) -> Option<Format> {
         let key = self.owner_of(key);
         self.textures.get(&key).and_then(|t| t.info.desc()).map(|d| d.format)
+    }
+
+    /// The description the host keeps of title texture `key` (a placed one too, which no resource
+    /// object describes).
+    #[cfg(target_os = "macos")]
+    pub(super) fn info_of(&self, key: usize) -> Option<&TextureInfo> {
+        self.textures.get(&key).map(|t| &t.info)
     }
 
     /// The host texture of title texture `key`.
@@ -1469,9 +1518,20 @@ impl<B: PresentBackend> Title<B> {
     /// work in flight reads it through an entry, and no list holds one), and none a submission in
     /// flight names. One still shown waits until the title writes another record over that entry.
     /// One named again later is made again from title memory.
-    fn give_up_covered(&mut self) {
-        let keys: Vec<usize> = self.covered.iter().copied().collect();
+    ///
+    /// shortcut: a sync checks at most [`COVERED_CHECKS`] of them, round-robin (a world keeps ~9,000
+    /// covered copies in use, and checking them all took ~8 ms of each submission under the host's
+    /// lock), so one is given up up to a sweep late (about a second); upgrade to a mark on the
+    /// copies whose entries or lists changed if memory is short.
+    pub(super) fn give_up_covered(&mut self) {
+        if self.covered_queue.is_empty() {
+            self.covered_queue = self.covered.iter().copied().collect();
+        }
+        let keys = self.covered_queue.split_off(self.covered_queue.len().saturating_sub(COVERED_CHECKS));
         for k in keys {
+            if !self.covered.contains(&k) {
+                continue;
+            }
             let Some(t) = self.textures.get(&k) else {
                 self.covered.remove(&k);
                 continue;
@@ -1590,9 +1650,19 @@ impl<B: PresentBackend> Title<B> {
         for key in self.host.take_wanted() {
             self.realize(key);
         }
+        let timed = lock_traced();
+        let phase = |i: usize, since: std::time::Instant| {
+            if timed {
+                SYNC_PHASES[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            std::time::Instant::now()
+        };
+        let t = std::time::Instant::now();
         self.keep_to_budget();
+        let t = phase(1, t);
         self.give_up_covered();
         let pools = self.host.memory();
+        phase(2, t);
         let mut dirty = watch(|w| std::mem::take(&mut w.dirty));
         // Hot textures (a movie's planes, a glyph cache) are probed synchronously, round-robin within
         // a time budget so world streaming (thousands of blank textures) never stalls submissions;
@@ -1604,6 +1674,7 @@ impl<B: PresentBackend> Title<B> {
         let hot = std::time::Instant::now();
         let until = budget.map(|budget| hot + budget);
         probe_round(&pools, &mut self.textures, &mut self.blank_keys, &mut self.blank_cursor, until, None, &mut self.probe_buf, &mut dirty);
+        phase(3, started);
         if env_set!("VICTORY_TRACE_TEXTURE_SYNC") {
             SyncCost { probe: [hot - started, hot.elapsed()], hot: self.hot_keys.len() as u64, ..Default::default() }.log();
         }
@@ -1969,6 +2040,19 @@ impl SyncCost {
     }
 }
 
+/// `VICTORY_TRACE_TITLE_LOCK=1`: once a second, how long the macOS host's `TITLE` lock was waited
+/// for and held, by the line of `glue.rs` that took it (the 12 that held it longest).
+pub(super) fn lock_traced() -> bool {
+    env_set!("VICTORY_TRACE_TITLE_LOCK")
+}
+
+/// With [`lock_traced`]: microseconds submissions spent in `keep_named`, `keep_to_budget`,
+/// `give_up_covered` and the probes (`Title::sync_jobs`).
+pub(super) static SYNC_PHASES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Covered copies a sync checks at most ([`Title::give_up_covered`]).
+pub(super) const COVERED_CHECKS: usize = 512;
+
 /// The texture budget: how many bytes of sampled host texture copies the host keeps before it
 /// gives up the least recently used of those it may ([`Title::keep_to_budget`]).
 #[derive(Default)]
@@ -2122,10 +2206,14 @@ impl<B: PresentBackend> Title<B> {
         }
         // shortcut: a record changed after this read (before held work is encoded) still gets the
         // cleared entry and `take_wanted`; reading again at encoding needs the title's state there.
+        let since = std::time::Instant::now();
         let held: Vec<Rc<NativeList<B>>> = self.held.segments().cloned().collect();
         let mut all: Vec<&NativeList<B>> = lists.collect();
         all.extend(held.iter().map(|l| &**l));
         let named = self.host.resources_named(all.into_iter());
+        if lock_traced() {
+            SYNC_PHASES[0].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         for &key in &named {
             if self.host.is_evicted(key) {
                 self.realize(key);
@@ -2965,13 +3053,24 @@ mod drop_top_mip_tests {
 
     #[test]
     fn only_large_sampled_2d_textures_with_a_lower_level_lose_their_top() {
-        assert_eq!(dropped_levels(true, false, false, 11, 2048), 1);
-        assert_eq!(dropped_levels(true, false, false, 2, 1024), 1);
-        assert_eq!(dropped_levels(false, false, false, 11, 2048), 0, "off unless asked for");
-        assert_eq!(dropped_levels(true, true, false, 11, 2048), 0, "render targets and UAVs keep it");
-        assert_eq!(dropped_levels(true, false, true, 11, 2048), 0, "3D textures keep it");
-        assert_eq!(dropped_levels(true, false, false, 1, 4096), 0, "no lower level to fall back on");
-        assert_eq!(dropped_levels(true, false, false, 10, 1023), 0, "small textures keep it");
+        assert_eq!(dropped_levels(1, false, false, 11, 2048), 1);
+        assert_eq!(dropped_levels(1, false, false, 2, 1024), 1);
+        assert_eq!(dropped_levels(0, false, false, 11, 2048), 0, "off unless asked for");
+        assert_eq!(dropped_levels(1, true, false, 11, 2048), 0, "render targets and UAVs keep it");
+        assert_eq!(dropped_levels(1, false, true, 11, 2048), 0, "3D textures keep it");
+        assert_eq!(dropped_levels(1, false, false, 1, 4096), 0, "no lower level to fall back on");
+        assert_eq!(dropped_levels(1, false, false, 10, 1023), 0, "small textures keep it");
+        assert_eq!(dropped_levels(1, false, false, 13, 8192), 1, "setting 1 never drops two");
+    }
+
+    #[test]
+    fn setting_two_drops_a_second_level_only_from_very_large_textures() {
+        assert_eq!(dropped_levels(2, false, false, 13, 4096), 2);
+        assert_eq!(dropped_levels(2, false, false, 13, 8192), 2);
+        assert_eq!(dropped_levels(2, false, false, 12, 2048), 1, "large, not very large: one");
+        assert_eq!(dropped_levels(2, false, false, 2, 4096), 1, "keeps at least one level");
+        assert_eq!(dropped_levels(2, false, false, 3, 4096), 2, "two levels below the top: both may go");
+        assert_eq!(dropped_levels(2, true, false, 13, 4096), 0, "GPU-written textures keep everything");
     }
 
     #[test]
@@ -2986,5 +3085,10 @@ mod drop_top_mip_tests {
         assert_eq!(host_mip_range(3, 2, 1, 10), (2, 2));
         // A count past the end is clamped to the host's levels.
         assert_eq!(host_mip_range(5, 99, 1, 10), (4, 6));
+        // Two dropped (13 title levels, 11 on the host): views of either dropped level see the
+        // host's top; lower levels move two down.
+        assert_eq!(host_mip_range(0, 13, 2, 11), (0, 11));
+        assert_eq!(host_mip_range(1, 1, 2, 11), (0, 1));
+        assert_eq!(host_mip_range(4, 3, 2, 11), (2, 3));
     }
 }

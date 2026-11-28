@@ -40,6 +40,7 @@ const EXCEPTIONS: &[(&str, &str)] = &[
     ("crates/victory-metal/tests/fixtures/heap_ps.dxil", "compiled from heap_ps.hlsl"),
     ("crates/victory-metal/tests/fixtures/heap_rw.dxil", "compiled from heap_rw.hlsl"),
     ("crates/victory-metal/tests/fixtures/sample2d.dxil", "compiled from sample2d.hlsl"),
+    ("crates/victory-metal/tests/fixtures/sample2d_grad.dxil", "compiled from sample2d_grad.hlsl"),
     ("crates/victory-metal/tests/fixtures/sample2darray.dxil", "compiled from sample2darray.hlsl"),
     ("crates/victory-metal/tests/fixtures/sample3d.dxil", "compiled from sample3d.hlsl"),
     ("crates/victory-metal/tests/fixtures/tex_fill.dxil", "compiled from tex_fill.hlsl"),

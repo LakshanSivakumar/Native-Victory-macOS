@@ -226,6 +226,8 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lockstep;
+#[cfg(test)]
+mod lockstep_tests;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
@@ -265,7 +267,7 @@ pub use sampler::StaticSampler;
 pub use shader::{
     ATOMIC_LOCKS, ATOMIC_LOCKS_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
     ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
-    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    VIEW_MIN_LOD_STEPS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
     VIEW_WRITES_BYTES,
 };
 
@@ -1173,8 +1175,12 @@ mod tests {
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let shader = emit(&c, &native, &p, &st, &io, &res);
+            // A raw barycentric read (the input not initialized first) is declared as
+            // `SV_Barycentrics`: the program then reads the input, not the value moved in.
+            let raw = |s: &super::HostShader| s.dxil.windows(15).any(|w| w == b"SV_Barycentrics");
             if matches!(case, Complete | NonzeroBase) {
                 let shader = shader.unwrap();
+                assert!(!raw(&shader), "{case:?}: reads the raw barycentric");
                 assert!(
                     Container::parse(&shader.dxil)
                         .unwrap()
@@ -1192,14 +1198,15 @@ mod tests {
             } else {
                 eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
                 assert!(
-                    matches!(
-                        shader,
-                        Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
-                            ..
-                        })
-                    ),
-                    "{case:?}"
+                    match &shader {
+                        Ok(s) => raw(s),
+                        Err(e) => matches!(
+                            e,
+                            ShaderError::Unsupported { what: "barycentrics read directly", .. }
+                        ),
+                    },
+                    "{case:?}: {:?}",
+                    shader.as_ref().err()
                 );
             }
         }

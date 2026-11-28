@@ -175,13 +175,14 @@ fn offset_samples_at_a_level_read_the_offset_first() {
     // image_sample_lz_o v[10:13], v[1:3], s[8:15], s[16:19] dmask:0xf dim:2D
     let (name, args) = call(CS, [0xF0DC_0F08, 0x0082_0A01]);
     assert_eq!(name, "dx.op.sampleLevel.f32");
-    // Coordinates (v2, v3), offsets (-3, 5), level 0.
-    assert_eq!(args, [TWO, QUARTER, U, U, i(-3), i(5), U, k(0)]);
+    // Coordinates (v2, v3), offsets (-3, 5), level 0 raised to the view's
+    // minimum LOD clamp (from the view-stride table: not a constant).
+    assert_eq!(args, [TWO, QUARTER, U, U, i(-3), i(5), U, U]);
 
     // image_sample_l_o v[10:13], v[1:4]: the level (v4) after the coordinates.
     let (name, args) = call(CS, [0xF0D0_0F08, 0x0082_0A01]);
     assert_eq!(name, "dx.op.sampleLevel.f32");
-    assert_eq!(args, [TWO, QUARTER, U, U, i(-3), i(5), U, THREE_QUARTERS]);
+    assert_eq!(args, [TWO, QUARTER, U, U, i(-3), i(5), U, U]);
 }
 
 #[test]

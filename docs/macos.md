@@ -93,7 +93,7 @@ On 25 November 2026 two testers ran the same Series X executable (one SHA-256) w
 
 ## Stacks during a freeze
 
-In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` printed nothing, not even its first line. Printing takes the stderr lock and allocates, and the thread snapshot goes through Wine, so a thread stuck while it holds one of those locks stops the dump too. With `VICTORY_STACKS_FILE=<path>` as well (in a build with `VICTORY_DIAGNOSTICS=1`), the dumps go to that file instead. The module table is written at start-up, and each dump writes a marker line before each step and raw addresses for each frame, with no allocation and no stderr lock. Where the file stops shows which step blocked.
+In the loading freeze from #50 every thread stops logging, and `VICTORY_STACKS` printed nothing, not even its first line. Printing takes the stderr lock and allocates, and the thread snapshot goes through Wine, so a thread stuck while it holds one of those locks stops the dump too. With `VICTORY_STACKS_FILE=<path>` as well, the dumps go to that file instead (`stacks.rs` reads it in any build). The module table is written at start-up, and each dump writes a marker line before each step and raw addresses for each frame, with no allocation and no stderr lock. Where the file stops shows which step blocked.
 
 ## Presented planes
 

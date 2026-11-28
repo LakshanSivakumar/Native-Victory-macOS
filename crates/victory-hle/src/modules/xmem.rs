@@ -37,7 +37,7 @@ use super::xmem_posix::{BOOL, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, find_expo
 #[cfg(not(windows))]
 pub use super::xmem_posix::{BasicInformation, XMemVirtualAlloc, XMemVirtualQuery};
 #[cfg(all(not(windows), target_arch = "x86_64"))]
-pub(crate) use super::xmem_posix::forget_physical;
+pub(crate) use super::xmem_posix::{commit_if_reserved, forget_physical};
 
 use crate::{HleModule, hle_export};
 

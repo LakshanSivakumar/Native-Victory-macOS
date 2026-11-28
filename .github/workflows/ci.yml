@@ -25,6 +25,8 @@ jobs:
         run: /bin/bash tools/macos/tests/target-directory.sh
       - name: Default console model by RAM (Bash 3.2)
         run: /bin/bash tools/macos/tests/console-default.sh
+      - name: find_rustup PATH handling (Bash 3.2)
+        run: /bin/bash tools/macos/tests/rustup-path.sh
       - name: verify.sh picks the host target off a Mac (Bash 3.2)
         run: /bin/bash tools/macos/tests/verify-target.sh
 

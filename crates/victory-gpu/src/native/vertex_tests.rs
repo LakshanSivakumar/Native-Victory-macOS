@@ -198,9 +198,12 @@ fn a_submission_that_never_committed_pays_its_value_writes_on_the_cpu() {
 }
 
 #[test]
-fn only_the_fills_of_refused_passes_are_paid_on_the_cpu() {
+fn a_committed_failure_leaves_the_fills_to_the_backend() {
     let backend = Capture::default();
     // The command buffer commits, but pass 0 (the first fill) and pass 1 (the draw) are dropped.
+    // The backend re-encodes the refused pass's fills itself (#80), in the GPU's order: the host
+    // pays none of them here, where a CPU write would let a waiter go on before this command
+    // buffer's earlier GPU passes have run.
     backend.refuse.replace(Some((true, vec![0, 1])));
     let host = NativeHost::new(backend);
     let mem = vec![0u8; 0x4000].into_boxed_slice();
@@ -214,8 +217,26 @@ fn only_the_fills_of_refused_passes_are_paid_on_the_cpu() {
     list.fill(alias + 0x200, 4, 0x5A); // pass 2: kept, runs on the GPU
     let err = host.execute(&(), &[&list], &[], &[]);
     assert!(err.is_err(), "the backend refused passes 0 and 1");
-    assert_eq!(&mem[0x100..0x108], &[0xAB; 8], "the refused pass's fill was not paid");
+    assert_eq!(&mem[0x100..0x108], &[0; 8], "a committed failure's fills are the backend's (re-encoded)");
     assert_eq!(&mem[0x200..0x204], &[0; 4], "a kept pass's fill must stay with the GPU");
+}
+
+/// A submission that never committed lost every pass, and no GPU work of its is in flight: the
+/// host pays all of its fills on the CPU, so a waiter on one goes on (#80).
+#[test]
+fn an_uncommitted_failure_pays_every_fill_on_the_cpu() {
+    let backend = Capture::default();
+    backend.refuse.replace(Some((false, vec![])));
+    let host = NativeHost::new(backend);
+    let mem = vec![0u8; 0x4000].into_boxed_slice();
+    let alias = aliased_pool(&host, &mem);
+    let mut list = NativeList::default();
+    list.fill(alias + 0x100, 8, 0xAB);
+    list.fill(alias + 0x200, 4, 0x5A);
+    let err = host.execute(&(), &[&list], &[], &[]);
+    assert!(err.is_err(), "the backend refused the submission");
+    assert_eq!(&mem[0x100..0x108], &[0xAB; 8], "the first fill was paid");
+    assert_eq!(&mem[0x200..0x204], &[0x5A; 4], "the second fill was paid");
 }
 
 #[test]
