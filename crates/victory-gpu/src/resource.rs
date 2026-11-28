@@ -2486,6 +2486,38 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
 
+    /// The texture budget counts a copy by its layout's size (`texture_layout(..).size`); what the
+    /// title is told to allocate (`footprint`) is never less, so the count never runs past the
+    /// memory the title gave textures: mips, arrays, block-compressed formats and mip tails.
+    #[test]
+    fn a_textures_counted_size_is_never_more_than_its_footprint() {
+        for (width, height, mips, layers, format, layout) in [
+            (1920u64, 1080u32, 1u16, 1u16, 28u32, 0x100 | 9),
+            (2048, 2048, 12, 1, 71, 0x100 | 9),
+            (1024, 512, 11, 6, 98, 0x100 | 9),
+            (64, 64, 7, 1, 28, 0),
+            (100, 37, 6, 3, 28, 1),
+            (8, 8, 4, 1, 77, 0x100 | 5),
+        ] {
+            let desc = ResourceDesc {
+                dimension: 3,
+                alignment: 0,
+                width,
+                height,
+                depth_or_array_size: layers,
+                mip_levels: mips,
+                format,
+                sample_count: 1,
+                sample_quality: 0,
+                layout,
+                flags: 0,
+            };
+            let counted = texture_layout(&desc).expect("a layout").size;
+            let allocated = footprint(&desc).expect("a footprint").size;
+            assert!(counted <= allocated, "{desc:?}: {counted} > {allocated}");
+        }
+    }
+
     #[test]
     fn a_regions_rows_in_a_footprint() {
         // R32_FLOAT (41) 100x8x1, pitch 512.

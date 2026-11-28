@@ -7,13 +7,17 @@
 
 use super::addr::{self, Mapping, Pages, Pairs};
 use super::descriptors::{Decoded, Res, decode, typed_buffer};
-use super::list::{Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, Targets};
+use super::list::{
+    Binding, Cmd, ComputePso, NativeHeap, NativeList, Root, StageHeapAccess, StageHeapElem, Targets,
+};
 use super::memory::PoolTable;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use victory_backend::backend::{Dispatch, Heaps, RootArgs};
+use victory_backend::backend::{
+    Dispatch, HeapAccess, HeapRange, Heaps, RootArgs, STAGE_FIRST, STAGE_FRAGMENT,
+};
 use victory_backend::resources::*;
 
 #[cfg(test)]
@@ -23,8 +27,9 @@ thread_local! {
 }
 
 /// Buffers over ranges of the title's own addresses, by `(start, end)`: the signature of the
-/// mappings they were made over, when they were last used, and the buffer.
-type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, Rc<Buf>)>>;
+/// mappings they were made over, the pool-table generation last verified against, when they were
+/// last used, and the buffer.
+type TitleAliases<Buf> = RefCell<HashMap<(u64, u64), (u64, u64, u64, Rc<Buf>)>>;
 
 /// Buffers in the host's own memory by `(start, key)`: their end and their wrap once made.
 type OwnBuffers<Buf> = RefCell<std::collections::BTreeMap<(u64, usize), (u64, Option<Rc<Buf>>)>>;
@@ -48,6 +53,9 @@ pub struct NativeHost<B: GraphicsBackend> {
     own: OwnBuffers<B::Buffer>,
     /// Counts changes to [`Self::resources`], so unrealized table entries retry once registered.
     resources_epoch: std::cell::Cell<u64>,
+    /// Textures made without their top levels (`VICTORY_TEXTURE_DROP_TOP_MIP`): key to
+    /// (levels dropped, levels the host texture has).
+    dropped: RefCell<HashMap<usize, (usize, usize)>>,
     heaps: RefCell<Vec<Rc<NativeHeap<B>>>>,
     contract: RefCell<Contract<B>>,
     /// Draws and dispatches dropped because they read a root parameter the title never set.
@@ -70,6 +78,53 @@ pub struct NativeHost<B: GraphicsBackend> {
     /// The same keys always, for the title side to stop filling them from title memory
     /// ([`Self::take_gpu_written`]).
     gpu_written: RefCell<std::collections::HashSet<usize>>,
+    /// Colour twins of depth textures compute writes, by the depth texture's address
+    /// ([`Self::depth_twin`]).
+    twins: RefCell<HashMap<usize, Rc<DepthTwin<B>>>>,
+    /// Textures given up under the texture budget (`Title::keep_to_budget`) and not made again.
+    evicted: RefCell<std::collections::HashSet<usize>>,
+    /// Evicted textures an entry's record named since the last [`Self::take_wanted`].
+    wanted: RefCell<Vec<usize>>,
+    /// Textures a heap entry showed through an unordered access view: what a shader may write,
+    /// so the host texture may hold what title memory does not and is never given up.
+    unordered: RefCell<std::collections::HashSet<usize>>,
+}
+
+/// Which side of a [`DepthTwin`] holds the newer contents.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TwinNewer {
+    Depth,
+    Twin,
+    Both,
+}
+
+/// One `(slice, mip)` subresource's layout in [`DepthTwin::stage`].
+#[derive(Clone, Copy)]
+struct TwinRoute {
+    mip: usize,
+    slice: usize,
+    width: usize,
+    height: usize,
+    row_pitch: usize,
+    slice_pitch: usize,
+    offset: usize,
+}
+
+/// A colour texture standing in for a depth texture that compute writes ([`NativeHost::depth_twin`]).
+/// Metal does not support shader writes to a depth texture, so the title's unordered views of its depth plane,
+/// and its depth-plane shader reads made after the first of those, get this twin. The newer
+/// contents move between the two by copies where the use changes ([`NativeHost::twin_copies`]):
+/// into the twin before a compute pass or a render pass that may sample it, into the depth texture
+/// before a render pass whose depth target it is or a copy to or from it.
+pub(crate) struct DepthTwin<B: GraphicsBackend> {
+    depth: std::rc::Weak<B::Texture>,
+    texture: Rc<B::Texture>,
+    /// A buffer the copies go through: Metal copies a depth plane to and from buffers only.
+    stage: Pages<B>,
+    routes: Vec<TwinRoute>,
+    /// Bytes of a texel of the depth plane, and of the twin: 2 for 16-bit depth, else 4.
+    texel: usize,
+    newer: Cell<TwinNewer>,
 }
 
 /// Warns that a dropped command was a fill: a bottom-of-pipe value write, which another queue's
@@ -112,6 +167,26 @@ impl<B: GraphicsBackend> Default for Contract<B> {
     }
 }
 
+// By hand: `B` itself is not `Clone`.
+impl<B: GraphicsBackend> Clone for Prep<B> {
+    fn clone(&self) -> Self {
+        Prep {
+            root: self.root.clone(),
+            ps_root: self.ps_root.clone(),
+            bufs: self.bufs.clone(),
+            vertex: self.vertex.clone(),
+            index: self.index.clone(),
+            blit: self.blit.clone(),
+            indirect: self.indirect.clone(),
+            count: self.count.clone(),
+            heap: self.heap.clone(),
+            heap_all_stages: self.heap_all_stages,
+            heap_all_writes: self.heap_all_writes,
+            heap_ranges: self.heap_ranges,
+        }
+    }
+}
+
 /// What one command resolved to: title addresses are made into buffers here, kept alive until the
 /// submission has been handed over.
 struct Prep<B: GraphicsBackend> {
@@ -128,6 +203,81 @@ struct Prep<B: GraphicsBackend> {
     count: Option<(Rc<B::Buffer>, *const u8, u32)>,
     /// The resource heap the work needs in place of the one the title bound (none bound).
     heap: Option<Rc<NativeHeap<B>>>,
+    /// Unbounded stage bits (`STAGE_FIRST`, `STAGE_FRAGMENT`), whether any unbounded stage may
+    /// write to the resource heap, and `[start, end)` into `execute`'s shared `HeapRange` buffer.
+    heap_all_stages: u8,
+    heap_all_writes: bool,
+    heap_ranges: (usize, usize),
+}
+
+fn push_stage_heap_ranges<B: GraphicsBackend>(
+    stage: &StageHeapAccess,
+    fragment: bool,
+    root: &[Option<Root<B>>],
+    bound_heap: Option<&Rc<NativeHeap<B>>>,
+    p: &mut Prep<B>,
+    ranges_from: usize,
+    ranges: &mut Vec<HeapRange>,
+) {
+    if stage.unbounded {
+        p.heap_all_stages |= if fragment { STAGE_FRAGMENT } else { STAGE_FIRST };
+        p.heap_all_writes |= stage.unbounded_writes;
+        if stage.unbounded_writes {
+            return;
+        }
+    }
+    let max_idx = victory_shader::emit::HEAP_VIEWS as usize - 1;
+    let mut push = |start: usize, end: usize, writes: bool| {
+        if start >= end || (stage.unbounded && !writes) {
+            return;
+        }
+        if ranges.len() > ranges_from
+            && let Some(last) = ranges.last_mut()
+            && last.end == start
+            && last.writes == writes
+            && last.fragment == fragment
+        {
+            last.end = end;
+        } else {
+            ranges.push(HeapRange {
+                start,
+                end,
+                writes,
+                fragment,
+            });
+        }
+    };
+    for &elem in &stage.bounded {
+        match elem {
+            StageHeapElem::Table { slot, offset, writes } => {
+                if let Some(Some(Root::Table(h, at))) = root.get(usize::from(slot))
+                    && h.kind == HeapKind::Resource
+                {
+                    let idx = (*at + offset as usize).min(max_idx);
+                    push(idx, idx + 1, writes);
+                }
+            }
+            StageHeapElem::Pairs { writes } => {
+                if let Some(bh) = bound_heap {
+                    let pairs = bh.pairs.get().1;
+                    push(bh.count, bh.count + 2 * pairs, writes);
+                }
+            }
+            StageHeapElem::Fixed { index, writes } => {
+                let idx = (index as usize).min(max_idx);
+                push(idx, idx + 1, writes);
+            }
+        }
+    }
+}
+
+/// The bytes of an `ExecuteIndirect` argument record of `cmd`'s kind.
+fn indirect_size<B: GraphicsBackend>(cmd: &Cmd<B>) -> u64 {
+    match cmd {
+        Cmd::Draw { call: DrawCall::Indexed { .. }, .. } => 20,
+        Cmd::Draw { call: DrawCall::Arrays { .. } | DrawCall::Rects, .. } => 16,
+        _ => 12,
+    }
 }
 
 enum Group {
@@ -171,6 +321,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
             resources: RefCell::default(),
             own: RefCell::default(),
             resources_epoch: std::cell::Cell::new(0),
+            dropped: RefCell::default(),
             heaps: RefCell::default(),
             contract: RefCell::default(),
             unset_roots: std::cell::Cell::new(0),
@@ -182,6 +333,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
             typed_views: std::cell::Cell::new(0),
             written: Default::default(),
             gpu_written: Default::default(),
+            twins: RefCell::default(),
+            evicted: Default::default(),
+            wanted: Default::default(),
+            unordered: Default::default(),
         }
     }
 
@@ -239,11 +394,49 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// The buffer and pool-mapping address of `[addr, addr + len)` of title memory.
     /// Outside every pool, a buffer in the host's own memory that holds the whole range.
     pub fn resolve(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
+        crate::native::freed::check(addr, len, "resolve");
         self.forget_released();
         match self.memory.resolve(addr, len) {
             Some((pool, ptr)) => Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr)),
             None => self
                 .own_buffer(addr, len)
+                .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}")),
+        }
+    }
+
+    /// As [`Self::resolve`], falling back to [`Self::title_alias`] when `[addr, addr + len)` is
+    /// mapped without gaps across non-adjacent pool pages or multiple pools.
+    pub fn resolve_or_alias(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
+        self.resolve(addr, len).or_else(|e| {
+            self.title_alias(addr, len)
+                .map(|(b, p, _)| (b, p))
+                .ok_or(e)
+        })
+    }
+
+    /// Resolves the mapped prefix of `[addr, addr + len)` for a hardware vertex or index buffer
+    /// view: uses the pool buffer directly when all mapped pages of the view follow linearly in one
+    /// pool, wraps the title's own virtual pages via [`Self::title_alias`] when the mapped prefix
+    /// spans descending or scattered pool pages (even if a reserved buffer's `SizeInBytes` extends
+    /// past its mapped tail), and falls back to [`Self::own_buffer`] outside every pool.
+    pub fn resolve_span(&self, addr: u64, len: u64) -> Result<(Rc<B::Buffer>, *const u8), String> {
+        let len = len.max(1);
+        crate::native::freed::check(addr, len, "resolve");
+        self.forget_released();
+        match self.memory.resolve_prefix(addr, len) {
+            Some(super::memory::ResolvedPrefix::Linear(pool, ptr)) => {
+                Ok((self.pool_buffer(pool.id, pool.base, pool.len)?, ptr))
+            }
+            Some(super::memory::ResolvedPrefix::Scattered(covered)) => {
+                if let Some((buf, ptr, _)) = self.title_alias(addr, covered) {
+                    Ok((buf, ptr))
+                } else {
+                    self.resolve(addr, 1)
+                }
+            }
+            None => self
+                .own_buffer(addr, len)
+                .or_else(|| self.own_buffer(addr, 1))
                 .ok_or_else(|| format!("title address {addr:#x}+{len:#x} {NOT_MAPPED}")),
         }
     }
@@ -280,7 +473,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
         // mirrors make new ones. The others stay, so a heap entry mirrored again reuses its wrap
         // (dropping them all made a new 174 MB wrap at each release, while the old ones stayed
         // alive in the heap entries and in-flight work: Metal's count rose by gigabytes).
-        self.aliases.borrow_mut().retain(|&(base, end), (sig, _, _)| self.memory.signature(base, end - base) == Some(*sig));
+        let generation = self.memory.generation();
+        self.aliases.borrow_mut().retain(|&(base, end), (sig, g, _, _)| {
+            let ok = self.memory.signature(base, end - base) == Some(*sig);
+            if ok {
+                *g = generation;
+            }
+            ok
+        });
         let mut buffers = self.buffers.borrow_mut();
         let mut c = self.contract.borrow_mut();
         for &id in &gone {
@@ -304,7 +504,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// their instances through a heap view of 174 MB whose pages the title mapped from scattered
     /// pool pages (#258); the null view gave them zeros. A wrap is reused while the mappings under
     /// it are the same ([`PoolTable::signature`]), made again when they change; every wrap a heap
-    /// entry shows is kept and 64 others at most, and those over a released pool's pages are
+    /// entry shows is kept, plus up to 1024 small wraps (`< 16 MiB`, e.g. multi-page vertex/index
+    /// buffers) and 64 large wraps (`>= 16 MiB`), and those over a released pool's pages are
     /// dropped. A range with a gap stays the null view. A wrap keeps
     /// the physical pages it was made over, so the heap entries that show one are mirrored again
     /// when the title's mappings under them change ([`Self::follow_title_pages`]).
@@ -313,9 +514,22 @@ impl<B: GraphicsBackend> NativeHost<B> {
     // its own with zero pages in the holes if a title reads a view it maps sparsely.
     fn title_alias(&self, addr: u64, len: u64) -> Option<(Rc<B::Buffer>, *const u8, u64)> {
         // Wraps kept for reuse: the heap entries that show one keep it alive themselves.
-        const KEPT: usize = 64;
+        const KEPT_SMALL: usize = 1024;
+        const KEPT_LARGE: usize = 64;
+        const LARGE_BYTES: u64 = 16 << 20;
         static USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (base, end) = Self::alias_range(addr, len)?;
+        let generation = self.memory.generation();
+        let now = USE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut aliases = self.aliases.borrow_mut();
+            if let Some((sig, g, used, b)) = aliases.get_mut(&(base, end))
+                && *g == generation
+            {
+                *used = now;
+                return Some((b.clone(), addr as *const u8, *sig));
+            }
+        }
         let Some(sig) = self.memory.signature(base, end - base) else {
             // A real gap: the title maps nothing at part of the view. It stays the null view.
             static GAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -324,13 +538,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             return None;
         };
-        let now = USE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut aliases = self.aliases.borrow_mut();
-        if let Some((s, used, b)) = aliases.get_mut(&(base, end))
-            && *s == sig
         {
-            *used = now;
-            return Some((b.clone(), addr as *const u8, sig));
+            let mut aliases = self.aliases.borrow_mut();
+            if let Some((s, g, used, b)) = aliases.get_mut(&(base, end))
+                && *s == sig
+            {
+                *g = generation;
+                *used = now;
+                return Some((b.clone(), addr as *const u8, sig));
+            }
         }
         // What a large wrap costs (#267 review): the process footprint and Metal's own count.
         #[cfg(target_os = "macos")]
@@ -338,7 +554,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         #[cfg(not(target_os = "macos"))]
         let footprint = || 0usize;
         let measure = || (footprint(), self.backend.allocated_bytes());
-        let before = (len >= 16 << 20).then(measure);
+        let before = (len >= LARGE_BYTES).then(measure);
         let buf = Rc::new(self.backend.wrap_title_memory(base as *mut u8, (end - base) as usize).ok()?);
         if let Some(before) = before {
             static BIG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -347,7 +563,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 tracing::info!(addr = format!("{addr:#x}"), len, signature = format!("{sig:#x}"), footprint_before = before.0, footprint_after = after.0, metal_before = before.1, metal_after = after.1, "a large buffer view wraps the title's own pages");
             }
         }
-        if aliases.len() >= KEPT {
+        let large = end - base >= LARGE_BYTES;
+        let mut aliases = self.aliases.borrow_mut();
+        let over = if large {
+            aliases.keys().filter(|&&(b, e)| e - b >= LARGE_BYTES).count() >= KEPT_LARGE
+        } else {
+            aliases.len() >= KEPT_SMALL
+        };
+        if over {
             // Only a wrap no heap entry shows goes: one that is shown would be made again, and the
             // entry's copy would stay alive beside it.
             let shown: std::collections::HashSet<(u64, u64, u64)> = self
@@ -365,14 +588,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 .collect();
             if let Some(&oldest) = aliases
                 .iter()
-                .filter(|&(&(b, e), &(s, _, _))| !shown.contains(&(b, e, s)))
-                .min_by_key(|(_, (_, used, _))| *used)
+                .filter(|&(&(b, e), &(s, _, _, _))| {
+                    (e - b >= LARGE_BYTES) == large && !shown.contains(&(b, e, s))
+                })
+                .min_by_key(|(_, (_, _, used, _))| *used)
                 .map(|(k, _)| k)
             {
                 aliases.remove(&oldest);
             }
         }
-        aliases.insert((base, end), (sig, now, buf.clone()));
+        aliases.insert((base, end), (sig, generation, now, buf.clone()));
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::info!(addr = format!("{addr:#x}"), len, "a buffer view not linear in its pool reads the title's own mapping (first time)");
@@ -401,12 +626,15 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// Mirrors again, once per pool-table change and before the work that reads them, the heap
-    /// buffer views over title memory no pool run holds whose pages changed since they were
-    /// written: a wrap whose mappings the title changed or removed, and a null view whose gap the
-    /// title has mapped since. A shader can load such an entry from the heap itself (the
+    /// buffer views over title memory whose pages changed since they were written: a view one
+    /// pool run holds or a wrap whose mappings the title changed or removed, and a null view whose
+    /// gap the title has mapped since. A shader can load such an entry from the heap itself (the
     /// G-buffer culling programs' 174 MB view, #258), so no bound table brings it back to
     /// [`Self::remirror_tables`], and the title writes the entry once, early, while it keeps
     /// mapping pages into the range. Costs one comparison while the pool table is unchanged.
+    // shortcut: every followed view's range is walked at each look (4.7 ms a look with up to
+    // 570,000 views in a 300 s world run); walk only the views over the ranges the pool table
+    // changed since the last look if the looks get slow.
     fn follow_title_pages(&self) {
         let generation = self.memory.generation();
         if self.followed.replace(generation) == generation {
@@ -493,6 +721,351 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.backend.create_texture(desc).map(Rc::new)
     }
 
+    /// The colour twin of depth texture `depth` (title texture `resource`) that `view` (decoded
+    /// `format`) shows instead of it, the format of that view, and any previously mirrored heap
+    /// handles that must be re-mirrored onto the new twin; made at the first unordered view of the
+    /// depth plane (object or placed). `None` for views that stay on the depth texture: stencil
+    /// formats (`R8Uint`), multi-channel formats, any view before the first unordered one, and
+    /// every view with `VICTORY_DEPTH_TWINS=0`.
+    ///
+    /// The lighting's material depth (1280x720, DXGI 118, the console's `D16_UNORM_S8_UINT`) is
+    /// written by compute through `R16_UNORM` views of its depth plane and `R8_UINT` views of its
+    /// stencil plane, then tested equal by the tiled light draws and read through DXGI 119 / 21
+    /// depth-plane SRVs. A view of the depth texture itself let compute write it, but Metal does
+    /// not support shader writes to a depth texture: a blit reads them, a later render pass's
+    /// depth test does not (M4 Pro; the test
+    /// `a_draw_tests_against_the_depth_compute_wrote_through_an_unordered_view`).
+    /// The host keeps that format as 32-bit float depth with stencil, so an `R16_UNORM` view of
+    /// it writes the twin as 32-bit floats. Guess: the title writes `k / 65535` there, the very
+    /// float its draws rasterise (VIctory's D3D12 path converts `k` to `k * 0x37800080`). A
+    /// 16-bit depth texture (`D16Unorm`: the shadow maps) has a 16-bit twin, copied bit for bit.
+    #[allow(clippy::type_complexity)]
+    fn depth_twin(
+        &self,
+        resource: usize,
+        depth: &Rc<B::Texture>,
+        format: Option<Format>,
+        view: &crate::descriptor::View,
+        resources: &HashMap<usize, Res<Rc<B::Texture>>>,
+    ) -> (Option<(Rc<B::Texture>, Format)>, Vec<u64>) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_none_or(|v| v != "0")) {
+            return (None, Vec::new());
+        }
+        if let Some(f) = format
+            && !matches!(
+                f,
+                Format::R32Float
+                    | Format::R32Uint
+                    | Format::R16Unorm
+                    | Format::R16Uint
+                    | Format::D32Float
+                    | Format::D32FloatS8
+                    | Format::D16Unorm
+            )
+        {
+            return (None, Vec::new());
+        }
+        let view_on = |texel: usize, fmt: Option<Format>| match (texel, fmt) {
+            (2, None | Some(Format::R16Unorm | Format::D16Unorm)) => Some(Format::R16Unorm),
+            (2, Some(Format::R16Uint)) => Some(Format::R16Uint),
+            (
+                4,
+                None | Some(Format::R32Float | Format::R16Unorm | Format::D32Float | Format::D32FloatS8),
+            ) => Some(Format::R32Float),
+            (4, Some(Format::R32Uint)) => Some(Format::R32Uint),
+            _ => None,
+        };
+        let at = Rc::as_ptr(depth) as usize;
+        let known = self
+            .twins
+            .borrow()
+            .get(&at)
+            .filter(|t| t.depth.upgrade().is_some_and(|d| Rc::ptr_eq(&d, depth)))
+            .map(|t| (t.texture.clone(), t.texel));
+        if let Some((texture, texel)) = known {
+            return (view_on(texel, format).map(|v| (texture, v)), Vec::new());
+        }
+        let unordered = matches!(
+            view,
+            crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..)
+        );
+        if !unordered || format.is_none() {
+            return (None, Vec::new());
+        }
+        let info = match view {
+            crate::descriptor::View::Placed(true, res, d) if res[0] > 1 => {
+                let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                placed_info_of(address, res)
+            }
+            _ => texture_info_of(resource),
+        };
+        let Some(info) = info else {
+            return (None, Vec::new());
+        };
+        let Some(desc) = info.desc() else {
+            return (None, Vec::new());
+        };
+        if !desc.format.is_depth() || !matches!(desc.dim, TexDim::D2 | TexDim::D2Array) {
+            return (None, Vec::new());
+        }
+        let (texel, twin_format) = if desc.format == Format::D16Unorm {
+            (2, Format::R16Unorm)
+        } else {
+            (4, Format::R32Float)
+        };
+        let Some(view_fmt) = view_on(texel, format) else {
+            return (None, Vec::new());
+        };
+        let (width, height, mips) = match self.dropped.borrow().get(&resource).copied() {
+            Some((dropped, host_mips)) if host_mips > 0 => (
+                (desc.width >> dropped).max(1),
+                (desc.height >> dropped).max(1),
+                host_mips,
+            ),
+            _ => (desc.width, desc.height, desc.mips.max(1)),
+        };
+        let slices = if desc.dim == TexDim::D2Array {
+            desc.depth_or_layers.max(1)
+        } else {
+            1
+        };
+        let mut routes = Vec::with_capacity(slices * mips);
+        let mut stage_bytes = 0usize;
+        for slice in 0..slices {
+            for mip in 0..mips {
+                let mw = (width >> mip).max(1);
+                let mh = (height >> mip).max(1);
+                let row_pitch = mw * texel;
+                let slice_pitch = row_pitch * mh;
+                let offset = stage_bytes;
+                stage_bytes = (stage_bytes + slice_pitch).next_multiple_of(256);
+                routes.push(TwinRoute {
+                    mip,
+                    slice,
+                    width: mw,
+                    height: mh,
+                    row_pitch,
+                    slice_pitch,
+                    offset,
+                });
+            }
+        }
+        let Ok(texture) = self.texture(&TextureDesc {
+            dim: desc.dim,
+            format: twin_format,
+            width,
+            height,
+            depth_or_layers: slices,
+            mips,
+            render_target: false,
+            unordered_access: true,
+        }) else {
+            return (None, Vec::new());
+        };
+        let Ok(stage) = Pages::new(&self.backend, stage_bytes.max(256)) else {
+            return (None, Vec::new());
+        };
+        tracing::info!(
+            format = info.format,
+            w = width,
+            h = height,
+            slices,
+            mips,
+            "a depth texture compute writes gets a colour twin"
+        );
+        let twin = DepthTwin {
+            depth: Rc::downgrade(depth),
+            texture: texture.clone(),
+            stage,
+            routes,
+            texel,
+            newer: Cell::new(TwinNewer::Depth),
+        };
+        self.twins.borrow_mut().insert(at, Rc::new(twin));
+        // Entries mirrored before (under this key or any placed-view alias sharing `depth`) still
+        // show the depth texture, including bindless heap entries outside `Root::Table` spans:
+        // collect their handles so `mirror` rewrites them immediately onto the twin.
+        let alias_keys: Vec<usize> = resources
+            .iter()
+            .filter_map(|(&k, r)| match r {
+                Res::Texture(t) if Rc::ptr_eq(t, depth) => Some(k),
+                _ => None,
+            })
+            .collect();
+        let mut stale = Vec::new();
+        for heap in self.heaps.borrow().iter() {
+            let step = Self::step(heap.kind);
+            for &key in &alias_keys {
+                for index in heap.take_entries(key) {
+                    heap.mirrored.borrow_mut().remove(&index);
+                    stale.push(heap.start + index as u64 * step);
+                }
+            }
+        }
+        (Some((texture, view_fmt)), stale)
+    }
+
+    /// The colour twin of depth texture `depth`, if it has one.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn twin_of(&self, depth: &Rc<B::Texture>) -> Option<Rc<B::Texture>> {
+        let twins = self.twins.borrow();
+        let twin = twins.get(&(Rc::as_ptr(depth) as usize))?;
+        twin.depth.upgrade().is_some_and(|d| Rc::ptr_eq(&d, depth)).then(|| twin.texture.clone())
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn is_mirrored(&self, handle: u64) -> bool {
+        self.heaps.borrow().iter().any(|h| {
+            handle
+                .checked_sub(h.start)
+                .map(|at| (at / Self::step(h.kind)) as usize)
+                .is_some_and(|idx| idx < h.count && h.mirrored.borrow().contains_key(&idx))
+        })
+    }
+
+    /// The copies between depth textures and their twins that a pass needs before it runs, as
+    /// `(twin, its depth texture, whether into the depth texture)`; notes which side holds the
+    /// newer contents after the pass ([`DepthTwin::newer`]). Before a compute pass (`compute`),
+    /// every twin whose depth texture is newer takes its contents and becomes `Twin`. Before a
+    /// render pass (`sample_twins`), every twin not named in `depths` whose depth texture is newer
+    /// takes its contents and becomes `Both` so draws sampling a shadow map or scene depth read
+    /// fresh texels without forcing a reverse copy later. For each `(depth, whole, writes)` in
+    /// `depths`, a newer twin goes into `depth` first (unless `whole`: a depth clear), leaving
+    /// `Depth` when `writes` is true and `Both` when only read.
+    #[allow(clippy::type_complexity)]
+    fn twin_copies(
+        &self,
+        compute: bool,
+        sample_twins: bool,
+        depths: &[(&Rc<B::Texture>, bool, bool)],
+    ) -> Vec<(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)> {
+        let mut out = Vec::new();
+        let mut twins = self.twins.borrow_mut();
+        if twins.is_empty() {
+            return out;
+        }
+        twins.retain(|_, t| t.depth.strong_count() > 0);
+        if compute || sample_twins {
+            for (&at, t) in twins.iter() {
+                let in_depths = depths.iter().any(|&(d, ..)| Rc::as_ptr(d) as usize == at);
+                if compute {
+                    if t.newer.get() == TwinNewer::Depth
+                        && let Some(d) = t.depth.upgrade()
+                    {
+                        out.push((t.clone(), d, false));
+                    }
+                    t.newer.set(TwinNewer::Twin);
+                } else if !in_depths
+                    && t.newer.get() == TwinNewer::Depth
+                    && let Some(d) = t.depth.upgrade()
+                {
+                    t.newer.set(TwinNewer::Both);
+                    out.push((t.clone(), d, false));
+                }
+            }
+        }
+        for &(d, whole, writes) in depths {
+            if let Some(t) = twins.get(&(Rc::as_ptr(d) as usize))
+                && t.depth.upgrade().is_some_and(|x| Rc::ptr_eq(&x, d))
+            {
+                if t.newer.get() == TwinNewer::Twin && !whole {
+                    out.push((t.clone(), d.clone(), true));
+                    t.newer.set(TwinNewer::Both);
+                }
+                if writes {
+                    t.newer.set(TwinNewer::Depth);
+                }
+            }
+        }
+        out
+    }
+
+    /// The depth textures the commands `cmds` draw into, clear (depth plane), or copy to or from,
+    /// for [`Self::twin_copies`]: `(texture, whole, writes)`. Stencil-only clears (`z.is_none()`)
+    /// leave the depth plane untouched.
+    fn twin_uses<'a>(&self, cmds: &[&'a Cmd<B>]) -> Vec<(&'a Rc<B::Texture>, bool, bool)> {
+        if self.twins.borrow().is_empty() {
+            return vec![];
+        }
+        let mut uses = vec![];
+        for &c in cmds {
+            match c {
+                Cmd::Draw { targets: Targets { depth: Some(d), .. }, .. } => uses.push((d, false, true)),
+                Cmd::Clear { depth: Some((d, Some(_), _)), .. } => uses.push((d, true, true)),
+                Cmd::CopyTexture { src, dst, .. } => uses.extend([(src, false, false), (dst, false, true)]),
+                Cmd::CopyTextureToBuffer { src, .. } => uses.push((src, false, false)),
+                Cmd::CopyBufferToTexture { dst, .. } => uses.push((dst, false, true)),
+                _ => {}
+            }
+        }
+        uses
+    }
+
+    /// [`Self::twin_copies`] for one depth texture, before a compute pass (`compute`) or a render
+    /// pass into it: whether each copy it would make goes into the depth texture (`true`) or
+    /// into the twin.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn twin_copies_for_test(&self, compute: bool, depth: &Rc<B::Texture>) -> Vec<bool> {
+        let depths: &[(&Rc<B::Texture>, bool, bool)] = if compute { &[] } else { &[(depth, false, true)] };
+        self.twin_copies(compute, !compute, depths).into_iter().filter(|c| Rc::ptr_eq(&c.1, depth)).map(|c| c.2).collect()
+    }
+
+    /// The blits that make `copies` ([`Self::twin_copies`]): every `(slice, mip)` subresource
+    /// through the twin's staging buffer, since Metal copies a depth plane only to and from
+    /// buffers (`DepthFromDepthStencil`).
+    #[allow(clippy::type_complexity)]
+    fn twin_blits<'a>(copies: &'a [(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)]) -> Vec<BlitOp<'a, B>> {
+        let mut ops = Vec::new();
+        for (twin, depth, to_depth) in copies {
+            let (src, dst): (&B::Texture, &B::Texture) = if *to_depth { (&twin.texture, depth) } else { (depth, &twin.texture) };
+            for r in &twin.routes {
+                // SAFETY: `r.offset + r.slice_pitch <= stage_bytes` by construction in `depth_twin`.
+                let stage = (&*twin.stage.buf, unsafe { twin.stage.ptr().cast_const().add(r.offset) });
+                ops.push(BlitOp::CopyTextureToBuffer {
+                    src,
+                    src_mip: r.mip,
+                    src_slice: r.slice,
+                    src_origin: [0; 3],
+                    size: [r.width, r.height, 1],
+                    dst: stage,
+                    len: r.slice_pitch,
+                    row_pitch: r.row_pitch,
+                    slice_pitch: r.slice_pitch,
+                });
+            }
+            for r in &twin.routes {
+                // SAFETY: as above.
+                let stage = (&*twin.stage.buf, unsafe { twin.stage.ptr().cast_const().add(r.offset) });
+                ops.push(BlitOp::CopyBufferToTexture {
+                    src: stage,
+                    len: r.slice_pitch,
+                    row_pitch: r.row_pitch,
+                    slice_pitch: r.slice_pitch,
+                    size: [r.width, r.height, 1],
+                    dst,
+                    dst_mip: r.mip,
+                    dst_slice: r.slice,
+                    dst_origin: [0; 3],
+                });
+            }
+        }
+        ops
+    }
+
+    /// The copies [`Self::twin_copies`] gives, run on the GPU now and waited for.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn run_twin_copies_for_test(&self, compute: bool, depth: &Rc<B::Texture>) -> usize {
+        let depths: &[(&Rc<B::Texture>, bool, bool)] = if compute { &[] } else { &[(depth, false, true)] };
+        let copies: Vec<_> = self.twin_copies(compute, !compute, depths).into_iter().filter(|c| Rc::ptr_eq(&c.1, depth)).collect();
+        let q = self.backend.create_queue().unwrap();
+        let f = self.backend.create_fence(0).unwrap();
+        let passes = [Pass::Blit(Self::twin_blits(&copies))];
+        self.backend.submit_passes(&q, &PassSubmission { waits: &[], passes: &passes, signals: &[(&f, 1)] }).unwrap();
+        assert!(self.backend.wait(&f, 1, 10_000), "GPU did not finish");
+        copies.len()
+    }
+
     /// Names a buffer resource object `key` (what `CreateShaderResourceView` is passed) at title memory.
     pub fn register_buffer(&self, key: usize, addr: u64, len: u64) {
         self.resources
@@ -508,7 +1081,19 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.own.borrow_mut().insert((addr, key), (addr.saturating_add(len), None));
     }
 
+    /// Records that texture `key` was made without its top `dropped` levels, `host_mips` left,
+    /// so views of it map the title's levels onto the host's.
+    pub fn set_dropped_levels(&self, key: usize, dropped: usize, host_mips: usize) {
+        let mut map = self.dropped.borrow_mut();
+        if dropped == 0 {
+            map.remove(&key);
+        } else {
+            map.insert(key, (dropped, host_mips));
+        }
+    }
+
     pub fn register_texture(&self, key: usize, texture: &Rc<B::Texture>) {
+        self.evicted.borrow_mut().remove(&key);
         self.resources
             .borrow_mut()
             .insert(key, Res::Texture(texture.clone()));
@@ -631,6 +1216,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
 
     /// The title released resource object `key`: later views naming it decode to nothing.
     pub fn forget_resource(&self, key: usize) {
+        self.forget_marks(key);
         if self.resources.borrow_mut().remove(&key).is_some() {
             self.resources_epoch.set(self.resources_epoch.get() + 1);
         }
@@ -644,6 +1230,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// texture at this address again ([`Self::register_texture`]). Its old record is not: it may
     /// name the next object at this address, of a format the view cannot be made over.
     pub fn release_resource(&self, key: usize) {
+        self.forget_marks(key);
         let removed = self.resources.borrow_mut().remove(&key);
         if removed.is_some() {
             self.resources_epoch.set(self.resources_epoch.get() + 1);
@@ -662,6 +1249,42 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 self.cleared.set(self.cleared.get() + 1);
             }
         }
+    }
+
+    /// What the host noted of texture `key`, which is gone for good (the next object at its
+    /// address starts afresh).
+    fn forget_marks(&self, key: usize) {
+        self.evicted.borrow_mut().remove(&key);
+        self.unordered.borrow_mut().remove(&key);
+    }
+
+    /// Gives up the host texture of `key` under the texture budget: as [`Self::release_resource`]
+    /// (no heap entry shows it, so none is cleared), but an entry that names it again asks for it
+    /// ([`Self::take_wanted`]).
+    pub(crate) fn evict_texture(&self, key: usize) {
+        self.release_resource(key);
+        self.evicted.borrow_mut().insert(key);
+    }
+
+    /// Whether `key` was given up under the texture budget and not made again since.
+    pub(crate) fn is_evicted(&self, key: usize) -> bool {
+        self.evicted.borrow().contains(&key)
+    }
+
+    /// The evicted textures entries named since the last call (`Title` makes them again).
+    pub(crate) fn take_wanted(&self) -> Vec<usize> {
+        std::mem::take(&mut self.wanted.borrow_mut())
+    }
+
+    /// Whether an entry ever showed texture `key` for unordered access.
+    pub(crate) fn ever_unordered(&self, key: usize) -> bool {
+        self.unordered.borrow().contains(&key)
+    }
+
+    /// Whether a heap entry shows texture `key` (shaders index heaps themselves, so a texture an
+    /// entry shows counts as used), or ever showed it for unordered access.
+    pub(crate) fn texture_in_use(&self, key: usize) -> bool {
+        self.unordered.borrow().contains(&key) || self.heaps.borrow().iter().any(|h| h.shows_texture(key))
     }
 
     /// Heap entries cleared so far because the texture they showed was released.
@@ -746,7 +1369,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if heap.kind == HeapKind::Resource
             && let Some(strides) = &*heap.strides.borrow()
         {
-            strides.write_at(index, &[self.stride_word(view.as_ref())]);
+            self.write_strides(strides, index, view.as_ref());
         }
         if heap.kind == HeapKind::Resource
             && let Some(addresses) = &*heap.addresses.borrow()
@@ -766,6 +1389,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if !matches!(decoded, Decoded::Buffer { .. }) {
             heap.title_views.borrow_mut().remove(&index);
         }
+        let mut remirror = Vec::new();
         match decoded {
             // A buffer view of address 0 (what D3D12 writes for a null view): the null view, and
             // mirrored like any other entry, whatever its size. Nothing is ever mapped at 0 here
@@ -790,8 +1414,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 let found = self.resolve(addr, u64::from(size)).map(|(b, p)| (b, p, None));
                 let (buf, ptr) = match found.map_or_else(|e| alias().ok_or(e), Ok) {
                     Ok((buf, ptr, wrapped)) => {
+                        // A view one pool run holds is followed as a wrap is: the title maps
+                        // other pool pages under the same addresses (memory it frees and takes
+                        // again) and writes the same record, so nothing else mirrors it again.
+                        // Memory outside the pool table (the host's own) has no signature.
+                        let sig = wrapped.or_else(|| self.alias_signature(addr, u64::from(size)));
                         let mut views = heap.title_views.borrow_mut();
-                        match wrapped {
+                        match sig {
                             Some(sig) => {
                                 views.insert(index, (addr, u64::from(size), Some(sig)));
                             }
@@ -847,25 +1476,46 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 mips,
                 slices,
                 format,
+                min_lod,
             } => {
                 let Some(Res::Texture(tex)) = resources.get(&resource) else {
+                    // An evicted texture: made again at the next submission, which writes this
+                    // entry then (registering bumps the epoch its retry waits for). Until then the
+                    // entry shows nothing rather than what it showed before.
+                    if self.evicted.borrow().contains(&resource) {
+                        self.wanted.borrow_mut().push(resource);
+                        self.backend.clear_entry(&heap.heap, index);
+                        heap.shows(index, None);
+                    }
                     return Ok(false);
                 };
+                // A depth-plane view of a depth texture that compute writes shows its twin.
+                let (twin, stale) = self.depth_twin(resource, tex, format, &view, &resources);
+                remirror = stale;
+                let (tex, format) = match &twin {
+                    Some((t, f)) => (t, Some(*f)),
+                    None => (tex, format),
+                };
+                if matches!(view, crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..)) {
+                    self.unordered.borrow_mut().insert(resource);
+                }
                 match (mips, format) {
                     (Some((first, count)), Some(format)) if count > 0 => {
+                        let (dropped, host_mips) = self.dropped.borrow().get(&resource).copied().unwrap_or((0, 0));
+                        let mips = super::textures::host_mip_range(first as usize, count as usize, dropped, host_mips);
                         let v = self.backend.create_texture_view(
                             tex,
                             &ViewDesc {
                                 format,
-                                mips: (first as usize, count as usize),
+                                mips,
                                 slices: slices.map_or((0, usize::MAX), |(first, count)| {
                                     (first as usize, count as usize)
                                 }),
                             },
                         )?;
-                        self.backend.write_texture(&heap.heap, index, &v, 0.0);
+                        self.backend.write_texture(&heap.heap, index, &v, min_lod);
                     }
-                    _ => self.backend.write_texture(&heap.heap, index, tex, 0.0),
+                    _ => self.backend.write_texture(&heap.heap, index, tex, min_lod),
                 }
                 heap.typed_pending.borrow_mut().set(index, false, false);
                 heap.shows(index, Some(resource));
@@ -877,8 +1527,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 heap.shows(index, None);
             }
         }
+        drop(resources);
         heap.pending_mirror.borrow_mut().remove(&index);
         heap.mirrored.borrow_mut().insert(index, record_at(handle));
+        for h in remirror {
+            if h != handle {
+                let _ = self.mirror(h);
+            }
+        }
         Ok(true)
     }
 
@@ -919,11 +1575,14 @@ impl<B: GraphicsBackend> NativeHost<B> {
             if h.kind != HeapKind::Resource {
                 continue;
             }
-            let end = (*at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count);
-            for index in *at..end {
-                match crate::descriptor::view(h.start + index as u64 * Self::step(h.kind)) {
-                    Some(crate::descriptor::View::Unordered(r, ..)) => written.push(r),
-                    Some(crate::descriptor::View::Placed(true, res, d)) if res[0] > 1 => {
+            let records: Vec<[u32; 3]> = Self::table_records(h, Self::table_span(h, slot, *at, binding))
+                .iter()
+                .map(|r| std::array::from_fn(|k| u32::from_le_bytes(r[4 * k..][..4].try_into().expect("4 bytes"))))
+                .collect();
+            for view in crate::descriptor::views_of(&records).into_iter().flatten() {
+                match view {
+                    crate::descriptor::View::Unordered(r, ..) => written.push(r),
+                    crate::descriptor::View::Placed(true, res, d) if res[0] > 1 => {
                         let address = u64::from(d[10]) | u64::from(d[11]) << 32;
                         written.push(super::textures::placed_key(address, &res));
                     }
@@ -937,6 +1596,77 @@ impl<B: GraphicsBackend> NativeHost<B> {
         self.gpu_written.borrow_mut().extend(written);
     }
 
+    /// The entries of the table bound at root `slot` from entry `at` that a submission checks
+    /// ([`Self::remirror_tables`]): as many as the shader's table ranges reach, at least
+    /// [`Self::TABLE_CHECK`], within the heap.
+    fn table_span(h: &NativeHeap<B>, slot: usize, at: usize, binding: Option<&Binding>) -> std::ops::Range<usize> {
+        at..(at + table_check_count(slot, binding, Self::TABLE_CHECK)).min(h.count)
+    }
+
+    /// The title's records of entries `span` of `h`: the whole span in one read (a system call),
+    /// entry by entry only if part of it cannot be read. Never plain loads: an unreadable record
+    /// reads as zeros.
+    fn table_records(h: &NativeHeap<B>, span: std::ops::Range<usize>) -> Vec<[u8; 12]> {
+        let step = Self::step(h.kind) as usize;
+        let mut bytes = vec![0u8; span.len() * step];
+        if super::safe_read((h.start + (span.start * step) as u64) as *const u8, &mut bytes) {
+            bytes.chunks(step).map(|r| r[..12].try_into().expect("12 bytes")).collect()
+        } else {
+            span.map(|index| record_at(h.start + (index * step) as u64)).collect()
+        }
+    }
+
+    /// The resources the records of the tables `lists`' draws and dispatches bind name now: the
+    /// entries [`Self::remirror_tables`] mirrors when the lists are encoded, so a texture named
+    /// there must be made before (the texture budget).
+    pub(crate) fn resources_named<'a>(
+        &self,
+        lists: impl Iterator<Item = &'a NativeList<B>>,
+    ) -> std::collections::HashSet<usize>
+    where
+        B: 'a,
+    {
+        use crate::descriptor::View;
+        let (mut tables, mut named) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        for cmd in lists.flat_map(|l| &l.cmds) {
+            let (root, binding) = match cmd {
+                Cmd::Dispatch { root, pso, .. } => (root, pso.binding.as_ref()),
+                Cmd::Draw { root, binding, .. } => (root, binding.as_deref()),
+                _ => continue,
+            };
+            for (slot, r) in root.iter().enumerate() {
+                let Some(Root::Table(h, at)) = r else { continue };
+                let span = Self::table_span(h, slot, *at, binding);
+                if h.kind != HeapKind::Resource || !tables.insert((h.start, span.clone())) {
+                    continue;
+                }
+                let step = Self::step(h.kind) as usize;
+                let mut records = vec![0u8; span.len() * step];
+                if !super::safe_read((h.start + (span.start * step) as u64) as *const u8, &mut records) {
+                    continue;
+                }
+                for (i, record) in records.chunks(step).enumerate() {
+                    if record[..12] == [0; 12] {
+                        continue;
+                    }
+                    match crate::descriptor::view(h.start + ((span.start + i) * step) as u64) {
+                        Some(View::Shader(r, _) | View::Unordered(r, ..)) => named.insert(r),
+                        Some(View::Placed(_, res, d)) => {
+                            named.insert(super::textures::placed_key(u64::from(d[10]) | u64::from(d[11]) << 32, &res))
+                        }
+                        _ => continue,
+                    };
+                }
+            }
+        }
+        named
+    }
+
+    /// Whether any texture is given up under the texture budget and not made again.
+    pub(crate) fn any_evicted(&self) -> bool {
+        !self.evicted.borrow().is_empty()
+    }
+
     /// Mirrors again the entries of each table `root` binds whose title record changed since
     /// they were last mirrored. The title copies records into its shader-visible heaps with plain
     /// stores (the content draws' constant buffers, from frame ~700), which no device call reports,
@@ -946,10 +1676,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let res_gen = self.resources_epoch.get();
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
-            let check = table_check_count(slot, binding, Self::TABLE_CHECK);
             let (mut checked, mut changed) = (0, 0);
             let step = Self::step(h.kind) as usize;
-            let end = (*at + check).min(h.count);
+            let end = Self::table_span(h, slot, *at, binding).end;
             if heap_set_trace().is_some() {
                 let frame = (crate::frame::current() as u32).saturating_add(1);
                 let mut used = h.used.borrow_mut();
@@ -958,17 +1687,8 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 }
                 used[*at..end].fill(frame);
             }
-            // The whole span in one read (a system call each); entry by entry only if part of it
-            // cannot be read.
-            let mut span = vec![0u8; end.saturating_sub(*at) * step];
-            let whole = super::safe_read((h.start + (*at * step) as u64) as *const u8, &mut span);
-            for index in *at..end {
+            for (index, record) in (*at..end).zip(Self::table_records(h, *at..end)) {
                 let handle = h.start + (index * step) as u64;
-                let record = if whole {
-                    span[(index - *at) * step..][..12].try_into().expect("12 bytes")
-                } else {
-                    record_at(handle)
-                };
                 checked += 1;
                 let seen = h.mirrored.borrow().get(&index).copied();
                 // An empty record is mirrored only if a view was mirrored there before: the title
@@ -1168,10 +1888,23 @@ impl<B: GraphicsBackend> NativeHost<B> {
         view.map_or(0, |v| super::descriptors::stride_word(v, &self.resources.borrow()))
     }
 
+    /// Writes entry `index`'s dwords of the view-stride table: its stride, and past the first
+    /// `HEAP_VIEWS` its minimum LOD clamp ([`super::descriptors::min_lod_word`]).
+    fn write_strides(&self, pages: &Pages<B>, index: usize, view: Option<&crate::descriptor::View>) {
+        // Shaders read no index past `HEAP_VIEWS`; the clamps follow there.
+        let views = victory_shader::emit::HEAP_VIEWS as usize;
+        if index < views {
+            pages.write_at(index, &[self.stride_word(view)]);
+            let lod = view.map_or(0, |v| super::descriptors::min_lod_word(v, &self.resources.borrow()));
+            pages.write_at(views + index, &[lod]);
+        }
+    }
+
     /// The view-stride table of `heap` (the translator's root SRV `t255`, which a shader that
     /// takes a buffer view from the resource heap itself looks up before it reads the entry).
     /// One dword for every index a shader can compute (`HEAP_VIEWS`): the buffer view's element
-    /// size at the title's entries, 0 elsewhere (the shader then reads the null buffer view).
+    /// size at the title's entries, 0 elsewhere (the shader then reads the null buffer view); then
+    /// as many for the texture views' minimum LOD clamps (0 elsewhere).
     /// Made at first use from the heap as the title's memory has it now and kept current by
     /// [`Self::mirror`] (also for a bound table's record the title zeroed with stores,
     /// [`Self::remirror_tables`]). shortcut: an entry the title copied or zeroed as bytes outside
@@ -1181,13 +1914,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
             return Ok(made.clone());
         }
         self.write_null_buffers(heap)?;
-        let slots = heap.count.max(victory_shader::emit::HEAP_VIEWS as usize);
-        let pages = Rc::new(Pages::new(&self.backend, slots * 4)?);
+        // A stride, then a LOD clamp, for every index a shader can compute.
+        let pages = Rc::new(Pages::new(&self.backend, victory_shader::emit::HEAP_VIEWS as usize * 8)?);
         let step = Self::step(heap.kind);
         for index in 0..heap.count {
             let view = crate::descriptor::view(heap.start + index as u64 * step);
             if view.is_some() {
-                pages.write_at(index, &[self.stride_word(view.as_ref())]);
+                self.write_strides(&pages, index, view.as_ref());
             }
         }
         *heap.strides.borrow_mut() = Some(pages.clone());
@@ -1561,19 +2294,35 @@ impl<B: GraphicsBackend> NativeHost<B> {
             Some(i) => format!("{r:#x}:f{}:{}x{}@{:#x}", i.format, i.width, i.height, i.memory as usize),
             None => format!("{r:#x}:buf"),
         };
+        // A shader-resource view's minimum LOD clamp (in the resource's mips), and its component
+        // mapping when not the default (the host does not apply one).
+        let clamp = |v: &[u32; 10]| {
+            let map = if v[2] == 0x1688 { String::new() } else { format!(":map{:#x}", v[2]) };
+            match super::descriptors::min_lod(v, 0) {
+                0.0 => map,
+                c => format!(":clamp{c}{map}"),
+            }
+        };
         for (slot, r) in root.iter().enumerate() {
             let Some(Root::Table(h, at)) = r else { continue };
             if h.kind != HeapKind::Resource {
                 continue;
             }
             let n = limits.iter().filter(|(s, _)| *s as usize == slot).map(|(_, n)| *n).max().unwrap_or(if limits.is_empty() { 24 } else { 0 });
-            // Not past the heap's end.
+            // Not past the heap's end; entries the shader names beyond it are counted.
+            let past = n.saturating_sub(h.count.saturating_sub(*at));
+            if past > 0 {
+                reads.push(format!("{slot}.past-heap={past}@{at}/{}", h.count));
+            }
             for k in 0..n.min(h.count.saturating_sub(*at)) as u64 {
                 match crate::descriptor::view(h.start + (*at as u64 + k) * Self::step(HeapKind::Resource)) {
-                    Some(View::Shader(r, _)) => match texture_info_of(r) {
-                        Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}", d(r, Some(i)))); }
+                    Some(View::Shader(r, desc)) => match texture_info_of(r) {
+                        Some(i) => { keys.push(r); reads.push(format!("{slot}.{k}={}{}", d(r, Some(i)), desc.as_ref().map(clamp).unwrap_or_default())); }
                         // Named too, so a table entry the host cannot draw from shows in the trace.
-                        None => reads.push(format!("{slot}.{k}={r:#x}:untracked")),
+                        None => {
+                            let buffer = matches!(self.resources.borrow().get(&r), Some(Res::Buffer(..)));
+                            reads.push(format!("{slot}.{k}={}", untextured_srv(r, buffer, desc)));
+                        }
                     },
                     Some(View::Unordered(r, _, _)) => {
                         if texture_info_of(r).is_some() { keys.push(r); }
@@ -1581,11 +2330,35 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     Some(View::Placed(u, res, v)) if res[0] > 1 => {
                         let address = u64::from(v[10]) | u64::from(v[11]) << 32;
-                        let s = format!("{slot}.{k}=placed:{}", d(address as usize, placed_info_of(address, &res)));
+                        let info = placed_info_of(address, &res);
+                        // Named for `PASSTEX` (per-mip contents of formats it does not decode).
+                        if info.is_some() && !u {
+                            keys.push(super::textures::placed_key(address, &res));
+                        }
+                        let s = format!("{slot}.{k}=placed:{}{}", d(address as usize, info), if u { String::new() } else { clamp(v[..10].try_into().unwrap()) });
                         if u { writes.push(s) } else { reads.push(s) }
                     }
-                    Some(View::Placed(u, res, _)) => {
-                        let s = format!("{slot}.{k}=placed-dim{}", res[0]);
+                    // A constant buffer view: its address, size and first dwords now (up to 512 bytes).
+                    Some(View::Constant(a, size)) => {
+                        let mut w = vec![0u8; (size as usize).clamp(4, 512) & !3];
+                        let ok = a != 0 && super::safe_read(a as *const u8, &mut w);
+                        let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
+                        reads.push(format!("{slot}.{k}=cbv:{a:#x}+{size}:{}", if ok { words.join(",") } else { "unreadable".into() }));
+                    }
+                    Some(v @ View::Placed(u, res, _)) => {
+                        // Dimension 1 is a buffer, which the host reads as memory: its range and first dwords (up to 512 bytes).
+                        let s = match res[0] {
+                            1 => match super::descriptors::decode(&v, &self.resources.borrow()) {
+                                Some(super::descriptors::Decoded::Buffer { addr, size }) => {
+                                    let mut w = vec![0u8; (size as usize).clamp(4, 512) & !3];
+                                    let ok = addr != 0 && super::safe_read(addr as *const u8, &mut w);
+                                    let words: Vec<String> = w.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap()))).collect();
+                                    format!("{slot}.{k}=placed:buf:{addr:#x}+{size}:desc{:?}:{}", if let View::Placed(_, _, d) = &v { &d[..10] } else { &[][..] }, if ok { words.join(",") } else { "unreadable".into() })
+                                }
+                                _ => format!("{slot}.{k}=placed:buf"),
+                            },
+                            n => format!("{slot}.{k}=placed-dim{n}"),
+                        };
                         if u { writes.push(s) } else { reads.push(s) }
                     }
                     Some(_) => {}
@@ -1594,6 +2367,38 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
         }
         (reads, writes, none, keys)
+    }
+
+    /// Pass trace: the table entries of a noted draw or dispatch as they are when it is submitted,
+    /// against its `PASS` line (made when it was recorded). A `PASSSUB` line lists the entries that
+    /// read differently now: the title rewrote them between recording and submitting.
+    #[cfg(target_os = "macos")]
+    fn pass_at_submit(&self, exec: u64, notes: &[(usize, String)], li: usize, ci: usize, c: &Cmd<B>) {
+        // Only work that ran: a dropped draw's note reads its tables to other limits.
+        let Some((_, note)) = notes.iter().find(|(at, n)| *at == ci && n.contains("out=\"ran")) else { return };
+        let (root, limits): (&[Option<Root<B>>], Vec<(u8, usize)>) = match c {
+            Cmd::Draw { root, binding, .. } => {
+                let mut limits: Vec<(u8, usize)> = Vec::new();
+                // As the `PASS` note read them (`glue::pass_note`).
+                if let Some(b) = binding {
+                    limits.extend(b.table_entries.iter().copied());
+                    if let Some(ps) = &b.ps {
+                        limits.extend(ps.table_entries.iter().copied());
+                    }
+                    if limits.is_empty() {
+                        limits.push((255, 0));
+                    }
+                }
+                (root, limits)
+            }
+            Cmd::Dispatch { root, .. } => (root, Vec::new()),
+            _ => return,
+        };
+        let (reads, writes, _, _) = self.pass_views(root, &limits);
+        let changed = changed_entries(note, reads.iter().chain(&writes));
+        if !changed.is_empty() {
+            eprintln!("PASSSUB exec={exec} li={li} ci={ci} changed={changed:?}");
+        }
     }
 
     /// For `VICTORY_TRACE_RECORD_WRITERS`: what the first 64 entries from each of `root`'s tables
@@ -1632,7 +2437,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     /// that is non-zero, and (8-bit colour textures) the title memory detiled and the host
     /// texture, written as `<dir>/c<n>_<entry>_{title,host}.ppm`.
     #[inline(never)]
-    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[(usize, u64)], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
+    fn trace_content(&self, root: &[Option<Root<B>>], vertex: &[(usize, u64, u32)], call: &victory_backend::resources::DrawCall, binding: Option<&Binding>, targets: &Targets<B>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -1702,7 +2507,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 None => "unset".into(),
             })
             .collect();
-        let head = vertex.first().map(|&(_, a)| {
+        let head = vertex.first().map(|&(_, a, _)| {
             let mut b = [0u8; 32];
             super::safe_read(a as *const u8, &mut b);
             b
@@ -1781,7 +2586,28 @@ impl<B: GraphicsBackend> NativeHost<B> {
         }
     }
 
-    fn prep(&self, cmd: &Cmd<B>) -> Result<Prep<B>, String> {
+    /// The preparations of records 1 to n - 1 of `cmd` ([`Cmd::Draw::records`]), from `p`, the
+    /// first's: each its own record, resolved as the first's, and count index.
+    fn more_records(&self, cmd: &Cmd<B>, p: &Prep<B>) -> Vec<Result<Prep<B>, String>> {
+        let (Cmd::Draw { indirect: Some(first), count, records: (stride, n), .. }
+        | Cmd::Dispatch { indirect: Some(first), count, records: (stride, n), .. }) = cmd
+        else {
+            return Vec::new();
+        };
+        (1..*n)
+            .map(|i| {
+                let mut q = p.clone();
+                q.indirect = Some(self.resolve_or_alias(first + u64::from(i) * u64::from(*stride), indirect_size(cmd))?);
+                if let (Some((b, at, _)), Some((_, index))) = (&p.count, count) {
+                    q.count = Some((b.clone(), *at, index + i));
+                }
+                Ok(q)
+            })
+            .collect()
+    }
+
+    fn prep(&self, cmd: &Cmd<B>, ranges: &mut Vec<HeapRange>) -> Result<Prep<B>, String> {
+        let range_start = ranges.len();
         let mut p = Prep {
             root: RootArgs::default(),
             ps_root: None,
@@ -1792,6 +2618,9 @@ impl<B: GraphicsBackend> NativeHost<B> {
             indirect: None,
             count: None,
             heap: None,
+            heap_all_stages: 0,
+            heap_all_writes: false,
+            heap_ranges: (range_start, range_start),
         };
         self.forget_released();
         match cmd {
@@ -1803,12 +2632,13 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 threads,
                 indirect,
                 count,
+                ..
             } => {
                 if let Some(a) = indirect {
-                    p.indirect = Some(self.resolve(*a, 12)?);
+                    p.indirect = Some(self.resolve_or_alias(*a, 12)?);
                 }
                 if let Some((a, index)) = count {
-                    let (b, at) = self.resolve(*a, 4)?;
+                    let (b, at) = self.resolve_or_alias(*a, 4)?;
                     p.count = Some((b, at, *index));
                 }
                 tracing::debug!(?groups, "dispatch");
@@ -1833,8 +2663,23 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     if b.view_addresses {
                         self.view_address_args(heaps.0.as_ref(), &mut p)?;
                     }
+                    let bh = p.heap.clone().or_else(|| heaps.0.clone());
+                    push_stage_heap_ranges(
+                        &b.heap_access,
+                        false,
+                        root,
+                        bh.as_ref(),
+                        &mut p,
+                        range_start,
+                        ranges,
+                    );
+                    p.heap_ranges = (range_start, ranges.len());
                 }
-                None => self.root_args(root, &mut p)?,
+                None => {
+                    self.root_args(root, &mut p)?;
+                    p.heap_all_stages = STAGE_FIRST;
+                    p.heap_all_writes = true;
+                }
             }},
             Cmd::Draw {
                 root,
@@ -1849,10 +2694,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
                 ..
             } => {
                 if let Some(a) = indirect {
-                    p.indirect = Some(self.resolve(*a, match call { DrawCall::Indexed { .. } => 20, DrawCall::Mesh { .. } => 12, DrawCall::Arrays { .. } | DrawCall::Rects => 16 })?);
+                    p.indirect = Some(self.resolve_or_alias(*a, indirect_size(cmd))?);
                 }
                 if let Some((a, index)) = count {
-                    let (b, at) = self.resolve(*a, 4)?;
+                    let (b, at) = self.resolve_or_alias(*a, 4)?;
                     p.count = Some((b, at, *index));
                 }
                 if !vertex.is_empty() {
@@ -1890,24 +2735,62 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                     None => self.root_args(root, &mut p)?,
                 }
-                for &(slot, address) in vertex {
-                    let (buffer, ptr) = self.resolve(address, 1)?;
-                    p.vertex.push((slot, buffer, ptr));
+                if !matches!(call, DrawCall::Mesh { .. }) {
+                    for &(slot, address, size) in vertex {
+                        let (buffer, ptr) = self.resolve_span(address, u64::from(size))?;
+                        p.vertex.push((slot, buffer, ptr));
+                    }
+                    if matches!(call, DrawCall::Indexed { .. })
+                        && let Some((a, size, _)) = index
+                    {
+                        p.index = Some(self.resolve_span(*a, u64::from(*size))?);
+                    }
                 }
-                if let Some((a, _)) = index {
-                    p.index = Some(self.resolve(*a, 1)?);
+                match binding {
+                    Some(b) => {
+                        let bh = p.heap.clone().or_else(|| heaps.0.clone());
+                        push_stage_heap_ranges(
+                            &b.heap_access,
+                            false,
+                            root,
+                            bh.as_ref(),
+                            &mut p,
+                            range_start,
+                            ranges,
+                        );
+                        if let Some(ps_access) = b
+                            .ps_heap_access
+                            .as_ref()
+                            .or_else(|| b.ps.as_ref().map(|ps| &ps.heap_access))
+                        {
+                            push_stage_heap_ranges(
+                                ps_access,
+                                true,
+                                root,
+                                bh.as_ref(),
+                                &mut p,
+                                range_start,
+                                ranges,
+                            );
+                        }
+                        p.heap_ranges = (range_start, ranges.len());
+                    }
+                    None => {
+                        p.heap_all_stages = STAGE_FIRST | STAGE_FRAGMENT;
+                        p.heap_all_writes = true;
+                    }
                 }
             }
             Cmd::Copy { dst, src, len } => {
-                p.blit.push(self.resolve(*src, *len as u64)?);
-                p.blit.push(self.resolve(*dst, *len as u64)?);
+                p.blit.push(self.resolve_or_alias(*src, *len as u64)?);
+                p.blit.push(self.resolve_or_alias(*dst, *len as u64)?);
             }
-            Cmd::Fill { dst, len, .. } => p.blit.push(self.resolve(*dst, *len as u64)?),
+            Cmd::Fill { dst, len, .. } => p.blit.push(self.resolve_or_alias(*dst, *len as u64)?),
             Cmd::CopyBufferToTexture { src, len, .. } => {
-                p.blit.push(self.resolve(*src, *len as u64)?);
+                p.blit.push(self.resolve_or_alias(*src, *len as u64)?);
             }
             Cmd::CopyTextureToBuffer { dst, len, .. } => {
-                p.blit.push(self.resolve(*dst, *len as u64)?);
+                p.blit.push(self.resolve_or_alias(*dst, *len as u64)?);
             }
             Cmd::CopyTexture { .. } | Cmd::Clear { .. } => {}
         }
@@ -1924,6 +2807,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
         signals: &[(&B::Fence, u64)],
     ) -> Result<(), String> {
         let _counted = super::descriptor_trace::Submission;
+        // `VICTORY_SUBMIT_TIMING=1`: this submission's CPU time, entry to commit, split into
+        // prep (everything before encoding: page following and per-command preparation) and
+        // encode+commit (#461).
+        let timing = env_set!("VICTORY_SUBMIT_TIMING");
+        let t0 = timing.then(std::time::Instant::now);
         self.follow_title_pages();
         // A draw or dispatch that reads a root parameter the title never set is dropped by itself:
         // refusing the whole piece for it also dropped the piece's value writes, and a queue that
@@ -1954,6 +2842,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let trace = env_set!("VICTORY_TRACE_TARGETS");
         let mut cmds: Vec<&Cmd<B>> = Vec::new();
         let mut preps = Vec::new();
+        let mut heap_ranges: Vec<HeapRange> = Vec::new();
         // Whether a pass ends before the kept command of that index, and the commands dropped since
         // the last kept one.
         let mut cut: Vec<bool> = Vec::new();
@@ -2000,7 +2889,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
             }
             // Reported from this one preparation: preparing again for the trace would mirror tables
             // and write view pairs twice.
-            let prepared = self.prep(c);
+            let prepared = self.prep(c, &mut heap_ranges);
+            #[cfg(target_os = "macos")]
+            if noted {
+                self.pass_at_submit(exec, &lists[li].notes, li, ci, c);
+            }
             if noted && let Err(e) = &prepared {
                 eprintln!("PASSFAIL exec={exec} li={li} ci={ci} err={e}");
             }
@@ -2011,8 +2904,24 @@ impl<B: GraphicsBackend> NativeHost<B> {
                         self.note_written(root, pso.binding.as_ref());
                     }
                     cut.push(dropped.drain(..).any(|d| !same(d, c)));
+                    // The other records of an `ExecuteIndirect`: the same preparation, each with
+                    // its own record (and count index), as if recorded one by one.
+                    let more = self.more_records(c, &p);
                     cmds.push(c);
                     preps.push(p);
+                    for q in more {
+                        match q {
+                            Ok(q) => {
+                                cut.push(false);
+                                cmds.push(c);
+                                preps.push(q);
+                            }
+                            Err(e) => {
+                                self.unmapped.set(self.unmapped.get() + 1);
+                                tracing::debug!(error = %e, "native host drops a record at unmapped title memory");
+                            }
+                        }
+                    }
                 }
                 Err(e)
                     if e.ends_with(NEVER_SET)
@@ -2122,6 +3031,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                 },
                                 None => heaps(h),
                             },
+                            heap_access: HeapAccess {
+                                all_stages: preps[k].heap_all_stages,
+                                all_writes: preps[k].heap_all_writes,
+                                ranges: &heap_ranges[preps[k].heap_ranges.0..preps[k].heap_ranges.1],
+                            },
                             groups: *groups,
                             threads_per_group: pso.threads,
                             indirect: preps[k].indirect.as_ref().map(|(b, p)| (&**b, *p)),
@@ -2133,8 +3047,25 @@ impl<B: GraphicsBackend> NativeHost<B> {
             })
             .collect();
 
+        // Copies between depth textures and their twins, before the passes that need them
+        // ([`Self::twin_copies`]).
+        #[allow(clippy::type_complexity)]
+        let twin_copies: Vec<Vec<(Rc<DepthTwin<B>>, Rc<B::Texture>, bool)>> = groups
+            .iter()
+            .map(|g| match *g {
+                Group::Compute(..) => self.twin_copies(true, false, &[]),
+                // A render pass has one depth target, its first draw's, and its shaders may sample
+                // any other depth twin.
+                Group::Render(a, _) => self.twin_copies(false, true, &self.twin_uses(&cmds[a..a + 1])),
+                Group::Clear(a) => self.twin_copies(false, false, &self.twin_uses(&cmds[a..a + 1])),
+                Group::Blit(a, b) => self.twin_copies(false, false, &self.twin_uses(&cmds[a..b])),
+            })
+            .collect();
         let mut passes: Vec<Pass<'_, B>> = vec![];
         for (n, g) in groups.iter().enumerate() {
+            if !twin_copies[n].is_empty() {
+                passes.push(Pass::Blit(Self::twin_blits(&twin_copies[n])));
+            }
             passes.push(match g {
                 Group::Compute(..) => Pass::Compute(&compute[n]),
                 Group::Blit(a, b) => Pass::Blit(
@@ -2303,6 +3234,11 @@ impl<B: GraphicsBackend> NativeHost<B> {
                                         },
                                         None => heaps(h),
                                     },
+                                    heap_access: HeapAccess {
+                                        all_stages: preps[k].heap_all_stages,
+                                        all_writes: preps[k].heap_all_writes,
+                                        ranges: &heap_ranges[preps[k].heap_ranges.0..preps[k].heap_ranges.1],
+                                    },
                                     resources: preps[k].bufs.iter().map(|b| &**b).collect(),
                                     vertex_buffers: preps[k]
                                         .vertex
@@ -2321,14 +3257,59 @@ impl<B: GraphicsBackend> NativeHost<B> {
             });
         }
         self.passes.set(self.passes.get() + passes.len() as u64);
-        self.backend.submit_passes(
+        let t_encode = t0.map(|_| std::time::Instant::now());
+        let submitted = self.backend.submit_passes(
             queue,
             &PassSubmission {
                 waits,
                 passes: &passes,
                 signals,
             },
-        )
+        );
+        if let Some(t0) = t0 {
+            let total = t0.elapsed();
+            let submit = t_encode.map(|t| t.elapsed()).unwrap_or_default();
+            let prep = total.checked_sub(submit).unwrap_or_default();
+            tracing::info!("{}", submit_timing_line(lists.len(), cmds.len(), prep, submit));
+        }
+        // A refused submission must not lose its bottom-of-pipe value writes: another queue waits
+        // on one of them with no other way to go on, and a lost write is the title's
+        // `Unsignaled CrossQueueBarrier`, which kills it (#80).
+        //
+        // A command buffer that committed carries the refused passes' fills itself: the backend
+        // re-encodes them as a blit pass of the same command buffer, in the GPU's order (after
+        // the passes that ran, before the fence signals), so a queue the fence releases or a
+        // value wait the CPU polls sees the writes only once this submission's earlier GPU passes
+        // have run. Paying them here instead would let a waiting queue go on before those passes
+        // ran, and a GPU fill that did run would then overwrite a newer value the title wrote.
+        //
+        // A submission that never committed lost every pass, and no GPU work of its is in
+        // flight: its fills are paid here on the CPU. Pass `n` is group `n` below.
+        if let Err(f) = &submitted
+            && !f.committed
+        {
+            let mut paid = 0usize;
+            for group in &groups {
+                let Group::Blit(a, b) = group else { continue };
+                for k in *a..*b {
+                    if let Cmd::Fill { len, value, .. } = cmds[k] {
+                        let (_, ptr) = &preps[k].blit[0];
+                        // SAFETY: the range lies inside a mapped pool's title memory: it resolved.
+                        unsafe { std::ptr::write_bytes(*ptr as *mut u8, *value, *len) };
+                        paid += 1;
+                    }
+                }
+            }
+            if paid > 0 {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!("native host pays a lost submission's value writes on the CPU (first time; each after at debug level)");
+                });
+                tracing::debug!("native host paid {paid} value writes of a submission that never committed on the CPU: {f}");
+            }
+        }
+        submitted.map_err(|e| e.to_string())
     }
 }
 
@@ -2341,6 +3322,73 @@ fn texture_info_of(r: usize) -> Option<super::textures::TextureInfo> {
 #[cfg(not(target_os = "macos"))]
 fn texture_info_of(_: usize) -> Option<super::textures::TextureInfo> {
     None
+}
+
+/// The pass trace's name for a shader-resource view the host has no texture for: a buffer the host
+/// knows (`<key>:buf`), a null resource with its view description's format and dimension
+/// (`null:f<format>:dim<dimension>`, read as zeros), or anything else (`<key>:untracked`).
+/// The entries (`<slot>.<index>=<view>`) of `now` that a `PASS` note does not hold as they are.
+#[cfg(any(test, target_os = "macos"))]
+fn changed_entries<'a>(note: &str, now: impl Iterator<Item = &'a String>) -> Vec<&'a String> {
+    now.filter(|e| !note.contains(&format!("\"{e}\""))).collect()
+}
+
+/// The `VICTORY_SUBMIT_TIMING=1` line for one `ExecuteCommandLists` (#461): the submission's
+/// CPU time from entry to commit, split into prep (page following and per-command preparation:
+/// translation, descriptor remirror, memory syncs) and encode+commit.
+fn submit_timing_line(
+    lists: usize,
+    cmds: usize,
+    prep: std::time::Duration,
+    submit: std::time::Duration,
+) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    format!(
+        "submit timing: lists={lists} cmds={cmds} prep={:.1}ms encode_commit={:.1}ms total={:.1}ms",
+        ms(prep),
+        ms(submit),
+        ms(prep + submit)
+    )
+}
+
+#[test]
+fn submit_timing_line_splits_prep_from_encode_commit() {
+    use std::time::Duration;
+    assert_eq!(
+        submit_timing_line(2, 17, Duration::from_micros(1500), Duration::from_micros(300)),
+        "submit timing: lists=2 cmds=17 prep=1.5ms encode_commit=0.3ms total=1.8ms"
+    );
+    assert_eq!(
+        submit_timing_line(0, 0, Duration::ZERO, Duration::ZERO),
+        "submit timing: lists=0 cmds=0 prep=0.0ms encode_commit=0.0ms total=0.0ms"
+    );
+}
+
+#[test]
+fn an_entry_rewritten_after_recording_is_listed_at_submit() {
+    let note = r#"kind=draw rd=["1.29=0x10:f54:240x135@0xa0", "1.30=null:f34:dim4"] wr=[]"#;
+    let now = ["1.29=0x10:f54:240x135@0xa0".to_owned(), "1.30=0x20:f34:1280x720@0xb0".to_owned()];
+    assert_eq!(changed_entries(note, now.iter()), [&now[1]]);
+    // A prefix of an entry is not that entry.
+    assert_eq!(changed_entries(r#"rd=["1.3=0x2"]"#, ["1.3=0x".to_owned()].iter()).len(), 1);
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn untextured_srv(r: usize, buffer: bool, desc: Option<[u32; 10]>) -> String {
+    match (r, desc) {
+        (0, Some(d)) => format!("null:f{}:dim{}", d[0], d[1]),
+        (0, None) => "null".into(),
+        _ if buffer => format!("{r:#x}:buf"),
+        _ => format!("{r:#x}:untracked"),
+    }
+}
+
+#[test]
+fn the_pass_trace_names_views_without_a_texture_by_kind() {
+    assert_eq!(untextured_srv(0, false, Some([34, 4, 0, 0, 0, 0, 0, 0, 0, 0])), "null:f34:dim4");
+    assert_eq!(untextured_srv(0, false, None), "null");
+    assert_eq!(untextured_srv(0x1000, true, None), "0x1000:buf");
+    assert_eq!(untextured_srv(0x1000, false, None), "0x1000:untracked");
 }
 
 #[cfg(target_os = "macos")]

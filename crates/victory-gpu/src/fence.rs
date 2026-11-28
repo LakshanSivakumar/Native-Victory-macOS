@@ -101,24 +101,23 @@ pub(crate) fn initial(this: This) -> u64 {
     fence(this).initial
 }
 
-/// Raises the value to what the GPU has reached (never lowers it) and wakes the events waiting.
+/// Synchronises the title's copy of the fence with the native host's current value (called under
+/// the title lock, so CPU `Signal`s and GPU completions apply in order, including rewinds).
 #[cfg(target_os = "macos")]
-pub(crate) fn raise(this: This, value: u64) {
-    // The test and the store are one step under the waiters' lock: two raisers (the host's timer
-    // and a title thread) must not store out of order, which would lower the value.
-    set_if(this, |now| now < value, value);
+pub(crate) fn sync_host(this: This, value: u64) {
+    set_if(this, |now| now != value, value);
 }
 
 extern "system" fn completed(this: This) -> u64 {
     #[cfg(target_os = "macos")]
-    raise(this, crate::native::glue::fence_poll(this));
+    crate::native::glue::fence_poll(this);
     // A title polling for a value: held work that may run now does first.
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     #[cfg(target_os = "macos")]
-    raise(this, crate::native::glue::fence_poll(this));
+    crate::native::glue::fence_poll(this);
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -135,7 +134,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         drop(waiters);
         let reached =
             crate::native::glue::fence_wait(this, value, std::time::Duration::from_secs(60));
-        raise(this, crate::native::glue::fence_poll(this));
+        crate::native::glue::fence_poll(this);
         return if reached { S_OK } else { E_NOTIMPL };
     }
     if event.is_null() {
@@ -151,7 +150,12 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 /// may run now (`crate::hold`).
 extern "system" fn signal(this: This, value: u64) -> HRESULT {
     #[cfg(target_os = "macos")]
-    crate::native::glue::fence_signal(this, value);
+    let hr = if crate::native::glue::fence_signal(this, value) {
+        S_OK
+    } else {
+        set(this, value)
+    };
+    #[cfg(not(target_os = "macos"))]
     let hr = set(this, value);
     crate::queue::pump_held(crate::queue::Why::Fence);
     hr

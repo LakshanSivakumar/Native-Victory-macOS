@@ -1,7 +1,7 @@
 //! Descriptor heaps, textures, samplers and render passes: the second slice of the seam (`backend`
 //! has queues, fences and compute). Platform neutral, no Metal types.
 
-use crate::backend::{ComputeBackend, Dispatch, Heaps, RootArgs, RootLayout};
+use crate::backend::{ComputeBackend, Dispatch, HeapAccess, Heaps, RootArgs, RootLayout};
 
 /// Which descriptor heap type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -630,6 +630,7 @@ pub struct Draw<'a, B: GraphicsBackend + ?Sized> {
     /// The pixel stage's own argument block, if it has one (else it reads `root`).
     pub fragment_root: Option<RootArgs>,
     pub heaps: Heaps<'a, B>,
+    pub heap_access: HeapAccess<'a>,
     pub resources: Vec<&'a B::Buffer>,
     /// `(input slot, buffer, title address)` for each bound vertex stream.
     pub vertex_buffers: Vec<(usize, &'a B::Buffer, *const u8)>,
@@ -724,6 +725,44 @@ pub struct PassSubmission<'a, B: GraphicsBackend + ?Sized> {
     pub signals: &'a [(&'a B::Fence, u64)],
 }
 
+/// Why a submission was not made as submitted, and what of it did not run: the caller pays for
+/// the lost work (a dropped pass's value writes never happen, and a queue waiting on one has no
+/// other way to go on).
+#[derive(Debug)]
+pub struct SubmitFailure {
+    /// The command buffer committed without the passes in `refused`. `false` when nothing was
+    /// committed at all, so every pass of the submission was lost.
+    pub committed: bool,
+    /// Indices into `PassSubmission::passes` dropped from a committed command buffer (a pass the
+    /// backend could not encode).
+    pub refused: Vec<usize>,
+    /// What failed: the first refusal's message, or why nothing was committed.
+    pub error: String,
+}
+
+impl SubmitFailure {
+    /// Nothing was committed: every pass of the submission was lost.
+    pub fn uncommitted(error: impl Into<String>) -> Self {
+        Self {
+            committed: false,
+            refused: Vec::new(),
+            error: error.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SubmitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.committed {
+            write!(f, "passes {:?} were refused: {}", self.refused, self.error)
+        } else {
+            write!(f, "nothing was committed: {}", self.error)
+        }
+    }
+}
+
+impl std::error::Error for SubmitFailure {}
+
 pub trait GraphicsBackend: ResourceBackend {
     type RenderPipeline;
 
@@ -745,7 +784,9 @@ pub trait GraphicsBackend: ResourceBackend {
         &self,
         queue: &Self::Queue,
         work: &PassSubmission<'_, Self>,
-    ) -> Result<(), String>;
+    ) -> Result<(), SubmitFailure>;
+    /// Names a render pipeline for diagnostics (`VICTORY_TRACE_GPU_FAILS`); the default does nothing.
+    fn name_render_pipeline(&self, _p: &Self::RenderPipeline, _name: &str) {}
 }
 
 /// Showing a texture of the title in a window.

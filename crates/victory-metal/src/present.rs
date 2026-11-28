@@ -40,6 +40,19 @@ fragment float4 present_fragment(Out in [[stage_in]], texture2d<float> source [[
 
 type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
+/// Whether the window showing the surfaces is minimised or wholly covered (its event loop says,
+/// [`set_window_hidden`]). macOS then hands out few drawables or none, and a present that waited
+/// for one held the title's presents back until the title stopped (#333). A hidden window's
+/// presents count as shown with nothing drawn, as a headless run's do.
+static HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the presents whether their window can be seen (see [`HIDDEN`]).
+pub fn set_window_hidden(hidden: bool) {
+    if HIDDEN.swap(hidden, std::sync::atomic::Ordering::Relaxed) != hidden {
+        tracing::info!(hidden, "present: the window's visibility changed");
+    }
+}
+
 // CAMetalLayer supports drawable acquisition on a background rendering thread. Only the
 // worker calls nextDrawable; ownership of each retained drawable crosses the channel once.
 struct AcquisitionLayer(Retained<CAMetalLayer>);
@@ -312,6 +325,14 @@ impl PresentBackend for Metal {
 
     fn try_present(&self, queue: &Queue, surface: &Surface, sources: &[&Texture]) -> Result<bool, String> {
         let Some(first) = sources.first() else { return Err("nothing to present".into()) };
+        // A hidden window shows nothing; a drawable asked for already is still taken below.
+        if HIDDEN.load(std::sync::atomic::Ordering::Relaxed) && !surface.acquiring.get() {
+            surface.frames.set(surface.frames.get() + 1);
+            if counting_green() {
+                surface.green.borrow_mut().presented();
+            }
+            return Ok(true);
+        }
         if !surface.acquiring.replace(true) {
             surface.acquisition.send(()).map_err(|_| "drawable worker stopped")?;
         }
@@ -419,7 +440,9 @@ mod tests {
     /// it by its alpha: clear where alpha is 0, its own colour where alpha is 1.
     #[test]
     fn a_second_plane_is_blended_over_the_first_by_its_alpha() {
-        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::metal::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use crate::backend::Submission;
         let Ok(metal) = Metal::new() else { return };
         let layer = metal.create_layer(4, 4);
@@ -445,8 +468,35 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_window_presents_without_a_drawable() {
+        let _one = crate::metal::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(metal) = Metal::new() else { return };
+        let layer = metal.create_layer(4, 4);
+        let mut surface = metal.create_surface(layer.as_ptr()).unwrap();
+        let queue = metal.create_queue().unwrap();
+        let source = metal.create_texture(&TextureDesc::d2(Format::Rgba8Unorm, 4, 4)).unwrap();
+        // A worker that never hands out a drawable, as macOS does for a minimised window.
+        let (requests, _requests_rx) = std::sync::mpsc::channel();
+        let (_results, drawables) = std::sync::mpsc::channel();
+        surface.acquisition = requests;
+        surface.drawables = drawables;
+        set_window_hidden(true);
+        let shown = (0..3).map(|_| metal.try_present(&queue, &surface, &[&source])).collect::<Vec<_>>();
+        set_window_hidden(false);
+        assert_eq!(shown, vec![Ok(true), Ok(true), Ok(true)]);
+        assert_eq!(surface.frames(), 3);
+        // Seen again: the present waits for a drawable as before.
+        assert_eq!(metal.try_present(&queue, &surface, &[&source]), Ok(false));
+        assert_eq!(surface.frames(), 3);
+    }
+
+    #[test]
     fn blocking_present_times_out_when_acquisition_never_returns() {
-        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = crate::metal::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Ok(metal) = Metal::new() else { return };
         let layer = metal.create_layer(4, 4);
         let mut surface = metal.create_surface(layer.as_ptr()).unwrap();

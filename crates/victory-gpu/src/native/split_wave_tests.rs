@@ -1346,6 +1346,49 @@ fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_wi
     assert_eq!(got[20..], [0; 12]);
 }
 
+/// A 32-lane program that swaps a mask into `s8` by three `s_xor_b64` of SGPR pairs (the tile
+/// classifiers swap their loop masks out of a waterfall loop so) on lanes 0..19, and joins it
+/// with the address the lanes that skip bring in `s8`; the join is ANDed with EXEC before EXEC
+/// is restored, so only the swapped edge's lanes need a bit. `last` is the third XOR.
+fn swapped_mask(last: u32) -> [u32; 17] {
+    [
+        0xBE88_0302, // s_mov_b32 s8, s2
+        0xBE89_0303, // s_mov_b32 s9, s3
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+        skip_execz(5),
+        0xD4C4_0000, 0x0002_008A, // v_cmp_gt_u32 s0, 10, v0
+        0x8988_0008, // s_xor_b64 s[8:9], s[8:9], s[0:1]
+        0x8980_0008, // s_xor_b64 s[0:1], s[8:9], s[0:1]
+        last,
+        0x8708_7E08, // join: s_and_b32 s8, s8, exec_lo
+        0xBEFE_0304, // s_mov_b32 exec_lo, s4
+        0xD501_0002, 0x0021_0280, // v_cndmask_b32 v2, 0, 1, s8
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+    ]
+}
+
+#[test]
+fn a_mask_swapped_into_a_pair_by_64_bit_xors_in_a_32_lane_wave_is_that_mask_at_a_join() {
+    // The swap's last XOR gives the mask back bit for bit, so the join holds lanes 0..9 on the
+    // edge that swapped it (was refused: "data, at a join of several edges").
+    let mut w = swapped_mask(0x8988_0008).to_vec(); // s_xor_b64 s[8:9], s[8:9], s[0:1]
+    w.push(S_ENDPGM);
+    assert_eq!(refusal32(&w), None);
+    // Look-alike: a third XOR with another pair is no swap; `s8` is the mask XORed with data.
+    let mut other = swapped_mask(0x8988_0208).to_vec(); // s_xor_b64 s[8:9], s[8:9], s[2:3]
+    other.push(S_ENDPGM);
+    let why = refusal32(&other);
+    assert!(why.as_ref().is_some_and(|r| r.contains("at a join of several edges")), "{why:?}");
+    let got = run32(&w, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..10], [1; 10]);
+    assert_eq!(got[10..], [0; 22]);
+}
+
 #[test]
 fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
     let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -1654,6 +1697,50 @@ fn a_mask_joined_with_data_on_an_exec_skips_edge_is_its_lanes_in_lockstep() {
 }
 
 #[test]
+fn a_mask_relayed_by_a_jump_and_read_only_with_exec_is_its_lanes_in_lockstep() {
+    // As above, with a second EXEC skip (on the flag, in s4) inside the region: the join of
+    // `s[10:11]` after it is only relayed by the fall-through into the block where it is ANDed
+    // with EXEC. Lanes below 40 pass the outer skip, those below the flag the inner one (and read
+    // lane 35); of those, the lanes below 8 are in the mask.
+    let w = [
+        0xD4C4_000A, 0x0202_0090, // v_cmp_gt_u32 s[10:11], 16, v0
+        0xBE8A_0385, // s_mov_b32 s10, 5
+        V_LSHLREV_V1_2_V0,
+        0x4A06_00FF, 0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+        skip_execz(8), // the outer skip, to the AND
+        0x7DA8_0004, // v_cmpx_gt_u32 s4, v0
+        skip_execz(5), // the inner skip, to the relay block
+        0xD760_0008, 0x0201_4703, // v_readlane_b32 s8, v3, 35
+        0x7E04_0208, // v_mov_b32 v2, s8
+        0xD4C4_000A, 0x0202_0088, // v_cmp_gt_u32 s[10:11], 8, v0
+        0xBE89_0380, // relay block: s_mov_b32 s9, 0
+        0x878C_7E0A, // s_and_b64 s[12:13], s[10:11], exec
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+        0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+        0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+        0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+        GLOBAL_STORE_V2_AT_V1[0], GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run(&w, 0, 40);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..8], [1042; 8]);
+    assert_eq!(got[8..40], [1035; 32]);
+    assert_eq!(got[40..], [0; 24]);
+    // Only lanes below 4 stay in EXEC past the `v_cmpx`; the others add nothing at the join.
+    let got = run(&w, 0, 4);
+    assert_eq!(got[..4], [1042; 4]);
+    assert_eq!(got[4..], [0; 60]);
+    // No lane enters at all.
+    assert_eq!(run(&w, 0, 0), [0; 64]);
+}
+
+#[test]
 fn a_loop_register_that_is_exec_on_every_edge_counts_the_lanes_still_looping() {
     let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Two nested loops keeping the lanes still looping in an SGPR beside EXEC (a copy of EXEC
@@ -1776,4 +1863,215 @@ fn a_wave_maximum_read_at_its_last_lane_after_its_section_is_the_maximum() {
 fn a_lane_holding_half_a_wave_maximum_is_refused() {
     let why = refusal(&max_read_at_lane(0));
     assert!(why.as_deref().is_some_and(|w| w.contains("no reduction or prefix")), "{why:?}");
+}
+
+/// A wave32 prefix sum as the title's compute programs end it: an inclusive sum in each row of 16
+/// lanes (`row_shr` 1, 2, 4, 8), then the upper row alone, under `s_bfm_b32 exec_lo, 16, 16`,
+/// adds lane 15 through `v_permlanex16_b32`. The `s_bfm` is a constant lane set, as an `s_mov` of
+/// 0xffff0000 is; it was refused as "s_bfm_b32 is not supported". Lane `i` stores the sum of
+/// `1..=i + 1` over the lanes that were on before the section, the others nothing.
+#[test]
+fn a_wave32_prefix_sum_whose_upper_row_s_bfm_selects_runs() {
+    let section = [
+        0x4A08_0081u32, // v_add_nc_u32 v4, 1, v0
+        0xBE88_3DC1,    // s_or_saveexec_b32 s8, -1
+        0xD501_0001,
+        0x0022_0880, // v_cndmask_b32_e64 v1, 0, v4, s8
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1
+        0x4A02_02FA,
+        0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+        0x4A02_02FA,
+        0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+        0x4A02_02FA,
+        0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+        0x927E_9090, // s_bfm_b32 exec_lo, 16, 16
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0xBEFE_0308, // s_mov_b32 exec_lo, s8
+        0x7E04_0301, // v_mov_b32 v2, v1
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let sum = |i: u32| (i + 1) * (i + 2) / 2;
+    let got = run32(&section, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, (0..32).map(sum).collect::<Vec<_>>());
+    // Lanes 20 and up off before the section: their terms are the identity and they store nothing.
+    let mut below_20 = vec![
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+    ];
+    below_20.extend(section);
+    let got = run32(&below_20, 0);
+    let want: Vec<u32> = (0..32).map(|i| if i < 20 { sum(i) } else { CANARY }).collect();
+    assert_eq!(got, want);
+}
+
+/// The wave64 form of the title's prefix sums: an inclusive sum in each row of 16 lanes, then the
+/// upper row of each half (`s_bitreplicate_b64_b32 exec, 0xff00ff00`) adds lane 15 of its half
+/// through `v_permlanex16_b32`, then the upper half (`s_bfm_b64 exec, 32, 32`) adds lane 31. Lane
+/// `i` stores the sum of `1..=i + 1`, across the two host waves of the console wave.
+#[test]
+fn a_wave64_prefix_sum_whose_rows_s_bitreplicate_and_s_bfm_select_runs() {
+    let words = [
+        0x4A08_0081u32, // v_add_nc_u32 v4, 1, v0
+        0xBE88_25C1,    // s_or_saveexec_b64 s[8:9], -1
+        0xD501_0001,
+        0x0022_0880, // v_cndmask_b32_e64 v1, 0, v4, s[8:9]
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1
+        0x4A02_02FA,
+        0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+        0x4A02_02FA,
+        0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+        0x4A02_02FA,
+        0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+        0xBEFE_3BFF,
+        0xFF00_FF00, // s_bitreplicate_b64_b32 exec, 0xff00ff00
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0x92FE_A0A0, // s_bfm_b64 exec, 32, 32
+        0xD760_0009,
+        0x0001_3F01, // v_readlane_b32 s9, v1, 31
+        0x4A02_0209, // v_add_nc_u32_e32 v1, s9, v1
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0x7E04_0301, // v_mov_b32 v2, v1
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    let got = run_io(&words, 0, 64, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, (0..64u32).map(|i| (i + 1) * (i + 2) / 2).collect::<Vec<_>>());
+}
+
+/// `v_sub_nc_u32` and `v_add_nc_u32` with the clamp bit saturate as unsigned numbers (`usubsat`
+/// and `uaddsat` in LLVM's AMDGPU backend): lane `i` stores `i - 5` clamped at 0, and
+/// `0xfffffff0 + i` clamped at 0xffffffff. They were refused as "integer output modifiers".
+#[test]
+fn clamped_unsigned_sums_and_differences_saturate() {
+    let program = |op: [u32; 2], v3: [u32; 2]| {
+        vec![
+            v3[0],
+            v3[1], // v_mov_b32 v3, <constant>
+            op[0],
+            op[1], // v_sub_nc_u32 / v_add_nc_u32 v2, v0, v3 clamp
+            V_LSHLREV_V1_2_V0,
+            GLOBAL_STORE_V2_AT_V1[0],
+            GLOBAL_STORE_V2_AT_V1[1],
+            S_ENDPGM,
+        ]
+    };
+    const V_NOP: u32 = 0x7E00_0000;
+    let sub = program([0xD526_8002, 0x0002_0700], [0x7E06_0285, V_NOP]); // v3 = 5
+    let got = run32(&sub, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, (0..32u32).map(|i| i.saturating_sub(5)).collect::<Vec<_>>());
+    let add = program([0xD525_8002, 0x0002_0700], [0x7E06_02FF, 0xFFFF_FFF0]); // v3 = 0xfffffff0
+    let got = run32(&add, 0);
+    assert_eq!(got, (0..32u32).map(|i| 0xFFFF_FFF0u32.saturating_add(i)).collect::<Vec<_>>());
+}
+
+/// A whole-wave f16 sum of the title's shape (`v_add_f16` steps keeping the high half: row
+/// butterflies, `v_permlanex16_b32` of lane 0, then lane 0 added into every lane), read at lane
+/// 63, in groups of two console waves, so the fast path splits each into two host waves. Each
+/// lane's term is `i & 3` as an f16 with 0x1234 in its high half. Lane 63 of each wave holds the
+/// wave's total in its low half (96.0; 60.0 for the first wave with lanes 40 and up off before the
+/// section, where the second has none on) and lane 63's high half (0x1234, or the identity's 0
+/// when lane 63 is off). It was refused as "a 16-bit wave reduction across the host's waves".
+#[test]
+fn a_whole_wave_half_sum_reads_across_the_host_waves() {
+    let section = [
+        0x3608_0083u32, // v_and_b32 v4, 3, v0
+        0x7E08_A104,    // v_cvt_f16_u16 v4, v4
+        0x3808_08FF,
+        0x1234_0000, // v_or_b32 v4, 0x12340000, v4
+        0xBE96_25C1, // s_or_saveexec_b64 s[22:23], -1
+        0xD501_000C,
+        0x005A_0880, // v_cndmask_b32_e64 v12, 0, v4, s[22:23]
+        0x6418_18FA,
+        0xFF00_B10C, // v_add_f16_dpp v12, v12, v12 quad_perm:[1,0,3,2]
+        0x6418_18FA,
+        0xFF00_4E0C, // v_add_f16_dpp v12, v12, v12 quad_perm:[2,3,0,1]
+        0x6418_18FA,
+        0xFF01_410C, // v_add_f16_dpp v12, v12, v12 row_half_mirror
+        0x6418_18FA,
+        0xFF01_400C, // v_add_f16_dpp v12, v12, v12 row_mirror
+        0xD778_000D,
+        0x0201_010C, // v_permlanex16_b32 v13, v12, 0, 0
+        0x6418_1B0C, // v_add_f16 v12, v12, v13
+        0xD760_000D,
+        0x0001_010C, // v_readlane_b32 s13, v12, 0
+        0x6418_180D, // v_add_f16 v12, s13, v12
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0xD760_000D,
+        0x0001_7F0C, // v_readlane_b32 s13, v12, 63
+        0x7E04_020D, // v_mov_b32 v2, s13
+        V_LSHLREV_V1_2_V0,
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal(&section), None);
+    let got = run_io(&section, 0, 128, 0);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got, vec![0x1234_5600; 128], "96.0 under lane 63's high half, in each wave");
+    let mut below_40 = LANES_BELOW_40.to_vec();
+    below_40.extend(section);
+    let got = run_io(&below_40, 0, 128, 0);
+    let want: Vec<u32> = (0..128).map(|i| if i < 40 { 0x0000_5380 } else { CANARY }).collect();
+    assert_eq!(got, want, "60.0, and lane 63 (off) holds the identity");
+}
+
+/// `v_cvt_pk_u16_u32` and `v_cvt_pk_i16_i32` saturate each source to 16 bits, src0 in the low
+/// half and src1 in the high one. Lane `i` packs `i << 12` (from lane 16 past 0xffff) and
+/// `0x10002 - i` (past 0xffff in lanes 0 to 2) unsigned; and `(i << 12) - 0x10000` (below -32768
+/// in lanes 0 to 7, above 32767 from lane 24) and `0x10002 - i` signed. They were refused by name.
+#[test]
+fn integer_pairs_pack_to_16_bits_with_saturation() {
+    let program = |signed: bool| {
+        let mut w = vec![
+            0x3406_008C, // v_lshlrev_b32 v3, 12, v0
+            0x4C08_00FF,
+            0x0001_0002, // v_sub_nc_u32 v4, 0x10002, v0
+        ];
+        if signed {
+            w.extend([0x4A06_06FF, 0xFFFF_0000]); // v_add_nc_u32 v3, 0xffff0000, v3
+        }
+        w.extend([
+            if signed { 0xD76B_0002 } else { 0xD76A_0002 },
+            0x0002_0903, // v_cvt_pk_{u16_u32,i16_i32} v2, v3, v4
+            V_LSHLREV_V1_2_V0,
+            GLOBAL_STORE_V2_AT_V1[0],
+            GLOBAL_STORE_V2_AT_V1[1],
+            S_ENDPGM,
+        ]);
+        w
+    };
+    let got = run32(&program(false), 0);
+    if got.is_empty() {
+        return;
+    }
+    let u = |x: u32| x.min(0xFFFF);
+    let want: Vec<u32> = (0..32u32).map(|i| u(i << 12) | u(0x10002 - i) << 16).collect();
+    assert_eq!(got, want, "unsigned");
+    let got = run32(&program(true), 0);
+    let s = |x: i32| x.clamp(-32768, 32767) as u32 & 0xFFFF;
+    let want: Vec<u32> =
+        (0..32i32).map(|i| s((i << 12) - 0x10000) | s(0x10002 - i) << 16).collect();
+    assert_eq!(got, want, "signed");
 }

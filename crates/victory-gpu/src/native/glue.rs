@@ -59,9 +59,88 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Shared>> {
     TITLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+use super::textures::{lock_traced, SYNC_PHASES};
+
+/// With [`lock_traced`]: `ExecuteIndirect` executions recorded, their records, and microseconds
+/// under the lock finding the pipeline (`graphics`, `pipe`) and recording the records.
+static INDIRECT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Adds one `ExecuteIndirect` of `records` to [`INDIRECT`]: begun at `start`, its pipeline found
+/// at `found`, its records recorded now.
+fn note_indirect(records: u32, start: std::time::Instant, found: std::time::Instant) {
+    if lock_traced() {
+        INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+        INDIRECT[1].fetch_add(u64::from(records), Ordering::Relaxed);
+        INDIRECT[2].fetch_add((found - start).as_micros() as u64, Ordering::Relaxed);
+        INDIRECT[3].fetch_add(found.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Adds one taking of `TITLE` at `at` (file, line) to the trace, and logs it once a second.
+fn note_lock(at: (&'static str, u32), wait: std::time::Duration, hold: std::time::Duration) {
+    type Stats = std::collections::HashMap<(&'static str, u32), [u64; 4]>;
+    static STATS: Mutex<Option<(std::time::Instant, Stats)>> = Mutex::new(None);
+    let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let (since, by) = stats.get_or_insert_with(|| (std::time::Instant::now(), Default::default()));
+    let s = by.entry(at).or_default();
+    let (wait, hold) = (wait.as_micros() as u64, hold.as_micros() as u64);
+    *s = [s[0] + 1, s[1] + wait, s[2] + hold, s[3].max(hold)];
+    if since.elapsed().as_secs() < 1 {
+        return;
+    }
+    let secs = since.elapsed().as_secs_f32();
+    let mut rows: Vec<_> = by.drain().collect();
+    rows.sort_by_key(|(_, s)| std::cmp::Reverse(s[2]));
+    let held: u64 = rows.iter().map(|(_, s)| s[2]).sum();
+    let waited: u64 = rows.iter().map(|(_, s)| s[1]).sum();
+    let top: Vec<String> = rows
+        .iter()
+        .take(12)
+        .map(|((file, line), s)| {
+            let file = file.rsplit('/').next().unwrap_or(file);
+            format!("{file}:{line} n={} held={}ms waited={}ms longest={}ms", s[0], s[2] / 1000, s[1] / 1000, s[3] / 1000)
+        })
+        .collect();
+    let phase = |i: usize| SYNC_PHASES[i].swap(0, Ordering::Relaxed) / 1000;
+    let indirect = |i: usize| INDIRECT[i].swap(0, Ordering::Relaxed);
+    tracing::info!(
+        "title lock in the last {secs:.1} s: held {} ms, waited {} ms; at submissions: keep_named {} ms, keep_to_budget {} ms, give_up_covered {} ms, probes {} ms; ExecuteIndirect: {} executions, {} records, pipelines {} ms, records {} ms; {}",
+        held / 1000,
+        waited / 1000,
+        phase(0),
+        phase(1),
+        phase(2),
+        phase(3),
+        indirect(0),
+        indirect(1),
+        indirect(2) / 1000,
+        indirect(3) / 1000,
+        top.join("; ")
+    );
+    *stats = None;
+}
+
 /// Runs `f` on the native host, made on first use; `None` if there is no Metal device (the call
 /// is then ignored, as when there is no host GPU on Windows).
+#[track_caller]
 pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
+    if !lock_traced() {
+        return with_title_untraced(f);
+    }
+    let at = std::panic::Location::caller();
+    let asked = std::time::Instant::now();
+    let mut got = None;
+    let r = with_title_untraced(|t| {
+        got = Some(std::time::Instant::now());
+        f(t)
+    });
+    if let Some(got) = got {
+        note_lock((at.file(), at.line()), got - asked, got.elapsed());
+    }
+    r
+}
+
+fn with_title_untraced<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
     let mut guard = lock();
     if guard.is_none() {
         if FAILED.load(Ordering::Relaxed) {
@@ -71,13 +150,23 @@ pub(crate) fn with_title<R>(f: impl FnOnce(&mut MetalTitle) -> R) -> Option<R> {
             Ok(metal) => {
                 let console = crate::console::current();
                 let (gpu_optimal, standard) = console.title_memory();
+                let budget =
+                    super::textures::texture_budget(std::env::var("VICTORY_METAL_TEXTURE_BUDGET_MB").ok().as_deref());
+                let suggested = super::textures::suggested_texture_budget(
+                    metal.recommended_working_set(),
+                    (gpu_optimal + standard) as u64,
+                );
                 tracing::info!(
                     console = console.name(),
                     title_memory_mib = (gpu_optimal + standard) / (1 << 20),
                     recommended_working_set_mib = metal.recommended_working_set() / (1 << 20),
+                    texture_budget_mib = budget >> 20,
+                    suggested_texture_budget_mib = suggested >> 20,
                     "native host: Metal"
                 );
-                *guard = Some(Shared(Title::new(metal, pools().clone())));
+                let mut title = Title::new(metal, pools().clone());
+                title.set_texture_budget(budget);
+                *guard = Some(Shared(title));
                 start_timer();
             }
             Err(e) => {
@@ -98,8 +187,15 @@ fn start_timer() {
         .spawn(|| {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                if let Some(t) = lock().as_mut() {
+                let asked = std::time::Instant::now();
+                let mut guard = lock();
+                let got = std::time::Instant::now();
+                if let Some(t) = guard.as_mut() {
                     refresh(&mut t.0);
+                }
+                drop(guard);
+                if lock_traced() {
+                    note_lock(("timer refresh", 0), got - asked, got.elapsed());
                 }
             }
         });
@@ -140,11 +236,12 @@ fn refresh(t: &mut MetalTitle) {
         }
     }
     for (fence, value) in t.completed() {
-        crate::fence::raise(fence as This, value);
+        crate::fence::sync_host(fence as This, value);
     }
 }
 
 /// Runs `f` on the native host and a title list's recording.
+#[track_caller]
 pub(crate) fn with_list<R>(
     this: This,
     f: impl FnOnce(&mut MetalTitle, &mut MetalList) -> R,
@@ -174,8 +271,25 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
     // test's submission with textures read but not yet uploaded would upset: there the lock is
     // kept from the probes to the uploads (`Title::submit`).
     let unlocked = !cfg!(test);
+    // The lists' snapshots hold `Rc`s the recording threads share: they are taken and dropped
+    // under the title lock, once here and once for the submission below.
+    let segments = |t: &MetalTitle| {
+        let mut segments = Vec::new();
+        for &l in lists.iter().filter(|l| !l.is_null()) {
+            let list = crate::list::native(l);
+            segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments(t));
+        }
+        segments
+    };
+    let mut named = Default::default();
     if unlocked {
-        let jobs = with_title(|t| t.sync_jobs()).unwrap_or_default();
+        let jobs = with_title(|t| {
+            if t.names_wanted() {
+                named = t.keep_named(segments(t).iter().map(|(l, _)| l));
+            }
+            t.sync_jobs()
+        })
+        .unwrap_or_default();
         for batch in super::textures::batches(jobs) {
             // Without the lock: the title's other threads go on recording.
             let prepared = super::textures::prepare(&batch);
@@ -190,18 +304,16 @@ pub(crate) fn submit(queue: This, lists: &[This]) {
             t.gpu_written(key);
         }
         if t.ensure_queue(queue as usize).is_err() {
+            t.let_named_go(named);
             return;
         }
-        let mut segments = Vec::new();
-        for &l in lists.iter().filter(|l| !l.is_null()) {
-            let list = crate::list::native(l);
-            segments.extend(list.lock().unwrap_or_else(|e| e.into_inner()).segments());
-        }
+        let segments = segments(t);
         if unlocked {
             t.submit_synced(queue as usize, segments);
         } else {
             t.submit(queue as usize, segments);
         }
+        t.let_named_go(named);
         // `VICTORY_TRACE_DESCRIPTORS=sites`: the heaps' pages are closed again for the next
         // interval, so the title's first store into each is seen.
         if super::descriptor_trace::sites() {
@@ -231,19 +343,23 @@ pub(crate) fn queue_released(queue: This) {
 }
 
 /// `ID3D12Fence::Signal`.
-pub(crate) fn fence_signal(fence: This, value: u64) {
+pub(crate) fn fence_signal(fence: This, value: u64) -> bool {
     let initial = crate::fence::initial(fence);
-    with_title(|t| t.signal_cpu(fence as usize, initial, value));
+    with_title(|t| {
+        t.signal_cpu(fence as usize, initial, value);
+        crate::fence::set(fence, value);
+    })
+    .is_some()
 }
 
-/// The value fence `fence` has completed, queues pumped first.
-pub(crate) fn fence_poll(fence: This) -> u64 {
+/// Syncs fence `fence`'s completed value from the host, queues pumped first.
+pub(crate) fn fence_poll(fence: This) {
     let initial = crate::fence::initial(fence);
     with_title(|t| {
         t.pump();
-        t.fence_value(fence as usize, initial)
-    })
-    .unwrap_or(initial)
+        let value = t.fence_value(fence as usize, initial);
+        crate::fence::sync_host(fence, value);
+    });
 }
 
 /// `GetCompletedValue` of a fence that has no GPU behind it yet: nothing to ask.
@@ -354,9 +470,39 @@ fn dump_title_memory(stats: &std::collections::HashMap<usize, [u32; 3]>) {
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("m{time}_{n}.ppm")), out);
+            write_dump(&dir, &format!("m{time}_{n}.ppm"), &out);
         }
     });
+}
+
+/// Writes one image of a dump switch (`VICTORY_DUMP_TITLE`, `VICTORY_DUMP_TARGETS`,
+/// `VICTORY_TRACE_PASSES`) into `dir`, making the folder first. The first write that fails is
+/// logged; later failures are not, so a bad folder costs one line, not one per image.
+fn write_dump(dir: &str, name: &str, bytes: &[u8]) -> bool {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let dir = std::path::Path::new(dir);
+    let result = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(name), bytes));
+    if let Err(e) = &result {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(error = %e, "dump image {} not written (later failures are not logged)", dir.join(name).display());
+        }
+    }
+    result.is_ok()
+}
+
+#[cfg(test)]
+#[test]
+fn a_dump_makes_its_folder_and_reports_a_write_it_cannot_make() {
+    let base = std::env::temp_dir().join(format!("victory-dump-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = base.join("not/made/yet");
+    assert!(write_dump(dir.to_str().unwrap(), "p0.ppm", b"P6\n1 1\n255\n\0\0\0"));
+    assert_eq!(std::fs::read(dir.join("p0.ppm")).unwrap().len(), 14);
+    // A file where the folder should be: the write fails and says so, without a panic.
+    let blocked = base.join("file");
+    std::fs::write(&blocked, b"").unwrap();
+    assert!(!write_dump(blocked.join("sub").to_str().unwrap(), "p1.ppm", b""));
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// `VICTORY_DUMP_TARGETS=<dir>,<seconds>`: once, at the first present after that many seconds,
@@ -404,7 +550,7 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
                 }
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
                 out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_f{}.ppm", info.memory as usize, info.format)), out);
+                write_dump(&dir, &format!("t{n}_{now}_{:x}_f{}.ppm", info.memory as usize, info.format), &out);
                 tracing::info!(n, key = format!("{key:#x}"), w, h, format = info.format, max, mean = sum / count.max(1) as f64, lit = lit as f64 / (rgb.len() * 3).max(1) as f64, "target dumped");
                 continue;
             }
@@ -417,11 +563,11 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
             let bgra = matches!(info.format, 87 | 91);
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             out.extend(px.as_chunks::<4>().0.iter().flat_map(|p| if bgra { [p[2], p[1], p[0]] } else { [p[0], p[1], p[2]] }));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}.ppm", info.memory as usize)), out);
+            write_dump(&dir, &format!("t{n}_{now}_{:x}.ppm", info.memory as usize), &out);
             // The alpha channel as grey.
             let mut alpha = format!("P6\n{w} {h}\n255\n").into_bytes();
             alpha.extend(px.as_chunks::<4>().0.iter().flat_map(|p| [p[3], p[3], p[3]]));
-            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("t{n}_{now}_{:x}_alpha.ppm", info.memory as usize)), alpha);
+            write_dump(&dir, &format!("t{n}_{now}_{:x}_alpha.ppm", info.memory as usize), &alpha);
             tracing::info!(n, key = format!("{key:#x}"), w, h, "target dumped");
         }
     });
@@ -430,17 +576,22 @@ fn dump_targets(stats: &std::collections::HashMap<usize, [u32; 3]>) {
 /// One texel of an HDR or 10-bit colour target (DXGI 2, 10, 24, 26) as linear RGB.
 fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
     let word = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
-    // An unsigned small float: `mbits` mantissa bits over a 5-bit exponent.
+    // The magnitude of a small float with `mbits` mantissa bits and a 5-bit exponent.
     let small = |v: u32, mbits: u32| {
         let (e, m) = ((v >> mbits) & 0x1f, v & ((1 << mbits) - 1));
-        if e == 0 { m as f32 * 2f32.powi(-14 - mbits as i32) } else { (1.0 + m as f32 / (1 << mbits) as f32) * 2f32.powi(e as i32 - 15) }
+        match (e, m) {
+            (0, m) => m as f32 * 2f32.powi(-14 - mbits as i32),
+            (31, 0) => f32::INFINITY,
+            (31, _) => f32::NAN,
+            _ => (1.0 + m as f32 / (1 << mbits) as f32) * 2f32.powi(e as i32 - 15),
+        }
     };
     match format {
         2 => [0, 4, 8].map(|i| f32::from_bits(word(i))),
         10 => [0, 2, 4].map(|i| {
             let h = u32::from(u16::from_le_bytes([p[i], p[i + 1]]));
             let v = small(h & 0x7fff, 10);
-            if h >> 15 == 1 { -v } else if (h >> 10) & 0x1f == 0x1f { f32::NAN } else { v }
+            if h >> 15 == 1 { -v } else { v }
         }),
         24 => [0, 10, 20].map(|s| ((word(0) >> s) & 0x3ff) as f32 / 1023.0),
         _ => {
@@ -448,6 +599,29 @@ fn decode_hdr(format: u32, p: &[u8]) -> [f32; 3] {
             [small(v & 0x7ff, 6), small((v >> 11) & 0x7ff, 6), small(v >> 22, 5)]
         }
     }
+}
+
+#[test]
+fn hdr_dump_preserves_non_finite_channels() {
+    let rgba16 = |words: [u16; 4]| {
+        let bytes: Vec<u8> = words.into_iter().flat_map(u16::to_le_bytes).collect();
+        decode_hdr(10, &bytes)
+    };
+    let rgb11 = |r: u32, g: u32, b: u32| {
+        decode_hdr(26, &(r | (g << 11) | (b << 22)).to_le_bytes())
+    };
+
+    let [r, g, b] = rgba16([0x7c00, 0xfc00, 0xfe00, 0]);
+    assert_eq!(r, f32::INFINITY);
+    assert_eq!(g, f32::NEG_INFINITY);
+    assert!(b.is_nan());
+    assert_eq!(rgba16([0x3c00, 0xb800, 1, 0]), [1.0, -0.5, 2f32.powi(-24)]);
+
+    let [r, g, b] = rgb11(0x7c0, 0x7e0, 0x3e0);
+    assert_eq!(r, f32::INFINITY);
+    assert!(g.is_nan());
+    assert_eq!(b, f32::INFINITY);
+    assert_eq!(rgb11(0x3c0, 1, 0x1c0), [1.0, 2f32.powi(-20), 0.5]);
 }
 
 /// A texture operation the native host does not do (copies, resolves), counted by the trace.
@@ -493,6 +667,13 @@ static RECORD_TRACE: Mutex<Option<RecordTrace>> = Mutex::new(None);
 
 fn tracing_record_writers() -> bool {
     env_set!("VICTORY_TRACE_RECORD_WRITERS")
+}
+
+/// `VICTORY_TRACE_RECORD_WRITERS=<hash>[,<hash>...]`: the records watched are those of the
+/// indirect dispatches of these compute shaders, not the mesh records (`None`: the mesh records).
+fn record_writers_of() -> Option<&'static str> {
+    static OF: OnceLock<Option<String>> = OnceLock::new();
+    OF.get_or_init(|| std::env::var("VICTORY_TRACE_RECORD_WRITERS").ok().filter(|v| v.len() >= 16)).as_deref()
 }
 
 /// The records and zero records of the executions whose first record is inside one of `buffers`.
@@ -885,7 +1066,7 @@ pub(crate) fn mirror(handle: u64) {
                     && let Some(info) = crate::resource::placed_info(address, &res)
                     && let Some((pool, _)) = t.host.memory().resolve(address, 1)
                 {
-                    t.texture_placed(address, key, pool.id);
+                    t.texture_placed(address, key, pool.id, info.size);
                     if !t.alias_placed(address, key, &info) {
                         t.texture_created(key, info);
                         t.realize(key);
@@ -1169,6 +1350,24 @@ fn pass_note_op(l: &mut MetalList, what: &str, src: Option<usize>, dst: Option<u
     l.list.notes.push((at, format!("kind={what} src={:?} dst={:?}", src.map(pass_tex), dst.map(pass_tex))));
 }
 
+/// The description of a texture the pass trace named: the title's object at `key`, else the
+/// host's own record (`host`). A placed texture's key is no object's address
+/// (`textures::placed_key` sets its top bit), so only the host's record describes it: reading it
+/// as an object crashed the game at the window's last present.
+fn pass_info(key: usize, host: impl Fn(usize) -> Option<super::textures::TextureInfo>) -> Option<super::textures::TextureInfo> {
+    if key >> (usize::BITS - 1) != 0 {
+        return host(key);
+    }
+    crate::resource::texture_info(key as This).or_else(|| host(key))
+}
+
+#[cfg(test)]
+#[test]
+fn the_pass_trace_reads_no_object_at_a_placed_textures_key() {
+    let key = super::textures::placed_key(0x1000, &[0; 14]);
+    assert!(pass_info(key, |_| None).is_none());
+}
+
 /// At each present: switch the window on and off, and while on write every texture the window's
 /// work named: its range, how much is non-zero and not finite, and (colour formats) an image.
 fn pass_present(resource: This) {
@@ -1216,22 +1415,30 @@ fn pass_present(resource: This) {
     if !keys.contains(&(resource as usize)) { keys.push(resource as usize); }
     with_title(|t| {
         for key in keys {
-            let Some(info) = crate::resource::texture_info(key as This) else { continue };
+            let Some(info) = pass_info(key, |k| t.info_of(k).cloned()) else { continue };
             let (w, h) = (info.width as usize, info.height as usize);
             let bpp = match info.format { 2 => 16, 10 | 11 | 16 => 8, 24 | 26 | 28 | 29 | 34 | 41 | 42 | 67 | 87 | 91 => 4, 49 | 54 | 56 | 57 => 2, 61 | 62 | 65 => 1, _ => 0 };
-            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || info.depth_or_layers > 1 && info.format != 28 {
-                eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} layers={} skipped", info.format, info.depth_or_layers);
+            // A 3D texture (a colour grading table) is read whole; arrays are skipped.
+            let d = if info.dimension == victory_formats::texture::Dimension::Tex3d { info.depth_or_layers.max(1) as usize } else { 1 };
+            if bpp == 0 || w * h == 0 || w * h > 3840 * 2160 || d == 1 && info.depth_or_layers > 1 && info.format != 28 {
+                eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} layers={} skipped{}", info.format, info.depth_or_layers, pass_mips(t, key, &info));
                 continue;
             }
             let Some(tex) = t.texture_of(key) else {
                 eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} no host texture", info.format);
                 continue;
             };
-            let mut raw = vec![0u8; w * h * bpp];
+            let mut raw = vec![0u8; w * h * d * bpp];
             victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, 0, 0, &mut raw, w * bpp, w * h * bpp);
-            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h) as f64;
+            let nonzero = raw.chunks_exact(bpp).filter(|p| p.iter().any(|&b| b != 0)).count() as f64 / (w * h * d) as f64;
+            let mut slices = String::new();
+            if d > 1 {
+                let lit = raw.chunks_exact(w * h * bpp).filter(|s| s.iter().any(|&b| b != 0)).count();
+                let distinct = raw.chunks_exact(bpp).collect::<std::collections::HashSet<_>>().len();
+                slices = format!(" depth={d} slices_nonzero={lit} distinct_texels={distinct}");
+            }
             let name = format!("p{num}_{key:x}_f{}_{w}x{h}.ppm", info.format);
-            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            let mut out = format!("P6\n{w} {}\n255\n", h * d).into_bytes();
             let mut extra = String::new();
             match info.format {
                 2 | 10 | 24 | 26 => {
@@ -1247,6 +1454,11 @@ fn pass_present(resource: This) {
                         nan16 = raw.chunks_exact(2).filter(|p| u16::from_le_bytes([p[0], p[1]]) & 0x7c00 == 0x7c00).count();
                     }
                     extra = format!(" max={max} min={min} mean={} notfinite={bad} infnan16={nan16} negative={neg}", sum / (rgb.len() * 3).max(1) as f64);
+                    // A few texels of 32-bit floats (exposure and histogram results): every channel, alpha too.
+                    if info.format == 2 && w * h <= 16 {
+                        let v: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                        extra += &format!(" values={v:?}");
+                    }
                     out.extend(rgb.iter().flat_map(|c| c.map(|v| if v.is_finite() && v > 0.0 { ((v / (1.0 + v)).sqrt() * 255.0) as u8 } else { 0 })));
                 }
                 28 | 29 | 87 | 91 => {
@@ -1258,10 +1470,36 @@ fn pass_present(resource: This) {
                     out.extend(raw.chunks_exact(bpp).flat_map(|p| [p[0], p[bpp / 2], p[bpp - 1]]));
                 }
             }
-            let _ = std::fs::write(std::path::Path::new(dir).join(&name), out);
-            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{extra} file={name}", info.format, info.memory as usize);
+            write_dump(dir, &name, &out);
+            eprintln!("PASSTEX present={num} key={key:#x} fmt={} {w}x{h} at={:#x} nonzero={nonzero:.4}{slices}{extra} file={name}", info.format, info.memory as usize);
         }
     });
+}
+
+/// For a single 2D texture `PASSTEX` decodes no image of (block-compressed ones): the share of
+/// non-zero elements (blocks) in each mip of the host texture, and in the title memory the
+/// host read it from (mips in the tail, which share a block, are left out), so a trace shows
+/// which mips the title had not filled and which the host had not uploaded.
+fn pass_mips(t: &mut MetalTitle, key: usize, info: &super::textures::TextureInfo) -> String {
+    let l = &info.layout;
+    let n = l.desc.element_bytes as usize;
+    if info.depth_or_layers > 1 || info.dimension != victory_formats::texture::Dimension::Tex2d || n == 0 {
+        return String::new();
+    }
+    let Some(tex) = t.texture_of(key) else { return " no host texture".into() };
+    let share = |bytes: &[u8]| bytes.chunks_exact(n).filter(|e| e.iter().any(|&b| b != 0)).count() as f64 / (bytes.len() / n).max(1) as f64;
+    let (mut host, mut title) = (Vec::new(), Vec::new());
+    for (mip, m) in l.mips.iter().enumerate() {
+        let (w, h) = (m.width as usize, m.height as usize);
+        let mut out = vec![0u8; w * h * n];
+        victory_backend::resources::ResourceBackend::read_texture(&t.host.backend, &tex, mip, 0, &mut out, w * n, w * h * n);
+        host.push(format!("{:.3}", share(&out)));
+        if (mip as u32) < l.first_tail_mip {
+            let bytes = super::textures::read_memory(info.memory.wrapping_add(m.offset as usize), (m.pitch * m.rows) as usize * n);
+            title.push(format!("{:.3}", share(&bytes)));
+        }
+    }
+    format!(" at={:#x} mips_nonzero=[{}] title_mips_nonzero=[{}]", info.memory as usize, host.join(","), title.join(","))
 }
 
 /// Work dropped because its pipeline has no host pipeline.
@@ -1337,12 +1575,17 @@ pub(crate) fn log_draw_counts(frame: u64) {
     let (mesh, mesh_indirect, _, copies, _) = crate::list::dropped_kinds();
     let copies_recorded = COPIES[0].load(Ordering::Relaxed);
     let indirect = crate::list::indirect_dropped();
-    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps]) = with_title(|t| {
+    let (r, heap_cleared, [dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps], metal_mb) = with_title(|t| {
         let h = &t.host;
-        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64])
+        (h.backend.residency_counts(), h.cleared(), [h.unset_roots(), h.unmapped(), h.failed(), h.typed_views(), h.resource_heaps() as u64], victory_backend::backend::ComputeBackend::allocated_bytes(&h.backend) >> 20)
     })
     .unwrap_or_default();
-    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
+    // Where the memory is when command buffers stall (#79): Metal's own count and the process footprint.
+    #[cfg(target_os = "macos")]
+    let footprint_mb = victory_platform::mem::footprint() >> 20;
+    #[cfg(not(target_os = "macos"))]
+    let footprint_mb = 0usize;
+    tracing::info!(frame, recorded, encoded, no_pipeline, no_texture, mesh, mesh_indirect, indirect, texture_copies = copies, copies_recorded, use_resource = r.use_resource, heap_resources = r.heap_resources, heap_entries = r.heap_entries, heap_allocations = r.heap_allocations, heap_set_mb = r.heap_set_bytes >> 20, metal_mb, footprint_mb, heap_cleared, dropped_unset_root, dropped_unmapped, dropped_failed, typed_views, resource_heaps, "native draws so far");
     if let Some(n) = super::host::heap_set_trace()
         && let Some([all, idle, never]) = with_title(|t| t.host.heap_set_report(n)).flatten()
     {
@@ -1509,6 +1752,7 @@ pub(crate) fn install_test_render_pipeline(
 
 pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+        _ if skipped_dispatch(t, l, &format!("groups [{x}, {y}, {z}]")) => {}
         Pipe::Compute(pso) => {
             trace_record_dispatch(t, l, "ran");
             if pass_on() {
@@ -1554,11 +1798,38 @@ fn stage_hashes(pipeline: usize) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `VICTORY_SKIP_PIPELINES=<hash>[,<hash>...]` (debugging): whether title pipeline `pipeline`
+/// has a shader of one of the listed 16-digit hashes, so that its draws and dispatches are
+/// dropped (to see which work makes a fault in the picture). Read once; off when unset.
+fn skipped_pipeline(pipeline: usize) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        crate::pipeline::parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default())
+    });
+    !hashes.is_empty()
+        && crate::pipeline::native_stages(pipeline as This)
+            .is_some_and(|(stages, _)| stages.iter().any(|(_, sh)| hashes.contains(&sh.hash)))
+}
+
+/// A dispatch of a pipeline `VICTORY_SKIP_PIPELINES` lists: counted as dropped and noted in the
+/// pass trace. Returns whether it was skipped.
+fn skipped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) -> bool {
+    if !skipped_pipeline(l.pipeline) {
+        return false;
+    }
+    dropped("a dispatch skipped by VICTORY_SKIP_PIPELINES");
+    if pass_on() {
+        pass_note(t, l, &format!("dispatch {how}"), "skipped by VICTORY_SKIP_PIPELINES", true, 1);
+    }
+    true
+}
+
 /// `DispatchX` with thread counts (`crate::list::dispatch_x`). Without the translation for
 /// them it is dropped: run as group counts, its lanes past the counts would write over memory
 /// that is not theirs.
 pub(crate) fn dispatch_threads(this: This, threads: [u32; 3]) {
     with_list(this, |t, l| match thread_pipe(t, l.pipeline) {
+        _ if skipped_dispatch(t, l, &format!("threads {threads:?}")) => {}
         Pipe::Compute(pso) => {
             if pass_on() {
                 pass_note(t, l, &format!("dispatch-threads{threads:?}"), "ran", true, 1);
@@ -1615,10 +1886,10 @@ pub(crate) fn stencil_ref(this: This, reference: u32) {
     with_list(this, |_, l| l.list.set_stencil_ref(reference));
 }
 
-/// `IASetIndexBuffer`: the buffer's address and whether its indices are 32 bits.
-pub(crate) fn index_buffer(this: This, view: Option<(u64, bool)>) {
+/// `IASetIndexBuffer`: the buffer's address, byte size, and whether its indices are 32 bits.
+pub(crate) fn index_buffer(this: This, view: Option<(u64, u32, bool)>) {
     with_list(this, |_, l| match view {
-        Some((address, wide)) => l.list.set_index_buffer(address, wide),
+        Some((address, size, wide)) => l.list.set_index_buffer_sized(address, size, wide),
         None => l.list.clear_index_buffer(),
     });
 }
@@ -1635,11 +1906,11 @@ pub(crate) fn vertex_buffers(this: This, start: u32, count: u32, views: &[Vertex
     with_list(this, |_, l| {
         for i in 0..count as usize {
             let slot = start as usize + i;
-            let (address, stride) = match views.get(i) {
-                Some(v) if v.address != 0 && v.size != 0 => (v.address, v.stride),
-                _ => (0, 0),
+            let (address, size, stride) = match views.get(i) {
+                Some(v) if v.address != 0 && v.size != 0 => (v.address, v.size, v.stride),
+                _ => (0, 0, 0),
             };
-            l.list.set_vertex_buffer(slot, address);
+            l.list.set_vertex_buffer_sized(slot, address, size);
             if l.strides.len() <= slot {
                 l.strides.resize(slot + 1, 0);
             }
@@ -1741,6 +2012,11 @@ fn graphics(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
 }
 
 fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<bool> {
+    if skipped_pipeline(l.pipeline) {
+        dropped("a draw skipped by VICTORY_SKIP_PIPELINES");
+        trace_drop(l);
+        return None;
+    }
     if !l.targets_ready {
         dropped("a draw of a pass whose render targets the host cannot make");
         trace_drop(l);
@@ -1857,6 +2133,31 @@ pub(crate) fn draw(this: This, vertices: u32, instances: u32, first: u32, first_
     });
 }
 
+/// A direct mesh dispatch (`DispatchMesh`, or `DispatchMeshX` without an argument address): the
+/// bound mesh pipeline runs `[x, y, z]` groups, as an indirect one runs its record's (#353). With
+/// no mesh pipeline it is dropped for the reason `graphics` gives, and counted in the frame line's
+/// `mesh=` as before.
+pub(crate) fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+    RECORDED.fetch_add(1, Ordering::Relaxed);
+    with_list(this, |t, l| {
+        if graphics(t, l, true).is_none() {
+            crate::list::DROPPED_KINDS[0].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if pass_on() {
+            pass_note_op(l, &format!("mesh[{x},{y},{z}]"), None, None);
+        }
+        match l.list.dispatch_mesh(x, y, z) {
+            Ok(()) => {
+                ENCODED.fetch_add(1, Ordering::Relaxed);
+                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
+                trace_present_draw(t, l);
+            }
+            Err(e) => tracing::warn!(error = %e, "mesh dispatch"),
+        }
+    });
+}
+
 pub(crate) fn draw_indexed(this: This, indices: u32, instances: u32, first: u32, base: i32, first_instance: u32) {
     RECORDED.fetch_add(1, Ordering::Relaxed);
     with_list(this, |t, l| {
@@ -1901,13 +2202,16 @@ pub(crate) fn execute_indirect(
         Command::DispatchMesh => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
             with_list(this, |t, l| {
+                let start = std::time::Instant::now();
                 if graphics(t, l, true).is_none() {
                     return;
                 }
+                let found = std::time::Instant::now();
+                let _timed = Defer(|| note_indirect(max, start, found));
                 if pass_on() {
                     pass_note_op(l, &format!("mesh-records n={max} counted={}", count.is_some()), None, None);
                 }
-                if tracing_record_writers() {
+                if tracing_record_writers() && record_writers_of().is_none() {
                     let zero = (0..max)
                         .filter(|&i| super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0))
                         .count() as u64;
@@ -1916,35 +2220,60 @@ pub(crate) fn execute_indirect(
                     n[0] += u64::from(max);
                     n[1] += zero;
                 }
-                for i in 0..max {
-                    match l.list.dispatch_mesh_indirect(at(i), count.map(|c| (c, i))) {
-                        Ok(()) => {
-                            ENCODED.fetch_add(1, Ordering::Relaxed);
-                            l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
-                        }
-                        Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
+                match l.list.indirect_records(at(0), stride, max, count, |l, r, c| l.dispatch_mesh_indirect(r, c)) {
+                    Ok(()) => {
+                        ENCODED.fetch_add(u64::from(max), Ordering::Relaxed);
+                        l.target_keys.iter().for_each(|&k| (0..max).for_each(|_| trace_bump(k, 0)));
                     }
+                    Err(e) => tracing::warn!(error = %e, "indirect mesh dispatch"),
                 }
                 trace_present_draw(t, l);
             });
             true
         }
         Command::Dispatch => {
-            with_list(this, |t, l| match pipe(t, l.pipeline, &TargetFormats::default()) {
+            let mut start = std::time::Instant::now();
+            with_list(this, |t, l| match (start = std::time::Instant::now(), pipe(t, l.pipeline, &TargetFormats::default())).1 {
+                _ if skipped_dispatch(t, l, "indirect") => {}
                 Pipe::Compute(pso) => {
+                    let found = std::time::Instant::now();
+                    let _timed = Defer(|| note_indirect(max, start, found));
                     trace_record_dispatch(t, l, "ran");
                     if pass_on() {
                         pass_note(t, l, "dispatch-indirect", "ran", true, max);
                     }
                     l.list.set_compute_pipeline(&pso);
                     for i in 0..max {
-                        let r = match count {
-                            Some(c) => l.list.dispatch_indirect_counted(at(i), c, i),
-                            None => l.list.dispatch_indirect(at(i)),
-                        };
-                        if let Err(e) = r {
-                            tracing::warn!(error = %e, "indirect dispatch");
+                        if let Some(of) = record_writers_of()
+                            && stage_hashes(l.pipeline).iter().any(|h| h.strip_prefix("compute ").is_some_and(|h| of.contains(h)))
+                        {
+                            let zero = super::textures::read_memory(at(i) as *const u8, 4).iter().all(|&b| b == 0);
+                            let mut trace = RECORD_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+                            let n = trace.get_or_insert_default().executions.entry(at(i)).or_default();
+                            n[0] += 1;
+                            n[1] += u64::from(zero);
                         }
+                        if crate::list::trace_dispatch_flags() {
+                            static SEEN: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+                            let mut seen = SEEN.lock().unwrap();
+                            let key = (l.pipeline as usize, count.is_some());
+                            if seen.iter().filter(|k| **k == key).count() < 3 {
+                                seen.push(key);
+                                // What title memory holds now, not what the GPU will read.
+                                let now: Vec<u32> = super::textures::read_memory(at(i) as *const u8, 12)
+                                    .chunks_exact(4)
+                                    .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                                    .collect();
+                                tracing::warn!(shader = ?stage_hashes(l.pipeline), ?command, counted = count.is_some(), stride, record = format_args!("{:#x}", at(i)), ?now, "an indirect dispatch (the first three of each pipeline)");
+                            }
+                        }
+                    }
+                    let r = l.list.indirect_records(at(0), stride, max, count, |l, r, c| match c {
+                        Some((c, i)) => l.dispatch_indirect_counted(r, c, i),
+                        None => l.dispatch_indirect(r),
+                    });
+                    if let Err(e) = r {
+                        tracing::warn!(error = %e, "indirect dispatch");
                     }
                 }
                 _ => dropped_dispatch(t, l, "indirect"),
@@ -1953,7 +2282,8 @@ pub(crate) fn execute_indirect(
         }
         Command::Draw | Command::DrawIndexed => {
             RECORDED.fetch_add(u64::from(max), Ordering::Relaxed);
-            with_list(this, |t, l| match graphics(t, l, false) {
+            let mut start = std::time::Instant::now();
+            with_list(this, |t, l| match (start = std::time::Instant::now(), graphics(t, l, false)).1 {
                 // shortcut: an indexed rectangle list is not drawn, as directly.
                 Some(true) if command == Command::DrawIndexed => {
                     dropped("an indirect rectangle-list draw");
@@ -1964,21 +2294,21 @@ pub(crate) fn execute_indirect(
                     true
                 }
                 Some(rect) => {
-                    for i in 0..max {
-                        let indexed = command == Command::DrawIndexed;
-                        let r = match count {
-                            // As a direct one: four-vertex instances, the record rewritten on the GPU.
-                            _ if rect => l.list.draw_rects_indirect(at(i), count.map(|c| (c, i))),
-                            Some(c) => l.list.draw_indirect_counted(at(i), indexed, c, i),
-                            None => l.list.draw_indirect(at(i), indexed),
-                        };
-                        match r {
-                            Ok(()) => {
-                                ENCODED.fetch_add(1, Ordering::Relaxed);
-                                l.target_keys.iter().for_each(|&k| trace_bump(k, 0));
-                            }
-                            Err(e) => tracing::warn!(error = %e, "indirect draw"),
+                    let found = std::time::Instant::now();
+                    let _timed = Defer(|| note_indirect(max, start, found));
+                    let indexed = command == Command::DrawIndexed;
+                    let r = l.list.indirect_records(at(0), stride, max, count, |l, r, c| match c {
+                        // As a direct one: four-vertex instances, the record rewritten on the GPU.
+                        _ if rect => l.draw_rects_indirect(r, c),
+                        Some((c, i)) => l.draw_indirect_counted(r, indexed, c, i),
+                        None => l.draw_indirect(r, indexed),
+                    });
+                    match r {
+                        Ok(()) => {
+                            ENCODED.fetch_add(u64::from(max), Ordering::Relaxed);
+                            l.target_keys.iter().for_each(|&k| (0..max).for_each(|_| trace_bump(k, 0)));
                         }
+                        Err(e) => tracing::warn!(error = %e, "indirect draw"),
                     }
                     true
                 }
@@ -2073,6 +2403,14 @@ fn subresource_mip_slice(info: &super::textures::TextureInfo, subresource: u32) 
     };
     let sub = subresource as usize;
     (sub < mips * slices).then(|| (sub % mips, sub / mips))
+}
+
+/// The host texture's level for title level `mip`: `None` for a top level the host texture was
+/// made without (`VICTORY_TEXTURE_DROP_TOP_MIP`). Host level `mip - dropped` has the title level's
+/// size. Shortcut: a copy to or from a dropped level is skipped, not scaled; the switch is off by
+/// default.
+fn host_mip(info: &super::textures::TextureInfo, mip: usize) -> Option<usize> {
+    mip.checked_sub(info.dropped_levels())
 }
 
 fn mip_dims(info: &super::textures::TextureInfo, mip: usize) -> [usize; 3] {
@@ -2233,17 +2571,20 @@ pub(crate) fn copy_texture_resource(this: This, dst: This, src: This) -> bool {
         }
         for slice in 0..slices {
             for mip in 0..mips {
+                let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, mip), host_mip(&dst_info, mip)) else {
+                    continue;
+                };
                 let s = mip_dims(&src_info, mip);
                 let d = mip_dims(&dst_info, mip);
                 let size = [s[0].min(d[0]), s[1].min(d[1]), s[2].min(d[2])];
                 l.list.copy_texture_region(
                     &src_tex,
-                    mip,
+                    src_mip,
                     slice,
                     [0, 0, 0],
                     size,
                     &dst_tex,
-                    mip,
+                    dst_mip,
                     slice,
                     [0, 0, 0],
                 );
@@ -2300,6 +2641,9 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
+            let (Some(src_mip), Some(dst_mip)) = (host_mip(&src_info, src_mip), host_mip(&dst_info, dst_mip)) else {
+                return true;
+            };
             with_list(this, |t, l| {
                 let (Some(src_tex), Some(dst_tex)) =
                     (t.texture_of(src.resource as usize), t.texture_of(dst.resource as usize))
@@ -2350,6 +2694,9 @@ pub(crate) fn copy_texture_region(
             if (0..3).any(|i| dst_origin[i].saturating_add(size[i]) > dst_dims[i]) {
                 return false;
             }
+            let Some(dst_mip) = host_mip(&dst_info, dst_mip) else {
+                return true;
+            };
             let Some((src_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(src.resource, &src.footprint, src_at, size_u32)
             else {
@@ -2391,6 +2738,9 @@ pub(crate) fn copy_texture_region(
             if size.contains(&0) {
                 return true;
             }
+            let Some(src_mip) = host_mip(&src_info, src_mip) else {
+                return true;
+            };
             let size_u32 = size.map(|v| v as u32);
             let Some((dst_addr, len, row_pitch, slice_pitch)) =
                 footprint_span(dst.resource, &dst.footprint, origin, size_u32)
@@ -2458,4 +2808,13 @@ pub(crate) fn locked<R>(f: impl FnOnce() -> R) -> R {
 /// Counters of the host for tests and the frame line.
 pub fn stats() -> Option<super::title::Stats> {
     with_title(|t| t.stats.clone())
+}
+
+/// Runs its closure when dropped (the end of a scope).
+struct Defer<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
 }

@@ -12,8 +12,19 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+/// The mapped prefix of `[addr, addr + len)` in [`PoolTable`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResolvedPrefix {
+    /// Every mapped byte of `[addr, addr + len)` up to `addr + len` (or the first unmapped gap)
+    /// lies in one contiguous physical run of `PoolInfo`.
+    Linear(PoolInfo, *const u8),
+    /// The mapped prefix `[addr, addr + covered)` crosses non-adjacent pool pages or multiple
+    /// pools without an unmapped gap.
+    Scattered(u64),
+}
+
 /// `xmem_physical::PoolInfo`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolInfo {
     pub id: usize,
     /// The pool's own read-write mapping, 16 KiB aligned, never moved until `pool_released`.
@@ -128,6 +139,48 @@ impl PoolTable {
         ))
     }
 
+    /// Resolves the contiguous mapped prefix of `[addr, addr + len)`: returns
+    /// [`ResolvedPrefix::Linear`] when all mapped pages up to `addr + len` (or the first unmapped
+    /// gap) follow linearly in one pool, or [`ResolvedPrefix::Scattered`] with the mapped prefix
+    /// byte length when they cross non-adjacent pool offsets or multiple pools without a gap.
+    pub fn resolve_prefix(&self, addr: u64, len: u64) -> Option<ResolvedPrefix> {
+        let (addr, len) = (
+            usize::try_from(addr).ok()?,
+            usize::try_from(len.max(1)).ok()?,
+        );
+        let g = self.lock();
+        let (&at, m) = g.maps.range(..=addr).next_back()?;
+        if addr >= at + m.len {
+            return None;
+        }
+        let pool = g.pools.get(&m.pool)?;
+        let end = addr.saturating_add(len);
+        let (mut title_end, mut pool_end) = (at + m.len, m.offset + m.len);
+        let mut linear = true;
+        while end > title_end {
+            let Some(next) = g
+                .maps
+                .get(&title_end)
+                .filter(|n| n.len > 0 && g.pools.contains_key(&n.pool))
+            else {
+                break;
+            };
+            if next.pool != m.pool || next.offset != pool_end {
+                linear = false;
+            }
+            title_end += next.len;
+            pool_end = next.offset + next.len;
+        }
+        if linear {
+            Some(ResolvedPrefix::Linear(
+                pool.clone(),
+                (pool.base + m.offset + (addr - at)) as *const u8,
+            ))
+        } else {
+            Some(ResolvedPrefix::Scattered((title_end.min(end) - addr) as u64))
+        }
+    }
+
     /// What the title maps at `[addr, addr + len)`, as a number that changes when any mapping in
     /// it does: a hash of the mappings it crosses (title address, length, pool, offset), which
     /// must follow one another in title addresses. `None` where part of it is not mapped.
@@ -190,6 +243,80 @@ impl PoolTable {
     /// Pools released since the last call; the host drops their buffers.
     pub fn take_released(&self) -> Vec<usize> {
         std::mem::take(&mut self.lock().released)
+    }
+
+    /// Reads `[addr, addr + out.len())` across the title-address spans mapped in this table,
+    /// coalescing adjacent mappings (even across different pools or out-of-order physical pages)
+    /// into one `read_span` call each and zeroing unmapped gaps without calling `read_span` or
+    /// querying VM regions. Returns `None` when no mapping overlaps `[addr, addr + out.len())`,
+    /// `Some(true)` when the entire range was mapped and read cleanly, and `Some(false)` when part
+    /// of the range was unmapped or `read_span` reported a partial/failed span.
+    pub fn read_mapped_with(
+        &self,
+        addr: usize,
+        out: &mut [u8],
+        mut read_span: impl FnMut(usize, &mut [u8]) -> bool,
+    ) -> Option<bool> {
+        if out.is_empty() {
+            return Some(true);
+        }
+        let end = addr.checked_add(out.len())?;
+        let mut inline = [(0usize, 0usize); 8];
+        let mut inline_len = 0usize;
+        let mut extra: Vec<(usize, usize)> = Vec::new();
+        {
+            let g = self.lock();
+            let before = g
+                .maps
+                .range(..addr)
+                .next_back()
+                .filter(|&(&a, m)| a.saturating_add(m.len) > addr);
+            for (&a, m) in before.into_iter().chain(g.maps.range(addr..end)) {
+                if m.len == 0 || !g.pools.contains_key(&m.pool) {
+                    continue;
+                }
+                let start = addr.max(a);
+                let stop = end.min(a.saturating_add(m.len));
+                if start >= stop {
+                    continue;
+                }
+                let merged = if !extra.is_empty() {
+                    extra.last_mut()
+                } else if inline_len > 0 {
+                    Some(&mut inline[inline_len - 1])
+                } else {
+                    None
+                };
+                if let Some(last) = merged.filter(|last| last.1 == start) {
+                    last.1 = stop;
+                } else if inline_len < inline.len() {
+                    inline[inline_len] = (start, stop);
+                    inline_len += 1;
+                } else {
+                    extra.push((start, stop));
+                }
+            }
+            if inline_len == 0 {
+                return None;
+            }
+        }
+        let mut cur = addr;
+        let mut whole = true;
+        for &(start, stop) in inline[..inline_len].iter().chain(extra.iter()) {
+            if cur < start {
+                out[cur - addr..start - addr].fill(0);
+                whole = false;
+            }
+            if !read_span(start, &mut out[start - addr..stop - addr]) {
+                whole = false;
+            }
+            cur = stop;
+        }
+        if cur < end {
+            out[cur - addr..].fill(0);
+            whole = false;
+        }
+        Some(whole)
     }
 }
 
@@ -340,6 +467,102 @@ mod tests {
         let second = t.mapping_at(0x6fff).unwrap();
         assert_eq!((second.at, second.len, second.pool, second.offset), (0x5000, 0x2000, 2, 0x800));
         assert!(t.mapping_at(0x7000).is_none());
+    }
+
+    #[test]
+    fn read_mapped_with_coalesces_adjacent_pages_across_pools_and_zeroes_gaps() {
+        let t = PoolTable::default();
+        let (pa, pb) = (pool(1), pool(2));
+        t.pool_created(&pa);
+        t.pool_created(&pb);
+
+        // No mapping yet: returns None so callers can fall back to non-pool memory reads.
+        let mut out = vec![0xffu8; 6 * 0x1_0000];
+        assert_eq!(
+            t.read_mapped_with(0x9000_0000, &mut out, |_, _| panic!("should not be called")),
+            None
+        );
+        assert!(out.iter().all(|&b| b == 0xff));
+
+        // Map scattered pages in descending pool order across two pools, leaving page 1 and pages
+        // 4..6 unmapped (mip-streamed texture with an unmapped hole and unmapped fine mips).
+        t.mapped(0x9000_0000, 0x1_0000, &pa, 5 * 0x1_0000);
+        t.mapped(0x9002_0000, 0x1_0000, &pb, 2 * 0x1_0000);
+        t.mapped(0x9003_0000, 0x1_0000, &pa, 0x1_0000);
+
+        let mut spans_seen = Vec::new();
+        assert_eq!(
+            t.read_mapped_with(0x9000_0000, &mut out, |at, dst| {
+                spans_seen.push((at, dst.len()));
+                dst.fill(((at - 0x9000_0000) >> 16) as u8 + 0x21);
+                true
+            }),
+            Some(false)
+        );
+        // Pages 2 and 3 come from different pools (`pb` then `pa`) at out-of-order pool offsets,
+        // yet coalesce into one contiguous title-address span `(0x9002_0000, 0x2_0000)`.
+        assert_eq!(
+            spans_seen,
+            vec![(0x9000_0000, 0x1_0000), (0x9002_0000, 0x2_0000)]
+        );
+        assert!(out[..0x1_0000].iter().all(|&b| b == 0x21));
+        assert!(out[0x1_0000..0x2_0000].iter().all(|&b| b == 0));
+        assert!(out[0x2_0000..0x4_0000].iter().all(|&b| b == 0x23));
+        assert!(out[0x4_0000..].iter().all(|&b| b == 0));
+
+        // Mapping the remaining pages coalesces all 6 pages into a single whole read (`Some(true)`).
+        t.mapped(0x9001_0000, 0x1_0000, &pa, 7 * 0x1_0000);
+        t.mapped(0x9004_0000, 0x2_0000, &pb, 0);
+        out.fill(0xff);
+        spans_seen.clear();
+        assert_eq!(
+            t.read_mapped_with(0x9000_0000, &mut out, |at, dst| {
+                spans_seen.push((at, dst.len()));
+                dst.fill(0x5a);
+                true
+            }),
+            Some(true)
+        );
+        assert_eq!(spans_seen, vec![(0x9000_0000, 6 * 0x1_0000)]);
+        assert!(out.iter().all(|&b| b == 0x5a));
+    }
+
+    #[test]
+    fn resolve_prefix_handles_linear_descending_and_partially_mapped_spans() {
+        let t = PoolTable::default();
+        let (p, q) = (pool(1), pool(2));
+        t.pool_created(&p);
+        t.pool_created(&q);
+
+        // Two contiguous pages in pool 1, then a descending page in pool 1, then a page in pool 2,
+        // followed by an unmapped gap.
+        t.mapped(0x7000_0000, 0x1_0000, &p, 0x4_0000);
+        t.mapped(0x7001_0000, 0x1_0000, &p, 0x5_0000);
+        t.mapped(0x7002_0000, 0x1_0000, &p, 0x2_0000);
+        t.mapped(0x7003_0000, 0x1_0000, &q, 0x1_0000);
+
+        // Linear span inside the first two pages stays on the pool buffer.
+        assert_eq!(
+            t.resolve_prefix(0x7000_8000, 0x1_8000),
+            Some(ResolvedPrefix::Linear(p.clone(), (p.base + 0x4_8000) as *const u8))
+        );
+        // Crossing into the descending page reports Scattered with the requested length.
+        assert_eq!(
+            t.resolve_prefix(0x7001_FFF0, 0x40),
+            Some(ResolvedPrefix::Scattered(0x40))
+        );
+        // Partially mapped reserved range stops cleanly at the unmapped gap (0x7004_0000).
+        assert_eq!(
+            t.resolve_prefix(0x7000_1000, 0x10_0000),
+            Some(ResolvedPrefix::Scattered(0x3_F000))
+        );
+        // Partially mapped range whose mapped prefix is linear stays Linear.
+        t.unmapped(0x7002_0000, 0x2_0000);
+        assert_eq!(
+            t.resolve_prefix(0x7000_1000, 0x10_0000),
+            Some(ResolvedPrefix::Linear(p, (0x1000_0000 + 0x4_1000) as *const u8))
+        );
+        assert_eq!(t.resolve_prefix(0x7002_0000, 0x100), None);
     }
 }
 

@@ -59,6 +59,8 @@ A change under `crates/victory-shader` can be checked against every shader the g
 
 ## How to work
 
+0. If several agents share this machine or repository, read [docs/multi-agent.md](docs/multi-agent.md) first (branch naming, claiming issues, the game-run lock).
+
 Before any work, book it (details in `CONTRIBUTING.md`, "Claim it before you start"):
 
 - Find or open the issue for the task. Skip it if it has an assignee or the `claimed` label, or if `gh pr list --state open --search "<issue number> in:title,body"` shows a pull request for it.

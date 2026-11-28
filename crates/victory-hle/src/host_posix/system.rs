@@ -1264,16 +1264,20 @@ impl MutexObject {
         true
     }
 
-    /// One release by the owner; false if the caller is not.
-    pub(crate) fn release(&self) -> bool {
+    /// One release by the owner: `Some(true)` if the mutex is now free for
+    /// another thread, `Some(false)` if still recursively owned, or `None` if
+    /// the caller does not own it.
+    pub(crate) fn release(&self) -> Option<bool> {
         if self.owner.load(Ordering::Acquire) != thread::current_id() {
-            return false;
+            return None;
         }
         if self.count.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.owner.store(0, Ordering::Release);
             self.free.release(1);
+            Some(true)
+        } else {
+            Some(false)
         }
-        true
     }
 }
 
@@ -1315,11 +1319,13 @@ pub extern "system" fn ReleaseMutex(handle: *mut c_void) -> i32 {
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
-    if !mutex.release() {
+    let Some(freed) = mutex.release() else {
         set_error(ERROR_NOT_OWNER);
         return 0;
+    };
+    if freed {
+        super::sync::signalled();
     }
-    super::sync::signalled();
     1
 }
 
@@ -1358,11 +1364,63 @@ pub extern "system" fn CreateSemaphoreExW(
     super::CreateSemaphoreW(attributes, initial, max, std::ptr::null())
 }
 
-/// A waitable timer: an event a thread of ours sets when it is due.
-/// `generation` retires the timer thread of an earlier `SetWaitableTimer`.
+/// A waitable timer: an event driven by at most one worker thread per timer,
+/// with `reset`, `set`, re-arm and cancellation serialised under `state`.
 pub(crate) struct TimerObject {
     pub(crate) event: Arc<Event>,
-    generation: AtomicU64,
+    inner: Arc<TimerInner>,
+}
+
+struct TimerInner {
+    event: Arc<Event>,
+    state: Mutex<TimerState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct TimerState {
+    generation: u64,
+    arm: Option<(Instant, Duration)>,
+    worker_running: bool,
+    closed: bool,
+}
+
+impl Drop for TimerObject {
+    fn drop(&mut self) {
+        let mut st = lock(&self.inner.state);
+        st.closed = true;
+        st.arm = None;
+        self.inner.changed.notify_all();
+    }
+}
+
+fn timer_worker(inner: Arc<TimerInner>) {
+    let mut st = lock(&inner.state);
+    loop {
+        if st.closed {
+            st.worker_running = false;
+            return;
+        }
+        let Some((deadline, period)) = st.arm else {
+            st.worker_running = false;
+            return;
+        };
+        let generation = st.generation;
+        let now = Instant::now();
+        if now >= deadline {
+            inner.event.set();
+            st.arm = (!period.is_zero()).then(|| (now + period, period));
+            drop(st);
+            super::sync::signalled();
+            st = lock(&inner.state);
+            continue;
+        }
+        st = inner
+            .changed
+            .wait_timeout_while(st, deadline - now, |s| !s.closed && s.generation == generation)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
 }
 
 pub extern "system" fn CreateWaitableTimerW(
@@ -1374,10 +1432,13 @@ pub extern "system" fn CreateWaitableTimerW(
         set_error(ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     };
-    new_handle(Object::Timer(Arc::new(TimerObject {
-        event: Arc::new(event),
-        generation: AtomicU64::new(0),
-    })))
+    let event = Arc::new(event);
+    let inner = Arc::new(TimerInner {
+        event: event.clone(),
+        state: Mutex::default(),
+        changed: Condvar::new(),
+    });
+    new_handle(Object::Timer(Arc::new(TimerObject { event, inner })))
 }
 
 pub extern "system" fn CreateWaitableTimerExW(
@@ -1417,27 +1478,39 @@ pub extern "system" fn SetWaitableTimer(
     _arg: *const c_void,
     _resume: i32,
 ) -> i32 {
+    if due.is_null() || period_ms < 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     let Some(timer) = timer_of(handle) else {
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
-    let generation = timer.generation.fetch_add(1, Ordering::AcqRel) + 1;
-    timer.event.reset();
-    // SAFETY: the title's due time.
+    // SAFETY: checked non-null; the title's due time.
     let first = until(unsafe { due.read_unaligned() });
-    let period = Duration::from_millis(period_ms.max(0) as u64);
-    std::thread::spawn(move || {
-        let live = || timer.generation.load(Ordering::Acquire) == generation;
-        std::thread::sleep(first);
-        while live() {
-            timer.event.set();
-            super::sync::signalled();
-            if period.is_zero() {
-                break;
-            }
-            std::thread::sleep(period);
-        }
-    });
+    let period = Duration::from_millis(period_ms as u64);
+    let now = Instant::now();
+    let mut st = lock(&timer.inner.state);
+    st.generation = st.generation.wrapping_add(1);
+    timer.event.reset();
+    let fired_now = first.is_zero();
+    if fired_now {
+        timer.event.set();
+        st.arm = (!period.is_zero()).then(|| (now + period, period));
+    } else {
+        st.arm = Some((now + first, period));
+    }
+    if st.arm.is_some() && !st.worker_running {
+        st.worker_running = true;
+        let inner = timer.inner.clone();
+        std::thread::spawn(move || timer_worker(inner));
+    } else {
+        timer.inner.changed.notify_all();
+    }
+    drop(st);
+    if fired_now {
+        super::sync::signalled();
+    }
     1
 }
 
@@ -1458,7 +1531,10 @@ pub extern "system" fn CancelWaitableTimer(handle: *mut c_void) -> i32 {
         set_error(ERROR_INVALID_HANDLE);
         return 0;
     };
-    timer.generation.fetch_add(1, Ordering::AcqRel);
+    let mut st = lock(&timer.inner.state);
+    st.generation = st.generation.wrapping_add(1);
+    st.arm = None;
+    timer.inner.changed.notify_all();
     1
 }
 
@@ -1762,9 +1838,9 @@ pub extern "system" fn SubmitThreadpoolWork(work: *mut PoolObject) {
     o.submit(&mut lock(&o.state), Duration::ZERO, Duration::ZERO);
 }
 
-pub extern "system" fn WaitForThreadpoolWorkCallbacks(work: *mut PoolObject, _cancel: i32) {
+pub extern "system" fn WaitForThreadpoolWorkCallbacks(work: *mut PoolObject, cancel: i32) {
     // SAFETY: as above.
-    unsafe { &*work }.wait_idle(false);
+    unsafe { &*work }.wait_idle(cancel != 0);
 }
 
 pub extern "system" fn CloseThreadpoolWork(work: *mut PoolObject) {
@@ -2737,9 +2813,9 @@ mod tests {
         let other = m.clone();
         let blocked = std::thread::spawn(move || other.acquire(Some(Duration::from_millis(20))));
         assert!(!blocked.join().unwrap());
-        assert!(m.release());
-        assert!(m.release());
-        assert!(!m.release());
+        assert_eq!(m.release(), Some(false));
+        assert_eq!(m.release(), Some(true));
+        assert_eq!(m.release(), None);
         let other = m.clone();
         assert!(
             std::thread::spawn(move || other.acquire(Some(Duration::ZERO)))
@@ -2925,6 +3001,97 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(CancelWaitableTimer(timer), 1);
         assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(super::super::CloseHandle(timer), 1);
+    }
+
+    #[test]
+    fn rearming_and_canceling_waitable_timers_retire_old_deadlines_cleanly() {
+        assert_eq!(
+            SetWaitableTimer(std::ptr::null_mut(), &0, 0, std::ptr::null(), std::ptr::null(), 0),
+            0
+        );
+        let timer = CreateWaitableTimerW(std::ptr::null(), 0, std::ptr::null());
+        assert_eq!(
+            SetWaitableTimer(timer, std::ptr::null(), 0, std::ptr::null(), std::ptr::null(), 0),
+            0
+        );
+        assert_eq!(
+            SetWaitableTimer(timer, &0, -1, std::ptr::null(), std::ptr::null(), 0),
+            0
+        );
+
+        // Re-arming from a short deadline to a far deadline must prevent the superseded short
+        // deadline from signalling the reset event.
+        let short_due = -((TICKS_PER_SECOND as i64) * 15 / 1000); // 15 ms
+        assert_eq!(
+            SetWaitableTimer(timer, &short_due, 0, std::ptr::null(), std::ptr::null(), 0),
+            1
+        );
+        assert_eq!(
+            SetWaitableTimer(timer, &ONE_HOUR_DUE, 0, std::ptr::null(), std::ptr::null(), 0),
+            1
+        );
+        assert_eq!(
+            super::super::WaitForSingleObject(timer, 35),
+            super::super::WAIT_TIMEOUT
+        );
+
+        // Re-arming from a far deadline down to a short periodic deadline wakes the existing
+        // worker immediately, fires at `due = 0` and on period, and stops on cancel + close.
+        assert_eq!(
+            SetWaitableTimer(timer, &0, 10, std::ptr::null(), std::ptr::null(), 0),
+            1
+        );
+        assert_eq!(super::super::WaitForSingleObject(timer, 0), 0);
+        assert_eq!(super::super::WaitForSingleObject(timer, 5000), 0);
+        assert_eq!(CancelWaitableTimer(timer), 1);
+        let _ = super::super::WaitForSingleObject(timer, 0);
+        assert_eq!(
+            super::super::WaitForSingleObject(timer, 30),
+            super::super::WAIT_TIMEOUT
+        );
+
+        // Closing an armed timer wakes and retires its worker thread promptly.
+        assert_eq!(
+            SetWaitableTimer(timer, &ONE_HOUR_DUE, 0, std::ptr::null(), std::ptr::null(), 0),
+            1
+        );
+        let inner = timer_of(timer).unwrap().inner.clone();
+        assert_eq!(super::super::CloseHandle(timer), 1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while lock(&inner.state).worker_running && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!lock(&inner.state).worker_running);
+    }
+
+    #[test]
+    fn wait_for_threadpool_work_callbacks_cancels_queued_submissions_when_requested() {
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        extern "C" fn bump(_instance: usize, _context: usize, _work: usize) {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let (done, result) = std::sync::mpsc::channel();
+        let callback = native::host_callbacks(&[(bump as *const () as usize, false)]).unwrap()[0];
+        std::thread::spawn(move || {
+            let work = CreateThreadpoolWork(callback, 0, std::ptr::null());
+            SubmitThreadpoolWork(work);
+            WaitForThreadpoolWorkCallbacks(work, 0);
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+
+            // Hold a queued work ticket and cancel pending callbacks via `cancel = 1`.
+            // SAFETY: `work` lives until `CloseThreadpoolWork` below.
+            let o = unsafe { &*work };
+            let ticket = lock(&o.state).queue_callback();
+            WaitForThreadpoolWorkCallbacks(work, 1);
+            assert!(!lock(&o.state).take_queued(ticket));
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+
+            CloseThreadpoolWork(work);
+            let _ = done.send(());
+        });
+        result.recv_timeout(Duration::from_millis(750)).unwrap();
     }
 
     #[test]

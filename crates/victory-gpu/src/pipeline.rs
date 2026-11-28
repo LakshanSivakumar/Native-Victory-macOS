@@ -140,7 +140,12 @@ fn prewarm(shader: &Arc<Shader>) {
             return false;
         }
         let cores = std::thread::available_parallelism().map_or(8, usize::from);
-        let n = crate::prewarm::pool_size(cores);
+        // `VICTORY_PREWARM_WORKERS=<n>`: the pool's size instead of all cores but two.
+        let n = std::env::var("VICTORY_PREWARM_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| crate::prewarm::pool_size(cores));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("shader-prewarm-{i}")).spawn(|| {
                 crate::prewarm::lower_priority();
@@ -203,6 +208,8 @@ impl Shader {
         self.native
             .get_or_init(|| {
                 let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                // For `victory translate --cache`, once the translator has changed.
+                crate::native::shaders::keep(&container);
                 let made = crate::native::shaders::translate(&container).map(Arc::new);
                 if (made.is_err() || std::env::var_os("VICTORY_DUMP_ALL_SHADERS").is_some())
                     && let Some(dir) = std::env::var_os("VICTORY_DUMP_REFUSED")
@@ -515,8 +522,10 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+/// The `VICTORY_SKIP_PIPELINES` list: lower-case 16-digit shader hashes, others warned about and
+/// left out (the D3D12 path and the native host read it alike).
+#[cfg(any(target_os = "macos", all(windows, feature = "diagnostics")))]
+pub(crate) fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -814,9 +823,10 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
                 .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
         }
     };
-    // The pixel program's input enables, from the register image (pair 0).
+    // The pixel program's input enables and user SGPR count, from the register image (pair 0).
     let ps_input = piece(0).and_then(victory_shader::emit::graphics::ps_input_ena);
-    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input) {
+    let ps_user_sgprs = piece(0).and_then(victory_shader::emit::graphics::ps_user_sgprs);
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input, ps_user_sgprs) {
         Ok(c) => Ok(shader(name, &c)),
         Err(e) => {
             tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
@@ -1374,7 +1384,7 @@ mod changed_descriptor_tests {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "diagnostics")))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -1613,9 +1623,16 @@ mod tests {
 /// with `user_sgprs` user SGPRs and `records` (32-byte `0x41` records), as the title passes them.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn test_compute_container(code: &[u32], records: &[[u8; 32]], user_sgprs: u32) -> Vec<u8> {
+    test_compute_container_of(code, records, user_sgprs, 32, false)
+}
+
+/// [`test_compute_container`] of `threads` x 1 x 1 in a group, in 64-lane waves if `wave64`.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn test_compute_container_of(code: &[u32], records: &[[u8; 32]], user_sgprs: u32, threads: u32, wave64: bool) -> Vec<u8> {
     let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-    // Thread-group size 32, 1, 1; wave32; 16 VGPRs.
-    let registers = words(&[0, 0, 0, 32 | 1 << 16, 1 | 1 << 4 << 16, 1, user_sgprs << 1]);
+    // Thread-group size `threads`, 1, 1; the wave size; 16 VGPRs (granules of 8, or 4 in wave64).
+    let (flags, granules) = if wave64 { (0, 3) } else { (1 << 4 << 16, 1) };
+    let registers = words(&[0, 0, 0, threads | 1 << 16, 1 | flags, granules, user_sgprs << 1]);
     let code = words(code);
     let mut metadata = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
     metadata.extend([0x40, 4, records.len() as u8, 0]);

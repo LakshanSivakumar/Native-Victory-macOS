@@ -873,6 +873,82 @@ fn descriptor_dwords_read_as_data_say_which() {
     }
 }
 
+/// A descriptor read only as data takes its dwords from the view addresses (`t1`), which hold a
+/// buffer's address and an image's size fields and give every other field as 0: a program that
+/// can see a bit of those is refused naming the field, and one that keeps only the address or
+/// the sizes translates.
+#[test]
+fn view_address_fields_the_table_gives_as_0_are_refused() {
+    use crate::native::tests::{fspx, fspx_resource};
+    // The view at table dword 8, loaded as a buffer's four dwords to s[12:15] or an image's
+    // eight to s[12:19]; `read` leaves what it keeps in s20, which is stored.
+    let program = |image: bool, read: &[u32]| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            if image { 0xF40C_0302 } else { 0xF408_0302 },
+            0xFA00_0020, // s_load_dwordx4 (x8) s[12:15] (s[12:19]), s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        code.extend_from_slice(read);
+        code.extend_from_slice(&[
+            0x7E02_0214, // v_mov_b32 v1, s20
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let and = |src: u32, mask: u32| vec![0x8714_FF00 | src, mask]; // s_and_b32 s20, s<src>, mask
+    let mov = |src: u32| vec![0xBE94_0300 | src]; // s_mov_b32 s20, s<src>
+    // s_lshr_b64 s[20:21], s[12:13], 8, then s_and_b32 s20, s21, mask: dword 1 bits 8 on.
+    let shifted = |mask: u32| vec![0x9094_880C, 0x8714_FF15, mask];
+    let accepted = [
+        (false, mov(12)),
+        (false, and(13, 0xFFFF)),
+        (false, shifted(0xFF)),
+        (true, and(13, 0xC000_0000)),
+        (true, and(14, 0x3FFF_FFFF)),
+        (true, and(15, 0xF00F_FFFF)),
+    ];
+    for (image, read) in accepted {
+        let shader = translate_with(&program(image, &read), Options::default());
+        assert!(
+            shader.as_ref().is_ok_and(|s| s.view_addresses),
+            "{read:x?}: {:?}",
+            shader.err()
+        );
+    }
+    let prefix = "a view address field the table gives as 0: ";
+    let dword_1 = "an image's base address, minimum level or format (dword 1)";
+    let refused = [
+        (false, mov(13), "a buffer's stride or swizzle"),
+        (false, and(13, 0x3FFF_0000), "a buffer's stride or swizzle"),
+        (false, shifted(0xFFFF), "a buffer's stride or swizzle"),
+        (false, mov(14), "a buffer's record count or format"),
+        (true, mov(12), "an image's base address"),
+        (true, and(13, 0xFF), dword_1),
+        (true, and(13, 0x1FF0_0000), dword_1),
+        (true, mov(14), "an image's dword 2"),
+        (true, and(15, 0x01F0_0000), "an image's tiling"),
+        (true, mov(16), "an image's dwords 4-7"),
+    ];
+    for (image, read, why) in refused {
+        let err = translate_with(&program(image, &read), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{read:x?}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage
@@ -2626,6 +2702,26 @@ fn a_pixel_program_reads_back_an_sgpr_spilled_on_two_paths() {
     assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);
 }
 
+/// The same reload inside a whole-wave section (`s_or_saveexec_b32 -1` ... restore): the title's
+/// pixel programs reload a spilled SGPR there, before a reduction. The section's shape for it is
+/// a read of lane 3, which a pixel program cannot make; it is the spilled SGPR, as outside a
+/// section (it was refused as "v_readlane_b32 of a constant lane in a pixel program").
+#[test]
+fn a_pixel_program_reads_back_a_spilled_sgpr_inside_a_whole_wave_section() {
+    let code = [
+        0xBE94_03F2, // s_mov_b32 s20, 1.0
+        0xD761_000E, 0x0001_0614, // v_writelane_b32 v14, s20, 3
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD760_0016, 0x0001_070E, // v_readlane_b32 s22, v14, 3
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0x7E02_0216, // v_mov_b32 v1, s22
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let l = lower_ps(&code, false, vec![], vec![], 0, 0, vec![], false).expect("lowers");
+    assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);
+}
+
 /// DPP8 in a pixel program stays refused under its own name. No open lowering (#259, #261,
 /// #262) takes it; whether to lower it waits for the op tally of current main on #4.
 #[test]
@@ -2807,16 +2903,21 @@ fn whole_wave_sections_refuse_unmodeled_effects_at_the_instruction() {
 /// A wave64 compute program of `threads` lanes with five root-constant SGPRs (`s[2:3]` an
 /// address), through `emit_with` as `translate_with` runs it on a 32-lane host.
 fn emit_wave64_cs(words: &[u32], threads: u32, lds: bool) -> Result<super::HostShader, ShaderError> {
+    emit_cs(words, true, threads, lds)
+}
+
+/// [`emit_wave64_cs`] for a program of either wave size.
+fn emit_cs(words: &[u32], wave64: bool, threads: u32, lds: bool) -> Result<super::HostShader, ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 16,
         layout: vec![root_const(0, 5)],
         used: vec![],
         io: StageIo::Cs(ComputeIo { rsrc2: u32::from(lds) << 15 | 5 << 1, threads: [threads, 1, 1] }),
         code: bytes_of(words),
     };
-    let p = ir::build(&native.code, true, native.vgprs)?;
+    let p = ir::build(&native.code, wave64, native.vgprs)?;
     let st = structure::structure(&p)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native)?;
@@ -2948,6 +3049,53 @@ fn a_join_read_with_exec_needs_the_data_an_execnz_branch_brings() {
     assert!(err.contains("data whose high dword is not known"), "{err:?}");
 }
 
+/// A 32-lane program rotates a value through a lane mask's register by two swaps of three XORs
+/// each, on the path of the lanes below 20 only, and reads it after the join: `s21` is 7 on both
+/// edges (a copy before the branch, a swap's last XOR giving back what an earlier swap's last XOR
+/// gave back), so it is 7 in every lane whichever edge it took. The last XOR's operand was a lane
+/// mask in the structure (an XOR with the mask's register), so the swapped copy was no number and
+/// the join was refused as "a lane mask read as data" (four world compute programs, and pixel and
+/// vertex programs of the same shape).
+const SWAPPED_COPIES: &[u32] = &[
+    0xD4C4_000A,
+    0x0002_0090, // v_cmp_gt_u32 s10, 16, v0
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0xBE94_0387, // s_mov_b32 s20, 7
+    0xBE95_0314, // s_mov_b32 s21, s20
+    0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+    0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+    0xBF88_0006, // s_cbranch_execz JOIN
+    0x890A_140A, // s_xor_b32 s10, s10, s20
+    0x8914_140A, // s_xor_b32 s20, s10, s20
+    0x890A_140A, // s_xor_b32 s10, s10, s20 (s10: 7)
+    0x8915_0A15, // s_xor_b32 s21, s21, s10
+    0x890A_0A15, // s_xor_b32 s10, s21, s10
+    0x8915_0A15, // s_xor_b32 s21, s21, s10 (s21: what s10 held, 7)
+    0x887E_067E, // JOIN: s_or_b32 exec_lo, exec_lo, s6
+    0x7E04_0215, // v_mov_b32 v2, s21
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_join_of_swapped_copies_of_one_value_is_that_value() {
+    if let Err(e) = emit_cs(SWAPPED_COPIES, false, 32, false) {
+        panic!("{e}");
+    }
+}
+
+/// [`SWAPPED_COPIES`] with `s21` set to 8 before the branch: the edges bring 8 and 7, so what the
+/// register holds after the join depends on the path the wave ran last, and it stays refused.
+#[test]
+fn a_join_of_copies_of_two_values_stays_refused() {
+    let w: Vec<u32> =
+        SWAPPED_COPIES.iter().map(|&x| if x == 0xBE95_0314 { 0xBE95_0388 } else { x }).collect();
+    assert_ne!(w, SWAPPED_COPIES);
+    let err = emit_cs(&w, false, 32, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("a lane mask read as data"), "{err:?}");
+}
+
 /// [`SKIP`] with the skip written as `s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1` and the region
 /// entered by lanes 32 and up: in a wave64 program that compare sees only EXEC's low half, so the
 /// high lanes reach the join with the data and it stays refused.
@@ -2963,4 +3111,160 @@ fn a_wave64_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     }
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("data whose high dword is not known"), "{err:?}");
+}
+
+/// [`SKIP`] with a second EXEC skip inside the region: the join `s[10:11]` reaches is not read in
+/// its own block (J1) but relayed unchanged, by one unconditional jump, into the next block's phi
+/// (J2) and read there only ANDed with EXEC. The outer skip (to J2) brings an empty EXEC there.
+const RELAY: &[u32] = &[
+    0xD4C4_000A,
+    0x0202_0090, // v_cmp_gt_u32 s[10:11], 16, v0
+    0xBE8A_0385, // s_mov_b32 s10, 5 (data; s11 keeps the mask's high dword)
+    0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+    0x4A06_00FF,
+    0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+    0xBF88_0008, // s_cbranch_execz J2 (the outer skip)
+    0x7DA8_0004, // v_cmpx_gt_u32 s4, v0
+    0xBF88_0005, // s_cbranch_execz J1 (the inner skip)
+    0xD760_0008,
+    0x0201_4703, // v_readlane_b32 s8, v3, 35 (refused on the fast path: lockstep)
+    0x7E04_0208, // v_mov_b32 v2, s8
+    0xD4C4_000A,
+    0x0202_0088, // v_cmp_gt_u32 s[10:11], 8, v0 (a mask on this path only)
+    0xBE89_0380, // J1: s_mov_b32 s9, 0 (the join is not read here, only relayed on)
+    0x878C_7E0A, // J2: s_and_b64 s[12:13], s[10:11], exec
+    0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+    0x87FE_7E0C, // s_and_b64 exec, s[12:13], exec
+    0x4A04_0487, // v_add_nc_u32 v2, 7, v2
+    0x88FE_067E, // s_or_b64 exec, exec, s[6:7]
+    0xDC70_8000,
+    0x0002_0201, // global_store_dword v1, v2, s[2:3]
+    0xBF81_0000, // s_endpgm
+];
+
+/// A join read only by an AND with EXEC in the block after an unconditional jump (`RELAY`): on the
+/// edge the outer skip takes, that EXEC is empty, so the relayed value is not needed there either.
+#[test]
+fn a_join_relayed_by_a_jump_and_read_only_with_exec_needs_nothing_from_an_exec_skip() {
+    if let Err(e) = emit_wave64_cs(RELAY, 64, false) {
+        panic!("{e}");
+    }
+}
+
+/// [`RELAY`] with J1 making EXEC `s_mov_b64 exec, s[6:7]`: the relay block now writes EXEC, so the
+/// EXEC J2 reads is not the one the skip found empty and the data is needed: still refused.
+#[test]
+fn a_relay_block_that_rewrites_exec_still_needs_the_data() {
+    let w: Vec<u32> = RELAY.iter().map(|&x| if x == 0xBE89_0380 { 0xBEFE_0406 } else { x }).collect();
+    assert_ne!(w, RELAY);
+    let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("lane-mask join") && err.contains("0x44"), "{err:?}");
+}
+
+/// [`RELAY`] with the inner skip written as `s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1`: in wave64
+/// that sees only half of EXEC, so the edge is not proved empty and stays refused.
+#[test]
+fn a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
+    let mut w = Vec::new();
+    for &x in RELAY {
+        match x {
+            0xBF88_0005 => w.extend([0xBF06_807E, 0xBF85_0005]), // s_cmp_eq_u32 exec_lo, 0; s_cbranch_scc1 J1
+            0xBF88_0008 => w.push(0xBF88_0009), // the outer branch, one word further
+            _ => w.push(x),
+        }
+    }
+    let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(err.contains("lane-mask join") && err.contains("0x48"), "{err:?}");
+}
+/// A lane mask held as the saved EXEC (every lane), joined with data on the
+/// skip edge, is refused naming the exact case: the data is on the host's
+/// lanes (the synthetic GPU test runs this shape on Windows).
+#[test]
+fn a_saved_exec_mask_joined_with_data_names_the_host_lanes_case() {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBE86_0385, // s_mov_b32 s6, 5
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+        0xBF88_0002, // s_cbranch_execz +2
+        0xD4C4_0006,
+        0x0002_0088, // v_cmp_gt_u32 s6, 8, v0
+        0xBEFE_0308, // s_mov_b32 exec_lo, s8
+        0xD501_0003,
+        0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+        0xE070_1000,
+        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    // The saved EXEC instead of the compare: every lane, so the skipping
+    // lanes' bit would be 1 on the console.
+    words[10..12].copy_from_slice(&[0xBE86_0308, 0xBF80_0000]); // s_mov_b32 s6, s8; s_nop 0
+    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            range(ResourceType::Srv, 0, 8, 0),
+            range(ResourceType::Srv, 8, 4, 16),
+            range(ResourceType::Uav, 16, 4, 0),
+        ],
+        io: StageIo::Cs(ComputeIo { rsrc2: 1 << 1, threads: [32, 1, 1] }),
+        code: bytes_of(&words),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io");
+    let r = lower::lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: false,
+        zero_copy_memory: false,
+        view_marks: false,
+        rect_list: false,
+        copy_params: [0; 32],
+    });
+    let Err(ShaderError::Unsupported { what, .. }) = r else {
+        panic!("a saved-EXEC mask joined with data translated");
+    };
+    assert!(
+        what == "a lane-mask join of an untracked mask: data, on the host's lanes",
+        "{what}"
+    );
 }

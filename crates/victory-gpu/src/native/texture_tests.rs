@@ -16,6 +16,20 @@ fn pool(id: usize, pages: usize) -> Option<Pool> {
     // Needs a device; the title is made on first use.
     with_title(|_| ())?;
     let mem = Alias::new(pages * page_size().max(16384)).unwrap();
+    // Textures earlier tests left over memory now freed and mapped here again: a new texture laid
+    // out as one of them would share its copy (`Title::realize`). The title releases its own.
+    let span = mem.alias as usize..mem.alias as usize + mem.len;
+    with_title(|t| loop {
+        let stale: Vec<usize> =
+            t.at_memory.iter().filter(|(a, _)| span.contains(a)).flat_map(|(_, k)| k.clone()).collect();
+        if stale.is_empty() {
+            break;
+        }
+        for k in stale {
+            t.host.release_resource(k);
+            t.texture_released(k);
+        }
+    });
     let info = PoolInfo {
         id,
         base: mem.primary as usize,
@@ -111,6 +125,60 @@ fn a_tiled_title_texture_is_detiled_into_the_host_texture() {
     }
 }
 
+/// `VICTORY_TEXTURE_DROP_TOP_MIP`: a host texture made without the top level receives the title's
+/// level 1 as its level 0, and so on down the chain.
+#[test]
+fn a_texture_made_without_its_top_level_gets_the_lower_levels() {
+    let Some(pool) = pool(9301, 8) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (64, 32), 4, 28, Swizzle::SW_64KB_D.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    tile(&pool, 0, &info.layout);
+    let tiled = super::super::textures::read_memory(info.memory, info.size);
+    let mut desc = info.desc().unwrap();
+    (desc.width, desc.height, desc.mips) = (32, 16, 3);
+    with_title(|t| {
+        let tex = t.host.backend.create_texture(&desc).unwrap();
+        super::super::textures::upload_from(&t.host.backend, &tex, &info, &tiled, 1).unwrap();
+        for host_mip in 0..3usize {
+            let (w, h) = (32 >> host_mip, 16 >> host_mip);
+            let mut out = vec![0u8; w * h * 4];
+            t.host.backend.read_texture(&tex, host_mip, 0, &mut out, w * 4, 0);
+            for (x, y) in [(0, 0), (w - 1, h - 1), (w / 2, h / 2)] {
+                let at = (y * w + x) * 4;
+                assert_eq!(out[at..at + 4], texel(host_mip as u32 + 1, x as u32, y as u32), "host mip {host_mip} at {x},{y}");
+            }
+        }
+    })
+    .unwrap();
+}
+
+/// `VICTORY_TEXTURE_DROP_TOP_MIP=2`: a host texture made without two levels receives the title's
+/// level 2 as its level 0.
+#[test]
+fn a_texture_made_without_two_levels_gets_the_levels_below() {
+    let Some(pool) = pool(9302, 8) else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (64, 32), 4, 28, Swizzle::SW_64KB_D.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    tile(&pool, 0, &info.layout);
+    let tiled = super::super::textures::read_memory(info.memory, info.size);
+    let mut desc = info.desc().unwrap();
+    (desc.width, desc.height, desc.mips) = (16, 8, 2);
+    with_title(|t| {
+        let tex = t.host.backend.create_texture(&desc).unwrap();
+        super::super::textures::upload_from(&t.host.backend, &tex, &info, &tiled, 2).unwrap();
+        for host_mip in 0..2usize {
+            let (w, h) = (16 >> host_mip, 8 >> host_mip);
+            let mut out = vec![0u8; w * h * 4];
+            t.host.backend.read_texture(&tex, host_mip, 0, &mut out, w * 4, 0);
+            for (x, y) in [(0, 0), (w - 1, h - 1), (w / 2, h / 2)] {
+                let at = (y * w + x) * 4;
+                assert_eq!(out[at..at + 4], texel(host_mip as u32 + 2, x as u32, y as u32), "host mip {host_mip} at {x},{y}");
+            }
+        }
+    })
+    .unwrap();
+}
+
 /// Held by the tests that count on a texture staying hot: the many submissions of
 /// `a_texture_blank_for_thousands_of_submissions_is_still_probed` and
 /// `hot_textures_cool_by_submissions_even_when_probe_round_is_capped` cool every other test's
@@ -174,22 +242,55 @@ fn a_texture_blank_for_thousands_of_submissions_is_still_probed() {
     let res = crate::resource::test_texture_at(pool.va(0), (256, 256), 1, 28, Swizzle::LINEAR.0, 0);
     let info = crate::resource::texture_info(res).unwrap();
     let key = res as usize;
+    // One title lock for the whole test, and no probe deadline for the submission after the write:
+    // other tests leave hundreds of blank textures, and a round the deadline cuts short under load
+    // probes only `MIN_SYNC_HOT` of them, so a few submissions may not reach this one.
     with_title(|t| {
         assert!(t.realize(key));
         for _ in 0..2000 {
             t.sync_dirty();
         }
         assert_eq!(t.uploads_of(key), 1, "the blank first upload");
+        pool.write(0, &vec![0xABu8; info.size]);
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 2, "still probed: the first frame is uploaded at the next submission");
     });
-    pool.write(0, &vec![0xABu8; info.size]);
-    // Within a few submissions: other tests' blank textures share the probe's time budget.
-    with_title(|t| {
-        let n = (1..=4).find(|_| {
-            t.sync_dirty();
-            t.uploads_of(key) == 2
+}
+
+/// A blank texture written in the same submission as other blank textures is still probed in it:
+/// one leaving the round after the wrap moved the last key into its place, which was probed a
+/// second time if the round had probed it already, and the key just before the round's start not
+/// at all.
+#[test]
+fn a_blank_texture_leaving_after_the_wrap_does_not_skip_another() {
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    const SIZE: usize = 64 * 64 * 4;
+    let Some(pool) = pool(9141, 8 * SIZE / page_size().max(16384) + 1) else { return };
+    // Four blank textures, only they in the list in this order, the round starting at the last:
+    // it probes 3, wraps to 0. Writing 1 and 2: 1 leaves and its place takes 3, probed already.
+    // Writing 0, 1 and 2: 0 leaves (3 takes its place, probed), then 1 leaves and 2 takes its
+    // place, not probed yet.
+    for (case, written, uploads) in [(0, &[1, 2][..], [1, 2, 2, 1]), (1, &[0, 1, 2][..], [2, 2, 2, 1])] {
+        let at = |i: usize| (4 * case + i) * SIZE;
+        let keys: Vec<usize> = (0..4)
+            .map(|i| crate::resource::test_texture_at(pool.va(at(i)), (64, 64), 1, 28, Swizzle::LINEAR.0, 0) as usize)
+            .collect();
+        with_title(|t| {
+            for &key in &keys {
+                assert!(t.realize(key));
+            }
+            t.sync_dirty_without_probe_deadline();
+            let others = std::mem::replace(&mut t.blank_keys, keys.clone());
+            t.blank_cursor = 3;
+            for &i in written {
+                pool.write(at(i), &[1u8; SIZE]);
+            }
+            t.sync_dirty_without_probe_deadline();
+            let got: Vec<u64> = keys.iter().map(|&k| t.uploads_of(k)).collect();
+            t.blank_keys.extend(others);
+            assert_eq!(got, uploads, "every written texture is uploaded at the next submission (writing {written:?})");
         });
-        assert!(n.is_some(), "the first frame is uploaded within a few submissions");
-    });
+    }
 }
 
 /// A texture rewritten whole (a movie's chroma plane) is not read whole at every submission, yet
@@ -480,6 +581,40 @@ fn a_texture_just_uploaded_is_not_read_again_until_it_changes() {
     }
     write(&[1u8; 16]);
     assert!((1..=4).any(|_| submit().1 == 3), "a write is seen");
+}
+
+/// A texture whose memory was partly unreadable when first uploaded (a page the title had not
+/// mapped yet: zeros there) is uploaded again once that page can be read, though no byte of title
+/// memory changed: the zeros it read were not the memory's.
+#[test]
+fn a_page_that_becomes_readable_after_the_upload_is_uploaded() {
+    use victory_platform::mem::{Protect, protect};
+    let _aging = AGING.lock().unwrap_or_else(|e| e.into_inner());
+    let page = page_size().max(16384);
+    let Some(pool) = pool(9131, 8) else { return };
+    // 128x128 RGBA8, linear: 64 KiB, its rows 32 at a time a 16 KiB page.
+    let res = crate::resource::test_texture_at(pool.va(0), (128, 128), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    with_title(|_| pool.write(0, &vec![0xABu8; info.size])).unwrap();
+    let hole = pool.va(page) as *mut u8;
+    // SAFETY: a page of this test's pool; protected and opened again only here.
+    unsafe { protect(hole, page, Protect::NO_ACCESS).unwrap() };
+    let texel = || read_mip(key, 0, 128, 128)[page + 4];
+    with_title(|t| {
+        assert!(t.realize(key));
+        t.sync_dirty_without_probe_deadline();
+    });
+    assert_eq!(read_mip(key, 0, 128, 128)[page - 4], 0xAB, "the readable page");
+    assert_eq!(texel(), 0, "the unreadable page reads zeros");
+    // SAFETY: as above.
+    unsafe { protect(hole, page, Protect::READ_WRITE).unwrap() };
+    let filled = (0..200).any(|_| {
+        with_title(|t| t.sync_dirty_without_probe_deadline());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        texel() == 0xAB
+    });
+    assert!(filled, "the page read zeros after it became readable");
 }
 
 /// A block-compressed texture: 16 bytes a 4x4 block, in the console's layout, detiled as blocks.
@@ -856,6 +991,72 @@ fn a_target_the_host_cannot_make_does_not_shift_the_ones_after_it() {
     drop(slots);
 }
 
+/// A dispatch whose bound table runs into a page that cannot be read (#445): the textures it may
+/// write are still noted from the entries that can be, and the rest are skipped, not loaded. Here
+/// the copy-back shows the UAV was noted.
+#[test]
+fn a_table_running_into_an_unreadable_page_is_noted_without_a_fault() {
+    use victory_platform::mem::{Protect, protect};
+    // Skips without the Shader Converter.
+    if super::host().is_none() {
+        return;
+    }
+    let dxil = include_bytes!("../../../victory-metal/tests/fixtures/tex_fill.dxil");
+    const W: u32 = 64;
+    let mut t = Title::new(victory_metal::metal::Metal::new().unwrap(), Default::default());
+    let mem = Alias::new((64 << 10).max(page_size())).unwrap();
+    let info = PoolInfo { id: 9133, base: mem.primary as usize, len: mem.len, memory_entry: None };
+    t.host.memory().pool_created(&info);
+    t.host.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+    let pool = Pool { mem };
+    t.set_texture_back(true);
+    let res = crate::resource::test_texture_at(pool.va(0), (u64::from(W), W), 1, 28, Swizzle::LINEAR.0, 4);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    pool.write(0, &vec![0u8; info.size]);
+    t.texture_created(key, info.clone());
+    assert!(t.realize(key));
+    // Two pages of descriptor records: the UAV in the last entry of the first, the table bound
+    // there, and its checked span (16 entries) running on into the second.
+    let (page, step) = (page_size(), crate::descriptor::increment(0).unwrap_or(32) as usize);
+    let mut records = 0u64;
+    // SAFETY: no arguments; the task port of this process.
+    let task = unsafe { super::mach_task_self() };
+    // SAFETY: `records` is written with the new allocation's address.
+    assert_eq!(unsafe { super::mach_vm_allocate(task, &mut records, 2 * page as u64, 1) }, 0);
+    let at = page / step - 1;
+    let uav = [28u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_uav(std::ptr::null(), res, std::ptr::null(), &uav, records + (at * step) as u64);
+    let heap = t.host.heap(HeapKind::Resource, records, 2 * page / step).unwrap();
+    // SAFETY: the second page of our own allocation.
+    unsafe { protect((records as usize + page) as *mut u8, page, Protect::NO_ACCESS) }.unwrap();
+    let pso = t.host.compute_pipeline(dxil, [8, 8, 1]).unwrap();
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, at);
+    l.dispatch(W / 8, W / 8, 1).unwrap();
+    t.ensure_queue(1).unwrap();
+    t.submit(1, vec![(l, vec![])]);
+    t.signal_queue(1, 11, 0, 1);
+    let start = std::time::Instant::now();
+    while !t.try_wait(11, 0, 1) {
+        assert!(start.elapsed().as_secs() < 10, "the dispatch did not complete");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut out = vec![0u8; info.size];
+    assert!(crate::native::safe_read(pool.va(0) as *const u8, &mut out));
+    let linear: Vec<u8> = (0..W).flat_map(|y| (0..W).flat_map(move |x| [x as u8, y as u8, 64, 255])).collect();
+    let mut want = vec![0u8; info.size];
+    info.layout.tile(&mut want, 0, 0, &linear, W as usize * 4, linear.len()).unwrap();
+    assert!(out == want, "the UAV in the readable entry was not noted");
+    t.host.drop_heap(records);
+    t.host.forget_resource(key);
+    t.texture_released(key);
+    // SAFETY: our allocation, which nothing uses any more.
+    assert_eq!(unsafe { super::mach_vm_deallocate(task, records, 2 * page as u64) }, 0);
+}
+
 /// A compute dispatch writes a tiled title texture through a UAV; once its fence value shows, the
 /// title's own memory holds the texels, in the texture's layout (the ocean maps' path, #46).
 #[test]
@@ -1214,6 +1415,58 @@ fn an_indirect_dispatch_mesh_x_draws_the_groups_its_record_holds() {
         })
         .unwrap();
     }
+}
+
+/// A list with a mesh pipeline (one triangle covering the target, red) bound and a 16x16 RGBA8
+/// target at `pool` offset `at`, after `call` records its mesh dispatch through the method table;
+/// the target's pixels once the list ran.
+fn mesh_dispatch_into(pool: &Pool, at: usize, pipe_key: usize, call: impl FnOnce(This)) -> Vec<[u8; 4]> {
+    use super::mesh_tests::{RED, TRIANGLE, translate};
+    use victory_shader::native::HwStage;
+    let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
+    let state = crate::native::state::Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let pso = match with_title(|t| t.render_pipe(&ms, Some(&ps), &state, "mesh")).unwrap() {
+        crate::native::title::Pipe::Render(pso, _) => pso,
+        _ => panic!("no mesh pipeline"),
+    };
+    glue::install_test_render_pipeline(pipe_key, pso);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let handle = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let rt = crate::resource::test_texture_at(pool.va(at), (16, 16), 1, 28, Swizzle::SW_64KB_R_X.0, 1);
+    crate::descriptor::create_rtv(std::ptr::null(), rt, std::ptr::null(), handle);
+    let list = crate::list::test_list(false, std::ptr::null());
+    glue::set_pipeline(list, pipe_key as This);
+    slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(list, 1, &handle, 0, std::ptr::null());
+    call(list);
+    run_title_list(list);
+    read_mip(rt as usize, 0, 16, 16).as_chunks::<4>().0.to_vec()
+}
+
+/// `DispatchMeshX` without an argument address runs `x` groups of the bound mesh pipeline (#353):
+/// one group colours the target, zero groups leave it as it was. It was dropped before.
+#[test]
+fn a_direct_dispatch_mesh_x_draws_its_groups() {
+    let Some(pool) = pool(9217, 4) else { return };
+    let red = [255u8, 128, 128, 255];
+    for (i, (x, want)) in [(1u32, red), (0, [0; 4])].into_iter().enumerate() {
+        let before = crate::list::DROPPED_KINDS[0].load(std::sync::atomic::Ordering::Relaxed);
+        // DispatchMeshX(x, flags, indirect arguments, payload), no arguments.
+        let got = mesh_dispatch_into(&pool, 0x2000 * i, 0xDEAD_BEF1, |list| {
+            slot::<extern "system" fn(This, u32, u64, u64, u64)>(list, 0x310)(list, x, 0, 0, 0)
+        });
+        assert!(got.iter().all(|p| *p == want), "x {x}: {:?}", &got[..2]);
+        assert_eq!(crate::list::DROPPED_KINDS[0].load(std::sync::atomic::Ordering::Relaxed), before, "x {x}: not dropped");
+    }
+}
+
+/// `DispatchMesh(x, y, z)` (method 0x3f8) runs those groups of the bound mesh pipeline (#353).
+#[test]
+fn a_direct_dispatch_mesh_draws_its_groups() {
+    let Some(pool) = pool(9218, 4) else { return };
+    let got = mesh_dispatch_into(&pool, 0, 0xDEAD_BEF2, |list| {
+        slot::<extern "system" fn(This, u32, u32, u32)>(list, 0x3f8)(list, 1, 1, 1)
+    });
+    assert!(got.iter().all(|p| *p == [255, 128, 128, 255]), "{:?}", &got[..2]);
 }
 
 /// A render target a recorded draw wrote is the GPU's: when the title then changes the memory
@@ -1630,4 +1883,1083 @@ fn a_placed_rgb9e5_view_over_an_r32_uint_object_shares_its_texture() {
     });
     glue::resource_released(object);
     with_title(|t| assert!(!t.host.knows(key), "released with the object"));
+}
+
+/// Compute writes a depth texture through unordered views of its depth plane (the lighting's
+/// material depth), which Metal shaders cannot write: the view shows a colour twin. A colour read
+/// made before the first unordered view stays on the depth texture; one made after reads the twin.
+/// The newer contents move where the use changes: into the twin before compute, into the depth
+/// texture before a render pass into it, once per change.
+#[test]
+fn an_unordered_view_of_a_depth_texture_writes_a_colour_twin() {
+    let Some(pool) = pool(9216, 8) else { return };
+    // DXGI 19 (D32_FLOAT_S8X24_UINT); flags 2 | 4: a depth target compute also writes.
+    let depth = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 19, Swizzle::LINEAR.0, 2 | 4);
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    // R32_FLOAT, 2D, mip 0.
+    let srv = [41u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+    let uav = [41u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_srv(std::ptr::null(), depth, &srv, start + 64);
+    with_title(|t| {
+        let tex = t.texture_of(depth as usize).expect("the depth texture");
+        t.host.heap(HeapKind::Resource, start, 4).unwrap();
+        assert_eq!(t.host.mirror(start + 64), Ok(true));
+        assert!(t.host.twin_of(&tex).is_none(), "a colour read alone makes no twin");
+    });
+    crate::descriptor::create_uav(std::ptr::null(), depth, std::ptr::null(), &uav, start);
+    with_title(|t| {
+        let tex = t.texture_of(depth as usize).unwrap();
+        assert_eq!(t.host.mirror(start), Ok(true));
+        let twin = t.host.twin_of(&tex).expect("an unordered view of a depth texture makes a colour twin");
+        assert!(!std::rc::Rc::ptr_eq(&twin, &tex));
+        assert_eq!(t.host.twin_copies_for_test(false, &tex), Vec::<bool>::new(), "the depth texture is newer");
+        assert_eq!(t.host.twin_copies_for_test(true, &tex), [false], "into the twin before compute");
+        assert_eq!(t.host.twin_copies_for_test(true, &tex), Vec::<bool>::new(), "the twin is newer already");
+        assert_eq!(t.host.twin_copies_for_test(false, &tex), [true], "into the depth texture before it is drawn into");
+        assert_eq!(t.host.twin_copies_for_test(false, &tex), Vec::<bool>::new(), "the depth texture is newer now");
+    });
+    // A colour read written after the twin exists reads the twin.
+    crate::descriptor::create_srv(std::ptr::null(), depth, &srv, start + 32);
+    with_title(|t| assert_eq!(t.host.mirror(start + 32), Ok(true)));
+    glue::resource_released(depth);
+}
+
+/// The console's 16-bit depth with stencil (DXGI 118, the lighting's material depth), which the
+/// host keeps as 32-bit float depth with stencil, is written through `R16_UNORM` views of its
+/// depth plane: they get a 32-bit float twin. A 16-bit depth texture (the shadow maps: DXGI 53
+/// as a depth target) gets a 16-bit twin. What the twin holds goes into the depth plane and back
+/// unchanged, bit for bit.
+#[test]
+fn a_depth_twin_and_its_depth_plane_hold_the_same_texels() {
+    let Some(pool) = pool(9218, 16) else { return };
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    with_title(|t| {
+        t.host.heap(HeapKind::Resource, start, 4).unwrap();
+    });
+    // (DXGI format, bytes a texel of the twin); R16_UNORM views (56), 2D, mip 0.
+    for (n, (format, texel)) in [(118u32, 4usize), (53, 2)].into_iter().enumerate() {
+        let depth = crate::resource::test_texture_at(pool.va(n * 65536), (16, 16), 1, format, Swizzle::LINEAR.0, 2 | 4);
+        crate::descriptor::create_uav(std::ptr::null(), depth, std::ptr::null(), &[56u32, 4, 0, 0, 0, 0, 0, 0, 0, 0], start + 32 * n as u64);
+        with_title(|t| {
+            let tex = t.texture_of(depth as usize).expect("the depth texture");
+            assert_eq!(t.host.mirror(start + 32 * n as u64), Ok(true), "{format}");
+            let twin = t.host.twin_of(&tex).expect("an R16_UNORM view of the depth plane makes the twin");
+            // The twin as compute leaves it, after it took the depth texture's contents.
+            assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1, "{format}: into the twin before compute");
+            let written: Vec<u8> = match texel {
+                4 => (0..256u32).flat_map(|i| (i as f32 / 65535.0).to_le_bytes()).collect(),
+                _ => (0..256u32).flat_map(|i| (i as u16 * 251).to_le_bytes()).collect(),
+            };
+            t.host.backend.upload_texture(&twin, 0, 0, &written, 16 * texel, written.len());
+            assert_eq!(t.host.run_twin_copies_for_test(false, &tex), 1, "{format}: into the depth plane before a draw");
+            // The twin is wiped, then takes the depth plane back before the next compute.
+            t.host.backend.upload_texture(&twin, 0, 0, &vec![0u8; written.len()], 16 * texel, written.len());
+            assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1, "{format}: into the twin again");
+            let mut out = vec![0u8; written.len()];
+            t.host.backend.read_texture(&twin, 0, 0, &mut out, 16 * texel, 0);
+            assert!(out == written, "{format}: the depth plane did not hold what the twin had");
+        });
+        glue::resource_released(depth);
+    }
+}
+
+/// Multi-mip (`D32_FLOAT_S8X24_UINT`, 4 mips) and 2D-array (`D16_UNORM`, 2 layers x 3 mips) depth
+/// twins keep every mip and array layer, mirror high-mip UAVs and DXGI 21/119 full-chain SRVs,
+/// create twins on placed UAVs, immediately re-mirror pre-existing heap entries onto the twin, and
+/// round-trip every `(slice, mip)` subresource through the depth plane bit for bit.
+#[test]
+fn multi_mip_array_and_placed_depth_twins_preserve_all_subresources_and_remirror_immediately() {
+    let Some(pool) = pool(9219, 32) else { return };
+    let heap = crate::descriptor::test_heap(false, 32);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    with_title(|t| {
+        t.host.heap(HeapKind::Resource, start, 32).unwrap();
+    });
+
+    // 1. 16x16 DXGI 19 (D32_FLOAT_S8X24_UINT) with 4 mips: mirror a DXGI 21 full-chain SRV at
+    //    bindless entry 24 *before* any UAV exists, then mirror UAVs at mips 0..4.
+    let depth4 = crate::resource::test_texture_at(pool.va(0), (16, 16), 4, 19, Swizzle::LINEAR.0, 2 | 4);
+    let srv_all = [21u32, 4, 5768, 0, 0, 4, 0, 0, 0, 0];
+    crate::descriptor::create_srv(std::ptr::null(), depth4, &srv_all, start + 24 * 32);
+    for mip in 0..4u32 {
+        let uav = [41u32, 4, mip, 0, 0, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(std::ptr::null(), depth4, std::ptr::null(), &uav, start + u64::from(mip) * 32);
+    }
+    with_title(|t| {
+        assert_eq!(t.host.mirror(start + 24 * 32), Ok(true));
+        for mip in 0..4u64 {
+            assert_eq!(t.host.mirror(start + mip * 32), Ok(true), "mip {mip}");
+        }
+        let tex = t.texture_of(depth4 as usize).unwrap();
+        let twin = t.host.twin_of(&tex).expect("multi-mip depth twin");
+        // Entry 24 (outside any 16-entry bound table) must be re-mirrored immediately onto the twin.
+        assert!(t.host.is_mirrored(start + 24 * 32), "bindless SRV at index 24 was immediately re-mirrored");
+        assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1);
+        let mut expected = Vec::new();
+        for mip in 0..4usize {
+            let w = (16 >> mip).max(1);
+            let bytes: Vec<u8> = (0..(w * w))
+                .flat_map(|i| (((mip * 64 + i + 1) as f32) / 512.0).to_le_bytes())
+                .collect();
+            t.host.backend.upload_texture(&twin, mip, 0, &bytes, w * 4, bytes.len());
+            expected.push(bytes);
+        }
+        assert_eq!(t.host.run_twin_copies_for_test(false, &tex), 1, "all 4 mips into depth plane");
+        for mip in 0..4usize {
+            let w = (16 >> mip).max(1);
+            t.host.backend.upload_texture(&twin, mip, 0, &vec![0u8; w * w * 4], w * 4, w * w * 4);
+        }
+        assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1, "all 4 mips back into twin");
+        for (mip, want) in expected.iter().enumerate() {
+            let w = (16 >> mip).max(1);
+            let mut got = vec![0u8; want.len()];
+            t.host.backend.read_texture(&twin, mip, 0, &mut got, w * 4, 0);
+            assert!(got == *want, "mip {mip} mismatch");
+        }
+    });
+    glue::resource_released(depth4);
+
+    // 2. 16x16 DXGI 53 (D16_UNORM) 2D array with 2 layers x 3 mips.
+    let arr = crate::resource::test_texture_array_at(pool.va(65536), (16, 16), 3, 2, 53, Swizzle::LINEAR.0, 2 | 4);
+    let uav_arr = [56u32, 5, 1, 0, 2, 0, 0, 0, 0, 0]; // R16_UNORM, Texture2DArray, mip 1, slices 0..2
+    crate::descriptor::create_uav(std::ptr::null(), arr, std::ptr::null(), &uav_arr, start + 8 * 32);
+    with_title(|t| {
+        let tex = t.texture_of(arr as usize).unwrap();
+        assert_eq!(t.host.mirror(start + 8 * 32), Ok(true));
+        let twin = t.host.twin_of(&tex).expect("array depth twin");
+        assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1);
+        for slice in 0..2usize {
+            for mip in 0..3usize {
+                let w = (16 >> mip).max(1);
+                let bytes: Vec<u8> = (0..(w * w))
+                    .flat_map(|i| (((slice * 1000 + mip * 100 + i + 3) as u16) * 17).to_le_bytes())
+                    .collect();
+                t.host.backend.upload_texture(&twin, mip, slice, &bytes, w * 2, bytes.len());
+            }
+        }
+        assert_eq!(t.host.run_twin_copies_for_test(false, &tex), 1);
+        for slice in 0..2usize {
+            for mip in 0..3usize {
+                let w = (16 >> mip).max(1);
+                t.host.backend.upload_texture(&twin, mip, slice, &vec![0u8; w * w * 2], w * 2, w * w * 2);
+            }
+        }
+        assert_eq!(t.host.run_twin_copies_for_test(true, &tex), 1);
+        for slice in 0..2usize {
+            for mip in 0..3usize {
+                let w = (16 >> mip).max(1);
+                let want: Vec<u8> = (0..(w * w))
+                    .flat_map(|i| (((slice * 1000 + mip * 100 + i + 3) as u16) * 17).to_le_bytes())
+                    .collect();
+                let mut got = vec![0u8; want.len()];
+                t.host.backend.read_texture(&twin, mip, slice, &mut got, w * 2, 0);
+                assert!(got == want, "slice {slice} mip {mip} mismatch");
+            }
+        }
+    });
+    glue::resource_released(arr);
+
+    // 3. Placed UAV (`View::Placed(true, ..)`) creates a depth twin and immediately re-mirrors a
+    //    pre-existing placed SRV of the same depth texture.
+    let placed_va = pool.va(131072);
+    let res_words = [
+        3u32,
+        0,
+        0,
+        0,
+        16,
+        0,
+        16,
+        1 | (1 << 16),
+        40,
+        1,
+        0,
+        0x100 | Swizzle::LINEAR.0,
+        2 | 4,
+        0,
+    ];
+    let mut placed_srv = [0u32; 16];
+    (placed_srv[0], placed_srv[1], placed_srv[2], placed_srv[5]) = (41, 4, 5768, 1);
+    placed_srv[10] = placed_va as u32;
+    placed_srv[11] = (placed_va >> 32) as u32;
+    crate::descriptor::record(start + 28 * 32, crate::descriptor::View::Placed(false, res_words, placed_srv));
+    glue::mirror(start + 28 * 32);
+    let mut placed_uav = [0u32; 16];
+    placed_uav[0] = 41; // R32_FLOAT
+    placed_uav[1] = 4; // Texture2D
+    placed_uav[10] = placed_va as u32;
+    placed_uav[11] = (placed_va >> 32) as u32;
+    crate::descriptor::record(start + 29 * 32, crate::descriptor::View::Placed(true, res_words, placed_uav));
+    glue::mirror(start + 29 * 32);
+    let pkey = crate::native::textures::placed_key(placed_va, &res_words);
+    with_title(|t| {
+        let tex = t.texture_of(pkey).unwrap();
+        assert!(t.host.twin_of(&tex).is_some(), "placed UAV created a depth twin");
+        assert!(t.host.is_mirrored(start + 28 * 32), "placed SRV was immediately re-mirrored");
+    });
+}
+
+
+/// A mip-streamed 64 KiB XOR-tiled texture placed in an unmapped reservation (`NO_ACCESS`) and
+/// populated step by step across scattered 64 KiB physical pages (tail mips first, then mid mips,
+/// then mip 0): each residency step is caught on the next submission by the mip-aware probes
+/// without forcing immediate unchanged whole-texture re-reads while fine mips remain unmapped.
+#[test]
+fn streamed_mips_across_scattered_pool_pages_upload_each_step_without_whole_rereads() {
+    use victory_platform::mem::{Protect, protect};
+
+    let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+    let mut t = Title::new(metal, Default::default());
+    const TILE: usize = 64 << 10;
+    const POOL_TILES: usize = 32;
+    let mem = Alias::new(POOL_TILES * TILE).unwrap();
+    let pool_info = PoolInfo {
+        id: 9290,
+        base: mem.primary as usize,
+        len: mem.len,
+        memory_entry: None,
+    };
+    t.host.memory().pool_created(&pool_info);
+
+    // 512x512 RGBA8, 10 mips, SW_64KB_D_X: 1,441,792 bytes (22 x 64 KiB pages):
+    //   [0 .. 64 KiB)       = tail mips 3..9
+    //   [64 .. 128 KiB)     = mip 2 (128x128)
+    //   [128 .. 384 KiB)    = mip 1 (256x256, 4 pages)
+    //   [384 .. 1408 KiB)   = mip 0 (512x512, 16 pages)
+    let proto = crate::resource::test_texture_at(mem.alias as u64, (512, 512), 10, 28, Swizzle::SW_64KB_D_X.0, 0);
+    let mut info = crate::resource::texture_info(proto).unwrap();
+    let total_tiles = info.size / TILE;
+    assert_eq!(total_tiles, 22);
+
+    let px = |mip: u32, x: u32, y: u32| [x as u8, y as u8, (mip as u8).wrapping_mul(23).wrapping_add(17), 255];
+    let mut tiled_full = vec![0u8; info.size];
+    for mip in 0..10u32 {
+        let m = &info.layout.mips[mip as usize];
+        let linear: Vec<u8> = (0..m.height)
+            .flat_map(|y| (0..m.width).flat_map(move |x| px(mip, x, y)))
+            .collect();
+        info.layout
+            .tile(&mut tiled_full, mip, 0, &linear, m.width as usize * 4, linear.len())
+            .unwrap();
+    }
+
+    let mut va = 0u64;
+    let task = unsafe { super::mach_task_self() };
+    assert_eq!(unsafe { super::mach_vm_allocate(task, &mut va, info.size as u64, 1) }, 0);
+    // SAFETY: `va..va + info.size` is our freshly allocated reservation.
+    unsafe { protect(va as *mut u8, info.size, Protect::NO_ACCESS) }.unwrap();
+    info.memory = va as *const u8;
+    let key = 0x7E57_0179usize;
+
+    let map_tile = |t: &Title<victory_metal::metal::Metal>, title_idx: usize, pool_idx: usize| {
+        let pool_off = pool_idx * TILE;
+        let title_off = title_idx * TILE;
+        // SAFETY: `pool_off..+TILE` is inside `mem.primary` and `va + title_off..+TILE` is inside `va`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                tiled_full[title_off..title_off + TILE].as_ptr(),
+                mem.primary.add(pool_off),
+                TILE,
+            );
+            let (mut at, mut cur, mut max) = (va + title_off as u64, 0, 0);
+            let r = super::mach_vm_remap(
+                task,
+                &mut at,
+                TILE as u64,
+                0,
+                0x4000,
+                task,
+                mem.primary as u64 + pool_off as u64,
+                0,
+                &mut cur,
+                &mut max,
+                0,
+            );
+            assert_eq!(r, 0, "mach_vm_remap tile {title_idx} -> {pool_idx}");
+        }
+        t.host.memory().mapped(va as usize + title_off, TILE, &pool_info, pool_off);
+    };
+
+    let check_mip = |t: &mut Title<victory_metal::metal::Metal>, mip: u32, expect_zero: bool| {
+        let (w, h) = ((512usize >> mip).max(1), (512usize >> mip).max(1));
+        let tex = t.texture_of(key).unwrap();
+        let mut out = vec![0xffu8; w * h * 4];
+        t.host.backend.read_texture(&tex, mip as usize, 0, &mut out, w * 4, 0);
+        if expect_zero {
+            assert!(out.iter().all(|&b| b == 0), "unmapped mip {mip} must stay zero");
+        } else {
+            for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w / 2, h / 2)] {
+                let p = (y * w + x) * 4;
+                assert_eq!(&out[p..p + 4], &px(mip, x as u32, y as u32), "mip {mip} ({x},{y})");
+            }
+        }
+    };
+
+    // Hold the shared title lock across all steps so no parallel test drains the process-wide
+    // `WATCH.dirty` set while this test's watched texture is live (`5ba3cce6`).
+    with_title(|_shared| {
+        // Step 0: Completely unmapped reservation (`blank` first upload).
+        t.texture_created(key, info);
+        assert!(t.realize(key));
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 1, "initial blank upload");
+        check_mip(&mut t, 0, true);
+        check_mip(&mut t, 4, true);
+
+        // Step 1: Stream tail mips 3..9 (`[0..64 KiB)`) into scattered pool page 29 while mips 0..2
+        // remain `NO_ACCESS`. `probe_nonzero` must catch it on the very next submission.
+        map_tile(&t, 0, 29);
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 2, "tail mips uploaded on next submission");
+        for mip in 3..10 {
+            check_mip(&mut t, mip, false);
+        }
+        for mip in 0..3 {
+            check_mip(&mut t, mip, true);
+        }
+
+        // Step 2: Stream mip 2 (`[64..128 KiB)`) into scattered pool page 7 while mips 0..1 stay
+        // `NO_ACCESS`. Mip-aware `probe_read` must catch it immediately AND keep `sampled_sees_writes`
+        // true so the next `WHOLE_EVERY - 1` idle submissions do 0 whole re-reads.
+        map_tile(&t, 1, 7);
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 3, "mip 2 uploaded on next submission");
+        check_mip(&mut t, 2, false);
+        check_mip(&mut t, 1, true);
+        check_mip(&mut t, 0, true);
+        for sub in 0..crate::native::textures::WHOLE_EVERY - 1 {
+            let jobs = t.sync_jobs_within(None);
+            assert!(
+                !jobs.iter().any(|j| j.key == key),
+                "unchanged partial texture re-read whole at idle submission {sub}"
+            );
+            t.sync(jobs);
+        }
+
+        // Step 3: Stream mip 1 (`[128..384 KiB)`) across 4 scattered out-of-order pool pages.
+        for (k, &pool_idx) in [21usize, 3, 18, 11].iter().enumerate() {
+            map_tile(&t, 2 + k, pool_idx);
+        }
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 4, "mip 1 uploaded on next submission");
+        check_mip(&mut t, 1, false);
+        check_mip(&mut t, 0, true);
+        for sub in 0..crate::native::textures::WHOLE_EVERY - 1 {
+            let jobs = t.sync_jobs_within(None);
+            assert!(!jobs.iter().any(|j| j.key == key), "idle submission {sub} after mip 1");
+            t.sync(jobs);
+        }
+
+        // Step 4: Stream mip 0 (`[384..1408 KiB)`) across 16 scattered pool pages.
+        let mip0_pages = [30usize, 0, 27, 4, 25, 1, 23, 6, 20, 8, 17, 9, 15, 10, 14, 12];
+        for (k, &pool_idx) in mip0_pages.iter().enumerate() {
+            map_tile(&t, 6 + k, pool_idx);
+        }
+        t.sync_dirty_without_probe_deadline();
+        assert_eq!(t.uploads_of(key), 5, "mip 0 uploaded on next submission");
+        check_mip(&mut t, 0, false);
+
+        t.texture_released(key);
+    });
+    t.host.memory().pool_released(&pool_info);
+    // SAFETY: Release our test reservation before dropping `mem`.
+    assert_eq!(unsafe { super::mach_vm_deallocate(task, va, (total_tiles * TILE) as u64) }, 0);
+}
+
+#[test]
+#[ignore = "benchmark"]
+fn bench_streamed_texture_sync_pool_reads_and_mip_probes() {
+    use std::time::Instant;
+    use victory_platform::mem::{Protect, next_region, page_size, protect};
+
+    let Ok(metal) = victory_metal::metal::Metal::new() else { return };
+    let mut t = Title::new(metal, Default::default());
+    const N: usize = 32;
+    const TILE: usize = 64 << 10;
+    const TILES_PER_TEX: usize = 22; // 512x512 RGBA8, 10 mips, SW_64KB_D_X = 1.375 MiB
+    const RESIDENT_TILES: usize = 6; // mips 1..9 (384 KiB) mapped; mip 0 (1 MiB) NO_ACCESS
+
+    let mem = Alias::new(N * RESIDENT_TILES * TILE).unwrap();
+    let pool_info = PoolInfo {
+        id: 9299,
+        base: mem.primary as usize,
+        len: mem.len,
+        memory_entry: None,
+    };
+    t.host.memory().pool_created(&pool_info);
+
+    let proto = crate::resource::test_texture_at(mem.alias as u64, (512, 512), 10, 28, Swizzle::SW_64KB_D_X.0, 0);
+    let base_info = crate::resource::texture_info(proto).unwrap();
+    assert_eq!(base_info.size, TILES_PER_TEX * TILE);
+
+    let mut tiled_template = vec![0u8; base_info.size];
+    for mip in 1..10u32 {
+        let m = &base_info.layout.mips[mip as usize];
+        let linear = vec![0x40u8 + mip as u8 * 9; (m.width * m.height * 4) as usize];
+        base_info
+            .layout
+            .tile(&mut tiled_template, mip, 0, &linear, m.width as usize * 4, linear.len())
+            .unwrap();
+    }
+
+    let task = unsafe { super::mach_task_self() };
+    let mut va = 0u64;
+    let total_va = N * TILES_PER_TEX * TILE;
+    assert_eq!(unsafe { super::mach_vm_allocate(task, &mut va, total_va as u64, 1) }, 0);
+    unsafe { protect(va as *mut u8, total_va, Protect::NO_ACCESS) }.unwrap();
+
+    // Realize all 32 textures blank first.
+    let keys: Vec<usize> = (0..N)
+        .map(|i| {
+            let key = 0xBEEF_0000 + i;
+            let mut info = base_info.clone();
+            info.memory = (va as usize + i * TILES_PER_TEX * TILE) as *const u8;
+            t.texture_created(key, info);
+            assert!(t.realize(key));
+            key
+        })
+        .collect();
+
+    let t_blank = Instant::now();
+    t.sync_dirty();
+    let blank_ms = t_blank.elapsed().as_secs_f64() * 1000.0;
+
+    // Map 6 scattered 64 KiB physical pages per texture (reverse pool order so adjacent pages are
+    // separate `vm_map_entry` regions in XNU) while leaving mip 0 (`1 MiB`) `NO_ACCESS`.
+    for i in 0..N {
+        let tex_va = va as usize + i * TILES_PER_TEX * TILE;
+        for r in 0..RESIDENT_TILES {
+            let pool_slot = (N * RESIDENT_TILES - 1) - (i * RESIDENT_TILES + r);
+            let pool_off = pool_slot * TILE;
+            let src_off = r * TILE;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    tiled_template[src_off..src_off + TILE].as_ptr(),
+                    mem.primary.add(pool_off),
+                    TILE,
+                );
+                // Ensure each texture has a unique content hash.
+                *mem.primary.add(pool_off + 0x800) ^= (i as u8).wrapping_add(1);
+                let (mut at, mut cur, mut max) = ((tex_va + src_off) as u64, 0, 0);
+                assert_eq!(
+                    super::mach_vm_remap(
+                        task,
+                        &mut at,
+                        TILE as u64,
+                        0,
+                        0x4000,
+                        task,
+                        mem.primary as u64 + pool_off as u64,
+                        0,
+                        &mut cur,
+                        &mut max,
+                        0,
+                    ),
+                    0
+                );
+            }
+            t.host.memory().mapped(tex_va + src_off, TILE, &pool_info, pool_off);
+        }
+    }
+
+    // 1. Measure old page-by-page VM region walk vs `PoolTable::read_mapped_with` across 10 rounds
+    //    (320 partial texture reads = 440 MiB logical).
+    let mut buf = vec![0u8; base_info.size];
+    let page = page_size();
+    let mut old_syscalls = 0usize;
+    let t_old_read = Instant::now();
+    for _ in 0..10 {
+        for i in 0..N {
+            let base = va as usize + i * TILES_PER_TEX * TILE;
+            let end = base + base_info.size;
+            let mut cur = base;
+            while cur < end {
+                old_syscalls += 1;
+                let Some(region) = next_region(cur) else { break };
+                let start = cur.max(region.base);
+                let stop = end.min(region.base.saturating_add(region.len));
+                if start >= stop {
+                    break;
+                }
+                if region.protect.0 & Protect::READ.0 == 0 {
+                    buf[start - base..stop - base].fill(0);
+                } else {
+                    old_syscalls += 1;
+                    let _ = crate::native::safe_read(start as *const u8, &mut buf[start - base..stop - base]);
+                }
+                cur = stop;
+            }
+            let _ = page;
+            std::hint::black_box(&buf[0]);
+        }
+    }
+    let old_read_ms = t_old_read.elapsed().as_secs_f64() * 1000.0;
+
+    let pools = t.host.memory();
+    let mut new_syscalls = 0usize;
+    let t_new_read = Instant::now();
+    for _ in 0..10 {
+        for i in 0..N {
+            let base = va as usize + i * TILES_PER_TEX * TILE;
+            let _ = pools.read_mapped_with(base, &mut buf, |span_at, dst| {
+                new_syscalls += 1;
+                crate::native::safe_read(span_at as *const u8, dst)
+            });
+            std::hint::black_box(&buf[0]);
+        }
+    }
+    let new_read_ms = t_new_read.elapsed().as_secs_f64() * 1000.0;
+
+    // 2. Sync all 32 partial textures (probes + prepare + upload, skipping unmapped 1 MiB mip 0),
+    //    then measure whole-read volume across 30 idle submissions (~1 world frame).
+    let t_stream_sync = Instant::now();
+    t.sync_dirty_without_probe_deadline();
+    let stream_sync_ms = t_stream_sync.elapsed().as_secs_f64() * 1000.0;
+    assert!(keys.iter().all(|&k| t.uploads_of(k) == 2));
+
+    let mut idle_whole_jobs = 0usize;
+    let mut idle_whole_bytes = 0usize;
+    let t_idle = Instant::now();
+    for _ in 0..30 {
+        let jobs = t.sync_jobs();
+        idle_whole_jobs += jobs.len();
+        idle_whole_bytes += jobs.iter().map(|_| base_info.size).sum::<usize>();
+        t.sync(jobs);
+    }
+    let idle_ms = t_idle.elapsed().as_secs_f64() * 1000.0;
+
+    eprintln!(
+        "BENCH #179 ({N}x 1.375 MiB partial streamed textures, 6 scattered 64K pages + 1 MiB unmapped mip 0):\n\
+         - initial blank sync ({N} textures): {blank_ms:.2} ms\n\
+         - 320 partial reads (440 MiB): page-by-page VM walk {old_read_ms:.2} ms ({old_syscalls} kernel calls) -> PoolTable coalesced {new_read_ms:.2} ms ({new_syscalls} kernel calls, {:.2}x speedup)\n\
+         - streamed mips 1..9 sync ({N} textures, mip 0 skipped): {stream_sync_ms:.2} ms\n\
+         - 30 idle submissions (~1 world frame): {idle_whole_jobs} whole checks ({:.2} MiB, {idle_ms:.2} ms total; vs ~240 MiB before mip-aware probes)",
+        old_read_ms / new_read_ms.max(1e-6),
+        idle_whole_bytes as f64 / (1024.0 * 1024.0),
+    );
+
+    for k in keys {
+        t.texture_released(k);
+    }
+    t.host.memory().pool_released(&pool_info);
+    assert_eq!(unsafe { super::mach_vm_deallocate(task, va, total_va as u64) }, 0);
+}
+
+
+/// Over the texture budget, the least recently used go first, only until the excess is freed.
+#[test]
+fn the_least_recently_used_textures_go_first_until_the_excess_is_freed() {
+    use crate::native::textures::choose_evictions;
+    // (key, bytes, last used)
+    let c = vec![(1, 100, 5), (2, 100, 1), (3, 100, 3), (4, 100, 3)];
+    assert_eq!(choose_evictions(c.clone(), 0), Vec::<usize>::new());
+    assert_eq!(choose_evictions(c.clone(), 1), vec![2]);
+    assert_eq!(choose_evictions(c.clone(), 150), vec![2, 3], "equal use: the lower key first");
+    assert_eq!(choose_evictions(c.clone(), 300), vec![2, 3, 4]);
+    assert_eq!(choose_evictions(c, 10_000), vec![2, 3, 4, 1]);
+}
+
+/// The budget is off unless `VICTORY_METAL_TEXTURE_BUDGET_MB` sets it; the figure suggested for a
+/// Mac is what Metal's working set leaves after the title's memory, with a floor.
+#[test]
+fn the_texture_budget_is_off_unless_set() {
+    use crate::native::textures::{MIN_TEXTURE_BUDGET, suggested_texture_budget, texture_budget};
+    const MIB: u64 = 1 << 20;
+    assert_eq!(texture_budget(None), 0, "off by default");
+    assert_eq!(texture_budget(Some("2048")), 2048 * MIB);
+    assert_eq!(texture_budget(Some("0")), 0, "0: no budget");
+    assert_eq!(texture_budget(Some("lots")), 0, "not a number: no budget");
+    // An M4 with 16 GB, Series S (#8).
+    assert_eq!(suggested_texture_budget(12124 * MIB, 7776 * MIB), 4348 * MIB);
+    // Series X on the same Mac: the title alone is past the working set.
+    assert_eq!(suggested_texture_budget(12124 * MIB, 13824 * MIB), MIN_TEXTURE_BUDGET);
+}
+
+/// A title host of its own over a pool of its own, and a 16x16 RGBA8 texture of `flags` at `at`
+/// in it, filled with `byte` and made.
+fn budget_title() -> Option<(Title<victory_metal::metal::Metal>, Pool)> {
+    with_title(|_| ())?;
+    let t = Title::new(victory_metal::metal::Metal::new().unwrap(), Default::default());
+    let mem = Alias::new((256 << 10).max(page_size())).unwrap();
+    let info = PoolInfo { id: 9141, base: mem.primary as usize, len: mem.len, memory_entry: None };
+    t.host.memory().pool_created(&info);
+    t.host.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+    Some((t, Pool { mem }))
+}
+
+fn budget_texture(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, at: usize, flags: u32, byte: u8) -> usize {
+    let res = crate::resource::test_texture_at(pool.va(at), (16, 16), 1, 28, Swizzle::LINEAR.0, flags);
+    let info = crate::resource::texture_info(res).unwrap();
+    pool.write(at, &vec![byte; info.size]);
+    let key = res as usize;
+    t.texture_created(key, info);
+    assert!(t.realize(key));
+    key
+}
+
+/// Over budget, only textures no heap entry shows, no recorded or submitted work holds, and that
+/// are filled only from title memory are given up; one named again is made and filled again.
+#[test]
+fn over_budget_only_textures_nothing_uses_are_given_up_and_come_back() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let idle = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let shown = budget_texture(&mut t, &pool, 0x4000, 0, 0x22);
+    let held = budget_texture(&mut t, &pool, 0x8000, 0, 0x33);
+    // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ALLOW_UNORDERED_ACCESS.
+    let target = budget_texture(&mut t, &pool, 0xC000, 1, 0x44);
+    let unordered = budget_texture(&mut t, &pool, 0x10000, 4, 0x55);
+    t.sync_textures();
+    // A heap entry shows `shown`; one showed `unordered` through an unordered access view.
+    let records = [0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let _heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), shown as _, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    let uav = [28u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_uav(std::ptr::null(), unordered as _, std::ptr::null(), &uav, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    crate::descriptor::create_srv(std::ptr::null(), shown as _, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap(), "the unordered view is gone from the heap");
+    // A recorded list copies from `held` (work the GPU has not run yet).
+    let mut list = NativeList::<victory_metal::metal::Metal>::default();
+    let src = t.texture_of(held).unwrap();
+    let dst = t.texture_of(target).unwrap();
+    list.copy_texture_region(&src, 0, 0, [0; 3], [16, 16, 1], &dst, 0, 0, [0; 3]);
+    drop((src, dst));
+
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(idle), "the one texture nothing uses is given up");
+    for key in [shown, held, target, unordered] {
+        assert!(t.host.knows(key), "{key:#x} is in use");
+    }
+    drop(list);
+    // Still over budget after that check, so the next one waits a while.
+    t.keep_to_budget();
+    assert!(t.host.knows(held), "not checked again at once");
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(!t.host.knows(held), "once the work that held it is gone");
+
+    // Named again (a view, a copy): made again and filled from title memory at the next sync.
+    assert!(t.realize(idle));
+    t.sync_textures();
+    let tex = t.texture_of(idle).unwrap();
+    let mut out = vec![0u8; 16 * 16 * 4];
+    t.host.backend.read_texture(&tex, 0, 0, &mut out, 16 * 4, 0);
+    assert!(out.iter().all(|&b| b == 0x11));
+}
+
+/// The fallback when a record naming an evicted texture is mirrored outside the scan of a
+/// submission's tables ([`Title::keep_named`]): the entry asks for the texture, the next submission
+/// makes it again and the entry is written then. Until then the entry shows nothing (a draw would
+/// sample transparent black), not what it showed before.
+#[test]
+fn an_entry_copied_with_plain_stores_gets_an_evicted_texture_back() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let gone = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    let other = budget_texture(&mut t, &pool, 0x4000, 0, 0x77);
+    let records = [0u32; 8];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 1).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), other as _, &srv, start);
+    assert!(t.host.mirror(start).unwrap());
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(gone) && t.host.knows(other));
+
+    // The title's record now names the evicted texture.
+    crate::descriptor::create_srv(std::ptr::null(), gone as _, &srv, start);
+    assert!(!t.host.mirror(start).unwrap(), "not made yet");
+    assert!(!heap.shows_texture(other), "the entry no longer shows the texture it showed");
+    t.set_texture_budget(0);
+    t.sync_dirty();
+    assert!(t.host.knows(gone), "made again at the next submission");
+    assert!(t.host.mirror(start).unwrap());
+    assert!(heap.shows_texture(gone));
+}
+
+/// Draws a triangle covering the centre of a 16x16 target, red vertex colour times texture `key`
+/// sampled through entry 0 of a heap whose record the title stored with plain stores (no device
+/// call, so the host has not mirrored it), in one submission of `t`; the centre pixel.
+fn draw_sampling(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, key: usize, queue: usize) -> [u8; 4] {
+    let (l, color, records) = sampling_list(t, pool, key);
+    let fence = queue + 100;
+    t.ensure_queue(queue).unwrap();
+    t.submit(queue, vec![(l, vec![])]);
+    t.signal_queue(queue, fence, 0, 1);
+    let start = std::time::Instant::now();
+    while !t.try_wait(fence, 0, 1) {
+        assert!(start.elapsed().as_secs() < 10, "the draw did not complete");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut out = vec![0u8; SAMPLED * SAMPLED * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut out, SAMPLED * 4, 0);
+    drop(records);
+    out[(8 * SAMPLED + 8) * 4..][..4].try_into().unwrap()
+}
+
+const SAMPLED: usize = 16;
+
+/// The list [`draw_sampling`] submits, its target, and the heaps' records (kept while it is used).
+#[allow(clippy::type_complexity)]
+fn sampling_list(
+    t: &mut Title<victory_metal::metal::Metal>,
+    pool: &Pool,
+    key: usize,
+) -> (NativeList<victory_metal::metal::Metal>, std::rc::Rc<<victory_metal::metal::Metal as ResourceBackend>::Texture>, (Vec<u32>, Vec<u32>)) {
+    const W: usize = SAMPLED;
+    let v = |x: f32, y: f32| [x, y, 0.5, 0.5, 1.0, 0.0, 0.0, 1.0];
+    pool.write(0x20000, &[v(-0.5, -0.5), v(0.5, -0.5), v(0.0, 0.5)]);
+    let attrs = [
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 0 },
+        VertexAttr { format: VertexFormat::Float2, slot: 0, offset: 8 },
+        VertexAttr { format: VertexFormat::Float4, slot: 0, offset: 16 },
+    ];
+    let pso = t
+        .host
+        .render_pipeline(&RenderPipelineDesc {
+            vs: &super::fixture("tri_vs"),
+            ps: Some(&super::fixture("tri_ps")),
+            vs_layout: None,
+            ps_layout: None,
+            attributes: &attrs,
+            streams: &[VertexStream { slot: 0, stride: 32, per_instance: false }],
+            color: &[Format::Rgba8Unorm],
+            depth: None,
+            depth_test: None,
+            cull: Cull::None,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut rt = TextureDesc::d2(Format::Rgba8Unorm, W, W);
+    rt.render_target = true;
+    let color = t.host.texture(&rt).unwrap();
+    let (views, smp) = (vec![0u32; 8], vec![0u32; 4]);
+    let (vstart, sstart) = (views.as_ptr() as u64, smp.as_ptr() as u64);
+    let vheap = t.host.heap(HeapKind::Resource, vstart, 1).unwrap();
+    let sheap = t.host.heap(HeapKind::Sampler, sstart, 1).unwrap();
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, vstart);
+    let mut sw = [0u32; 27];
+    (sw[1], sw[2], sw[6], sw[7], sw[8]) = (1, 1, 3, 3, 3);
+    crate::descriptor::create_sampler_x(std::ptr::null_mut(), &sw, sstart);
+    assert!(t.host.mirror(sstart).unwrap());
+
+    let mut l = NativeList::default();
+    l.set_render_targets(std::slice::from_ref(&color), None);
+    l.clear_render_target(&color, [0.0, 0.0, 1.0, 1.0]);
+    l.set_graphics_pipeline(&pso, Topology::Triangles);
+    l.set_heaps(Some(&vheap), Some(&sheap));
+    l.set_graphics_root_constants(0, &[0.5f32.to_bits(), 0, 0, 0]);
+    l.set_graphics_root_table(1, &vheap, 0);
+    l.set_graphics_root_table(2, &sheap, 0);
+    l.set_vertex_buffer(0, pool.va(0x20000));
+    l.draw_instanced(3, 1, 0, 0).unwrap();
+    (l, color, (views, smp))
+}
+
+/// Over the texture budget, a draw samples a texture given up before through an entry the title
+/// stored with plain stores in the table it binds: the texture is made again for that draw, in
+/// that submission (it sampled transparent black, the entry cleared, until the next one).
+#[test]
+fn a_texture_given_up_is_back_for_the_draw_whose_table_names_it() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let gone = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(gone));
+    assert_eq!(draw_sampling(&mut t, &pool, gone, 1), [0x66, 0, 0, 0x66]);
+    assert!(t.host.knows(gone));
+}
+
+/// Over the texture budget, a texture no entry the host mirrored shows, which the table of a draw
+/// in the submission names through a record the title stored with plain stores, is not given up
+/// at that submission's sync, under the draw.
+#[test]
+fn a_texture_the_submission_names_is_not_given_up_under_its_draw() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let live = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    t.set_texture_budget(1);
+    assert_eq!(draw_sampling(&mut t, &pool, live, 2), [0x66, 0, 0, 0x66]);
+    assert!(t.host.knows(live));
+}
+
+/// Names a submission's tables read stay out of the budget's reach until that submission is with
+/// its queue, even when another submission's sync comes in between (`glue::submit` lets the title
+/// lock go between the two).
+#[test]
+fn a_texture_named_by_a_submission_in_flight_is_not_given_up_by_another() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let named = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    let idle = budget_texture(&mut t, &pool, 0x4000, 0, 0x77);
+    t.set_texture_budget(1);
+    let (a, _color, records) = sampling_list(&mut t, &pool, named);
+    let first = t.keep_named(std::iter::once(&a));
+    assert!(first.contains(&named));
+    // Another queue's submission, with nothing bound, synced in between.
+    let b = NativeList::<victory_metal::metal::Metal>::default();
+    let second = t.keep_named(std::iter::once(&b));
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(idle), "over budget: the idle one goes");
+    assert!(t.host.knows(named), "the first submission still names it");
+    t.let_named_go(second);
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(t.host.knows(named), "still in flight");
+    t.let_named_go(first);
+    for _ in 0..crate::native::textures::RECHECK {
+        t.keep_to_budget();
+    }
+    assert!(!t.host.knows(named), "given up once nothing in flight names it");
+    drop((a, records));
+}
+
+/// The budget counts a copy by its size in title memory, once per title texture: views of one
+/// object, in other formats or of other mips, name the object, and share its one host texture.
+#[test]
+fn views_of_one_texture_share_one_copy_counted_once() {
+    use crate::descriptor::View;
+    let Some((mut t, pool)) = budget_title() else { return };
+    let res = crate::resource::test_texture_at(pool.va(0), (32, 32), 6, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    t.texture_created(key, info.clone());
+    // Two views of it: RGBA8 UNORM, all mips; RGBA8 UNORM sRGB (29), mip 2 only.
+    let heap = crate::descriptor::test_heap(false, 4);
+    let start = slot::<extern "system" fn(This) -> u64>(heap, 0x48)(heap);
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[2], srv[5]) = (28, 4, 0x1688, u32::MAX);
+    crate::descriptor::create_srv(std::ptr::null(), res, &srv, start);
+    (srv[0], srv[4], srv[5]) = (29, 2, 1);
+    crate::descriptor::create_srv(std::ptr::null(), res, &srv, start + 32);
+    for handle in [start, start + 32] {
+        let Some(View::Shader(r, _)) = crate::descriptor::view(handle) else { panic!("a view") };
+        assert_eq!(r, key, "the view names the object");
+        assert!(t.realize(r));
+    }
+    let a = t.texture_of(key).unwrap();
+    assert!(std::rc::Rc::ptr_eq(&a, &t.texture_of(key).unwrap()), "one host texture");
+    assert_eq!(t.budget.live, info.size as u64, "counted once, all mips");
+}
+
+/// Views of memory the title placed itself are keyed by address and resource description, not
+/// by the view's own description: views of one placed texture share one copy.
+#[test]
+fn placed_views_of_one_description_share_one_key() {
+    use crate::native::textures::placed_key;
+    let res = crate::resource::test_texture_at(0x10_0000_0000, (32, 32), 6, 28, Swizzle::SW_64KB_S.0, 0);
+    let words = crate::resource::texture_desc(res).unwrap();
+    let key = placed_key(0x10_0000_0000, &words);
+    // The key reads no view description at all; padding words do not change it either.
+    let mut padded = words;
+    (padded[1], padded[13]) = (0xdead, 0xbeef);
+    assert_eq!(placed_key(0x10_0000_0000, &padded), key);
+    let mut other = words;
+    other[8] = 29; // another format
+    assert_ne!(placed_key(0x10_0000_0000, &other), key, "another description: another copy");
+    assert_ne!(placed_key(0x10_0001_0000, &words), key, "another address: another copy");
+}
+
+/// Copies are counted, and held, once per title texture, not once per byte of title memory: two
+/// objects over the same memory (aliasing placed resources) and a placed description starting
+/// inside another's memory each get a host texture of their own, so the copies add up to more
+/// than the title memory under them. The trace's distinct figure counts that memory once.
+#[test]
+fn textures_over_one_memory_each_hold_a_copy_of_their_own() {
+    use crate::native::textures::{distinct_bytes, placed_key};
+    let Some((mut t, pool)) = budget_title() else { return };
+    let a = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
+    let b = crate::resource::test_texture_at(pool.va(0), (64, 64), 1, 71, Swizzle::LINEAR.0, 0);
+    let (ia, ib) = (crate::resource::texture_info(a).unwrap(), crate::resource::texture_info(b).unwrap());
+    // A description the title places at 4 KiB into the same memory (no object; a view names it).
+    let c = crate::resource::test_texture_at(pool.va(0x1000), (32, 32), 1, 28, Swizzle::LINEAR.0, 0);
+    let words = crate::resource::texture_desc(c).unwrap();
+    let ic = crate::resource::placed_info(pool.va(0x1000), &words).unwrap();
+    let kc = placed_key(pool.va(0x1000), &words);
+    t.texture_placed(pool.va(0x1000), kc, 9141, 0x1000);
+    for (key, info) in [(a as usize, ia.clone()), (b as usize, ib.clone()), (kc, ic.clone())] {
+        t.texture_created(key, info);
+        assert!(t.realize(key));
+    }
+    let (ta, tb, tc) = (t.texture_of(a as usize).unwrap(), t.texture_of(b as usize).unwrap(), t.texture_of(kc).unwrap());
+    assert!(!std::rc::Rc::ptr_eq(&ta, &tb) && !std::rc::Rc::ptr_eq(&ta, &tc), "three host textures");
+    let counted = (ia.size + ib.size + ic.size) as u64;
+    assert_eq!(t.budget.live, counted);
+    let under = distinct_bytes(vec![(ia.memory as usize, ia.size), (ib.memory as usize, ib.size), (ic.memory as usize, ic.size)]);
+    assert_eq!(under, ia.size as u64, "all three lie in the first one's 16 KiB");
+    assert!(counted > under);
+    assert_eq!(t.memory_under_copies(), (under, 0), "what the trace logs");
+    // The same pool pages mapped at a second title address: a texture there is over the same
+    // bytes, and counts once too.
+    let info = PoolInfo { id: 9141, base: pool.mem.primary as usize, len: pool.mem.len, memory_entry: None };
+    t.host.memory().mapped(pool.mem.primary as usize, pool.mem.len, &info, 0);
+    let d = crate::resource::test_texture_at(pool.mem.primary as u64, (64, 64), 1, 28, Swizzle::LINEAR.0, 0);
+    let id = crate::resource::texture_info(d).unwrap();
+    t.texture_created(d as usize, id.clone());
+    assert!(t.realize(d as usize));
+    assert_eq!(t.budget.live, counted + id.size as u64);
+    assert_eq!(t.memory_under_copies(), (under, 0), "one memory at two addresses");
+}
+
+/// A copy over memory in no title pool is logged as outside them.
+#[test]
+fn a_copy_outside_the_titles_pools_is_logged_so() {
+    let Some((mut t, _pool)) = budget_title() else { return };
+    let own = vec![0u8; 16 * 16 * 4];
+    let res = crate::resource::test_texture_at(own.as_ptr() as u64, (16, 16), 1, 28, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    t.texture_created(res as usize, info.clone());
+    assert!(t.realize(res as usize));
+    assert_eq!(t.memory_under_copies(), (info.size as u64, info.size as u64));
+}
+
+/// The trace's distinct title memory under copies: each byte once, gaps not counted.
+#[test]
+fn distinct_bytes_counts_overlaps_once() {
+    use crate::native::textures::distinct_bytes;
+    assert_eq!(distinct_bytes(vec![]), 0);
+    assert_eq!(distinct_bytes(vec![(0, 100), (0, 100)]), 100);
+    assert_eq!(distinct_bytes(vec![(50, 100), (0, 100)]), 150);
+    assert_eq!(distinct_bytes(vec![(0, 100), (10, 20), (200, 10)]), 110);
+    assert_eq!(distinct_bytes(vec![(0, 100), (100, 1)]), 101);
+}
+
+/// A 16x16 (`size`) RGBA8 texture the title places at `at` in the budget pool (no object; a view
+/// names it), filled with `byte` and made.
+fn budget_placed(t: &mut Title<victory_metal::metal::Metal>, pool: &Pool, at: usize, size: u32, byte: u8) -> usize {
+    let res = crate::resource::test_texture_at(pool.va(at), (size.into(), size), 1, 28, Swizzle::LINEAR.0, 0);
+    let words = crate::resource::texture_desc(res).unwrap();
+    let info = crate::resource::placed_info(pool.va(at), &words).unwrap();
+    pool.write(at, &vec![byte; info.size]);
+    let key = crate::native::textures::placed_key(pool.va(at), &words);
+    t.texture_placed(pool.va(at), key, 9141, info.size);
+    t.texture_created(key, info);
+    assert!(t.realize(key));
+    key
+}
+
+/// A title texture laid out exactly as a live copy over the same memory (here a placed view of
+/// an object's memory in the object's description) uses that copy's texture, counted once; one
+/// in another host format gets its own. A GPU write through the sharing key makes the shared
+/// copy the GPU's.
+#[test]
+fn an_identical_texture_over_the_same_memory_shares_its_copy() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let object = budget_texture(&mut t, &pool, 0, 0, 0x11);
+    let size = t.budget.live;
+    let placed = budget_placed(&mut t, &pool, 0, 16, 0x11);
+    let own = t.texture_of(object).unwrap();
+    assert!(std::rc::Rc::ptr_eq(&own, &t.texture_of(placed).unwrap()), "one texture");
+    assert!(std::rc::Rc::ptr_eq(&own, &t.host.texture_at(placed).expect("registered")));
+    assert_eq!(t.budget.live, size, "counted once");
+    // B8G8R8A8 (87) over the same bytes: another host format, its own copy.
+    let res = crate::resource::test_texture_at(pool.va(0), (16, 16), 1, 87, Swizzle::LINEAR.0, 0);
+    let info = crate::resource::texture_info(res).unwrap();
+    t.texture_created(res as usize, info);
+    assert!(t.realize(res as usize));
+    assert!(!std::rc::Rc::ptr_eq(&own, &t.texture_of(res as usize).unwrap()));
+    assert_eq!(t.budget.live, 2 * size);
+    // Uploaded once; a GPU write through the placed key keeps the object's copy from memory.
+    t.sync_textures();
+    assert_eq!(t.uploads_of(object), 1);
+    t.gpu_written(placed);
+    pool.write(0, &[0x22u8; 64]);
+    t.sync_textures();
+    assert_eq!(t.uploads_of(object), 1, "the GPU's now");
+}
+
+/// When the copy a texture shared goes with its title texture, the texture that shared it takes the
+/// copy over: still registered, the same texture, not uploaded again, counted once; a draw reads it.
+#[test]
+fn a_texture_sharing_a_released_copy_takes_it_over() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let object = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    let size = t.budget.live;
+    let placed = budget_placed(&mut t, &pool, 0, 16, 0x66);
+    let copy = t.texture_of(object).unwrap();
+    t.sync_textures();
+    assert_eq!(t.uploads_of(placed), 1);
+    t.host.release_resource(object);
+    t.texture_released(object);
+    assert!(t.host.knows(placed) && !t.host.is_evicted(placed));
+    assert!(std::rc::Rc::ptr_eq(&copy, &t.texture_of(placed).unwrap()), "the same texture");
+    assert_eq!(t.budget.live, size);
+    t.sync_textures();
+    assert_eq!(t.uploads_of(placed), 1, "not uploaded again");
+    assert_eq!(draw_sampling(&mut t, &pool, placed, 3), [0x66, 0, 0, 0x66]);
+}
+
+/// A sync checks a bounded share of the covered copies, round-robin: thousands of them are not
+/// all read again at every submission, and every one is checked within a sweep.
+#[test]
+fn a_sync_checks_covered_copies_a_share_at_a_time() {
+    let Some((mut t, _pool)) = budget_title() else { return };
+    // Keys with no copy any more: a check drops them from the set.
+    t.covered.extend(1..=1000);
+    t.give_up_covered();
+    assert_eq!(t.covered.len(), 1000 - crate::native::textures::COVERED_CHECKS, "one share checked");
+    t.give_up_covered();
+    assert!(t.covered.is_empty(), "the rest at the next sync");
+}
+
+/// Has the one entry of a host heap over `views` show title texture `key` (a mirrored view).
+fn show(t: &mut Title<victory_metal::metal::Metal>, views: &[u32], key: usize) {
+    let at = views.as_ptr() as u64;
+    if t.host.heap_at(at).is_none() {
+        t.host.heap(HeapKind::Resource, at, 1).unwrap();
+    }
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, at);
+    assert!(t.host.mirror(at).unwrap());
+}
+
+/// A placed copy another placement covers at another start is given up at the next sync once
+/// nothing uses it; one a heap entry still shows stays until the title writes another record over
+/// that entry (work in flight may read it through the entry). One named again comes back for its
+/// draw, with its texels. One not overlapped stays, as does one that holds what title memory does
+/// not (GPU-written). A view of a copy given up, written again at its own address, is not a new
+/// placement and covers nothing.
+#[test]
+fn a_placed_copy_another_placement_covers_is_given_up_once_unused() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let old = budget_placed(&mut t, &pool, 0, 32, 0x44);
+    let shown = budget_placed(&mut t, &pool, 0x4000, 32, 0x33);
+    let apart = budget_placed(&mut t, &pool, 0x8000, 16, 0x55);
+    let written = budget_placed(&mut t, &pool, 0xA000, 32, 0x77);
+    t.gpu_written(written);
+    let views = vec![0u32; 8];
+    show(&mut t, &views, shown);
+    let new = budget_placed(&mut t, &pool, 0x800, 16, 0x44);
+    let _ = budget_placed(&mut t, &pool, 0x4800, 16, 0x33);
+    let _ = budget_placed(&mut t, &pool, 0xA800, 16, 0x77);
+    assert!(t.host.knows(old), "not at the placement itself");
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(old) && t.host.is_evicted(old), "covered and unused: given up");
+    assert!(t.host.knows(shown), "an entry still shows it");
+    assert!(t.host.knows(new) && t.host.knows(apart));
+    assert!(t.host.knows(written), "the GPU's copy stays");
+    assert!(!t.covered.contains(&written), "and is not even marked");
+    show(&mut t, &views, apart);
+    let _ = t.sync_jobs();
+    assert!(!t.host.knows(shown), "given up once its entry shows another");
+    // The old view written again: back, and the new one stays.
+    let res = crate::resource::test_texture_at(pool.va(0), (32, 32), 1, 28, Swizzle::LINEAR.0, 0);
+    let words = crate::resource::texture_desc(res).unwrap();
+    let info = crate::resource::placed_info(pool.va(0), &words).unwrap();
+    t.texture_placed(pool.va(0), old, 9141, info.size);
+    let _ = t.sync_jobs();
+    assert!(t.host.knows(new), "a copy coming back covers nothing anew");
+    assert_eq!(draw_sampling(&mut t, &pool, old, 4), [0x44, 0, 0, 0x44]);
+    drop(views);
 }

@@ -34,6 +34,38 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
     translate_cached(container, options())
 }
 
+/// Whether [`translate`]'s translation is in the disk cache already.
+pub fn cached(container: &[u8]) -> bool {
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{:?}", options()));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = container;
+        false
+    }
+}
+
+/// Keeps `container`, as the run is about to translate it, for later warm-ups
+/// (`crate::prewarm::keep`); nothing with the shader cache off.
+#[cfg(target_os = "macos")]
+pub fn keep(container: &[u8]) {
+    if let Some(dir) = crate::prewarm::kept_dir() {
+        crate::prewarm::keep(&dir, &blake3::hash(container).to_hex()[..16], container);
+    }
+}
+
+/// The files of the containers earlier runs kept ([`keep`]).
+#[cfg(target_os = "macos")]
+pub fn kept() -> Vec<std::path::PathBuf> {
+    crate::prewarm::kept_dir().map(|dir| crate::prewarm::kept(&dir)).unwrap_or_default()
+}
+
+/// The container in one of [`kept`]'s files; `None` if it is damaged.
+#[cfg(target_os = "macos")]
+pub fn read_kept(file: &std::path::Path) -> Option<Vec<u8>> {
+    crate::prewarm::read_kept(file)
+}
+
 /// [`victory_shader::emit::translate_with`] through the on-disk cache (`shader_cache::native_shader`):
 /// `o` is part of the key.
 fn translate_cached(container: &[u8], o: Options) -> Result<HostShader, String> {
@@ -81,7 +113,14 @@ pub fn translate_targets(container: &[u8], integer: u8) -> Result<HostShader, St
 
 /// Whether [`translate_targets`]'s translation is in the disk cache already.
 pub fn targets_cached(container: &[u8], integer: u8) -> bool {
-    crate::shader_cache::native_present(container, &format!("{:?}", Options { integer_targets: integer, ..options() }))
+    let o = Options { integer_targets: integer, ..options() };
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{o:?}"));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (container, o);
+        false
+    }
 }
 
 /// Bit n set: colour target n has an integer format.
@@ -325,6 +364,7 @@ impl<B: PresentBackend> Title<B> {
         if let Some(p) = &ps_full {
             vs_binding.typed_buffers |= p.typed_buffers;
             vs_binding.heap_typed_buffers |= p.heap_typed_buffers;
+            vs_binding.ps_heap_access = Some(p.heap_access.clone());
         }
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
@@ -332,7 +372,7 @@ impl<B: PresentBackend> Title<B> {
         let vs_layout = vs_binding.layout();
         let ps_layout = ps_full.as_ref().and_then(Binding::layout);
         let ps_binding = ps_full
-            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+            .filter(|b| b.memory || b.view_addresses || b.dwords > 0 || !b.views.is_empty());
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),
@@ -353,6 +393,7 @@ impl<B: PresentBackend> Title<B> {
             Ok(None) => self.put_off(),
             Ok(Some(p)) => {
                 self.shaders.pipelines += 1;
+                self.host.backend.name_render_pipeline(&p, name);
                 Pipe::Render(Rc::new(p), Some(Rc::new(Binding {
                     ps: ps_binding.map(Rc::new),
                     ..vs_binding

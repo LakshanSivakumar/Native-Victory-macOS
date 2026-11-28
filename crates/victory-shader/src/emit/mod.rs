@@ -156,7 +156,8 @@
 //!   0), a texture view's width and height - 1 (dword 1 bits 30-31, dword 2
 //!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
 //!   and type (bits 28-31) with an identity swizzle; zeros for anything
-//!   else.
+//!   else. A program that can see a bit of a field the table gives as 0
+//!   is refused (`Lower::seen_bits`).
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -215,6 +216,8 @@ mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
+#[cfg(test)]
+mod container_tests;
 pub mod graphics;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -223,6 +226,8 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lockstep;
+#[cfg(test)]
+mod lockstep_tests;
 mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
@@ -262,7 +267,7 @@ pub use sampler::StaticSampler;
 pub use shader::{
     ATOMIC_LOCKS, ATOMIC_LOCKS_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
     ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
-    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    VIEW_MIN_LOD_STEPS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
     VIEW_WRITES_BYTES,
 };
 
@@ -470,8 +475,10 @@ pub struct Options {
     pub zero_copy_memory: bool,
     /// A guessed graphics vertex shader ([`graphics`]) drawn as a rectangle list: each fetched
     /// attribute is read for the rectangle's three corners (instance-stepped, so one instance is a
-    /// rectangle) and the vertex id 0 to 3 picks a corner, the fourth being the sum of two corners
-    /// less the right-angle one, found from the first two-channel float fetch (the position).
+    /// rectangle), or when the program reads `SV_VertexID` directly its body runs for console
+    /// vertex ids `3 * instance + 0..2`, and the strip vertex id 0 to 3 picks a corner, the fourth
+    /// being the sum of two corners less the right-angle one (`SV_Position.xy` or the first
+    /// two-channel float fetch).
     pub rect_list: bool,
     /// A guessed graphics vertex shader that must also write these parameters (bit n: `TEXCOORD`
     /// n, undefined values) because its pixel shader reads them.
@@ -1168,8 +1175,12 @@ mod tests {
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let shader = emit(&c, &native, &p, &st, &io, &res);
+            // A raw barycentric read (the input not initialized first) is declared as
+            // `SV_Barycentrics`: the program then reads the input, not the value moved in.
+            let raw = |s: &super::HostShader| s.dxil.windows(15).any(|w| w == b"SV_Barycentrics");
             if matches!(case, Complete | NonzeroBase) {
                 let shader = shader.unwrap();
+                assert!(!raw(&shader), "{case:?}: reads the raw barycentric");
                 assert!(
                     Container::parse(&shader.dxil)
                         .unwrap()
@@ -1187,14 +1198,15 @@ mod tests {
             } else {
                 eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
                 assert!(
-                    matches!(
-                        shader,
-                        Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
-                            ..
-                        })
-                    ),
-                    "{case:?}"
+                    match &shader {
+                        Ok(s) => raw(s),
+                        Err(e) => matches!(
+                            e,
+                            ShaderError::Unsupported { what: "barycentrics read directly", .. }
+                        ),
+                    },
+                    "{case:?}: {:?}",
+                    shader.as_ref().err()
                 );
             }
         }

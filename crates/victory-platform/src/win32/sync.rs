@@ -24,7 +24,7 @@ fn wait_handle(handle: HANDLE, timeout: Option<Duration>) -> bool {
 
 /// A Win32 event: signalled or not, manual or auto reset.
 #[derive(Debug)]
-pub struct Event(HANDLE);
+pub struct Event(HANDLE, bool);
 
 // SAFETY: kernel handles are usable from any thread.
 unsafe impl Send for Event {}
@@ -45,7 +45,11 @@ impl Event {
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
-        Ok(Event(handle))
+        Ok(Event(handle, manual_reset))
+    }
+
+    pub fn is_manual(&self) -> bool {
+        self.1
     }
 
     /// Signals the event. A manual-reset event releases every waiter and

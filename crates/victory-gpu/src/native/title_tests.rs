@@ -464,3 +464,68 @@ fn a_refused_pipeline_drops_its_work_and_nothing_else() {
         "{stats:?}"
     );
 }
+
+/// Rewinding a title `ID3D12Fence` to 0 after it reached a higher value keeps both `GetCompletedValue`
+/// and the in-memory fence word at 0 across background refreshes until the next GPU `Signal` finishes.
+#[test]
+fn rewound_title_fences_stay_low_until_the_new_gpu_signal_completes() {
+    if !available() {
+        return;
+    }
+    let pool = pool(9007, 4);
+    let (src, mid, dst, gate) = (0, 8192, 16384, 24576);
+    let (qa, qb) = (Queue::new(), Queue::new());
+    let (f, done) = (Fence::new(3), Fence::new(0));
+    let pso = pipeline();
+
+    // First reach 5 on the GPU, then rewind to 0 on the CPU (below `initial = 3`).
+    qa.signal(&f, 5);
+    assert_eq!(f.wait(5), S_OK);
+    assert_eq!((f.completed(), f.in_memory()), (5, 5));
+
+    for round in 1..=2u32 {
+        pool.write(src, &(0..N as u32).map(|i| i + round).collect::<Vec<_>>());
+        pool.write(mid, &[0u32; N]);
+        pool.write(dst, &[0u32; N]);
+        pool.write(gate, &[0u32]);
+
+        f.signal(0);
+        done.signal(0);
+        assert_eq!((f.completed(), f.in_memory()), (0, 0));
+
+        let prod = List::new(pso);
+        prod.wait_for(pool.va(gate), EQUAL, 1);
+        affine(&prod, 2, round, pool.va(src), pool.va(mid));
+        prod.close();
+
+        let cons = List::new(pso);
+        affine(&cons, 3, 0, pool.va(mid), pool.va(dst));
+        cons.close();
+
+        qa.execute(&[&prod]);
+        qa.signal(&f, 1);
+        qb.wait(&f, 1);
+        qb.execute(&[&cons]);
+        qb.signal(&done, 1);
+
+        assert!(
+            nothing_for(25, || f.in_memory() != 0 || f.completed() != 0 || done.completed() != 0),
+            "round {round}: stale Metal event raised the rewound fence early"
+        );
+
+        pool.write(gate, &[1u32]);
+        assert_eq!(done.wait(1), S_OK);
+        assert_eq!((f.completed(), f.in_memory()), (1, 1));
+        assert!(
+            pool.read::<u32>(dst, N)
+                .iter()
+                .enumerate()
+                .all(|(i, &v)| v == ((i as u32 + round) * 2 + round) * 3),
+            "round {round}"
+        );
+    }
+
+    // GPU-side rewind via `ID3D12CommandQueue::Signal(f, 0)` also lowers the title's copy.
+    qa.signal(&f, 0);
+    wait_until("GPU fence rewind to 0", || f.completed() == 0 && f.in_memory() == 0);
+}

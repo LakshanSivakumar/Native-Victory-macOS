@@ -41,14 +41,62 @@ fn track(base: usize, len: usize) {
     crate::host_posix::adopt_region(base, len);
 }
 
+/// Serialises deferred pool-backing commits and releases on `XMemVirtualAlloc` reservations.
+static COMMIT_LOCK: Mutex<()> = Mutex::new(());
+
 /// What releasing `[base, base + len)` owes the physical pages behind it, whichever call releases
 /// it: the title's `VirtualFree(MEM_RELEASE)` (`host_posix`, which gives the address space back
 /// itself) as well as [`release_reservation`]. Left behind, the pool views kept the old pool
 /// mapped there for the GPU and aliases while the next allocation got the same address: two
 /// memories at one title address.
 pub(crate) fn forget_physical(base: usize, len: usize) {
+    let _serial = COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reservations().remove(&base);
     super::xmem_physical::release_pool_backing(base, len);
+}
+
+/// If `start` falls inside an `XMemVirtualAlloc` reservation, commits `[start, end)` (host-page
+/// aligned) after backing any unbacked 64 KiB granules in it with a GPU-reachable pool. Returns
+/// `None` when `start` is outside `RESERVATIONS`, or `Some(Err(..))` when `end` crosses past the
+/// reservation's end.
+pub(crate) fn commit_if_reserved(
+    start: usize,
+    end: usize,
+    prot: Protect,
+) -> Option<std::io::Result<()>> {
+    let _serial = COMMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (res_base, res_len) = reservations()
+        .range(..=start)
+        .next_back()
+        .map(|(&b, &l)| (b, l))
+        .filter(|&(b, l)| start < b.saturating_add(l))?;
+    if end > res_base.saturating_add(res_len) {
+        return Some(Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)));
+    }
+    let g_start = start & !(GRANULE - 1);
+    let g_end = end.next_multiple_of(GRANULE);
+    for (u_start, u_end) in super::xmem_physical::unbacked_ranges(g_start, g_end) {
+        if super::xmem_physical::back_with_pool(u_start, u_end - u_start) {
+            if u_start < start {
+                // SAFETY: uncommitted prefix of the newly backed granule inside our reservation.
+                if let Err(e) =
+                    unsafe { mem::protect(u_start as *mut u8, start - u_start, Protect::NO_ACCESS) }
+                {
+                    return Some(Err(e));
+                }
+            }
+            if end < u_end {
+                // SAFETY: uncommitted tail of the newly backed granule inside our reservation.
+                if let Err(e) =
+                    unsafe { mem::protect(end as *mut u8, u_end - end, Protect::NO_ACCESS) }
+                {
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+    // SAFETY: `[start, end)` lies inside `[res_base, res_base + res_len)`.
+    Some(unsafe { mem::commit(start as *mut u8, end - start, prot) })
 }
 
 /// Gives back a reservation `XMemVirtualAlloc` made (the title's
@@ -167,8 +215,11 @@ pub extern "system" fn XMemVirtualAlloc(
         else {
             return std::ptr::null_mut();
         };
-        // SAFETY: the title commits inside a reservation of its own.
-        unsafe { mem::commit(start as *mut u8, end - start, prot) }.map(|()| at as *mut u8)
+        // SAFETY: the title commits inside a reservation of its own; if `XMemVirtualAlloc` made
+        // the reservation without `MEM_COMMIT`, back the touched 64 KiB granules with a pool now.
+        commit_if_reserved(start, end, prot)
+            .unwrap_or_else(|| unsafe { mem::commit(start as *mut u8, end - start, prot) })
+            .map(|()| at as *mut u8)
     } else {
         return std::ptr::null_mut();
     };
@@ -443,6 +494,7 @@ mod tests {
 
     #[test]
     fn a_placeholder_reservation_commits_in_parts() {
+        use super::super::xmem_physical::{pool_shown_at, pools};
         let p = XMemVirtualAlloc(
             std::ptr::null_mut(),
             8 * GRANULE,
@@ -457,15 +509,75 @@ mod tests {
         assert!(again.is_null());
         let split = XMemVirtualAlloc(p, GRANULE, PAGES_64K | MEM_REPLACE_PLACEHOLDER, 0, 0);
         assert_eq!(split, p);
-        // Commit the third granule only.
+        // Commit the third granule only: it becomes pool-backed so the GPU can reach it.
         let at = p.cast::<u8>().wrapping_add(2 * GRANULE).cast();
         let committed = XMemVirtualAlloc(at, GRANULE, MEM_COMMIT, 0, PAGE_READWRITE);
         assert_eq!(committed, at);
+        let pool = pool_shown_at(at as usize).expect("committed granule is pool-backed");
+        let gpu = pools().iter().find(|info| info.id == pool).expect("live").base as *const u8;
+        // SAFETY: committed read-write; the pool's primary mapping mirrors the same page.
+        unsafe {
+            at.cast::<u8>().write(0x5A);
+            assert_eq!(gpu.read(), 0x5A);
+        }
         let info = query(at);
         assert_eq!((info.state, info.region_size), (MEM_COMMIT, GRANULE));
         assert_eq!(info.allocation_base, p as usize);
         assert_eq!(query(p).state, MEM_RESERVE);
         release_reservation(p as usize);
+        assert!(!pools().iter().any(|info| info.id == pool));
+    }
+
+    #[test]
+    fn subgranule_deferred_commits_share_one_pool_and_preserve_uncommitted_tails() {
+        use super::super::xmem_physical::{pool_shown_at, pools};
+        let page = mem::page_size();
+        let p = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * GRANULE,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!p.is_null());
+        assert_eq!(pool_shown_at(p as usize), None);
+
+        // Commit only the first host page of granule 0; the rest of granule 0 stays MEM_RESERVE.
+        assert_eq!(
+            XMemVirtualAlloc(p, page, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
+            p
+        );
+        let pool = pool_shown_at(p as usize).expect("pool-backed on first commit");
+        let gpu = pools().iter().find(|info| info.id == pool).expect("live").base as *const u8;
+        // SAFETY: first host page is committed read-write.
+        unsafe { p.cast::<u8>().write(0x33) };
+        assert_eq!(query(p).state, MEM_COMMIT);
+        assert_eq!(
+            query(p.cast::<u8>().wrapping_add(page).cast()).state,
+            MEM_RESERVE
+        );
+
+        // Commit the second host page of granule 0: reuses the same pool without wiping page 0.
+        let second = p.cast::<u8>().wrapping_add(page).cast();
+        assert_eq!(
+            XMemVirtualAlloc(second, page, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
+            second
+        );
+        assert_eq!(pool_shown_at(second as usize), Some(pool));
+        // SAFETY: both host pages are committed read-write.
+        unsafe {
+            assert_eq!(p.cast::<u8>().read(), 0x33);
+            second.cast::<u8>().write(0x77);
+            assert_eq!(gpu.read(), 0x33);
+            assert_eq!(gpu.add(page).read(), 0x77);
+        }
+
+        // Committing past the reservation's end fails cleanly.
+        let last = p.cast::<u8>().wrapping_add(2 * GRANULE - page).cast();
+        assert!(XMemVirtualAlloc(last, 2 * page, MEM_COMMIT, GRAPHICS, PAGE_READWRITE).is_null());
+
+        release_reservation(p as usize);
+        assert!(!pools().iter().any(|info| info.id == pool));
     }
 
     #[test]
