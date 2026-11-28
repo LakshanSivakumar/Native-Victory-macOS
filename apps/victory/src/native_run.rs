@@ -304,6 +304,10 @@ pub fn run(
     // The manifest names the title and its storage quota; the console's
     // fixed drives are the package as `G:` and temporary files `T:`.
     let cfg = victory_core::Config::load()?;
+    // The import registry holds the FidelityFX module only when the host serves the title's
+    // upscaler (MetalFX with VICTORY_METALFX=1 on this host), so this must land before the
+    // registry is first consulted.
+    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
     victory_gpu::shader_cache::use_native_cache(cfg.cache_subdir("native-shaders")?);
     let manifest = match dll::find_file(title_dir, "MicrosoftGame.config") {
         Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
