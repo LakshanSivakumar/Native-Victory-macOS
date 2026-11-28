@@ -153,6 +153,9 @@ pub struct NativeHeap<B: GraphicsBackend> {
     /// Unmaterialized `texture_buffer` entry bits set by `NativeHost::mirror` and promoted lazily
     /// at draw or dispatch when a bound shader uses DXIL `TypedBuffer` operations.
     pub typed_pending: std::cell::RefCell<PendingTyped>,
+    /// Entries mirrored from an earlier recorded command's snapshot after title memory at that slot
+    /// had already moved on; brought current with title memory at the start of the next submission.
+    pub rolled_back: std::cell::RefCell<Vec<usize>>,
 }
 
 /// A heap buffer view over title memory: its address, length and the signature of the mappings
@@ -1207,8 +1210,9 @@ pub enum Root<B: GraphicsBackend> {
     Constants(Vec<u32>),
     /// A root SRV, UAV or CBV: a title address.
     View(u64),
-    /// A descriptor table: heap and the index of its first entry.
-    Table(Rc<NativeHeap<B>>, usize),
+    /// A descriptor table: heap, the index of its first entry, and (on recorded commands) the
+    /// 12-byte `[tag, index, generation]` records its span held when the command was recorded.
+    Table(Rc<NativeHeap<B>>, usize, Rc<[[u8; 12]]>),
 }
 
 impl<B: GraphicsBackend> Clone for Root<B> {
@@ -1216,9 +1220,27 @@ impl<B: GraphicsBackend> Clone for Root<B> {
         match self {
             Root::Constants(c) => Root::Constants(c.clone()),
             Root::View(a) => Root::View(*a),
-            Root::Table(h, i) => Root::Table(h.clone(), *i),
+            Root::Table(h, i, r) => Root::Table(h.clone(), *i, r.clone()),
         }
     }
+}
+
+fn snapshot_roots<B: GraphicsBackend>(
+    root: &[Option<Root<B>>],
+    binding: Option<&Binding>,
+) -> Vec<Option<Root<B>>> {
+    root.iter()
+        .enumerate()
+        .map(|(slot, r)| match r {
+            Some(Root::Constants(c)) => Some(Root::Constants(c.clone())),
+            Some(Root::View(a)) => Some(Root::View(*a)),
+            Some(Root::Table(h, at, _)) => {
+                let span = super::host::table_span(h, slot, *at, binding);
+                Some(Root::Table(h.clone(), *at, super::host::table_records(h, span)))
+            }
+            None => None,
+        })
+        .collect()
 }
 
 type Heaps<B> = (Option<Rc<NativeHeap<B>>>, Option<Rc<NativeHeap<B>>>);
@@ -1638,7 +1660,7 @@ impl<B: GraphicsBackend> NativeList<B> {
         set(
             &mut self.state.compute_root,
             slot,
-            Root::Table(heap.clone(), index),
+            Root::Table(heap.clone(), index, Rc::from(&[][..])),
         );
     }
 
@@ -1658,7 +1680,7 @@ impl<B: GraphicsBackend> NativeList<B> {
         set(
             &mut self.state.graphics_root,
             slot,
-            Root::Table(heap.clone(), index),
+            Root::Table(heap.clone(), index, Rc::from(&[][..])),
         );
     }
 
@@ -1708,9 +1730,10 @@ impl<B: GraphicsBackend> NativeList<B> {
         if indirect.is_none() && groups.contains(&0) {
             return Ok(());
         }
+        let root = snapshot_roots(&self.state.compute_root, pso.binding.as_ref());
         self.cmds.push(Cmd::Dispatch {
             pso,
-            root: self.state.compute_root.clone(),
+            root,
             heaps: self.state.heaps.clone(),
             groups,
             threads,
@@ -2023,11 +2046,12 @@ impl<B: GraphicsBackend> NativeList<B> {
             .graphics
             .clone()
             .ok_or("draw without a graphics pipeline")?;
+        let root = snapshot_roots(&self.state.graphics_root, self.state.graphics_binding.as_deref());
         self.cmds.push(Cmd::Draw {
             pso,
             binding: self.state.graphics_binding.clone(),
             topology,
-            root: self.state.graphics_root.clone(),
+            root,
             heaps: self.state.heaps.clone(),
             targets: self.state.targets.clone(),
             vertex: self

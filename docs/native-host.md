@@ -1987,6 +1987,24 @@ alone, as read from the CPU (a read the reset pass makes meaningless, #258). Wit
 view-stride table (#264) as well, the G-buffer's targets are 11 to 15 % covered in a warm world
 run, against 0 to 8 % before.
 
+## Descriptor table records captured at recording (#538)
+
+Grand Theft Auto VI rewrites entries of its shared descriptor table (root slot 0, entries 8..251)
+between recording a dispatch and submitting the command list (bind, dispatch, unbind). Reading the
+table's records from title memory at submission made an earlier dispatch see the later record (for
+example, a null constant buffer where a 2,048-byte one was bound when recorded). `NativeList` now
+snapshots the 12-byte `[tag, index, generation]` records of each bound `Root::Table` span when a
+draw or dispatch is recorded (`snapshot_roots`), and `NativeHost::resources_named`,
+`remirror_tables`, `materialize_typed_buffers` and `note_written` consume those recorded snapshots.
+Within one submission, an entry claimed by an earlier command's statically bounded heap accesses is
+not overwritten by a later command whose shader does not read that entry; entries rolled back behind
+current title memory (`NativeHeap::rolled_back`) are brought current at the start of the next
+submission (`NativeHost::sync_rolled_back`). Null buffer and image SRV/UAV descriptors (`resource ==
+0`) decode to the null buffer view and cleared image entry respectively. Tests:
+`heap_tests::recorded_dispatches_keep_their_table_entries_when_unbound_or_rewritten_before_submission`,
+`texture_tests::an_evicted_texture_unbound_after_recording_is_still_made_again_for_its_draw`, and
+`tests::table_entries_rewritten_after_recording_keep_each_commands_recorded_view`.
+
 ## View addresses on the native host (#306)
 
 A shader that reads a buffer view's title address from its descriptor (dwords 0-1, the start of a

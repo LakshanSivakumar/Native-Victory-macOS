@@ -238,6 +238,9 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
         // SRV words: format, dimension, mapping, pad, then the union (buffer: first element (8
         // bytes), count, stride, flags; 2D: first mip, mip count).
         View::Shader(r, Some(d)) if d[1] == BUFFER => {
+            if *r == 0 {
+                return Some(Decoded::Buffer { addr: 0, size: 0 });
+            }
             let base = buffer_base(r)?;
             let first = u64::from(d[4]) | u64::from(d[5]) << 32;
             let (addr, size) = buffer_view(base, d[0], d[7], d[8], first, d[6])?;
@@ -246,6 +249,9 @@ pub(super) fn decode<T>(view: &View, resources: &HashMap<usize, Res<T>>) -> Opti
         // UAV words: format, dimension, then the union (buffer: first element (8 bytes), count,
         // stride, counter offset (8 bytes), flags; 2D: mip slice, plane).
         View::Unordered(r, _, Some(d)) if d[1] == BUFFER => {
+            if *r == 0 {
+                return Some(Decoded::Buffer { addr: 0, size: 0 });
+            }
             let base = buffer_base(r)?;
             let first = u64::from(d[2]) | u64::from(d[3]) << 32;
             let (addr, size) = buffer_view(base, d[0], d[5], d[8], first, d[4])?;

@@ -139,9 +139,7 @@ impl ResourceBackend for Capture {
     fn write_sampler(&self, _: &Self::Heap, _: usize, _: &(), _: f32) {
         unreachable!()
     }
-    fn clear_entry(&self, _: &Self::Heap, _: usize) {
-        unreachable!()
-    }
+    fn clear_entry(&self, _: &Self::Heap, _: usize) {}
     fn create_texture(&self, desc: &TextureDesc) -> Result<TextureDesc, String> {
         Ok(*desc)
     }

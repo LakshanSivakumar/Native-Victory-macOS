@@ -81,7 +81,24 @@ pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {
         };
         r == 0 && got == out.len() as u64
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut got = 0usize;
+        // SAFETY: `out` is writable for its length; the kernel validates the source range.
+        let ok = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                at.cast(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+                &mut got,
+            )
+        };
+        ok != 0 && got == out.len()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (at, out);
         false

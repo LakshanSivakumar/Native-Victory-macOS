@@ -2649,6 +2649,41 @@ fn a_texture_given_up_is_back_for_the_draw_whose_table_names_it() {
     assert!(t.host.knows(gone));
 }
 
+/// Same as [`a_texture_given_up_is_back_for_the_draw_whose_table_names_it`], when the title
+/// overwrites the descriptor slot with a null view after recording the draw and before submitting
+/// it (#538): `resources_named` and `remirror_tables` read the draw's recorded table snapshot, so
+/// the evicted texture is still restored and sampled.
+#[test]
+fn an_evicted_texture_unbound_after_recording_is_still_made_again_for_its_draw() {
+    let Some((mut t, pool)) = budget_title() else { return };
+    let gone = budget_texture(&mut t, &pool, 0, 0, 0x66);
+    t.set_texture_budget(1);
+    t.keep_to_budget();
+    assert!(!t.host.knows(gone));
+
+    let (l, color, (mut views, smp)) = sampling_list(&mut t, &pool, gone);
+    // Unbind entry 0 in title memory before submission.
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &srv, views.as_mut_ptr() as u64);
+
+    let queue = 3usize;
+    let fence = queue + 100;
+    t.ensure_queue(queue).unwrap();
+    t.submit(queue, vec![(l, vec![])]);
+    t.signal_queue(queue, fence, 0, 1);
+    let start = std::time::Instant::now();
+    while !t.try_wait(fence, 0, 1) {
+        assert!(start.elapsed().as_secs() < 10, "the draw did not complete");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut out = vec![0u8; SAMPLED * SAMPLED * 4];
+    t.host.backend.read_texture(&color, 0, 0, &mut out, SAMPLED * 4, 0);
+    drop((views, smp));
+    assert!(t.host.knows(gone));
+    assert_eq!(out[(8 * SAMPLED + 8) * 4..][..4], [0x66, 0, 0, 0x66]);
+}
+
 /// Over the texture budget, a texture no entry the host mirrored shows, which the table of a draw
 /// in the submission names through a record the title stored with plain stores, is not given up
 /// at that submission's sync, under the draw.
