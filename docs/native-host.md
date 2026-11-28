@@ -1957,7 +1957,7 @@ not a claim that the observed `+0x55e56f8` crash is conclusively diagnosed.
 | `VICTORY_UPSCALER` | Optional `6` (title's own) or `7` (FidelityFX). |
 | `VICTORY_STEP_OVER=pool` | Off unless requested. Before title exception handlers, resume only a mapped-image breakpoint whose bytes are `int3; xor r,r`, including matching REX register extensions. Advance only RIP; the xor produces the title's NULL return. Reports the first three and powers of two. A caller that cannot accept NULL may still fail. |
 | `VICTORY_REPORT_HDR=1` | Default off. Report enabled (`1`) and, for non-null info, write `[0.0,1600.0,1000.0]`. These are fixed Wine-route luminance values, not measured display capabilities. |
-| `VICTORY_MESH_OVER_LIMIT=1` | Default guard refuses declared mesh outputs above 32,768 bytes before conversion, warning and counting the refusal. Uses the larger of packed components and the Wine-measured aligned layout. `1` bypasses only this guard. |
+| `VICTORY_MESH_OVER_LIMIT=1` | Default guard refuses declared mesh outputs above 32,768 bytes before conversion, warning and counting the refusal. Uses the larger of packed components and the Wine-measured aligned layout. `1` bypasses only this guard, at both places it is checked: before conversion and when the pipeline is made (#528). |
 
 HDR presentation recognizes an `R10G10B10A2_UNORM` source only with the HDR switch
 on. The drawable worker selects `BGR10A2Unorm`, `itur_2100_PQ` and

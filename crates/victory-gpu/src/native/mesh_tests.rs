@@ -1084,3 +1084,15 @@ fn a_two_wave_meshlet_draws_each_primitive_below_its_count_not_culled() {
     }
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
+
+/// Both mesh size checks follow the switch: with the guard on, a program over 32 KiB is refused
+/// and one at the limit is not; with `VICTORY_MESH_OVER_LIMIT=1` (the guard off) none is (#528:
+/// the check when the pipeline is made used to refuse whatever the switch said).
+#[test]
+fn the_mesh_size_guard_refuses_over_32_kib_only_while_it_is_on() {
+    assert!(shaders::over_limit(33_792, true));
+    assert!(shaders::over_limit(38_400, true));
+    assert!(!shaders::over_limit(32_768, true));
+    assert!(!shaders::over_limit(33_792, false));
+    assert!(!shaders::over_limit(38_400, false));
+}

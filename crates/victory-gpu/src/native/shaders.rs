@@ -269,6 +269,14 @@ fn refuse_over_limit_mesh() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_MESH_OVER_LIMIT").as_deref() != Ok("1"))
 }
 
+/// Whether a mesh program declaring `bytes` of outputs is refused for size: over Metal's
+/// documented 32 KiB, unless the guard is off (`refuse`: [`refuse_over_limit_mesh`]). Both checks
+/// ask this one (before conversion, `refuse_mesh`, and when the pipeline is made, `make_render`),
+/// so `VICTORY_MESH_OVER_LIMIT=1` lets such a program through both.
+pub(super) fn over_limit(bytes: u32, refuse: bool) -> bool {
+    refuse && bytes > METAL_MESH_OUTPUT_BYTES
+}
+
 /// Counts of what the shader path did, and why it refused what it did.
 #[derive(Default, Debug, Clone)]
 pub struct ShaderStats {
@@ -440,7 +448,7 @@ impl<B: PresentBackend> Title<B> {
         let failed = || if mesh { Pipe::MeshRefused(MeshRefusal::ConversionFailed) } else { Pipe::Refused };
         if mesh {
             match victory_shader::emit::metal_mesh_bytes(&vs.dxil) {
-                Some(bytes) if bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES => {
+                Some(bytes) if over_limit(bytes, refuse_over_limit_mesh()) => {
                     // A mesh can occur in many target-format variants. Warn once by source shader,
                     // but keep the refusal reason in every cached pipeline for per-dispatch counts.
                     self.shaders.mesh_limit(name, bytes);
@@ -550,9 +558,8 @@ impl<B: PresentBackend> Title<B> {
     /// Refuse before converting any stages of an over-limit mesh pipeline.
     pub(crate) fn refuse_mesh(&mut self, shader: &HostShader, name: &str) -> bool {
         if shader.stage == victory_shader::HwStage::Ms
-            && refuse_over_limit_mesh()
             && let Some(bytes) = metal_mesh_bytes(&shader.dxil)
-            && bytes > METAL_MESH_OUTPUT_BYTES
+            && over_limit(bytes, refuse_over_limit_mesh())
         {
             self.shaders.refuse(name, format!(
                 "mesh outputs {bytes} bytes exceed Metal's 32,768-byte limit (VICTORY_MESH_OVER_LIMIT=1 bypasses this guard)"
