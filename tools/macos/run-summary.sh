@@ -58,6 +58,24 @@ function tomsec(v,   n) {
     if (!pre_seen) { pre_seen = 1; pre_from = t - t0 }
     pre_to = t - t0
   }
+  # VICTORY_SUBMIT_TIMING=1 (#461): one line per ExecuteCommandLists.
+  if (line ~ /submit timing: /) {
+    nsub++
+    if (match(line, /prep=[0-9.]+ms/)) sub_prep += substr(line, RSTART + 5, RLENGTH - 7) + 0
+    if (match(line, /encode_commit=[0-9.]+ms/)) sub_enc += substr(line, RSTART + 14, RLENGTH - 16) + 0
+    if (match(line, /total=[0-9.]+ms/)) {
+      v = substr(line, RSTART + 6, RLENGTH - 8) + 0
+      sub_tot += v
+      if (v > sub_max) sub_max = v
+    }
+  }
+  # VICTORY_TRACE_UNMAPPED_LEVELS=1 (#458): one line per 64 submissions; keep the last, sans prefix.
+  if (line ~ /unmapped levels: /) {
+    nunm++
+    x = line
+    if (ts != "") { sub(/^[^ ]+ +[A-Z]+ +/, "", x) }
+    unm_last = x
+  }
   if (line ~ /title shader refused/) {
     sh = ""; rs = line
     if (match(line, /shader="[^"]*"/)) sh = substr(line, RSTART, RLENGTH)
@@ -140,6 +158,12 @@ function metrics(   i, k, w, nw, v, r, u, kd, d, end) { # the --compare rows, on
   emit("row", "first binds", nbind + 0)
   emit("row", "prewarm shaders", pre_n + 0)
   emit("row", "prewarm DXIL MB", pre_mb + 0)
+  if (nsub) {
+    emit("row", "submit timing: submissions", nsub)
+    emit("row", "submit timing: total ms", sprintf("%.1f", sub_tot))
+    emit("row", "submit timing: slowest ms", sprintf("%.1f", sub_max))
+  }
+  if (nunm) emit("row", "unmapped levels lines", nunm)
   u = 0; for (r in refc) { u += refc[r]; emit("cause", r, refc[r]) }
   emit("row", "refused lines", nref + 0)
   emit("row", "refused (unique reason+shader)", u)
@@ -195,6 +219,8 @@ END {
   nr = 0; for (r in refc) { rc[++nr] = refc[r]; rk[nr] = r }
   k = top(rc, nr, 12, ix)
   for (i = 1; i <= k; i++) printf "    %5d  %s\n", rc[ix[i]], rk[ix[i]]
+  if (nsub) printf "\n  submit timing (VICTORY_SUBMIT_TIMING): %d submissions, total %.1f ms (prep %.1f ms, encode+commit %.1f ms), slowest %.1f ms\n", nsub, sub_tot, sub_prep, sub_enc, sub_max
+  if (nunm) printf "\n  unmapped mip levels (VICTORY_TRACE_UNMAPPED_LEVELS): %d lines, last: %s\n", nunm, substr(unm_last, 1, 150)
   print ""
 
   print "-- dropped work / warnings (by template)"
@@ -318,6 +344,9 @@ metal: command buffer failed: NSError { code: 2, "Caused GPU Hang Error (0000000
 @ESC@[2m2026-01-01T00:00:04.500000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host_posix::wasapi: WASAPI: render client released frames in the last second frames=48000
 @ESC@[2m2026-01-01T00:00:04.000000Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::x: profile at 4.0s: 1 methods
 @ESC@[2m2026-01-01T00:00:04.000100Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_hle::x: profile k!f0x1 calls 3 total 9.0 ms max 4.00 ms
+@ESC@[2m2026-01-01T00:00:05.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::host: submit timing: lists=2 cmds=17 prep=1.5ms encode_commit=0.3ms total=1.8ms
+@ESC@[2m2026-01-01T00:00:05.100000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::host: submit timing: lists=1 cmds=9 prep=2.5ms encode_commit=0.5ms total=3.0ms
+@ESC@[2m2026-01-01T00:00:05.200000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::textures: unmapped levels: 12.0MB in 3 levels of 2 textures (f28=10.0MB f45=2.0MB)
 VIctory: unhandled exception 0xc0000005 at image+0x1234 [0]
 victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef
 LOG
@@ -331,6 +360,8 @@ LOG
   chk 'at frame~128..128 (first t=+3.1s)'
   chk 'output fell back to silence t=+3.5s frame~128 (AudioQueueStart failed with OSStatus N)'
   chk 'mixer seconds: 1, spatial stream activations: 1, DSP connects: 0, DSP streams: 0'
+  chk 'submit timing (VICTORY_SUBMIT_TIMING): 2 submissions, total 4.8 ms (prep 4.0 ms, encode+commit 0.8 ms), slowest 3.0 ms'
+  chk 'unmapped mip levels (VICTORY_TRACE_UNMAPPED_LEVELS): 1 lines, last: victory_gpu::native::textures: unmapped levels: 12.0MB in 3 levels of 2 textures'
   chk 'victory: fatal signal 11 (code 1) at address 0x7ff8deadbeef'
   [ "$ok" = 1 ] && echo "self-test ok" || { printf '%s\n' "$out"; exit 1; }
 }
