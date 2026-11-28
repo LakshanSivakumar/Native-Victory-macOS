@@ -56,3 +56,31 @@ pub fn current() -> Console {
         Console::SeriesX
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn series_x_declares_its_memory_and_compute_units() {
+        assert_eq!(Console::SeriesX.title_memory(), (10 * GIB, 7 * GIB / 2));
+        assert_eq!(Console::SeriesX.compute_units(), 52);
+        assert_eq!(Console::SeriesX.name(), "Xbox Series X");
+    }
+
+    #[test]
+    fn series_s_declares_its_single_memory_range_and_compute_units() {
+        assert_eq!(Console::SeriesS.title_memory(), (0, 7_776 << 20));
+        assert_eq!(Console::SeriesS.compute_units(), 20);
+        assert_eq!(Console::SeriesS.name(), "Xbox Series S");
+    }
+
+    #[test]
+    fn set_then_current_round_trips() {
+        // The one stateful test: the console flag is process-global, so keep it in one test.
+        set(Console::SeriesS);
+        assert_eq!(current(), Console::SeriesS);
+        set(Console::SeriesX);
+        assert_eq!(current(), Console::SeriesX);
+    }
+}
