@@ -978,7 +978,10 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = console
+            let compute_sample_quad = x.wave32_host
+                && matches!(cs.threads, [8, 4 | 8, 1] | [4, 4, 2])
+                && insts().any(|i| matches!(i.name(), "image_sample" | "image_sample_o"));
+            console_lanes = console || compute_sample_quad
                 || insts().any(|i| {
                     let n = i.name();
                     n.starts_with("ds_swizzle")
@@ -12523,6 +12526,45 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
+                60 if self.x.wave32_host
+                    && matches!(self.s.threads, Some([8, 4 | 8, 1] | [4, 4, 2]))
+                    && kind == 2 =>
+                {
+                    // Metal does not expose implicit samples or derivatives for 2D groups.
+                    // For these group shapes, each 2x2 tile fits in one host wave.
+                    let width = self.s.threads.expect("compute sample group")[0];
+                    let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+                    let quad_mask = self.s.m.i32(!(width | 1));
+                    let upper_left = self.s.m.bin(c, Bin::And, lane, quad_mask);
+                    let x_step = self.s.m.i32(1);
+                    let y_step = self.s.m.i32(width);
+                    let upper_right = self.s.m.bin(c, Bin::Or, upper_left, x_step);
+                    let lower_left = self.s.m.bin(c, Bin::Or, upper_left, y_step);
+                    let mut gradients = [fu; 6];
+                    for (k, coord) in cs.iter().copied().take(2).enumerate() {
+                        let bits = self.as_int(coord);
+                        let origin = self.read_lane(bits, upper_left);
+                        let right = self.read_lane(bits, upper_right);
+                        let bottom = self.read_lane(bits, lower_left);
+                        let origin = self.as_float(origin);
+                        let right = self.as_float(right);
+                        let bottom = self.as_float(bottom);
+                        gradients[k] = self.s.m.bin(c, Bin::Sub, right, origin);
+                        gradients[k + 3] = self.s.m.bin(c, Bin::Sub, bottom, origin);
+                    }
+                    self.s.flags |= flags::WAVE_OPS;
+                    args.extend(&os);
+                    args.extend(gradients);
+                    args.push(fu);
+                    self.s.op(
+                        c,
+                        "sampleGrad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        63,
+                        &args,
+                    )
+                }
                 60 => {
                     args.extend(&os);
                     args.push(fu);
