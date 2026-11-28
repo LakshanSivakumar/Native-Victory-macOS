@@ -267,6 +267,9 @@ fn a_thread_returns_its_exit_code_and_has_its_own_id() {
     let main_id = thread::current_id();
     let (tx, rx) = std::sync::mpsc::channel();
     let t = thread::spawn("probe", 1 << 20, move || {
+        thread::set_user_interactive();
+        #[cfg(target_os = "macos")]
+        assert_eq!(thread::current_qos_class(), thread::QOS_CLASS_USER_INTERACTIVE);
         tx.send(thread::current_id()).unwrap();
         42
     })

@@ -170,6 +170,7 @@ pub unsafe fn spawn_title_thread_with(
     on_exit: impl FnOnce(u32) + Send + 'static,
 ) -> std::io::Result<Thread> {
     thread::spawn(name, stack_size, move || {
+        thread::set_user_interactive();
         on_start();
         notify_threads(DLL_THREAD_ATTACH);
         // SAFETY: forwarded from the caller.
@@ -221,6 +222,7 @@ pub unsafe fn run_entry_with(
     let failure = std::sync::Arc::new(Mutex::new(None::<String>));
     let failed = failure.clone();
     let thread = thread::spawn("title-main", stack, move || {
+        thread::set_user_interactive();
         // SAFETY: forwarded from the caller.
         unsafe {
             for (i, dll) in dlls.iter().enumerate() {
@@ -249,5 +251,42 @@ pub unsafe fn run_entry_with(
     match failure.lock().unwrap_or_else(|e| e.into_inner()).take() {
         Some(message) => Err(anyhow::anyhow!(message)),
         None => Ok(code),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "win64" fn noop_entry(arg: usize) -> u32 {
+        arg as u32
+    }
+
+    #[test]
+    fn spawned_title_threads_run_at_user_interactive_qos() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let seen_start = seen.clone();
+        // SAFETY: `noop_entry` is a pure `extern "win64"` function of one `usize` argument.
+        let handle = unsafe {
+            spawn_title_thread_with(
+                "qos-probe",
+                1 << 20,
+                noop_entry as *const () as usize,
+                7,
+                move || {
+                    seen_start.store(
+                        thread::current_qos_class(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                },
+                |_| {},
+            )
+            .unwrap()
+        };
+        assert_eq!(handle.join(), 7);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            thread::QOS_CLASS_USER_INTERACTIVE
+        );
     }
 }

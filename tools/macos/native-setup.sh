@@ -54,6 +54,7 @@ sysroot=$(rustup run 1.98.1 rustc --print sysroot)
 export PATH="$sysroot/bin:$PATH"
 bin=$(native_binary) || fail "could not locate the Cargo build output"
 cargo build --release --target x86_64-apple-darwin -p victory
+[[ ! -x "$bin" ]] || stage_native_bundle "$bin" >/dev/null || fail "could not stage Victory.app bundle"
 ok "built $bin"
 
 echo

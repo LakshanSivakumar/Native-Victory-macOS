@@ -7,7 +7,13 @@ use std::time::Duration;
 
 unsafe extern "C" {
     fn pthread_threadid_np(thread: usize, id: *mut u64) -> i32;
+    fn pthread_self() -> usize;
+    fn pthread_set_qos_class_self_np(qos: u32, relative_priority: i32) -> i32;
+    fn pthread_get_qos_class_np(thread: usize, qos: *mut u32, relative_priority: *mut i32) -> i32;
 }
+
+/// `QOS_CLASS_USER_INTERACTIVE` in `<sys/qos.h>`.
+pub const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 
 /// A thread started by [`spawn`].
 #[derive(Debug)]
@@ -58,4 +64,23 @@ pub fn current_id() -> u32 {
 
 pub fn sleep(time: Duration) {
     std::thread::sleep(time);
+}
+
+/// Schedules the calling thread at `QOS_CLASS_USER_INTERACTIVE` so macOS treats
+/// title frame-driving threads as interactive work (#533).
+pub fn set_user_interactive() {
+    // SAFETY: documented libSystem call for the calling thread only.
+    unsafe {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
+/// The calling thread's macOS QoS class (`<sys/qos.h>`).
+pub fn current_qos_class() -> u32 {
+    let (mut qos, mut rel) = (0u32, 0i32);
+    // SAFETY: `pthread_self()` names the calling thread; local out-pointers.
+    unsafe {
+        pthread_get_qos_class_np(pthread_self(), &mut qos, &mut rel);
+    }
+    qos
 }

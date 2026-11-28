@@ -3,6 +3,10 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build_git.rs"]
+mod build_git;
 mod census;
 mod inspect;
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -351,4 +355,110 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod build_git_tests {
+    use super::build_git;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn unique_temp(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "victory-build-git-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn linked_worktree_watches_common_branch_ref_and_packed_refs() {
+        let root = unique_temp("worktree");
+        let common = root.join("main-repo/.git");
+        let worktree_git = common.join("worktrees/feature");
+        let worktree_checkout = root.join("wt/apps/victory");
+        fs::create_dir_all(common.join("refs/heads/feat")).unwrap();
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::create_dir_all(&worktree_checkout).unwrap();
+
+        fs::write(
+            root.join("wt/.git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        fs::write(worktree_git.join("HEAD"), "ref: refs/heads/feat/hud\n").unwrap();
+        fs::write(
+            common.join("refs/heads/feat/hud"),
+            "e20c939000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        fs::write(
+            common.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted\n1111111000000000000000000000000000000000 refs/heads/main\n",
+        )
+        .unwrap();
+
+        let watched = build_git::watch_paths(&worktree_checkout);
+        assert!(watched.iter().all(|p| p.exists()));
+        assert!(watched.iter().any(|p| p.ends_with("HEAD")));
+        assert!(watched.iter().any(|p| p.ends_with("refs/heads/feat/hud")));
+        assert!(watched.iter().any(|p| p.ends_with("packed-refs")));
+        assert_eq!(
+            build_git::commit_from_files(&worktree_checkout).as_deref(),
+            Some("e20c939")
+        );
+
+        // Advancing the branch ref without touching the worktree's HEAD updates
+        // a watched file and resolves the new short commit (#533).
+        fs::write(
+            common.join("refs/heads/feat/hud"),
+            "41d6563000000000000000000000000000000000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            build_git::commit_from_files(&worktree_checkout).as_deref(),
+            Some("41d6563")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn packed_branch_watches_existing_ancestor_dir_and_resolves_packed_ref() {
+        let root = unique_temp("packed");
+        let git = root.join(".git");
+        let sub = root.join("apps/victory");
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("packed-refs"),
+            "abcdef0123456789abcdef0123456789abcdef01 refs/heads/main\n",
+        )
+        .unwrap();
+
+        let watched = build_git::watch_paths(&sub);
+        assert!(watched.iter().all(|p| p.exists()));
+        assert!(watched.contains(&git.join("HEAD")));
+        assert!(watched.contains(&git.join("refs/heads")));
+        assert!(watched.contains(&git.join("packed-refs")));
+        assert_eq!(
+            build_git::commit_from_files(&sub).as_deref(),
+            Some("abcdef0")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn binary_carries_current_git_commit_env() {
+        let commit = env!("VICTORY_GIT_COMMIT");
+        assert!(!commit.is_empty());
+    }
 }

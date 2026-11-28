@@ -48,3 +48,68 @@ native_binary() {
   fi
   printf '%s/x86_64-apple-darwin/release/victory\n' "$target_dir"
 }
+
+# Wraps the built host executable in a minimal .app bundle beside it so macOS
+# sees an Info.plist with LSApplicationCategoryType=public.app-category.games
+# and LSSupportsGameMode=true, allowing Game Mode to engage in full screen (#533).
+# Prints the bundled executable path.
+stage_native_bundle() {
+  local bin="$1"
+  local bundle="$(dirname "$bin")/Victory.app"
+  local contents="$bundle/Contents"
+  local macos="$contents/MacOS"
+  local app_bin="$macos/victory"
+  local plist="$contents/Info.plist"
+  local changed=0
+  mkdir -p "$macos" || return 1
+  cat > "$plist.tmp" <<'PLIST' || return 1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>ScarlettMac Native</string>
+  <key>CFBundleExecutable</key>
+  <string>victory</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.victory.native</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>ScarlettMac Native</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.games</string>
+  <key>LSSupportsGameMode</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+  if [[ ! -f "$plist" ]] || ! cmp -s "$plist.tmp" "$plist"; then
+    mv -f "$plist.tmp" "$plist" || return 1
+    changed=1
+  else
+    rm -f "$plist.tmp"
+  fi
+  if [[ ! -x "$app_bin" ]] || ! cmp -s "$bin" "$app_bin"; then
+    # Remove before copying so Apple Silicon never sees an in-place Mach-O
+    # overwrite against a cached vnode code signature.
+    rm -f "$app_bin"
+    cp "$bin" "$app_bin" || return 1
+    chmod +x "$app_bin" || return 1
+    changed=1
+  fi
+  if (( changed )) && [[ -x /usr/bin/codesign ]]; then
+    /usr/bin/codesign --force --sign - "$bundle" >/dev/null 2>&1 || true
+  fi
+  printf '%s\n' "$app_bin"
+}

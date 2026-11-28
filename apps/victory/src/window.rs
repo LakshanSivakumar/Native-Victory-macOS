@@ -1,6 +1,7 @@
-//! The window of the native macOS host: an `NSWindow` (1920x1080 content, "VIctory") whose view
-//! is the `CAMetalLayer` the GPU presents into, driven by an AppKit event loop on the process
-//! main thread while the title runs on its own threads. Closing the window ends the process.
+//! The window of the native macOS host: an `NSWindow` (1920x1080 content,
+//! "ScarlettMac Native | <console> (<commit>)") whose view is the `CAMetalLayer` the GPU presents
+//! into, driven by an AppKit event loop on the process main thread while the title runs on its own
+//! threads. Closing the window ends the process.
 //!
 //! AppKit is reached through the Objective-C runtime (`objc2`'s `msg_send!`), with no binding
 //! crate for it. The loop is `nextEventMatchingMask:` by hand rather than `[NSApp run]`, so the
@@ -65,6 +66,18 @@ unsafe extern "C" {
     fn pthread_main_np() -> i32;
 }
 
+/// Formats the window HUD title (`ScarlettMac Native | Series S (<commit>)`).
+fn window_title(console: victory_hle::console::Console, commit: &str) -> String {
+    let model = match console {
+        victory_hle::console::Console::SeriesX => "Series X",
+        victory_hle::console::Console::SeriesS => "Series S",
+    };
+    match commit {
+        "" | "unknown" => format!("ScarlettMac Native | {model}"),
+        short => format!("ScarlettMac Native | {model} ({short})"),
+    }
+}
+
 /// The application, its menu (Quit) and the window, shown.
 unsafe fn open(layer: *mut std::ffi::c_void) -> Result<Retained<AnyObject>> {
     // SAFETY: documented AppKit calls; every receiver is a class or an object just made.
@@ -78,7 +91,7 @@ unsafe fn open(layer: *mut std::ffi::c_void) -> Result<Retained<AnyObject>> {
         let menu: Retained<AnyObject> = msg_send![class!(NSMenu), new];
         let quit: Retained<AnyObject> = msg_send![
             msg_send![class!(NSMenuItem), alloc],
-            initWithTitle: &*NSString::from_str("Quit VIctory"),
+            initWithTitle: &*NSString::from_str("Quit ScarlettMac Native"),
             action: objc2::sel!(terminate:),
             keyEquivalent: &*NSString::from_str("q")
         ];
@@ -98,7 +111,11 @@ unsafe fn open(layer: *mut std::ffi::c_void) -> Result<Retained<AnyObject>> {
             backing: 2usize,
             defer: Bool::NO
         ];
-        let _: () = msg_send![&*window, setTitle: &*NSString::from_str("VIctory")];
+        let title = window_title(victory_hle::console::current(), env!("VICTORY_GIT_COMMIT"));
+        let _: () = msg_send![&*window, setTitle: &*NSString::from_str(&title)];
+        // NSWindowCollectionBehaviorFullScreenPrimary (1 << 7): enables Full Screen
+        // Spaces so macOS Game Mode engages when the bundled host enters full screen (#533).
+        let _: () = msg_send![&*window, setCollectionBehavior: 1usize << 7];
         // The view hosts our layer: set the layer first, then ask for layers.
         let view: *mut AnyObject = msg_send![&*window, contentView];
         let layer = layer.cast::<AnyObject>();
@@ -620,5 +637,22 @@ mod tests {
             unsafe { super::poll_controller() };
             victory_hle::modules::gameinput::release_live_pad();
         });
+    }
+
+    #[test]
+    fn window_title_includes_console_model_and_build_commit() {
+        use victory_hle::console::Console;
+        assert_eq!(
+            window_title(Console::SeriesS, "41d6563"),
+            "ScarlettMac Native | Series S (41d6563)"
+        );
+        assert_eq!(
+            window_title(Console::SeriesX, "41d6563"),
+            "ScarlettMac Native | Series X (41d6563)"
+        );
+        assert_eq!(
+            window_title(Console::SeriesS, "unknown"),
+            "ScarlettMac Native | Series S"
+        );
     }
 }

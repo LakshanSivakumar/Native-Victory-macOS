@@ -62,7 +62,8 @@ launch() {
   fixture "$target"
   run_script run-native.sh --console series-x "$@" "$input"
   [[ "$rc" == "${CHILD_STATUS:-0}" ]] || fail "child status: $rc"
-  printf '%s\n' "$target/x86_64-apple-darwin/release/victory" run --execute --console series-x "$@" --unimplemented zero "$input" > "$root/expected"
+  /usr/bin/plutil -lint "$target/x86_64-apple-darwin/release/Victory.app/Contents/Info.plist" >/dev/null || fail "invalid Info.plist"
+  printf '%s\n' "$target/x86_64-apple-darwin/release/Victory.app/Contents/MacOS/victory" run --execute --console series-x "$@" --unimplemented zero "$input" > "$root/expected"
   cmp "$RECORD" "$root/expected" || fail "wrong executable or arguments"
 }
 
@@ -263,6 +264,23 @@ test_launch_without_cargo() {
   contains 'Cargo is not on your PATH'
   contains 'https://rustup.rs'
 }
+test_game_mode_bundle() {
+  launch "$default"
+  local plist="$default/x86_64-apple-darwin/release/Victory.app/Contents/Info.plist"
+  [[ $(/usr/bin/plutil -extract LSApplicationCategoryType raw -o - "$plist") == "public.app-category.games" ]] || fail "wrong category"
+  [[ $(/usr/bin/plutil -extract LSSupportsGameMode raw -o - "$plist") == "true" ]] || fail "Game Mode not enabled"
+  [[ $(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$plist") == "victory" ]] || fail "wrong bundle executable"
+  # Rebuilding victory refreshes the staged bundle copy on the next run.
+  cat > "$default/x86_64-apple-darwin/release/victory" <<'UPDATED'
+#!/bin/bash
+printf 'updated:%s\n' "$0" > "$RECORD"
+exit 0
+UPDATED
+  chmod +x "$default/x86_64-apple-darwin/release/victory"
+  run_script run-native.sh --console series-s "$input"
+  [[ "$rc" == 0 ]] || fail "re-run failed: $rc"
+  [[ $(cat "$RECORD") == "updated:$default/x86_64-apple-darwin/release/Victory.app/Contents/MacOS/victory" ]] || fail "bundle copy was not refreshed"
+}
 
 # Optional names allow the central regression to be checked against old scripts.
 if [[ $# == 0 ]]; then
@@ -270,7 +288,7 @@ if [[ $# == 0 ]]; then
     build_environment relative_environment project missing not_executable invalid_config \
     bad_metadata setup setup_sysroot_failure setup_metadata_failure setup_build_failure \
     setup_rustup_in_cargo_home setup_rustup_in_homebrew setup_without_rustup \
-    launch_rustup_in_cargo_home launch_without_cargo
+    launch_rustup_in_cargo_home launch_without_cargo game_mode_bundle
 fi
 for test in "$@"; do
   (prepare "$test"; "test_$test")

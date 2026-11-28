@@ -51,6 +51,7 @@ source tools/macos/native-binary.sh
 [[ -n "$console" ]] || console=$(default_console "$ram_gb")
 bin=$(native_binary) || exit 2
 [[ -x "$bin" ]] || { echo "victory is not executable at $bin: run tools/macos/native-setup.sh first"; exit 2; }
+app_bin=$(stage_native_bundle "$bin") || { echo "Failed to stage Game Mode bundle for $bin" >&2; exit 1; }
 
 mkdir -p runs || exit 1
 run_dir=$(mktemp -d "runs/$(date +%Y%m%d-%H%M%S)-XXXXXX") || exit 1
@@ -66,7 +67,7 @@ export VICTORY_KEYS="${VICTORY_KEYS:-$(seq 4 2 80 | sed 's/$/:Enter/' | paste -s
 echo "Running $exe (console=$console)"
 echo "Log: $log"
 
-"$bin" run --execute --console "$console" ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
+"$app_bin" run --execute --console "$console" ${headless[@]+"${headless[@]}"} --unimplemented zero "$exe" >> "$log" 2>&1 &
 pid=$!
 timer=""
 if (( decimal_seconds > 0 )); then

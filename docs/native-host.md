@@ -119,6 +119,8 @@ Why the Wine path is slow here: one 64 KiB view per page (`MapViewOfFile3`) make
 | Critical sections and SRW locks | inline in the title's CRT, over `ntdll` | `RtlEnterCriticalSection` and `RtlAcquireSRWLock*` on `os_unfair_lock` or the wait-on-address primitive; not yet reached |
 | DLL thread notices (`DLL_THREAD_ATTACH` through a TLS callback registered in `.CRT$XLY`) | `victory-loader/src/threads.rs` | The Windows loader calls each thread's callbacks for us today. Natively `spawn_title_thread` is the one place threads start in title code, so it must send the notices. Not yet done |
 
+The title's main thread (`run_entry_with`) and threads spawned through `CreateThread` (`spawn_title_thread_with`) call `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)` on startup so macOS schedules the frame-driving title threads as user-interactive work (#533). `tools/macos/run-native.sh` and `native-setup.sh` stage the built host binary inside `Victory.app` with `LSApplicationCategoryType = public.app-category.games` and `LSSupportsGameMode = true` so macOS Game Mode engages in full screen, and `apps/victory/build.rs` watches both the worktree `HEAD` and shared `commondir` branch ref / `packed-refs` so `VICTORY_GIT_COMMIT` in the `ScarlettMac Native | <console> (<commit>)` window title stays current across commits.
+
 ### Files
 
 | Win32 | Where | macOS |

@@ -86,3 +86,6 @@ pub fn sleep(time: Duration) {
     // SAFETY: no preconditions.
     unsafe { Sleep(time.as_millis().min(u128::from(u32::MAX - 1)) as u32) };
 }
+
+/// No-op on Windows (macOS QoS class promotion for title threads).
+pub fn set_user_interactive() {}
