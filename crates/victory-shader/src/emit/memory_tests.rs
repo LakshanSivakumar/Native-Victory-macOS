@@ -908,8 +908,9 @@ fn computed_buffer_subword_loads_preserve_values_and_bounds() {
 /// A size query of the view at a descriptor index (#407): the program scales the index to whole
 /// descriptors, loads the four dwords of the entry and keeps only the size fields of dwords 1-3,
 /// guarded by the null test of dword 1. The table's dword 1 bit 0 is always 0, so the translator
-/// carries the answer there: a view whose image words are in the table reads back with the width
-/// in the top bits and a null entry reads as 0, as the console's format field would.
+/// carries "this entry holds a texture" there, from the entry's dword 3: an image reads back with
+/// its size fields and the bit, a null entry and a buffer (whose table size fields are 0) read as
+/// 0, taking the program's null branch instead of a size of 0.
 #[test]
 fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
     let mut w = vec![s_mov_b32(5, 0)]; // s[4:5]: the table at s4, high half 0
@@ -970,10 +971,11 @@ fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
     ];
     let (shader, _memory) = lowered(&w, 4, layout, used);
     assert!(shader.view_addresses);
-    // Heap index 1 holds a 64x32 image, index 2 a null entry.
+    // Heap index 1 holds a 64x32 image, index 2 a null entry, index 3 a buffer (address only).
     let texel = [[0.0f32; 4]];
-    let mut view_addresses = vec![0u32; 4 * 3];
+    let mut view_addresses = vec![0u32; 4 * 4];
     view_addresses[4..8].copy_from_slice(&[0, 0xC000_0000, 0x0007_C00F, 0x9000_0FAC]);
+    view_addresses[12..16].copy_from_slice(&[0x1234_5678, 0x0000_9ABC, 0, 0]);
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -991,6 +993,7 @@ fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
         for (index, want) in [
             (1, [0xC000_0001, 0x0007_C00F, 0x9000_0FAC]),
             (2, [0, 0, 0]),
+            (3, [0x0000_9ABC, 0, 0]),
         ] {
             ud[0] = index;
             let out = host

@@ -7564,20 +7564,17 @@ impl<'a> Lower<'a> {
                 vals.push(self.raw_dword(views, at));
             }
             if null_test {
-                // A null entry is all 0 and a view is not: a buffer's dword 0 is its address,
-                // an image's dword 3 the `0xFAC` and levels (`0xFAC` alone when the base address
-                // is not loaded). Bit 0 of the table's dword 1 is always 0, so it can carry the
-                // answer for the null test.
+                // Whether the entry holds a texture: an image's dword 3 has `0xFAC` and the
+                // levels, a null entry is all 0, and a buffer's dword 3 is 0 too (its table
+                // dwords 2 and 3 are, so the image reading of a buffer would give it a size of
+                // 0). The program then takes its null branch for a buffer, as if it were empty.
+                // Bit 0 of the table's dword 1 is always 0 (the width is in bits 30-31), so it
+                // carries the answer.
                 let c = self.cur;
                 let at = |dword: u32| (dword - first) as usize;
                 let zero = self.s.m.i32(0);
                 let one = self.s.m.i32(1);
-                let mut seen = vals[at(3)];
-                if first == 0 {
-                    let d0 = vals[at(0)];
-                    seen = self.s.m.bin(c, Bin::Or, seen, d0);
-                }
-                let view = self.s.m.cmp(c, pred::NE, seen, zero);
+                let view = self.s.m.cmp(c, pred::NE, vals[at(3)], zero);
                 let view = self.s.m.select(c, view, one, zero);
                 let d1 = self.s.m.bin(c, Bin::Or, vals[at(1)], view);
                 vals[at(1)] = d1;

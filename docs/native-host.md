@@ -2098,7 +2098,9 @@ table's dword 1 (always 0, the width being in bits 30-31) carries it instead. `L
 image_size_half` takes a four-dword load at an index scaled to whole descriptors (`s_lshl_b32`,
 5) when every reader keeps only a size field (a constant `s_and_b32` or `s_bfe_u32` within width,
 height, first and last level) or tests dword 1 against 0; `view_addresses` sets that bit when the
-entry's dword 0 (a buffer's address) or dword 3 (an image's `0xFAC` and levels) is nonzero. Any
+entry's dword 3 (an image's `0xFAC` and levels) is nonzero. The table gives a buffer's dwords 2
+and 3 as 0, so the image reading of a buffer entry would size it 0: the bit says "a texture" and
+a buffer reads as a null entry, taking the program's null branch rather than a wrong size. Any
 other reader keeps the buffer reading of the four dwords and its refusals. The 723 programs of the
 corpus refused with "a view address field the table gives as 0: a buffer's stride or swizzle" are
 of this shape. Tests: `gfx_refusal_tests::a_size_query_of_a_view_at_a_descriptor_index_reads_the_table`
