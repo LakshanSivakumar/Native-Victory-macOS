@@ -136,3 +136,42 @@ pub(crate) fn path(module: *mut c_void) -> Option<Vec<u16>> {
     let name = name_of(module)?;
     Some(format!(r"C:\Windows\System32\{name}").encode_utf16().collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::normalise;
+
+    #[test]
+    fn full_windows_paths_keep_only_the_lower_cased_file_name() {
+        assert_eq!(normalise(r"C:\Windows\System32\Kernel32.DLL"), "kernel32.dll");
+        assert_eq!(normalise(r"C:\Windows\System32\ntdll.dll"), "ntdll.dll");
+        assert_eq!(
+            normalise(r"C:\Windows\System32\API-MS-WIN-CORE-HEAP-L1-1-0.DLL"),
+            "api-ms-win-core-heap-l1-1-0.dll"
+        );
+    }
+
+    #[test]
+    fn forward_slashes_separate_the_file_name_too() {
+        assert_eq!(normalise("C:/Windows/System32/ucrtbase.dll"), "ucrtbase.dll");
+        assert_eq!(normalise("a/b/Kernel32.DLL"), "kernel32.dll");
+    }
+
+    #[test]
+    fn bare_names_gain_the_dll_extension() {
+        assert_eq!(normalise("kernel32"), "kernel32.dll");
+        assert_eq!(normalise("NTDLL"), "ntdll.dll");
+    }
+
+    #[test]
+    fn names_with_an_extension_are_kept_but_lower_cased() {
+        assert_eq!(normalise("kernel32.dll"), "kernel32.dll");
+        assert_eq!(normalise("X.DLL"), "x.dll");
+    }
+
+    #[test]
+    fn a_dot_in_a_directory_name_does_not_count_as_the_file_extension() {
+        assert_eq!(normalise(r"C:\foo.bar\baz"), "baz.dll");
+        assert_eq!(normalise("some.dir/file"), "file.dll");
+    }
+}
