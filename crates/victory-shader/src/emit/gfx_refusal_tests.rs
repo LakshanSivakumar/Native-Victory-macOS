@@ -1026,6 +1026,47 @@ fn a_size_query_of_a_view_at_a_descriptor_index_reads_the_table() {
     }
 }
 
+/// The tail dwords of an image descriptor the program also samples from (a whole eight-dword
+/// load used by `image_load`) are built from the view beside its size fields: dword 5 carries
+/// the array pitch, the last level and the tuning value, dwords 6 and 7 the compression fields
+/// (0 here). The console compiler re-loads a descriptor it samples with to size from it, so a
+/// program that reads those dwords as data used to be refused.
+#[test]
+fn an_image_descriptors_tail_dwords_read_as_data_translate() {
+    use crate::native::tests::{fspx, fspx_resource};
+    // The view at table dword 8, whole: dwords 0-7 into s[24:31], then sampled and dword 5
+    // read as data to s20, which is stored.
+    let code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (the result UAV)
+        0xBE8C_0388, // s_mov_b32 s12, 8 (the descriptor's byte offset)
+        0x8006_040C, // s_add_u32 s6, s4, s12
+        0x8007_FDFF,
+        0x0000_0000, // s_add_u32 s7, scc, 0
+        0xF40C_0603,
+        0xFA00_0000, // s_load_dwordx8 s[24:31], s[6:7], 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E00_0281, // v_mov_b32 v0, 0
+        0x7E02_0282, // v_mov_b32 v1, 0
+        0xF000_1F08,
+        0x0006_0200, // image_load v[2:5], v[0:1], s[24:31] dmask:0xf dim:2D unorm
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_021D, // v_mov_b32 v1, s29 (dword 5)
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let resources = [
+        fspx_resource(3, 3, 0, 0, 4, 0),
+        fspx_resource(0, 3, 8, 0, 4, 0),
+    ];
+    let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+    let program = crate::dxbc::build(&[(FourCC::ACCC, &part)]);
+    let shader = translate_with(&program, Options::default());
+    assert!(shader.is_ok(), "{:?}", shader.err());
+}
+
 #[test]
 fn refusal2_pixel_system_inputs_lower_when_declared() {
     // Reads v0..v6 = Position.xyzw, FrontFace, Ancillary, SampleCoverage

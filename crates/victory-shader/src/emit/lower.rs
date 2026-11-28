@@ -6624,8 +6624,6 @@ impl<'a> Lower<'a> {
             "a descriptor's address or format read as data: a buffer's dword 3 (format and type)";
         const IMAGE_ADDRESS: Why =
             "a descriptor's address or format read as data: an image's base address (dword 0)";
-        const IMAGE_REST: Why =
-            "a descriptor's address or format read as data: an image's dwords 5 to 7";
         const OUTSIDE: Why =
             "a descriptor's address or format read as data: a dword outside the descriptor";
         let Fields::Smem {
@@ -6785,6 +6783,8 @@ impl<'a> Lower<'a> {
                     k(self, 16),
                     k(self, 0x3FFF),
                 );
+                let (zero, raw) = (k(self, 0), field(self, 0));
+                let null = self.s.m.cmp(c, pred::EQ, raw, zero);
                 let mut d1 = self.s.m.bin(c, Bin::Shl, w, k30);
                 // A null test of dword 1 (`s_cmp_eq_i32 d1, 0`, the compiler's guard before it
                 // sizes from it): the console's dword 1 is never 0 for a view, its format field
@@ -6793,9 +6793,6 @@ impl<'a> Lower<'a> {
                 // the dword, set a format bit for a view and give 0 for a null one.
                 let d1_value = inst.write(Reg::S(code + first + 1));
                 if d1_value.is_some_and(|v| self.width_bits_or_null_test(v)) {
-                    let width = field(self, 0);
-                    let zero = k(self, 0);
-                    let null = self.s.m.cmp(c, pred::EQ, width, zero);
                     let format = k(self, 1 << 20);
                     let view = self.s.m.bin(c, Bin::Or, d1, format);
                     d1 = self.s.m.select(c, null, zero, view);
@@ -6808,7 +6805,20 @@ impl<'a> Lower<'a> {
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+                // Dword 5: the array pitch (1 for a writable view, 0 otherwise, which tells a
+                // bound volume from a whole one), the last level again (MAX_MIP, relative to
+                // the base level, so the level count less one) and the tuning value 4 (PERF_MOD,
+                // what the console compiler and the drivers set). Dwords 6 and 7 hold the
+                // compression block sizes and metadata address, which the host does not use:
+                // 0 is what a view without compression has.
+                let (pitch, four, k20, k4) =
+                    (k(self, uav as u32), k(self, 4), k(self, 20), k(self, 4));
+                let perf = self.s.m.bin(c, Bin::Shl, four, k20);
+                let mip = self.s.m.bin(c, Bin::Shl, levels, k4);
+                let d5 = self.s.m.bin(c, Bin::Or, pitch, mip);
+                let d5 = self.s.m.bin(c, Bin::Or, d5, perf);
+                let d5 = self.s.m.select(c, null, zero, d5);
+                vec![(1, d1), (2, d2), (3, d3), (4, depth), (5, d5), (6, zero), (7, zero)]
             }
             None => vec![(2, field(self, 0))],
         };
@@ -6822,7 +6832,6 @@ impl<'a> Lower<'a> {
                         (false, 1) => BUFFER_DWORD1,
                         (false, 3) => BUFFER_FORMAT,
                         (true, 0) => IMAGE_ADDRESS,
-                        (true, 5..=7) => IMAGE_REST,
                         _ => OUTSIDE,
                     };
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {

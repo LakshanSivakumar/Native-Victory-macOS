@@ -2065,11 +2065,12 @@ swizzle reads as the identity.
 
 The console compiler computes sizes from descriptor bits instead of querying them; those fields
 are rebuilt from the host view (`Lower::descriptor_data`). Other dwords have no host value and
-were refused as "a descriptor's address or format read as data". That text is now followed by a
-colon and the dword: "a buffer's base address (dword 0)", "a buffer's dword 1 (address high
-bits, stride, swizzle)", "a buffer's dword 3 (format and type)", "an image's base address (dword
-0)", "an image's dwords 5 to 7" or "a dword outside the descriptor". Nothing is lowered: the
-native Metal host serves view addresses (see "View addresses on the native host") but no formats, and would have to first.
+were refused as "a descriptor's address or format read as data". That text is still followed by a
+colon and the dword for the ones left: "a buffer's base address (dword 0)", "a buffer's dword 1
+(address high bits, stride, swizzle)", "a buffer's dword 3 (format and type)", "an image's base
+address (dword 0)" or "a dword outside the descriptor". Nothing else is lowered: the native Metal
+host serves view addresses (see "View addresses on the native host") but no formats, and would
+have to first.
 `pipeline::pieces_tests::the_host_refuses_a_descriptor_dword_read_as_data_naming_it`
 (`victory-gpu`) checks the refusal on the native host's own path: the container made from the
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
@@ -2088,7 +2089,20 @@ passes the stale value on as scalar arithmetic does, and a result the path fixes
 holds nothing of it. Corpus: 651 programs gained (493 pixel, 158 vertex), 0 lost, 0 changed; of
 the world run's 14,508 pixel draws dropped for these two reasons, 12,156 were of pipelines whose
 every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Still refused, rightly
-for now: buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+for now: buffer dwords 2-3, which no host table holds.
+
+**An image's tail dwords (5-7).** A program that both samples a descriptor and reads later dwords
+of it as data (`s_load_dwordx8` at a whole descriptor, which the console compiler also re-loads to
+size from) names the console's field, and one that stops there used to be refused. The fields are
+the console's `SQ_IMG_RSRC_WORD5-7`: a writable view's array pitch 1 with 0 otherwise (bits 0-3,
+which tells a bound volume from a whole one), the last level (MAX_MIP, the level count less one,
+bits 4-7) and the tuning value 4 (PERF_MOD, bits 20-22); dwords 6 and 7 hold the compression
+block sizes and metadata address, 0 for a view without compression. A null descriptor gives 0
+for all three. shortcut: MIN_LOD_WARN (word 5 bits 8-19) and the MSAA word 5 (MAX_MIP is log2 of
+the sample count there) read 0. Tests:
+`gfx_refusal_tests::an_image_descriptors_tail_dwords_read_as_data_translate` (translation) and
+`memory_tests::a_view_descriptors_tail_dwords_are_the_arrays_fields` (the values, SRV, writable
+view and null entry, on hardware and WARP).
 
 A texture size query uses the four-dword shape, though, and dword 1 against 0 is what guards it:
 the console's dword 1 has a nonzero format field for every view and is 0 only for a null

@@ -1018,3 +1018,132 @@ fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// An image descriptor's tail dwords (5-7) read as data, beside the view's use: dword 5 is the
+/// console's array pitch (1 for a writable view, 0 otherwise, which tells a bound volume from a
+/// whole one), the last level (MAX_MIP, the level count less one) and the tuning value 4 (bits
+/// 20-22, which the console compiler sets). Dwords 6 and 7 hold the compression block sizes and
+/// metadata address of a compressed view: 0 for one without compression, and 0 for all three
+/// when the descriptor is null.
+#[test]
+fn a_view_descriptors_tail_dwords_are_the_arrays_fields() {
+    const KINDS: [ResourceType; 2] = [ResourceType::Srv, ResourceType::Uav];
+    let program = |kind: ResourceType| {
+        let mut w = vec![s_mov_b32(5, 0)]; // s[4:5]: the table at s4, high half 0
+        w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV (table dword 0)
+        w.extend([0x8F02_8500]); // s_lshl_b32 s2, s0, 5 (the descriptor index, a root constant)
+        w.extend([0x8002_0402]); // s_add_u32 s2, s4, s2
+        w.extend([0x8003_FDFF, 0x0000_0000]); // s_add_u32 s3, scc, 0
+        w.extend(s_load(3, 12, 2, 0)); // s[12:19]: the whole entry
+        w.push(S_WAITCNT_ALL);
+        w.extend((0..2).map(|v| v_mov_b32(v, 0)));
+        // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        w.extend([0xF000_1F08, 0x0003_0200]);
+        w.push(S_WAITCNT_ALL);
+        for (v, s, at) in [(1, 17, 0), (1, 18, 4), (1, 19, 8)] {
+            w.push(v_mov_b32(v, s));
+            w.extend(buffer_store_dword(v, 8, at));
+        }
+        w.push(S_ENDPGM);
+        let layout = vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind,
+                root: RootType::Table,
+                table_offset_dwords: 32,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+        ];
+        lowered(&w, 4, layout, used).0
+    };
+    let shaders: Vec<_> = KINDS.iter().map(|&k| program(k)).collect();
+    let texel = [[0.0f32; 4]];
+    // Heap index 1 holds the view, index 2 a null entry.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let psos: Vec<_> = shaders
+            .iter()
+            .map(|s| host.compute_pipeline(s).expect("pipeline"))
+            .collect();
+        // A 64x32 view of three levels, then of none (a storage view), then a null entry.
+        let views = [
+            View::Levels(64, 3),
+            View::TextureUav(64, 32),
+            View::NullPair,
+        ];
+        for (index, want) in [
+            (1, [0x0040_0020, 0, 0]), // three levels: MAX_MIP 2, SRV pitch 0, PERF_MOD
+            (2, [0x0040_0001, 0, 0]), // one level: MAX_MIP 0, UAV pitch 1
+            (3, [0, 0, 0]),           // a null entry
+        ] {
+            let (root, pso) = &psos[index - 1];
+            let mut ud = vec![0u32; pso.user_data_dwords() as usize];
+            for u in &pso.user_data {
+                ud[u.index as usize] = 0;
+            }
+            ud[0] = index;
+            let out = host
+                .dispatch(
+                    root,
+                    pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: vec![0; 12] }),
+                            (2, Root::View { srv: true, data: vec![0; 12] }),
+                        ],
+                        views: &[
+                            View::RawUav(9),
+                            views[(index - 1).min(1)],
+                            if index == 3 { View::NullPair } else { views[index] },
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(out[0][..3], want, "{label}: index {index}");
+        }
+        let _ = &texel;
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
