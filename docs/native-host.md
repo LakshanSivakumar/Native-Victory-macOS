@@ -2156,11 +2156,22 @@ real device on whatever Mac runs the test suite; on this M2 Pro it reported 12,1
 ## Reverb and convolution DSP (`chad.dll`), a CPU fallback (`VICTORY_GUESS_DSP=1`)
 
 The title's audio DSP coprocessor convolves blocks of float samples with an impulse response
-(`crates/victory-hle/src/modules/dsp.rs`). `XDspActivate`'s `StreamDesc::ir` holds that response,
-but in the hardware's own partitioned frequency-domain layout, which is not documented anywhere
-we have found, so it is not read. Issue #17: outputs were always zeroed, so reverb and
-convolution effects played back silent (dry sound, which does not go through this path, was
-unaffected).
+(`crates/victory-hle/src/modules/dsp.rs`). `XDspActivate`'s `StreamDesc::ir` holds that response
+in the hardware's partitioned frequency-domain layout, so it is not read. Issue #17: outputs
+were always zeroed, so reverb and convolution effects played back silent (dry sound, which does
+not go through this path, was unaffected).
+
+The layout is now documented in the public GDK 2026.10 docs (the XDK's XDSP audio reference and
+overviews; in our own words, not yet verified against a real run): the IR is frequency-domain,
+stored as interleaved complex float pairs (real, imaginary per bin; `impulseResponseLengthInFloats`
+counts floats, so N complex bins are N*2 floats), processed in blocks (convolution block sizes are
+512 or 1024 frames; mono or stereo streams only, and a stereo IR — the stereo-IR activation
+option with channel count 2 — doubles the buffer, one IR per channel). A reduction block may be
+appended at the end of the IR buffer, one block in size: it starts with the 4-byte signature
+`0xFFFFACE1`, followed by up to 15 little-endian 4-byte entries of (u16 cutoff frequency, u16 block
+index) with strictly increasing block indices; the hardware processes whole blocks up to an
+entry's block index, then only the first `cutoff` samples of each later block. The connection's
+base buffer must be 64K-aligned physical-cacheable `XMemAlloc` memory of at least 64 KB.
 
 Guess, marked in code (`synthetic_ir`, `convolve_merged`), off by default behind
 `VICTORY_GUESS_DSP=1` since it is unverified against a real run (without the variable, behaviour
@@ -2179,17 +2190,17 @@ allocating, and the title's input is always copied into it before any write to t
 in case the two happen to alias.
 
 `VICTORY_TRACE_DSP=1` logs the leading floats of a convolution stream's own `StreamDesc::ir` at
-activation (`trace_ir`). It exists to let a future run with the real game settle what format that
-data is actually in (time-domain samples, in which case `ir_floats` for a given `ir_seconds` would
-land near `ir_seconds * 48000`, or something else) and replace this guess with the real thing.
+activation (`trace_ir`). It exists to let a run with the real game confirm the documented layout
+above (complex float pairs in blocks, with a trailing `E1 AC FF FF` reduction block when present)
+and replace this guess with the real thing.
 
 `VICTORY_DUMP_DSP=<dir>` goes further: at activation it writes a convolution stream's whole own
 `StreamDesc::ir` to `<dir>/stream<n>_ir.f32` (the title's bytes, not the synthetic tail; capped at
 16 Mi floats, logged as truncated if longer), and each `XDspSubmitCommand` appends the command's
 gains and input block to `<dir>/stream<n>_blocks.f32` and the block the stream wrote — silence, or
 the `VICTORY_GUESS_DSP` result — to `<dir>/stream<n>_out.f32`. A run with both set captures what
-the title sends and hears, to validate the guess against the real effect once the hardware's
-partitioned IR layout is known.
+the title sends and hears, to validate the guess against the real effect now that the hardware's
+partitioned IR layout is documented (above).
 
 Tests (`modules::dsp::tests`): `convolve_merged_is_a_causal_fir_per_channel_scaled_by_gain` and
 `convolve_merged_reads_history_as_the_frames_before_the_block` (the convolution math against

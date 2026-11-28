@@ -11,8 +11,12 @@
 //!
 //! The transforms themselves are not computed from the title's own impulse
 //! response: the hardware takes it already in its own partitioned
-//! frequency-domain layout, which is not known, so `StreamDesc::ir` is not
-//! read. With `VICTORY_GUESS_DSP=1`, a convolution stream instead gets a
+//! frequency-domain layout, so `StreamDesc::ir` is not read. That layout is
+//! documented in the public GDK 2026.10 XDSP docs (frequency-domain
+//! interleaved complex float pairs, processed in 512/1024-frame blocks, with
+//! an optional trailing reduction block signed 0xFFFFACE1; see
+//! docs/native-host.md), but not yet verified against a real run. With
+//! `VICTORY_GUESS_DSP=1`, a convolution stream instead gets a
 //! short synthetic decaying-noise tail (see `synthetic_ir`), carried across
 //! blocks so it does not reset at every block boundary; this is a CPU
 //! fallback approximation of reverb coloration, not the title's actual
@@ -27,7 +31,8 @@
 // shortcut: convolution streams get one fixed synthetic decay instead of the
 // title's impulse response, behind VICTORY_GUESS_DSP=1 since it is unverified
 // against a real run; other transform kinds stay silent regardless. Upgrade
-// once the hardware's partitioned IR layout is documented.
+// to the title's own IR once a run confirms the layout the GDK 2026.10 docs
+// describe (docs/native-host.md, "Reverb and convolution DSP").
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
