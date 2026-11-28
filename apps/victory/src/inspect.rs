@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use victory_pe::implib::ImportLibrary;
+use victory_pe::implib::{ImportLibrary, LibImport};
 use victory_pe::{ImageInfo, layout};
 
 pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
@@ -103,13 +103,7 @@ pub fn lib_exports(lib: &Path, list: bool) -> Result<()> {
     let data = std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?;
     let parsed =
         ImportLibrary::parse(&data).with_context(|| format!("parsing {}", lib.display()))?;
-    let mut by_dll: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for i in &parsed.imports {
-        by_dll
-            .entry(i.dll.to_ascii_lowercase())
-            .or_default()
-            .push(i.export.to_string());
-    }
+    let by_dll = imports_by_dll(&parsed.imports);
     println!(
         "{} exports from {} DLLs ({} other members)",
         parsed.imports.len(),
@@ -125,6 +119,19 @@ pub fn lib_exports(lib: &Path, list: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A library's imports grouped by DLL, as `lib_exports` prints them: DLL
+/// names lowercased, DLLs in name order, each DLL's exports in file order.
+fn imports_by_dll(imports: &[LibImport]) -> BTreeMap<String, Vec<String>> {
+    let mut by_dll: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for i in imports {
+        by_dll
+            .entry(i.dll.to_ascii_lowercase())
+            .or_default()
+            .push(i.export.to_string());
+    }
+    by_dll
 }
 
 fn yes(b: bool) -> &'static str {
@@ -155,8 +162,51 @@ fn dll_flags(v: u16) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::imports_by_dll;
+    use victory_pe::ImportSymbol;
+    use victory_pe::implib::{LibImport, LibImportKind};
     use super::dll_flags;
     use victory_pe::layout::dll_flags as f;
+
+
+
+    fn named(dll: &str, name: &str) -> LibImport {
+        LibImport {
+            dll: dll.to_owned(),
+            export: ImportSymbol::Name {
+                hint: 0,
+                name: name.to_owned(),
+            },
+            kind: LibImportKind::Code,
+        }
+    }
+
+    #[test]
+    fn imports_group_by_lowercased_dll_keeping_file_order() {
+        let imports = [
+            named("KERNEL32.dll", "CreateFileW"),
+            named("kernel32.DLL", "CloseHandle"),
+            named("D3D12.dll", "D3D12CreateDevice"),
+            LibImport {
+                dll: "XINPUT.dll".to_owned(),
+                export: ImportSymbol::Ordinal(3),
+                kind: LibImportKind::Data,
+            },
+        ];
+        let grouped = imports_by_dll(&imports);
+        // DLLs in name order; the two kernel32 spellings are one group.
+        let keys: Vec<&String> = grouped.keys().collect();
+        assert_eq!(keys, ["d3d12.dll", "kernel32.dll", "xinput.dll"]);
+        assert_eq!(grouped["kernel32.dll"], ["CreateFileW", "CloseHandle"]);
+        assert_eq!(grouped["d3d12.dll"], ["D3D12CreateDevice"]);
+        // An ordinal export prints as #N, whatever the import kind.
+        assert_eq!(grouped["xinput.dll"], ["#3"]);
+    }
+
+    #[test]
+    fn no_imports_group_to_nothing() {
+        assert!(imports_by_dll(&[]).is_empty());
+    }
 
     #[test]
     fn dll_flags_render_names_in_the_table_order_not_bit_order() {
