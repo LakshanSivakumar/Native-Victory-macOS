@@ -244,7 +244,7 @@ Host to title (`call_win64(fn, &[u64])`): four register arguments, the rest on t
 
 `native::bind_imports` takes an `ImportResolver` (the same trait the Wine path uses, so `victory_hle::HleResolver` works unchanged), writes a stub address into each IAT slot (title exports are bound directly), and reports counts. `HostPolicy` on macOS resolves allowed DLLs (`kernel32`, `kernelbase`, `api-ms-win-core-*`) to `victory-hle::host_posix`, which is the first slice of "the host's own Win32, reimplemented on POSIX": `GetLastError`, `SetLastError`, ids, time (`QueryPerformanceCounter`, `GetTickCount(64)`, `Sleep`), `VirtualAlloc/Free/Protect`, `TlsAlloc/Free/GetValue/SetValue`, events, semaphores, `WaitForSingleObject`, `CloseHandle` and `CreateThread` (title threads), over a handle table. Everything else lands in the unimplemented-import stub, named. This module is x86-64 only for now because it reads the TEB; once the recompiler defines its thread context it moves behind a `current_teb()` that both hosts provide.
 
-The HLE functions are `extern "system"`, which is System V on macOS (x86-64 and arm64 alike), so no change to the 100+ existing HLE modules is needed to bridge them. The ones that compile on macOS today (the portable modules: `kernel`, `xgameruntime`, `gameinput`, `d3d12x`, `audio`, `dsp`, `xg`, `rpcrt4`) are in the registry; `files`, `xmem`, `lifecycle`, `net`, `media`, `dstorage`, `apu`, `xsystem` and `fidelityfx` are `cfg(windows)` and are the porting backlog.
+The HLE functions are `extern "system"`, which is System V on macOS (x86-64 and arm64 alike), so no change to the 100+ existing HLE modules is needed to bridge them. The ones that compile on macOS today (the portable modules: `kernel`, `xgameruntime`, `gameinput`, `d3d12x`, `audio`, `dsp`, `xg`, `rpcrt4`, plus `dstorage`, `xmem` and `fidelityfx`, which serves the title's FidelityFX with MetalFX when `VICTORY_METALFX=1`) are in the registry; `files`, `lifecycle`, `net`, `media`, `apu` and `xsystem` are `cfg(windows)` and are the porting backlog.
 
 ## Interfaces for the Metal backend
 
@@ -298,6 +298,68 @@ Limits: `RtlUnwindEx` unwinds from the exception being dispatched on the thread 
 
 **dstorage read errors.** A file read goes on through short reads and tries `EINTR` again, as `read_exact` does (`fill_at`; this process takes many signals), so a signal no longer fails a request. A failed request's log line (`dstorage: request failed`) gives the host's error with its `errno` and kind. Host errors reach the title as the Win32 codes Windows gives for them, the inverse of the UCRT's `_dosmaperr` table: `EBADF` is `ERROR_INVALID_HANDLE`, `EMFILE` and `ENFILE` `ERROR_TOO_MANY_OPEN_FILES`, `ENOMEM` `ERROR_NOT_ENOUGH_MEMORY`, `EINVAL` `ERROR_INVALID_PARAMETER`, `ENOSPC` `ERROR_DISK_FULL`, `ENOENT` and `EACCES` or `EPERM` as before, and `EIO` and the rest `ERROR_READ_FAULT`. Before, everything but the last two was `ERROR_READ_FAULT` and the log dropped the `errno`, so the 179 `hr=0x8007001e` failures before a crash on #110 could not be told apart.
 
+<<<<<<< HEAD
+=======
+**dstorage: a request that panics.** A panic while a worker ran a request (a bug of ours) killed that worker and left the read marked running for good, so every status entry behind it stayed pending and the title polled it forever (#446: `running 1`, no failure, 630,000 polls). The worker now catches it: the request fails with `E_FAIL`, which no other failure uses, its status entry completes, and the worker goes on. The panic hook still prints where, and the request's failure line says `panicked`. The pending warning (`a status entry is still pending`) now also lists the reads running longest: for how long, on which worker (`dstorage N`), and the file, offset and options. One that has run for seconds is a read that does not return, such as a stalled `pread`, not a panic.
+
+## The title's FidelityFX upscaler, served with MetalFX (#375, `VICTORY_METALFX=1`)
+
+With the variable set, the `fidelityfx` module enters the registry on macOS and serves
+the title's `amd_fidelityfx_loader_xbox.dll` and `amd_fidelityfx_upscaler_xbox.dll` (the
+title loads both; the upscaler used to be refused as outside the host policy). The five
+API functions answer:
+
+* `ffxQuery` answers the version negotiation (one provider, our own id "meta") per the
+  SDK's `GetVersions`/`GetProviderVersion`, and the jitter sequence the dispatch path
+  needs: `GetJitterPhaseCount` by the SDK's phase table (1.5x = 18, 1.7x = 23, 2.0x =
+  32, 3.0x = 72, custom = ceil(8n²)) and `GetJitterOffset` as Halton(2, 3) minus a half.
+* `ffxCreateContext` validates the upscaler description (sizes, the 4x scale bound) and
+  hands back a 4 KiB zero-filled block: the title reads fields of the provider context
+  past the description it gave us, and a bare config made those reads land past the
+  allocation (the run faulted at image+0x55e56f8 right after the first dispatch).
+* `ffxDispatch` resolves the dispatch's seven resources (colour, depth, motion vectors,
+  exposure, reactive, transparency, output; the temporal scaler takes the first five and
+  the output last) into host textures and records one `MetalFXUpscale` command into the
+  title's list; the `MTLFXTemporalScaler` itself is built from those textures at the
+  first encode and cached per context.
+
+Frame generation is refused: only the upscaler is served. Sharpening has no MetalFX
+equivalent and is dropped. Adjacent-pass hazards around the upscale are untracked
+(MetalFX opens its own encoder). Without the variable (or on Windows with
+`VICTORY_FIDELITYFX_DIR`) the title's own DLLs run as before.
+
+A game run on an M1 Max at the Series S profile survived 400 s with the dispatch
+recorded and the phase count answered (frame 4096+); the world's frame rate is bounded
+by the translated draws, not by the upscaler. An integration test runs a synthetic
+2x upscale through the host's recording and submission path with no title
+(`metalfx_e2e_tests::metalfx_upscale_runs_a_synthetic_frame_through_the_host`), and the
+hle layer's ABI is covered by the `fidelityfx` tests.
+
+## A title lookup that never ends (#456, `VICTORY_LOOKUP_EXIT=1`)
+
+The title stops on the loading screen when a save is loaded, and, on a new game, some minutes into the world (there the frame watchdog's faults at image+0x2215c35 and image+0x55e56f8 end the run; on the loading screen no watchdog fires).
+
+Observed (M4 Max, Series S, thread dumps and a write watch on the pool's generation entries, 27 and 28 November):
+
+* The title keeps a hash table of pooled objects (table pointer at image+0x876fc50, group count at image+0x876fc48; groups of 0x90 bytes: sixteen control bytes, then sixteen 8-byte entries). The key is a 32-bit handle: the object's pool slot in the low 17 bits, its pool's id in the next five, the slot's generation above. A job function (image+0x50eb750) rebuilds the handle from the object's address and the slot's current generation entry and probes for it in a loop at image+0x50eb80f. On a miss in one group it goes on to the next group; there is no exit for a key that is in no group.
+* In every stuck run with a thread dump a job worker is in that loop (its first frame between image+0x50eb80f and image+0x50eb82c, under image+ [31962, 317fd, 25d801b, 221c29c, 2215eca]), in about half of them two workers at once on different objects. In the 16 cases read, the slot's generation entry held generation 2 and a link to another slot (live entries around it: generation 1, low bits all set), and the table's one entry for the slot was the generation-1 handle. So the object was freed after it was put in the table and while the job still held it, and its entry stayed in the table.
+* The frees sampled came from other job workers, through a job (image+0x22a2370) that walks an array of objects and destroys each.
+* In the same dumps one job worker waits at image+0x55bfc39 and the main thread at image+ [509898d, 7b5a9d, 21b6d0d, 81269b]. Read from the code, not traced: the function there (image+0x55bfa00) empties the table (every control byte set to 0x80), and first waits for the lookups in flight to finish (a count at image+0x8d7a9b0, raised by the number of lookup jobs when they are started and lowered by each as it ends). With one lookup spinning it waits for good, and the main thread waits behind it.
+* How often: loading one save, 18 of 28 runs stuck across two builds (b998bb65 and 86cefd22, both with #459), and 4 of 4 on 8efcff13. A new game on Series S did not freeze in 2 runs of 600 s on b998bb65. Other testers see it on the new-game path in about one run in four (#456).
+
+Not known: what keeps the destroying job behind the lookups on the console. Guess: timing the host does not reproduce.
+
+`VICTORY_LOOKUP_EXIT=1` does not fix that order. It gives the probe an exit (`native/lookup_exit.rs`): the first byte of the probe's miss path (image+0x50eb9d1: count the group up, jump back to the loop head) becomes an `int3` before the title runs, and its handler either does what those two instructions did or, if the group just probed has an empty control byte (0x80), returns from the function through its own epilogue (image+0x50eb910), as the function does for an object with nothing to draw. Three kinds of assumption are in it:
+
+* Guess: a group with an empty control byte ends a probe, so a key that is in the table is never beyond one. It rests on the title's insert (image+0x554f7e0) taking the first control byte with bit 7 set that it meets on the same probe sequence, on the emptying job writing 0x80, and on a premise from the dumps only: nothing removes single entries (the freed object's entry is still there), so no other value with bit 7 set was seen. Only 0x80 ends the probe; past any other value it goes on as the title's own code does.
+* Read from the function, not traced: at the miss path `eax` is the group number (masked at the loop head) and `rdx` the table; the loop does not move `rsp`; the loop head's first instruction sets the flags again before anything reads them; the epilogue sets no return value and the caller on the stuck chain reads none.
+* Not checked: what else the early return leaves out for that object in that frame, and whether anything is missing on screen.
+
+Measured (same Mac and save, main 2f4d81e0). Switch unset, 4 runs: 4 stuck with a worker in the loop. Switch set, this code, 4 runs: 4 in the world (105 to 192 s into the run), none with a worker in the loop; three of them logged exits (at least 8 each, every handle a pool-4 handle with generation 2, after 19 to 151 steps to a next group) and in the fourth no lookup needed the exit. Earlier forms of the patch, which ended the probe at any control byte with bit 7 set: 4 of 4 in the world in runs alternating with the 4 stuck ones above, and on main 8efcff13 none of 10 runs stuck (9 in the world inside the 260 s of the run, one past the point where runs stick when it was stopped) against 4 of 4 without it; there the exit was taken 10 times in seven runs and 20 in one, and one new-game run of 480 s reached the world without taking it. Each step to a next group and each exit costs one breakpoint; the exit line gives both counts (`exits`, `steps`).
+
+A table with no empty byte in any group and a key in none still spins: that case has not been seen. The offsets are those of the one build we test (`build Series 1.0.2.1`). Nothing is patched unless the miss path is an `inc eax` followed by a jump back to the loop head.
+
+>>>>>>> 435dc311 (docs: VICTORY_METALFX — the title's FidelityFX upscaler served with MetalFX)
 ## Running a title natively (`victory run` on macOS)
 
 `victory run [--unimplemented trap|zero] [--strict] <exe>` maps the PE with `native::NativeImage`, registers its TLS, sets `runtime::set_main_image`/`set_image_path`, binds imports (unresolved ones get logging stubs that act on `UnimplementedPolicy` when *called*; loading never stops, and a per-DLL summary is printed), and stops. `--list-imports` also prints every import as `native (hle|host|title)` or `STUB`; `--execute` mounts `G:` (the title's folder) and `T:` (temp under the data dir), sets the title and console, and starts the main thread with `native::run_entry`. `--list-imports` and no-flag runs never execute title code. The host executable is linked with `-pagezero_size 0x1000` (`apps/victory/build.rs`): the default 4 GiB `__PAGEZERO` is the whole range 32-bit `XMemAlloc` results must come from. Not done: the title's own DLLs (`load_title_dlls` equivalent), the window, GPU and audio.
