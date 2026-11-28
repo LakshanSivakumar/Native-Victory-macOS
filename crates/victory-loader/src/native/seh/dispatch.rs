@@ -402,7 +402,7 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
                     let phases: u32 = std::env::var("VICTORY_METALFX_PERIOD")
                         .ok()
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(8);
+                        .unwrap_or(18);
                     // SAFETY: as above.
                     unsafe { period.write_unaligned(phases) };
                     tracing::warn!(

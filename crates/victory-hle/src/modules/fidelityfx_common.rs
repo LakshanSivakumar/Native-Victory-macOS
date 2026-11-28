@@ -91,6 +91,27 @@ pub(crate) struct ProviderVersion {
     pub(crate) name: *const c_char,
 }
 
+/// `ffxQueryDescUpscaleGetJitterPhaseCount` (`ffx_upscale.h`): the sequence
+/// length for the scaling factor between the render and display widths.
+#[repr(C)]
+pub(crate) struct JitterPhaseCount {
+    pub(crate) header: Header,
+    pub(crate) render_width: u32,
+    pub(crate) display_width: u32,
+    pub(crate) p_out_phase_count: *mut i32,
+}
+
+/// `ffxQueryDescUpscaleGetJitterOffset` (`ffx_upscale.h`): one subpixel
+/// offset from the jitter sequence.
+#[repr(C)]
+pub(crate) struct JitterOffset {
+    pub(crate) header: Header,
+    pub(crate) index: i32,
+    pub(crate) phase_count: i32,
+    pub(crate) p_out_x: *mut f32,
+    pub(crate) p_out_y: *mut f32,
+}
+
 pub(crate) type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
 pub(crate) type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
 /// Configure, query and dispatch.

@@ -278,6 +278,36 @@ unsafe fn metalfx_dispatch_refusal(
 const METALFX_PROVIDER_ID: u64 = 0x6d65_7461; // "meta"
 const METALFX_PROVIDER_NAME: &CStr = c"MetalFX (victory)";
 
+/// `FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT` (effect 0x10000, sub 0x04).
+const GET_JITTER_PHASE_COUNT: u64 = 0x1_0004;
+/// `FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET` (effect 0x10000, sub 0x05).
+const GET_JITTER_OFFSET: u64 = 0x1_0005;
+
+/// The jitter sequence length the FSR SDK's table gives for a scaling factor:
+/// Quality 1.5x = 18, Balanced 1.7x = 23, Performance 2.0x = 32, Ultra
+/// performance 3.0x = 72, custom n× = ceil(8 n²) (`ffx_upscale.h`).
+fn jitter_phase_count(render: u32, display: u32) -> i32 {
+    let n = display as f64 / render.max(1) as f64;
+    match (n * 100.0).round() as u32 {
+        150 => 18,
+        170 => 23,
+        200 => 32,
+        300 => 72,
+        _ => (8.0 * n * n).ceil() as i32,
+    }
+}
+
+/// Halton(2, 3) minus a half, as the SDK's `ffxGetJitterOffset` computes it.
+fn halton(mut index: i32, base: i32) -> f32 {
+    let (mut f, mut r) = (1.0f32, 0.0f32);
+    while index > 0 {
+        f /= base as f32;
+        r += f * (index % base) as f32;
+        index /= base;
+    }
+    r - 0.5
+}
+
 /// Answers the version negotiation the PC build answers on Windows. Without
 /// this the title concludes there is no provider and never creates a
 /// context. `None` when the query is not one of the version kinds.
@@ -319,6 +349,36 @@ unsafe fn metalfx_query(desc: *mut Header) -> Option<u32> {
                 (*desc.cast::<ProviderVersion>()).name = METALFX_PROVIDER_NAME.as_ptr().cast();
             }
             once!(info, "FidelityFX MetalFX: provider version answered");
+            Some(OK)
+        }
+        GET_JITTER_PHASE_COUNT => {
+            // SAFETY: a GetJitterPhaseCount description, by its type.
+            let d = unsafe { desc.cast::<JitterPhaseCount>().read() };
+            if d.p_out_phase_count.is_null() {
+                return Some(PARAMETER);
+            }
+            // SAFETY: the title owns the out-slot.
+            unsafe { *d.p_out_phase_count = jitter_phase_count(d.render_width, d.display_width) };
+            once!(
+                info,
+                render = d.render_width,
+                display = d.display_width,
+                "FidelityFX MetalFX: jitter phase count answered"
+            );
+            Some(OK)
+        }
+        GET_JITTER_OFFSET => {
+            // SAFETY: a GetJitterOffset description, by its type.
+            let d = unsafe { desc.cast::<JitterOffset>().read() };
+            if d.p_out_x.is_null() || d.p_out_y.is_null() {
+                return Some(PARAMETER);
+            }
+            let index = d.index.max(0) % d.phase_count.max(1);
+            // SAFETY: the title owns the out-slots.
+            unsafe {
+                *d.p_out_x = halton(index + 1, 2);
+                *d.p_out_y = halton(index + 1, 3);
+            }
             Some(OK)
         }
         _ => None,
@@ -858,6 +918,36 @@ mod metalfx_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&handle));
+    }
+
+    /// The jitter queries answer per the SDK's phase table and Halton(2, 3).
+    #[test]
+    fn jitter_queries_answer_from_the_sdk_table() {
+        let mut count: i32 = 0;
+        let mut d = JitterPhaseCount {
+            header: Header { kind: GET_JITTER_PHASE_COUNT, next: null_mut() },
+            render_width: 1280,
+            display_width: 1920,
+            p_out_phase_count: &mut count,
+        };
+        // SAFETY: our own description.
+        assert_eq!(unsafe { metalfx_query(&mut d.header) }, Some(OK));
+        assert_eq!(count, 18);
+
+        let (mut x, mut y) = (0.0f32, 0.0f32);
+        let mut o = JitterOffset {
+            header: Header { kind: GET_JITTER_OFFSET, next: null_mut() },
+            index: 2,
+            phase_count: 18,
+            p_out_x: &mut x,
+            p_out_y: &mut y,
+        };
+        // SAFETY: our own description.
+        assert_eq!(unsafe { metalfx_query(&mut o.header) }, Some(OK));
+        assert!(
+            x.abs() <= 0.5 && y.abs() <= 0.5 && (x != 0.0 || y != 0.0),
+            "jitter offset ({x}, {y}) is out of the Halton range"
+        );
     }
 
     #[test]
