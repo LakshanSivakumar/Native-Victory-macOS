@@ -18,4 +18,6 @@ pub mod metal;
 #[cfg(target_os = "macos")]
 pub mod msc;
 #[cfg(target_os = "macos")]
+pub(crate) mod pass_timing;
+#[cfg(target_os = "macos")]
 pub mod present;
