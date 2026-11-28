@@ -16,6 +16,7 @@ const N: usize = 4096;
 
 #[test]
 fn srv_and_uav_through_a_descriptor_table() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for m in backends() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
         // Two 16 KiB buffers = 32 KiB total; pages = ceil(32 KiB / page_size()).
@@ -128,6 +129,7 @@ fn d2(f: Format, w: usize, h: usize) -> TextureDesc {
 
 #[test]
 fn sample_rgba8_2d() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for m in backends() {
         let t = m.create_texture(&d2(Format::Rgba8Unorm, 4, 4)).unwrap();
         let px: Vec<u8> = (0..16)
@@ -159,6 +161,7 @@ fn sample_rgba8_2d() {
 
 #[test]
 fn sample_rgba16f_and_r32f() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     // Exact half floats: 0 = 0x0000, 0.25 = 0x3400, 0.5 = 0x3800, 1 = 0x3C00.
     let h = [0x0000u16, 0x3400, 0x3800, 0x3c00];
@@ -195,6 +198,7 @@ fn bytes<T>(v: &[T]) -> &[u8] {
 
 #[test]
 fn sample_bc1_and_create_every_bc_format() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     // 8x8 BC1 = 2x2 blocks: red, green, blue, white (colour0 = RGB565, colour1 = 0, all indices 0).
     let blk = |c: u16| {
@@ -267,6 +271,7 @@ fn sample_bc1_and_create_every_bc_format() {
 /// used the signed one for DXGI 95.
 #[test]
 fn sample_bc6h_unsigned_and_signed() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let block = (0b00011u128 | 0x100 << 5 | 0x300 << 15).to_le_bytes();
     let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * b.abs().max(1.0);
@@ -294,6 +299,7 @@ fn sample_bc6h_unsigned_and_signed() {
 
 #[test]
 fn sample_2d_array_and_3d() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let mut d = d2(Format::Rgba8Unorm, 4, 4);
     d.dim = TexDim::D2Array;
@@ -363,6 +369,7 @@ fn sample_2d_array_and_3d() {
 
 #[test]
 fn texture_views_and_sampler_filters() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     // A 4x4 texture with 3 mips: mip 0 all 0, mip 1 (2x2) all 200, mip 2 all 50. A view of mip 1 only.
     let mut d = d2(Format::Rgba8Unorm, 4, 4);
@@ -451,6 +458,7 @@ fn texture_views_and_sampler_filters() {
 
 #[test]
 fn texture_over_zero_copy_memory() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let a = Arena::new(&m, 2);
     let align = m.linear_alignment(Format::Rgba8Unorm);
@@ -498,6 +506,7 @@ fn texture_over_zero_copy_memory() {
 /// DXGI's `B4G4R4A4_UNORM` has blue low and alpha top.
 #[test]
 fn packed_16_bit_channel_order() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let rgba = [[0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
     for (f, px, want) in [
@@ -516,6 +525,7 @@ fn packed_16_bit_channel_order() {
 /// heap detaches all remaining allocations cleanly.
 #[test]
 fn heap_overwrite_detaches_replaced_residency_allocations() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for m in backends() {
         let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
         let t1 = m.create_texture(&d2(Format::Rgba8Unorm, 2, 2)).unwrap();
@@ -541,6 +551,7 @@ const INDIRECT_ARENA: usize = 48 * 1024;
 
 #[test]
 fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for m in backends() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
         let a = Arena::new(&m, INDIRECT_ARENA.div_ceil(page_size()));
@@ -575,6 +586,7 @@ fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
 
 #[test]
 fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for m in backends() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
         // Three records of 2, 4 and 8 groups of 64: what ran shows in how much was written.
@@ -616,6 +628,7 @@ fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
 
 #[test]
 fn zero_sized_dispatch_and_blit_do_not_fail_validation() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for m in backends() {
         let p = m.create_compute_pipeline(&fixture("heap_rw")).unwrap();
         let a = Arena::new(&m, 1);
@@ -652,6 +665,7 @@ fn zero_sized_dispatch_and_blit_do_not_fail_validation() {
 
 #[test]
 fn texture_blit_ops_copy_between_textures_and_buffers() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(m) = Metal::new() else { return };
     let q = m.create_queue().unwrap();
     let f = m.create_fence(0).unwrap();
@@ -765,6 +779,7 @@ fn fill(m: &Metal, dxil: &[u8], tex: &<Metal as ResourceBackend>::Texture, k: &[
 /// integer texture to `RGB9E5Float`, and a sample of the view decodes the bits the dispatch stored.
 #[test]
 fn an_rgb9e5_view_reads_what_compute_stored_as_r32_uint() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let mut d = d2(Format::R32Uint, 4, 4);
     d.unordered_access = true;
@@ -786,6 +801,7 @@ fn an_rgb9e5_view_reads_what_compute_stored_as_r32_uint() {
 /// shader lands, quantized to 5 bits a channel.
 #[test]
 fn a_compute_store_into_bgr5a1() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = backend() else { return };
     let mut d = d2(Format::Bgr5a1Unorm, 8, 8);
     d.unordered_access = true;

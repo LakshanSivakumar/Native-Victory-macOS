@@ -575,6 +575,9 @@ impl ComputeBackend for Metal {
 }
 
 #[cfg(test)]
+pub(crate) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::{Dispatch, RootArgs};
@@ -655,6 +658,7 @@ mod tests {
     /// and not the submission order that makes the result right.
     #[test]
     fn queue_b_waits_for_queue_a_over_the_same_buffer() {
+        let _one = super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = backend() else { return };
         let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let (qa, qb) = (m.create_queue().unwrap(), m.create_queue().unwrap());
@@ -698,6 +702,7 @@ mod tests {
     /// `ID3D12Fence::Signal` from the CPU releases a queue that waits (a title Signal / `hold.rs`).
     #[test]
     fn cpu_signal_releases_a_waiting_queue() {
+        let _one = super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = backend() else { return };
         let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let q = m.create_queue().unwrap();
@@ -725,6 +730,7 @@ mod tests {
     /// frame's worth of the pattern above (35 submissions, alternating queues, `x = x * 1 + 1`).
     #[test]
     fn many_submissions_in_flight_one_wait() {
+        let _one = super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = backend() else { return };
         let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         const SUBS: u64 = 64;
@@ -786,6 +792,7 @@ mod tests {
 
     #[test]
     fn missing_msc_returns_error_instead_of_panicking() {
+        let _one = super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let mut m = Metal::new().expect("Metal device available on macOS");
         m.msc = crate::msc::Msc::open("/nonexistent/libmetalirconverter.dylib").map(std::sync::Arc::new);
         // Non-shader operations still succeed without MSC.
@@ -800,6 +807,7 @@ mod tests {
 
     #[test]
     fn recommended_working_set_is_nonzero_on_real_hardware() {
+        let _one = super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().expect("Metal device available on macOS");
         assert!(m.recommended_working_set() > 0);
     }
@@ -808,6 +816,7 @@ mod tests {
     /// it up, and nothing is compiled twice.
     #[test]
     fn a_pipeline_still_compiling_is_picked_up_later() {
+        let _one = super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = backend() else { return };
         let none = std::time::Duration::ZERO;
         let (tx, rx) = std::sync::mpsc::channel();

@@ -11,6 +11,7 @@ const DST: usize = 0x6_0000;
 
 #[test]
 fn the_legacy_multiply_adds_round_once_and_keep_dx9_zeros() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // (1 + 2^-12)^2 - 1 is 2^-11 + 2^-24 exactly (0x3a000400); rounding the product first loses
     // the 2^-24 (0x3a000000). Each result goes to its own 64-dword row of `dst`.
     let w = [

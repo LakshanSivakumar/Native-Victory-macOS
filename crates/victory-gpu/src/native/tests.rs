@@ -239,6 +239,7 @@ impl Drop for TitlePages {
 /// it was the null view and the shader read zeros. It now wraps the title's own mapping.
 #[test]
 fn a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let page = page_size().max(16384);
     let pool = Alias::new(4 * page).unwrap();
@@ -287,6 +288,7 @@ fn a_buffer_view_across_title_pages_out_of_pool_order_reads_the_title_mapping() 
 /// then zeros (the null view) once part of its range is unmapped.
 #[test]
 fn a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let page = page_size().max(16384);
     let pool = Alias::new(5 * page).unwrap();
@@ -352,6 +354,7 @@ fn a_wrapped_view_follows_title_pages_remapped_or_unmapped_under_it() {
 /// remap (#267 review: 54 copies of the 174 MiB view cost about 3 ms a look).
 #[test]
 fn copies_of_a_wrapped_view_are_followed_with_one_walk() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let page = page_size().max(16384);
     let pool = Alias::new(5 * page).unwrap();
@@ -420,6 +423,7 @@ const N: usize = 1024;
 /// the destination is cleared first with a GPU fill, all in one list.
 #[test]
 fn compute_dispatch_writes_title_memory() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (staged, src, dst) = (0, 16384, 32768);
@@ -459,6 +463,7 @@ fn fixture_affine() -> Vec<u8> {
 /// first's fence value (no CPU wait between).
 #[test]
 fn descriptor_table_buffers_decode_into_metal_heap() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (src, dst) = (0, 16384);
@@ -524,6 +529,7 @@ fn descriptor_table_buffers_decode_into_metal_heap() {
 /// submission mirrors a bound table's entries whose record changed.
 #[test]
 fn table_records_copied_by_the_title_are_mirrored_at_submission() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (src, dst) = (0, 16384);
@@ -612,6 +618,7 @@ fn named_for_a_heap(h: &Host) -> [u64; 2] {
 /// entries naming one pool buffer are one allocation, so a dispatch names the heap and that buffer.
 #[test]
 fn a_heap_is_named_once_per_encoder() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if host().is_none() {
         return;
     }
@@ -627,6 +634,7 @@ fn a_heap_is_named_once_per_encoder() {
 /// memory would stay resident).
 #[test]
 fn a_heap_is_resident_through_its_set() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if host().is_none() {
         return;
     }
@@ -650,6 +658,7 @@ type Vertex = [f32; 8];
 /// it was.
 #[test]
 fn a_view_of_unmapped_memory_no_longer_shows_the_previous_buffer() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (src, dst) = (0, 16384);
@@ -856,6 +865,7 @@ fn vertex(x: f32, y: f32, c: [f32; 4]) -> Vertex {
 /// tables (written the title's way, then decoded), and read the pixels back.
 #[test]
 fn clear_and_draw_into_render_target() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     const W: usize = 16;
     let pool = Pool::new(&h, 2);
@@ -954,6 +964,7 @@ fn clear_and_draw_into_render_target() {
 /// write recorded with it still runs.
 #[test]
 fn a_draw_with_no_render_target_is_dropped_alone() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     const W: usize = 16;
     let pool = Pool::new(&h, 2);
@@ -1023,6 +1034,7 @@ fn a_draw_with_no_render_target_is_dropped_alone() {
 /// count were read before the copy).
 #[test]
 fn a_count_written_earlier_on_the_gpu_limits_the_indirect_dispatches() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (src, dst, records, staged, count) = (0, 16384, 32768, 32816, 32832);
@@ -1056,6 +1068,7 @@ fn a_count_written_earlier_on_the_gpu_limits_the_indirect_dispatches() {
 /// earlier in the same list that writes it (as a culling pass would) decides the group count.
 #[test]
 fn an_indirect_dispatch_reads_a_record_written_earlier_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (src, dst, staged, record) = (0, 16384, 32768, 32800);
@@ -1083,6 +1096,7 @@ fn an_indirect_dispatch_reads_a_record_written_earlier_on_the_gpu() {
 /// is dropped by itself: the value writes, and the dispatch, recorded around it still run.
 #[test]
 fn a_command_at_unmapped_title_memory_is_dropped_alone() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (src, dst, flag, done) = (0, 16384, 32768, 32776);
@@ -1118,6 +1132,7 @@ fn a_command_at_unmapped_title_memory_is_dropped_alone() {
 /// reach it while the buffer lives, and are refused as unmapped once it is released.
 #[test]
 fn root_views_and_copies_reach_committed_buffer_memory() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 1);
     pool.write(0, &(0..N as u32).collect::<Vec<_>>());
@@ -1155,6 +1170,7 @@ fn root_views_and_copies_reach_committed_buffer_memory() {
 /// write recorded before it and the dispatch after it still run (a queue may wait for that value).
 #[test]
 fn a_dispatch_with_an_unset_root_parameter_is_dropped_alone() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (src, dst, flag) = (0, 16384, 32768);
@@ -1185,6 +1201,7 @@ fn a_dispatch_with_an_unset_root_parameter_is_dropped_alone() {
 /// recorded after it still runs.
 #[test]
 fn a_dispatch_the_host_cannot_prepare_is_dropped_alone() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let flag = 32768;
@@ -1245,6 +1262,7 @@ fn triangle_pipeline(h: &Host) -> Rc<<Metal as GraphicsBackend>::RenderPipeline>
 /// ended a pass, and does not start to.
 #[test]
 fn a_dropped_command_between_two_dispatches_keeps_them_in_two_passes() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let pool = Pool::new(&h, 4);
     let (src, mid, dst) = (0, 16384, 32768);
@@ -1307,6 +1325,7 @@ fn a_dropped_command_between_two_dispatches_keeps_them_in_two_passes() {
 /// both would lose the ordering of their pool-buffer accesses the backend keeps between passes.
 #[test]
 fn a_dropped_dispatch_between_two_draws_keeps_them_in_two_passes() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     const W: usize = 16;
     let pool = Pool::new(&h, 2);
@@ -1370,6 +1389,7 @@ fn a_dropped_dispatch_between_two_draws_keeps_them_in_two_passes() {
 /// names every buffer on every dispatch, and gives the same results.
 #[test]
 fn pool_buffers_are_resident_through_one_set_per_queue() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if host().is_none() {
         return;
     }
@@ -1419,6 +1439,7 @@ fn pool_buffers_are_resident_through_one_set_per_queue() {
 /// A pool that goes away takes its buffer out of the set (and does not break the next work).
 #[test]
 fn a_released_pool_leaves_the_residency_set() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if host().is_none() {
         return;
     }
@@ -1468,6 +1489,7 @@ fn a_released_pool_leaves_the_residency_set() {
 
 #[test]
 fn zero_count_commands_are_not_recorded_and_still_check_pipeline() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(h) = host() else { return };
     let mut l = NativeList::default();
     assert!(l.dispatch(0, 1, 1).is_err());

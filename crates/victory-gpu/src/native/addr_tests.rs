@@ -289,6 +289,7 @@ fn prepare_computed(f: &Fixture, src_at: usize, dst_at: usize) {
 
 #[test]
 fn computed_addresses_read_and_write_the_pool_at_its_title_addresses() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);
     let cs = shader(COMPUTED, 4);
@@ -306,6 +307,7 @@ fn computed_addresses_read_and_write_the_pool_at_its_title_addresses() {
 /// SCC whether it is not 0 (RDNA2 ISA, SOP2).
 #[test]
 fn absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);
     let cs = shader(ABSDIFF, 4);
@@ -332,6 +334,7 @@ fn absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu() {
 /// sign-extended to 32 bits (RDNA2 ISA, SOP1), stored to dst and dst + 256.
 #[test]
 fn scalar_sign_extensions_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     const SEXT: &[u32] = &[
         0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
         0xBE84_1902, // s_sext_i32_i8 s4, s2
@@ -363,6 +366,7 @@ fn scalar_sign_extensions_on_the_gpu() {
 /// lanes 0 and 1 of each quad hold 1 and lanes 2 and 3 hold 0.
 #[test]
 fn a_compare_with_dpp_reads_the_quad_neighbour_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     const DPP_CMP: &[u32] = &[
         0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
         0x7E04_0D00, // v_cvt_f32_u32 v2, v0
@@ -383,6 +387,7 @@ fn a_compare_with_dpp_reads_the_quad_neighbour_on_the_gpu() {
 
 #[test]
 fn compares_with_16bit_dpp_vcmpx_and_class_run_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Input words at `VA_A + 0x1000` (`s[2:3]`): each lane loads its own pre-built dword into `v2`
     // (with junk in the upper 16 bits to verify `half_src` masks low 16 bits), and writes its
     // result to `VA_A` (`s[0:1]`). Expected outputs are fixed constants, independent of lowering.
@@ -497,6 +502,7 @@ fn compares_with_16bit_dpp_vcmpx_and_class_run_on_the_gpu() {
 
 #[test]
 fn guessed_fragment_buffer_reads_the_pool_and_checks_record_bounds() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let vertex = SCREEN_TRIANGLE;
     let pixel = [
         0x8004_9000, // s_add_u32 s4, s0, 16
@@ -580,6 +586,7 @@ const SCREEN_TRIANGLE: [u32; 13] = [
 /// (39 >> 1, 39) out as unorm bytes.
 #[test]
 fn a_pixel_wave_maximum_read_at_its_last_lane_is_drawn() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let pixel = [
         0x7E00_02A7, // v_mov_b32_e32 v0, 39
         0xBE88_25C1, // s_or_saveexec_b64 s[8:9], -1
@@ -646,6 +653,7 @@ fn a_pixel_wave_maximum_read_at_its_last_lane_is_drawn() {
 /// the triangle would have no area and nothing would be drawn.
 #[test]
 fn guessed_vertex_buffer_reads_the_pool() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let vertex = [
         0x8004_9000, // s_add_u32 s4, s0, 16
         0x8205_8080, // s_addc_u32 s5, 0, 0
@@ -713,6 +721,7 @@ fn guessed_vertex_buffer_reads_the_pool() {
 /// triangle had no area and nothing was drawn.
 #[test]
 fn a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let vertex = [
         0xBE84_0300, // s_mov_b32 s4, s0
         0x8805_FF01, 0x0008_0000, // s_or_b32 s5, s1, 0x80000 (stride 8)
@@ -779,6 +788,7 @@ fn a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool() {
 /// mapped the pages somewhere else.
 #[test]
 fn the_table_follows_remaps_and_a_title_heap_serves_as_well() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);
     let cs = shader(COMPUTED, 4);
@@ -807,6 +817,7 @@ fn the_table_follows_remaps_and_a_title_heap_serves_as_well() {
 /// nodes over streamed resources, with a compute queue held for seconds).
 #[test]
 fn a_page_table_lasts_until_the_gpu_ran_the_work_submitted_with_it() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);
     let cs = shader(COMPUTED, 4);
@@ -841,6 +852,7 @@ fn a_page_table_lasts_until_the_gpu_ran_the_work_submitted_with_it() {
 /// host's own) writes it again: the same title addresses reach the new pool.
 #[test]
 fn a_released_pools_pair_serves_the_next_pool() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let cs = shader(COMPUTED, 4);
     let [a, b] = halves(VA_A);
@@ -862,6 +874,7 @@ fn a_released_pools_pair_serves_the_next_pool() {
 /// the pool where a naive offset from the mapping would put it.
 #[test]
 fn memory_no_pool_shows_reads_zero_and_drops_writes() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);
     let cs = shader(MISSES, 6);
@@ -887,6 +900,7 @@ fn memory_no_pool_shows_reads_zero_and_drops_writes() {
 /// run with a bitmap nobody binds.
 #[test]
 fn a_shader_that_marks_pages_is_refused() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let mut cs = shader(COMPUTED, 4);
     cs.memory_writes = true;
@@ -906,6 +920,7 @@ fn only_the_zero_copy_option_drops_the_page_marks() {
 
 #[test]
 fn a_wave64_mask_joined_with_data_takes_each_lanes_bit_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);
     let cs = shader(MASK_DATA_JOIN, 2);
@@ -1008,6 +1023,7 @@ fn run_with_lds(t: &mut Title<Metal>, words: &[u32], wave64: bool, threads: u32)
 
 #[test]
 fn lds_append_consume_and_addtid_follow_m0_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);
     run_with_lds(&mut t, LDS_BY_M0, false, 32);
@@ -1045,6 +1061,7 @@ const STRIDE_CLEARED: &[u32] = &[
 
 #[test]
 fn a_descriptor_with_its_stride_cleared_reads_the_view_raw_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use victory_shader::native::{ResourceType, UsedResource};
     let Some(mut t) = title() else { return };
     let f = Fixture::new(&t);

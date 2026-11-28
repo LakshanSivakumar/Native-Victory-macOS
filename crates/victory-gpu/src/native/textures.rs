@@ -1549,6 +1549,8 @@ mod tests {
     /// element sizes 1 to 8, the shapes a world run names (#46).
     #[test]
     fn download_undoes_upload_for_every_mip_and_slice() {
+        #[cfg(target_os = "macos")]
+        let _one = super::super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use victory_formats::texture::{Desc, Swizzle};
         let Ok(metal) = victory_metal::metal::Metal::new() else { return };
         use Dimension::{Tex1d, Tex2d, Tex3d};

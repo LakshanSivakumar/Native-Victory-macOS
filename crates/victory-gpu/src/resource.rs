@@ -3361,6 +3361,8 @@ mod tests {
 
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
+        #[cfg(target_os = "macos")]
+        let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let mut committed = null;
         let hr = create_committed(

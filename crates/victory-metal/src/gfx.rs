@@ -3110,6 +3110,7 @@ mod render_target_tests {
 
     #[test]
     fn a_draw_into_a_narrowed_render_target_view_preserves_neighbors() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let metal = Metal::new().expect("Metal device");
         let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 8, 8);
         desc.dim = TexDim::D2Array;
@@ -3146,6 +3147,7 @@ mod render_target_tests {
 
     #[test]
     fn default_viewport_restores_the_full_target_in_the_same_pass() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let metal = Metal::new().expect("Metal device");
         let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 16, 16);
         desc.render_target = true;
@@ -3177,6 +3179,7 @@ mod owed_tests {
     /// pass runs and the fence is signalled once the last has.
     #[test]
     fn a_long_submission_is_cut_into_command_buffers_of_at_most_n_passes() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap().with_passes_per_buffer(8);
         let region = Region::new(page_size(), None).unwrap();
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
@@ -3216,6 +3219,7 @@ mod owed_tests {
     /// reached stays.
     #[test]
     fn a_failed_earlier_piece_pays_its_own_writes_and_the_later_pieces_still_run() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let _shared = FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap().with_passes_per_buffer(4);
         let region = Region::new(page_size(), None).unwrap();
@@ -3262,6 +3266,7 @@ mod owed_tests {
 
     #[test]
     fn a_failed_command_buffer_is_paid_on_the_cpu() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap();
         let region = Region::new(page_size(), None).unwrap();
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
@@ -3297,6 +3302,7 @@ mod owed_tests {
 
     #[test]
     fn repeated_recovery_preserves_the_waiters_write() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap();
         let region = Region::new(page_size(), None).unwrap();
         let buf = m.wrap_title_memory(region.ptr, region.len).unwrap();
@@ -3324,6 +3330,7 @@ mod owed_tests {
     /// title's queues wait for.
     #[test]
     fn a_lost_command_buffer_pays_what_it_owes() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let _alone = FLIGHTS_IN_TESTS.write().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap();
         let region = Region::new(page_size(), None).unwrap();
@@ -3351,6 +3358,7 @@ mod owed_tests {
 
     #[test]
     fn recovery_writes_the_fills_before_it_signals() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         struct Send<T>(T);
         // SAFETY: test only; the recovery runs on one other thread while this one only reads.
         unsafe impl<T> std::marker::Send for Send<T> {}
@@ -3405,6 +3413,7 @@ mod sampler_tests {
 
     #[test]
     fn dynamic_samplers_sample_their_border_color_and_keep_distinct_cache_keys() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use objc2_foundation::NSString;
 
         const GREEN: [u8; 4] = [0, 255, 0, 255];
@@ -3518,6 +3527,7 @@ mod sampler_tests {
 
     #[test]
     fn heap_samplers_keep_distinct_ids_for_independent_min_and_mag_filters() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use MTLSamplerMinMagFilter as MetalFilter;
 
         let m = Metal::new().unwrap();
@@ -3553,6 +3563,7 @@ mod heap_set_tests {
 
     #[test]
     fn each_command_buffer_attaches_each_heap_once_and_commits_later_changes() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap().with_heap_sets();
         let a = m.create_heap(HeapKind::Resource, 1).unwrap();
         let b = m.create_heap(HeapKind::Sampler, 1).unwrap();
@@ -3588,6 +3599,7 @@ mod heap_set_tests {
     /// attaches every heap again.
     #[test]
     fn the_next_piece_of_a_split_submission_attaches_the_heaps_again() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap().with_heap_sets();
         let heap = m.create_heap(HeapKind::Resource, 1).unwrap();
         if heap.set.is_none() {
@@ -3612,6 +3624,7 @@ mod heap_set_tests {
     /// command buffer that uses the heap keeps resident.
     #[test]
     fn a_heaps_set_follows_its_entries() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let m = Metal::new().unwrap().with_heap_sets();
         let heap = m.create_heap(HeapKind::Resource, 4).unwrap();
         let Some(set) = &heap.set else {
@@ -3692,6 +3705,7 @@ mod heap_set_tests {
     #[test]
     #[ignore = "benchmark: cargo test -p victory-metal typed_buffer_view_cost_benchmark -- --ignored --nocapture"]
     fn typed_buffer_view_cost_benchmark() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         fn phys_footprint() -> usize {
             const TASK_VM_INFO: i32 = 22;
             unsafe extern "C" {
@@ -3797,6 +3811,7 @@ mod heap_usage_tests {
 
     #[test]
     fn heap_allocations_give_each_allocation_once_with_its_latest_use() {
+        let _one = crate::metal::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use objc2_foundation::NSObjectProtocol;
         let Ok(mut m) = Metal::new() else { return };
         if !m.dev.respondsToSelector(objc2::sel!(newResidencySetWithDescriptor:error:)) {

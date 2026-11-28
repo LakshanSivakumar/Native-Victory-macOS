@@ -169,6 +169,7 @@ fn near(a: [u8; 4], b: [u8; 4]) -> bool {
 /// write mask keeps a channel out; the blend constant works as a factor.
 #[test]
 fn blend_and_write_mask_are_applied() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = Rig::new() else { return };
     let color = r.target(Format::Rgba8Unorm, false);
     let alpha_blend = Blend {
@@ -226,6 +227,7 @@ fn blend_and_write_mask_are_applied() {
 /// right of the target away; an empty scissor draws nothing.
 #[test]
 fn viewport_and_scissor_are_applied() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = Rig::new() else { return };
     let color = r.target(Format::Rgba8Unorm, false);
     let pso = r.pipeline(None, &[], |_| {});
@@ -268,6 +270,7 @@ fn viewport_and_scissor_are_applied() {
 /// passes only where the stencil equals 1, so it paints over the first and nowhere else.
 #[test]
 fn stencil_test_and_reference_are_applied() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = Rig::new() else { return };
     let color = r.target(Format::Rgba8Unorm, false);
     let depth = r.target(Format::D32FloatS8, true);
@@ -307,6 +310,7 @@ fn stencil_test_and_reference_are_applied() {
 /// scissor of the whole depth target. The pass used to be refused, and the whole piece with it.
 #[test]
 fn a_depth_target_larger_than_the_colour_target_still_draws() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = Rig::new() else { return };
     let color = r.target(Format::Rgba8Unorm, false);
     let mut d = TextureDesc::d2(Format::D32FloatS8, W * 2, W * 2);
@@ -325,6 +329,7 @@ fn a_depth_target_larger_than_the_colour_target_still_draws() {
 /// Clearing depth must preserve stencil written by an earlier draw.
 #[test]
 fn depth_only_clear_preserves_stencil() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = Rig::new() else { return };
     let color = r.target(Format::Rgba8Unorm, false);
     let depth = r.target(Format::D32FloatS8, true);
@@ -367,6 +372,7 @@ fn depth_only_clear_preserves_stencil() {
 /// depth and stencil together, then mismatching draws must be rejected by each test in turn.
 #[test]
 fn stencil_clears_select_the_requested_planes_and_value() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = Rig::new() else { return };
     let color = r.target(Format::Rgba8Unorm, false);
     let depth = r.target(Format::D32FloatS8, true);
@@ -416,6 +422,7 @@ fn stencil_clears_select_the_requested_planes_and_value() {
 /// it; front-face culling does the opposite.
 #[test]
 fn culling_follows_the_winding_and_its_front_face() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = Rig::new() else { return };
     let color = r.target(Format::Rgba8Unorm, false);
     let red = [1.0, 0.0, 0.0, 1.0];
@@ -441,6 +448,7 @@ fn culling_follows_the_winding_and_its_front_face() {
 /// Depth bias applies to a draw and resets to zero on the following draw in the same render pass.
 #[test]
 fn depth_bias_resets_between_draws_in_the_same_pass() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(r) = Rig::new() else { return };
     let color = r.target(Format::Rgba8Unorm, false);
     let depth = r.target(Format::D32Float, true);

@@ -65,6 +65,7 @@ fn run_io(words: &[u32], rsrc2: u32, threads: u32, flag: u32) -> Vec<u32> {
 
 #[test]
 fn bpermute_reads_an_active_source_in_the_same_half() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Only lanes 0..39 run. Byte address 124 + offset 4 wraps to local lane 0
     // (console lanes 0 and 32). Offset 36 picks local lane 8 (8 on, 40 off).
     for (offset, lo, hi) in [(4, 1, 33), (36, 9, 0)] {
@@ -89,6 +90,7 @@ fn bpermute_reads_an_active_source_in_the_same_half() {
 
 #[test]
 fn a_ballot_across_the_halves_after_lanes_left_for_the_end() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Lanes 0..39 stay; each stores the count of lanes above 5 among them (34: 26 in the
     // lower half, 8 in the upper). The lanes that left store nothing and count as off.
     let mut w = LANES_BELOW_40.to_vec();
@@ -111,6 +113,7 @@ fn a_ballot_across_the_halves_after_lanes_left_for_the_end() {
 
 #[test]
 fn lds_shared_across_the_halves_after_lanes_left_for_the_end() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Lanes 0..39 write their index to LDS and read lane 39 - i's, with no barrier (the console
     // runs the wave in lockstep).
     let mut w = LANES_BELOW_40.to_vec();
@@ -135,6 +138,7 @@ fn lds_shared_across_the_halves_after_lanes_left_for_the_end() {
 
 #[test]
 fn lds_shared_across_the_halves_behind_a_uniform_branch() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Every lane writes its index to LDS; when `s4` is not 0, each reads lane 63 - i's, with no
     // barrier. The branch is on SCC, so both host waves take it or skip it together.
     let mut w = vec![V_LSHLREV_V1_2_V0];
@@ -160,6 +164,7 @@ fn lds_shared_across_the_halves_behind_a_uniform_branch() {
 
 #[test]
 fn the_thread_group_info_sgpr_numbers_the_console_waves() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Two console waves of 64, four host waves. `s5`, the info SGPR (bit 10), holds the wave's
     // index from bit 6 and the group's wave count; index * 64 plus the lane's count of lanes below
     // it is the thread's index, so each slot is written once.
@@ -187,6 +192,7 @@ fn the_thread_group_info_sgpr_numbers_the_console_waves() {
 /// the power `s1`, a signed integer, in range or past it.
 #[test]
 fn ldexp_scales_by_an_integer_power_of_two() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let cases: &[(f32, i32, f32)] = &[
         (1.5, 3, 12.0),
         (3.0, -2, 0.75),
@@ -223,6 +229,7 @@ const FILL_XCHG: [u32; 3] = [0x7E02_02C1, 0xD760_0007, 0x0201_0101];
 
 #[test]
 fn a_group_of_96_lanes_exchanges_nothing_with_the_lanes_it_lacks() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Two console waves, the second of 32 lanes: one host wave, no upper half to exchange with.
     // Each lane stores the count of lanes above 5 in its wave's ballot, plus the -1 of the fill:
     // the second wave's high dword is no lane's, 0, not the slot the fill left.
@@ -335,6 +342,7 @@ fn group_flag(end_wave_1: bool) -> Vec<u32> {
 
 #[test]
 fn a_whole_wave_or_one_lane_puts_in_lds_reaches_the_group_at_its_barrier() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Without the barrier in the block, the exchanges were refused there: the block is reached
     // by uniform branches, and a culled wave may already have ended.
     let got = group_flag(true);
@@ -351,6 +359,7 @@ fn a_whole_wave_or_one_lane_puts_in_lds_reaches_the_group_at_its_barrier() {
 /// halves contribute and every lane must see 2^35.
 #[test]
 fn a_whole_wave_product_multiplies_both_halves() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut w = vec![
         0x7D88_00A3, // v_cmp_gt_u32 vcc, 35, v0
         0xD501_0004,
@@ -427,6 +436,7 @@ fn count_of_exec(wave64: bool) -> Vec<u32> {
 
 #[test]
 fn a_dispatch_of_thread_counts_starts_the_lanes_past_them_off() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // 100 threads in groups of 64: the second group's lanes from 36 on are not launched. They
     // store nothing and the group's count of EXEC is 36 (the ray-tracing node writers of Grand
     // Theft Auto VI count their nodes so; run as 100 groups they wrote 6,400).
@@ -450,6 +460,7 @@ fn a_dispatch_of_thread_counts_starts_the_lanes_past_them_off() {
 
 #[test]
 fn a_dispatch_of_thread_counts_in_32_lane_waves() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // The title's third such shader runs 32-lane waves, one thread of one group.
     let w = count_of_exec(false);
     let got = run_threads(&w, false, 32, 1, 64);
@@ -466,6 +477,7 @@ fn a_dispatch_of_thread_counts_in_32_lane_waves() {
 
 #[test]
 fn a_whole_wave_sum_under_thread_counts_leaves_out_the_lanes_past_them() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // The sum of the lanes' indices with every lane forced on, the lanes EXEC had off adding the
     // 0 of the v_cndmask: the lanes past the count are such lanes, as on the console, where they
     // run the section too.
@@ -496,6 +508,7 @@ fn a_whole_wave_sum_under_thread_counts_leaves_out_the_lanes_past_them() {
 
 #[test]
 fn a_mask_moved_to_every_lane_before_a_branch_to_a_join_holds_their_lanes() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // A join of a lane mask where lanes arrive from two places (per lane, as the translation
     // follows the console's EXEC regions): lanes 0..39 set `s[8:9]` to -1 and branch to it, lanes
     // 40..63 skip that region and compare themselves against 50. Each reads its own path's bit:
@@ -525,6 +538,7 @@ fn a_mask_moved_to_every_lane_before_a_branch_to_a_join_holds_their_lanes() {
 
 #[test]
 fn a_mask_anded_with_an_exec_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // `s[8:9]` holds an address (data) until lanes 0..39 make it the lanes below 10 or outside
     // EXEC (`s_orn2`, which sets lanes 40..63); lanes 40..63 skip that and join holding the
     // address, but the join's only read is an AND with an EXEC they are not in, so each reads a 0
@@ -553,6 +567,7 @@ fn a_mask_anded_with_an_exec_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
 
 #[test]
 fn data_joined_into_a_mask_seen_only_anded_off_at_a_later_join_is_not_needed() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // `s[8:9]` holds a mask (the lanes below 50) that lanes 0..39 replace with loaded data; the
     // first join (data for lanes 0..39) is read only by a second join, where lanes 20..63 skip in holding it and
     // the only read is an AND with an EXEC they are not in. No lane sees the first join's bits
@@ -587,6 +602,7 @@ fn data_joined_into_a_mask_seen_only_anded_off_at_a_later_join_is_not_needed() {
 
 #[test]
 fn data_joined_into_a_mask_whose_lanes_write_it_again_in_an_else_is_not_needed() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // `s[8:9]` holds the lanes below 50, then loaded data for lanes 0..59 (a first join of data
     // and a mask). An if/else on the lanes below 40 follows: the then part makes a new mask, and
     // the lanes that skip it (40..63, holding the first join) run the else part, which writes
@@ -629,6 +645,7 @@ fn data_joined_into_a_mask_whose_lanes_write_it_again_in_an_else_is_not_needed()
 
 #[test]
 fn a_mask_selected_by_scc_joined_with_data_nanded_with_exec_is_each_lanes_bit() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // `s[8:9]` holds loaded data; lanes 0..39 make it -1 or 0 by SCC (here -1). At the join
     // the only read is an `s_nand` with EXEC: lanes 40..63 skipped in with the data and are not
     // in that EXEC, so their bits are 1 whatever it holds; lanes 0..39 read SCC's bit, giving
@@ -661,6 +678,7 @@ fn a_mask_selected_by_scc_joined_with_data_nanded_with_exec_is_each_lanes_bit() 
 
 #[test]
 fn a_mask_join_read_by_two_ands_with_execs_its_skipping_lanes_are_not_in_is_theirs_at_zero() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // `s[8:9]` holds the lanes below 50, then loaded data for lanes 0..39 (a join of data and a
     // mask). Two ifs follow, on the lanes below 20 and below 30, each making a new mask; the
     // lanes that skip each join holding the older value, read there only ANDed with the EXEC
@@ -707,6 +725,7 @@ fn a_mask_join_read_by_two_ands_with_execs_its_skipping_lanes_are_not_in_is_thei
 
 #[test]
 fn a_mask_a_uniform_loop_carries_round_anded_off_is_not_needed() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // A uniform loop of three: the lanes below 40 run an if on the lanes below 20 that makes
     // the lanes below 10, read ANDed with the if's EXEC, then load data into the register,
     // which the loop carries round to the next if's join. The lanes that skip the inner if
@@ -750,6 +769,7 @@ fn a_mask_a_uniform_loop_carries_round_anded_off_is_not_needed() {
 
 #[test]
 fn data_joined_with_a_mask_nanded_with_exec_is_set_for_lanes_outside_it() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // `s[8:9]` holds an address; lanes 0..39 make it the lanes below 50. The join's only read
     // is an `s_nand` with EXEC (lanes 0..39): lanes 40..63 hold the address there but are not in
     // that EXEC, so their bits are 1 whatever it holds; lanes 0..39 get NOT of their bit, 0.
@@ -779,6 +799,7 @@ fn data_joined_with_a_mask_nanded_with_exec_is_set_for_lanes_outside_it() {
 
 #[test]
 fn a_mask_selected_by_scc_is_scc_for_every_lane() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // `s[8:9]` holds an address; lanes 0..39 make it -1 or 0 by SCC (`s4` is 0: -1). The join
     // ANDs it with their EXEC: lanes 0..39 read SCC, 1; the others are not in that EXEC.
     let w = [
@@ -807,6 +828,7 @@ fn a_mask_selected_by_scc_is_scc_for_every_lane() {
 
 #[test]
 fn a_mask_of_the_lanes_leaving_a_loop_by_a_uniform_exit_holds_them() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // A loop whose lanes leave as `v3` (`v0` plus 16 a time) reaches 64, ORing each leaver into
     // `s[8:9]` (moved to 0 before it), and that the wave leaves early when `s14` reaches `s4`
     // (2): at the uniform exit the mask holds the lanes from 32 (the title's shadow pass; was
@@ -940,6 +962,7 @@ fn a_loop_carried_mask_read_by_an_or_with_exec_is_not_taken_as_anded_off() {
 
 #[test]
 fn a_select_of_an_address_by_scc_is_not_taken_as_a_mask() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // As the SCC case, but the select is of the address or 0, not -1 or 0: still refused.
     let w = [
         0xBE88_0402, // s_mov_b64 s[8:9], s[2:3]
@@ -973,6 +996,7 @@ fn run_lockstep(words: &[u32], lds: u32, dwords: usize) -> Vec<u32> {
 
 #[test]
 fn a_lane_read_behind_an_exec_branch_runs_in_lockstep() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Lanes 0..39 read lane 35's `v3` (1035) and `exec_hi` as data (lanes 32..39: 0xff) behind
     // `s_cbranch_execz`: refused on the fast path (the halves split), run in lockstep.
     let w = [
@@ -1005,6 +1029,7 @@ fn a_lane_read_behind_an_exec_branch_runs_in_lockstep() {
 
 #[test]
 fn a_first_lane_read_in_lockstep_is_the_console_waves_first_lane() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Lanes 10..63 read the first lane EXEC leaves on (10: `v3` 1010), not each host wave's own
     // (32 in the upper one); with the lane read behind the branch the program runs in lockstep.
     let w = [
@@ -1037,6 +1062,7 @@ fn a_first_lane_read_in_lockstep_is_the_console_waves_first_lane() {
 
 #[test]
 fn a_per_lane_loop_shares_lds_across_the_halves_in_lockstep() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Lane i loops `i & 3` times; each trip it adds the value lane `i ^ 32` last wrote to LDS to
     // its own and writes that back, with no barrier (the console runs the wave in lockstep).
     let w = [
@@ -1083,6 +1109,7 @@ fn a_per_lane_loop_shares_lds_across_the_halves_in_lockstep() {
 
 #[test]
 fn a_whole_wave_prefix_sum_behind_an_exec_branch_runs_in_lockstep() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // In lanes 0..49, an inclusive prefix sum of the lane indices over the whole wave (lanes off
     // give 0): DPP row shifts, the other row's lane 15, then lane 31 added in the upper half.
     let w = [
@@ -1126,6 +1153,7 @@ fn a_whole_wave_prefix_sum_behind_an_exec_branch_runs_in_lockstep() {
 
 #[test]
 fn whole_wave_code_that_is_no_reduction_runs_literally_in_lockstep() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Behind an EXEC branch, with every lane on: a DPP row shift (lane i takes lane i - 1 of its
     // row of 16, 0 at a row's start) and lane 33's result read back, which no reduction or prefix
     // describes. Lockstep runs the instructions as they are.
@@ -1157,6 +1185,7 @@ fn whole_wave_code_that_is_no_reduction_runs_literally_in_lockstep() {
 
 #[test]
 fn a_mask_a_32_lane_wave_starts_as_a_pairs_constant_holds_the_lanes_ored_in() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // The loop above in 32-lane waves, its mask made 0 by `s_mov_b64 s[8:9], 0` or
     // `s_bfm_b64 s[8:9], 32, 32` (as the G-buffer's 32-lane compute programs do): lanes leave
     // as `v0` plus 8 a time reaches 32, and the wave when `s14` reaches `s4` (2), so the mask
@@ -1197,6 +1226,7 @@ fn a_mask_a_32_lane_wave_starts_as_a_pairs_constant_holds_the_lanes_ored_in() {
 
 #[test]
 fn a_mask_a_divergent_loop_copies_away_and_back_is_the_mask_it_entered_with() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // VCC holds the lanes below 20 into a loop the lanes leave as `v0` plus 8 a time reaches 32;
     // inside, the lanes of VCC count their passes and copy VCC to `s20` and back (the G-buffer's
     // 32-lane compute programs spill so). Every edge brings VCC or a copy of it, so it is the
@@ -1235,6 +1265,7 @@ fn a_mask_a_divergent_loop_copies_away_and_back_is_the_mask_it_entered_with() {
 
 #[test]
 fn a_mask_a_divergent_loop_replaces_is_not_taken_as_the_one_it_entered_with() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // As the copy case, but the copy back is of another mask (the lanes below 10): after the
     // first pass VCC holds those, so lanes 10 to 19 count one pass. Refused, or that.
     let w = [
@@ -1274,6 +1305,7 @@ fn a_mask_a_divergent_loop_replaces_is_not_taken_as_the_one_it_entered_with() {
 
 #[test]
 fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_with() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // As the copy case, but VCC is swapped with data (`s4`) by three XORs and back by three
     // more (the NGG vertex programs swap SGPRs so): the swap's last XOR is a copy, so VCC at
     // the loop head is still the mask it entered with.
@@ -1316,6 +1348,7 @@ fn a_mask_a_divergent_loop_swaps_away_and_back_by_xors_is_the_mask_it_entered_wi
 
 #[test]
 fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // 1. `s_bfm_b64` with a dynamic width/offset (`((1 << 10) - 1) << 30 = 0xFF_C000_0000`,
     //    lanes `30..39` across both 32-bit halves) written to `EXEC` and read back as data.
     let bfm = [
@@ -1451,6 +1484,7 @@ fn mask_number_bfm_brev_bitset_wqm_saveexec_and_wrexec_run_on_the_gpu() {
 
 #[test]
 fn wave64_lane63_writelane_and_salu_or_reductions_run_on_the_gpu() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // 1. Sum `v0 + 1` across each 64-lane console wave with lower-half `v_readlane_b32 s6, v1, 0`
     //    written into lane 63 only (`v_writelane_b32 v2, s6, 63; v_add_nc_u32 v1, v2, v1`), then
     //    narrow `EXEC` to lane 0 (`s_mov_b64 exec, 1`) and read lane 63 (`v_readlane_b32 s7, v1, 63`).
@@ -1582,6 +1616,7 @@ fn wave64_lane63_writelane_and_salu_or_reductions_run_on_the_gpu() {
 
 #[test]
 fn a_mask_joined_with_data_on_an_exec_skips_edge_is_its_lanes_in_lockstep() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Lanes below the flag enter a region that `s_cbranch_execz` skips when none do; `s[10:11]` is
     // a mask in it (the lanes below 8) and data on the skip's edge (5, and a mask's high dword),
     // read at the join only ANDed with EXEC. A lane read makes it run in lockstep, where the skip
@@ -1620,6 +1655,7 @@ fn a_mask_joined_with_data_on_an_exec_skips_edge_is_its_lanes_in_lockstep() {
 
 #[test]
 fn a_loop_register_that_is_exec_on_every_edge_counts_the_lanes_still_looping() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     // Two nested loops keeping the lanes still looping in an SGPR beside EXEC (a copy of EXEC
     // before the loop, `s_andn2_b64 s, s, exec` at the head, `s_andn2_wrexec_b64 s, s` at the back
     // edge). At the inner head `s[4:5]` is EXEC: each lane adds its bit count there to v6. Lanes
@@ -1724,6 +1760,7 @@ fn max_read_at_lane(lane_after: u32) -> Vec<u32> {
 
 #[test]
 fn a_wave_maximum_read_at_its_last_lane_after_its_section_is_the_maximum() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let w = max_read_at_lane(63);
     assert_eq!(refusal(&w), None);
     let got = run(&w, 0, 0);

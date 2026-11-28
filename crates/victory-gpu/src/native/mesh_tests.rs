@@ -62,6 +62,7 @@ fn translate_with(stage: HwStage, words: &[u32], meta: &[u8]) -> HostShader {
 /// thread-group size the converter reflects for its mesh shader.
 #[test]
 fn a_mesh_style_vertex_program_makes_a_mesh_pipeline() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let ms = translate(HwStage::Vs, TRIANGLE);
     assert_eq!(ms.stage, HwStage::Ms);
     let ps = translate(HwStage::Ps, RED);
@@ -99,6 +100,7 @@ fn pixels(t: &Title<Metal>, color: &Texture) -> Vec<[u8; 4]> {
 /// `DispatchMesh` of one group of the triangle program colours the whole target.
 #[test]
 fn a_mesh_draw_colours_the_target() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
     let Some(mut t) = title() else { return };
     let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
@@ -117,6 +119,7 @@ fn a_mesh_draw_colours_the_target() {
 /// draws nothing.
 #[test]
 fn a_mesh_shader_reads_its_root_constants() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
     words.splice(at..at, [
@@ -146,6 +149,7 @@ fn a_mesh_shader_reads_its_root_constants() {
 /// below it, leaves it black.
 #[test]
 fn a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (ms, ps) = (translate(HwStage::Vs, TRIANGLE), translate(HwStage::Ps, RED));
     let Some(mut t) = title() else { return };
     let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
@@ -172,6 +176,7 @@ fn a_counted_indirect_mesh_dispatch_runs_only_the_records_below_the_count() {
 /// pixel program is refused.
 #[test]
 fn packed_half_parameters_reach_the_pixel_program() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
     words.splice(at..at, [
@@ -214,6 +219,7 @@ fn packed_half_parameters_reach_the_pixel_program() {
 /// leaves it black.
 #[test]
 fn a_mesh_program_branches_on_the_scc_of_a_uniform_lane_mask() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
     words.splice(at..at, [
@@ -256,6 +262,7 @@ fn a_mesh_program_branches_on_the_scc_of_a_uniform_lane_mask() {
 /// black; -1.0 (below 0) and 2.0 (bit 29 clear) colour it.
 #[test]
 fn a_mesh_program_branches_on_the_scc_of_exec_without_a_uniform_lane_mask() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
     words.splice(at..at, [
@@ -302,6 +309,7 @@ fn a_mesh_program_branches_on_the_scc_of_exec_without_a_uniform_lane_mask() {
 /// -1.0 leaves it black.
 #[test]
 fn a_mesh_program_reads_back_a_spill_joined_and_swapped_with_a_mask() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
     words.splice(at..at, [
@@ -347,6 +355,7 @@ fn a_mesh_program_reads_back_a_spill_joined_and_swapped_with_a_mask() {
 /// refused such pairs as mismatching types, and crashed when the channels were left unwritten.
 #[test]
 fn halves_of_some_channels_link() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
     words.splice(at..at, [
@@ -377,6 +386,7 @@ fn halves_of_some_channels_link() {
 /// (so each may hold halves) still make a mesh pipeline, those past the room left without them.
 #[test]
 fn halves_of_many_parameters_stay_within_the_mesh_size() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
     words.splice(at..at, [0x7E10_02FF, 0x3C00_3800]); // v_mov_b32 v8, 0x3c003800
@@ -396,6 +406,7 @@ fn halves_of_many_parameters_stay_within_the_mesh_size() {
 /// x read them.
 #[test]
 fn a_parameter_of_halves_only_reaches_the_pixel_program() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
     words.splice(at..at, [
@@ -434,6 +445,7 @@ fn a_parameter_of_halves_only_reaches_the_pixel_program() {
 /// without the converter or those tools.
 #[test]
 fn a_converted_mesh_program_with_run_time_parameters_is_valid_ir() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use std::process::Command;
     let mut words = TRIANGLE.to_vec();
     let at = words.iter().position(|&w| w == 0xF800_08CF).unwrap(); // before exp pos0
@@ -521,6 +533,7 @@ fn lit(t: &Title<Metal>, color: &Texture) -> usize {
 /// 0 to 2 in one invocation (the program run three times), not a small change.
 #[test]
 fn a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let (color, mut list) = rect_list_into(&mut t);
     list.draw_instanced(4, 1, 0, 0).unwrap();
@@ -534,6 +547,7 @@ fn a_rectangle_of_a_vertex_id_program_covers_half_its_rectangle() {
 /// the direct draw does, one of 0 vertices, an instanced one, or one past the count, nothing.
 #[test]
 fn an_indirect_rectangle_list_draws_its_records_as_a_direct_one() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut t) = title() else { return };
     let direct = {
         let (color, mut list) = rect_list_into(&mut t);
@@ -565,6 +579,7 @@ fn an_indirect_rectangle_list_draws_its_records_as_a_direct_one() {
 /// formats), Metal makes the pipeline and the target holds the bits, not 3 (a conversion).
 #[test]
 fn a_pixel_program_writes_exact_bits_to_an_r32uint_target() {
+    let _one = crate::native::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     const BITS: &[u32] = &[
         0x7E00_02F2, // v_mov_b32 v0, 1.0
         0x7E02_02F0, // v_mov_b32 v1, 0.5

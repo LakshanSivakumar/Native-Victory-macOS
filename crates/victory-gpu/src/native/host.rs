@@ -2409,6 +2409,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_mapping_list_is_read_again_only_when_the_pool_table_changes() {
+        let _one = super::super::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         use super::super::memory::{PoolInfo, PoolObserver};
         let Ok(metal) = victory_metal::metal::Metal::new() else { return };
         let h = NativeHost::new(metal);

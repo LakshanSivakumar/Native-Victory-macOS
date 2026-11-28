@@ -1073,6 +1073,10 @@ pub(crate) mod tests {
 
     #[test]
     fn views_survive_copies() {
+        #[cfg(target_os = "macos")]
+        let _one = crate::native::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let mut heap = vec![0u64; 4 * 8]; // four 32-byte slots
         let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
@@ -1109,6 +1113,10 @@ pub(crate) mod tests {
     /// resource at the same address is a new record.
     #[test]
     fn views_die_with_their_resource() {
+        #[cfg(target_os = "macos")]
+        let _one = crate::native::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let slots = [0u64; 2 * 4];
         let (a, b) = (slots.as_ptr() as u64, slots.as_ptr() as u64 + 32);
@@ -1163,6 +1171,10 @@ pub(crate) mod tests {
     /// and checks that the heap starts there.
     #[test]
     fn placed_heaps_start_at_the_title_memory() {
+        #[cfg(target_os = "macos")]
+        let _one = crate::native::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut memory = vec![0u8; 64 * 32];
         let address = memory.as_mut_ptr() as u64;
         let desc = HeapDesc {

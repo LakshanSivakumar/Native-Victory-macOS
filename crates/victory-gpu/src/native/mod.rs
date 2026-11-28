@@ -88,6 +88,9 @@ pub fn safe_read(at: *const u8, out: &mut [u8]) -> bool {
 }
 
 #[cfg(all(test, target_os = "macos"))]
+pub(crate) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, target_os = "macos"))]
 mod tests;
 
 #[cfg(test)]
