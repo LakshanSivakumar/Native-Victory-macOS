@@ -416,6 +416,40 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
             }
         }
     }
+    // The title's ring-queue consistency check faults when the queue node at
+    // [rcx+0x38] does not point back at the queue's own buffer head
+    // (image+0x55e56f8: `cmp [r10], rax` with rax = rcx+0x70). Fires right after
+    // the first FSR dispatch on the MetalFX path; dump the queue object so the
+    // node and its expected position can be read off.
+    {
+        // SAFETY: both are ours for this dispatch.
+        let (c, r) = unsafe { (&*ctx, &*rec) };
+        if r.code == 0xc0000005
+            && unwind::image_base_of(c.rip as usize)
+                .is_some_and(|b| c.rip as usize - b == 0x55e5_6f8)
+        {
+            let rcx = c.gpr[1] as usize;
+            if rcx > 0x1000 {
+                let words: Vec<String> = (0..0x80 / 4)
+                    .map(|i| {
+                        // SAFETY: rcx is the object the faulting code was reading
+                        // through, so its first words are mapped.
+                        format!("{:x}", unsafe {
+                            (rcx.wrapping_add(i * 4) as *const u32).read_unaligned()
+                        })
+                    })
+                    .collect();
+                tracing::warn!(
+                    rcx = format_args!("{rcx:#x}"),
+                    node_ptr = format_args!("{:#x}", unsafe {
+                        (rcx as *const u64).add(7).read_unaligned()
+                    }),
+                    object = ?words,
+                    "the ring queue at the title's consistency fault"
+                );
+            }
+        }
+    }
     // First-chance log: the title's own handlers may hide where a fault started.
     // SAFETY: both are ours for this dispatch.
     unsafe {
