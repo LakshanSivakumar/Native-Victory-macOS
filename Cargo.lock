@@ -776,6 +776,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "libc",
  "memchr",
  "objc2",
  "objc2-foundation",

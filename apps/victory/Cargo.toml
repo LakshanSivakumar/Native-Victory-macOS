@@ -28,6 +28,10 @@ tracing.workspace = true
 objc2 = "0.6"
 objc2-foundation = "0.3"
 
+# The fatal-signal logger's sigaction calls (crates/victory-hle and victory-metal use it too).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
