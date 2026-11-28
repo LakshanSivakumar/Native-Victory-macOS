@@ -343,6 +343,11 @@ pub(crate) fn raise_graphics(
                     .unwrap_or_else(|| user.clamp(8, 104));
                 Some(base.min(104) as u8 + 2)
             }
+            // Mesh (the NGG stage, merged ES and GS): eight system SGPRs, then at most 32 user
+            // SGPRs from s8 (`SPI_SHADER_USER_DATA_GS_0..31`). Nothing from s40 up is set.
+            // Guess (docs/native-host.md, "SGPRs a mesh program reads before writing"): the
+            // console's merged stage takes no more user SGPRs than the PC part's 32.
+            StageIo::Ms(_) => Some(40),
             _ => None,
         },
         ..Io::default()

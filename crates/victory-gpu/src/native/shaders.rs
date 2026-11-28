@@ -36,7 +36,13 @@ pub fn translate(container: &[u8]) -> Result<HostShader, String> {
 
 /// Whether [`translate`]'s translation is in the disk cache already.
 pub fn cached(container: &[u8]) -> bool {
-    crate::shader_cache::native_present(container, &format!("{:?}", options()))
+    #[cfg(any(windows, target_os = "macos"))]
+    return crate::shader_cache::native_present(container, &format!("{:?}", options()));
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = container;
+        false
+    }
 }
 
 /// Keeps `container`, as the run is about to translate it, for later warm-ups
@@ -358,6 +364,7 @@ impl<B: PresentBackend> Title<B> {
         if let Some(p) = &ps_full {
             vs_binding.typed_buffers |= p.typed_buffers;
             vs_binding.heap_typed_buffers |= p.heap_typed_buffers;
+            vs_binding.ps_heap_access = Some(p.heap_access.clone());
         }
         // As for compute: without the host's layout the converter makes the user-data block a
         // root CBV (a pointer), while the host writes its dwords inline, so the shader reads its
@@ -365,7 +372,7 @@ impl<B: PresentBackend> Title<B> {
         let vs_layout = vs_binding.layout();
         let ps_layout = ps_full.as_ref().and_then(Binding::layout);
         let ps_binding = ps_full
-            .filter(|b| b.memory || b.dwords > 0 || !b.views.is_empty());
+            .filter(|b| b.memory || b.view_addresses || b.dwords > 0 || !b.views.is_empty());
         let desc = RenderPipelineDesc {
             vs: &vs.dxil,
             ps: ps.map(|p| &p.dxil[..]),

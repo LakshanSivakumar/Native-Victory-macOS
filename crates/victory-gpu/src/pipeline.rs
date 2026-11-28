@@ -522,8 +522,10 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+/// The `VICTORY_SKIP_PIPELINES` list: lower-case 16-digit shader hashes, others warned about and
+/// left out (the D3D12 path and the native host read it alike).
+#[cfg(any(target_os = "macos", all(windows, feature = "diagnostics")))]
+pub(crate) fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -821,9 +823,10 @@ unsafe fn graphics_containers(slot: *const u8) -> Result<Vec<Arc<Shader>>, &'sta
                 .then(|| std::slice::from_raw_parts(ptr as *const u8, size))
         }
     };
-    // The pixel program's input enables, from the register image (pair 0).
+    // The pixel program's input enables and user SGPR count, from the register image (pair 0).
     let ps_input = piece(0).and_then(victory_shader::emit::graphics::ps_input_ena);
-    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input) {
+    let ps_user_sgprs = piece(0).and_then(victory_shader::emit::graphics::ps_user_sgprs);
+    let make = |stage, name, code, meta| match victory_shader::emit::graphics::container_with_inputs(stage, code, meta, ps_input, ps_user_sgprs) {
         Ok(c) => Ok(shader(name, &c)),
         Err(e) => {
             tracing::warn!(stage = name, error = %e, "a guessed graphics piece is no program");
@@ -1381,7 +1384,7 @@ mod changed_descriptor_tests {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "diagnostics")))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());

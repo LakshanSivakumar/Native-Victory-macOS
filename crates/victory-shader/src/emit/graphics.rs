@@ -62,29 +62,35 @@ const RECORDS: usize = 0x10;
 /// A container with the part of `stage`'s `code` and `meta`, and the signatures inferred from the
 /// code.
 pub fn container(stage: HwStage, code: &[u8], meta: &[u8]) -> Result<Vec<u8>, ShaderError> {
-    container_with_inputs(stage, code, meta, None)
+    container_with_inputs(stage, code, meta, None, None)
 }
 
 /// [`container`], with a pixel program's input enables (`SPI_PS_INPUT_ENA`, [`ps_input_ena`])
-/// when the description's register image gives them: they say which input VGPRs the program
-/// gets, instead of the guess from the VGPRs it reads. The part carries the word after the
-/// metadata.
+/// and user SGPR count ([`ps_user_sgprs`]) when the description's register image gives them:
+/// they say which input VGPRs the program gets, instead of the guess from the VGPRs it reads,
+/// and how far its last root constants reach. The part carries them after the metadata: the
+/// enables (0 for none), then the count when there is one.
 pub fn container_with_inputs(
     stage: HwStage,
     code: &[u8],
     meta: &[u8],
     ps_input: Option<u32>,
+    user_sgprs: Option<u8>,
 ) -> Result<Vec<u8>, ShaderError> {
     let ps_input = ps_input.filter(|_| stage == HwStage::Ps);
-    let (program, sigs) = infer_with(stage, code, meta, ps_input)?;
+    let user_sgprs = user_sgprs.filter(|_| stage == HwStage::Ps);
+    let (program, sigs) = infer_with(stage, code, meta, ps_input, user_sgprs)?;
     let mut part = MAGIC.to_vec();
     for w in [u32::from(program.stage == HwStage::Ps), code.len() as u32, meta.len() as u32] {
         part.extend(w.to_le_bytes());
     }
     part.extend(code);
     part.extend(meta);
-    if let Some(ena) = ps_input {
-        part.extend(ena.to_le_bytes());
+    if ps_input.is_some() || user_sgprs.is_some() {
+        part.extend(ps_input.unwrap_or(0).to_le_bytes());
+    }
+    if let Some(n) = user_sgprs {
+        part.extend(u32::from(n).to_le_bytes());
     }
     let mut parts: Vec<(FourCC, Vec<u8>)> = vec![(FourCC::ACCC, part)];
     parts.push((FourCC::ISG1, signature(&sigs.0, true)));
@@ -102,9 +108,14 @@ pub fn program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         .get(16 + code_len..16 + code_len + meta_len)
         .ok_or(Malformed("FSPG metadata out of bounds"))?;
     let stage = if stage == 0 { HwStage::Vs } else { HwStage::Ps };
-    // The input enables, when the part carries them (a word after the metadata).
+    // The input enables and the user SGPR count, when the part carries them (words after the
+    // metadata).
     let ps_input = u32_at(part, 16 + code_len + meta_len).ok().filter(|&w| stage == HwStage::Ps && w != 0);
-    Ok(infer_with(stage, code, meta, ps_input)?.0)
+    let user_sgprs = u32_at(part, 20 + code_len + meta_len)
+        .ok()
+        .filter(|&n| stage == HwStage::Ps && (1..=32).contains(&n))
+        .map(|n| n as u8);
+    Ok(infer_with(stage, code, meta, ps_input, user_sgprs)?.0)
 }
 
 /// A pixel program's input enables in a 0x1c8 description slot's register image (pair 0):
@@ -121,6 +132,23 @@ pub fn ps_input_ena(image: &[u8]) -> Option<u32> {
         _ => return None,
     };
     u32_at(image, at).ok().filter(|&w| w != 0 && w >> 16 == 0)
+}
+
+/// A pixel program's user SGPR count in a 0x1c8 description slot's register image (pair 0): the
+/// `USER_SGPR` field (bits 1-5) of `SPI_SHADER_PGM_RSRC2_PS`, the word at 0x3c when the image's
+/// word 1 is 4 and at 0x50 when it is 6. `None` for an image of another kind or a count of 0.
+/// Guess (docs/native-host.md, "Pixel user SGPRs"): found by its values across 19,342 images, not
+/// from a console document. In every image whose pixel program moves its primitive mask to M0 for
+/// interpolation, the field is that mask's SGPR, the one after the user SGPRs, also in the 952
+/// where it sits above the last root parameter the metadata names.
+pub fn ps_user_sgprs(image: &[u8]) -> Option<u8> {
+    let at = match u32_at(image, 4).ok()? {
+        4 => 0x3c,
+        6 => 0x50,
+        _ => return None,
+    };
+    let n = (u32_at(image, at).ok()? >> 1 & 0x1F) as u8;
+    (n != 0).then_some(n)
 }
 
 type Signatures = (Vec<SigElement>, Vec<SigElement>);
@@ -144,7 +172,7 @@ fn element(name: &str, index: u32, kind: u8, row: u32, mask: u8) -> SigElement {
 
 #[cfg(test)]
 fn infer(stage: HwStage, code: &[u8], meta: &[u8]) -> Result<(NativeProgram, Signatures), ShaderError> {
-    infer_with(stage, code, meta, None)
+    infer_with(stage, code, meta, None, None)
 }
 
 fn infer_with(
@@ -152,6 +180,7 @@ fn infer_with(
     code: &[u8],
     meta: &[u8],
     ps_input: Option<u32>,
+    user_sgprs: Option<u8>,
 ) -> Result<(NativeProgram, Signatures), ShaderError> {
     if !matches!(stage, HwStage::Vs | HwStage::Ps) {
         return Err(ShaderError::Unsupported {
@@ -240,23 +269,36 @@ fn infer_with(
             layout[i].sgprs = u32::from(next - start);
         }
     }
-    // Guess: root constants that are a pixel program's last user data take the SGPRs after them
-    // (the metadata names only their first), as compute's reach its user SGPR count
-    // (`constants_to_the_end`): up to the primitive mask, which follows the user SGPRs and only
-    // reaches M0, when the program reads one (observed: b500 in s10 to s14, the mask in s15, s13
-    // read on entry); else as far as it reads them on entry (the upscale program's b500 in s9 to
-    // s12, with no interpolation).
+    // Root constants that are a pixel program's last user data take the SGPRs after them (the
+    // metadata names only their first), as compute's reach its user SGPR count
+    // (`constants_to_the_end`): up to the user SGPR count of the register image when the
+    // description gives one ([`ps_user_sgprs`]). Guess without it: up to the primitive mask,
+    // which follows the user SGPRs and only reaches M0, when the program reads one (observed:
+    // b500 in s10 to s14, the mask in s15, s13 read on entry); else as far as it reads them on
+    // entry (the upscale program's b500 in s9 to s12, with no interpolation). A program that
+    // leaves one of them unread stops that guess short: the Series X upscale program reads s9,
+    // s10 and s12 of b500, and its image gives 13 user SGPRs.
     if stage == HwStage::Ps
         && let Some(last) = layout.iter_mut().max_by_key(|r| r.user_data)
         && last.root == RootType::Constants
     {
-        let uses = crate::io::PrimMaskUses::new(&p);
-        let live = |s: u32| p.inputs.iter().find(|i| i.0 == Reg::S(s as u8)).map(|i| i.1);
-        let mask = |s: u32| live(s).is_some_and(|v| uses.is_prim_mask_only(v, true));
         let start = u32::from(last.user_data) + last.sgprs;
-        let end = match (start..32).find(|&s| mask(s)) {
-            Some(m) => m,
-            None => (start..32).find(|&s| live(s).is_none()).unwrap_or(32),
+        let end = match user_sgprs {
+            Some(n) => u32::from(n).max(start),
+            None => {
+                let uses = crate::io::PrimMaskUses::new(&p);
+                let live = |s: u32| {
+                    p.inputs
+                        .iter()
+                        .find(|i| i.0 == Reg::S(s as u8))
+                        .map(|i| i.1)
+                };
+                let mask = |s: u32| live(s).is_some_and(|v| uses.is_prim_mask_only(v, true));
+                match (start..32).find(|&s| mask(s)) {
+                    Some(m) => m,
+                    None => (start..32).find(|&s| live(s).is_none()).unwrap_or(32),
+                }
+            }
         };
         last.sgprs = end - u32::from(last.user_data);
     }
@@ -1299,18 +1341,96 @@ mod tests {
     }
 
     #[test]
+    fn the_pixel_user_sgprs_are_read_from_the_register_image_by_its_kind() {
+        let image = |kind: u32, at: usize, w: u32| {
+            let mut b = vec![0u8; 0x180];
+            b[4..8].copy_from_slice(&kind.to_le_bytes());
+            b[at..at + 4].copy_from_slice(&w.to_le_bytes());
+            b
+        };
+        assert_eq!(ps_user_sgprs(&image(4, 0x3c, 13 << 1)), Some(13));
+        assert_eq!(
+            ps_user_sgprs(&image(6, 0x50, 0x2C00_0000 | 17 << 1 | 1)),
+            Some(17),
+            "other fields"
+        );
+        assert_eq!(
+            ps_user_sgprs(&image(4, 0x50, 13 << 1)),
+            None,
+            "kind 4 keeps it at 0x3c"
+        );
+        assert_eq!(
+            ps_user_sgprs(&image(5, 0x3c, 13 << 1)),
+            None,
+            "another kind"
+        );
+        assert_eq!(ps_user_sgprs(&image(4, 0x3c, 1)), None, "no user SGPRs");
+        assert_eq!(
+            ps_user_sgprs(&[4, 0, 0, 0, 4, 0, 0, 0]),
+            None,
+            "short image"
+        );
+    }
+
+    /// The Series X upscale program reads its b500 root constants as s9, s10 and s12, not s11,
+    /// from a metadata record that names only s9 (and interpolates nothing). Reading as far as
+    /// the program reads on entry stops at s11, and s12 was refused as a hardware SGPR input. The
+    /// register image's user SGPR count (13) takes the constants to s12.
+    #[test]
+    fn a_pixel_programs_last_root_constants_reach_its_register_images_user_sgprs() {
+        let code = words(&[
+            0x7E00_0209, // v_mov_b32 v0, s9
+            0x7E02_020A, // v_mov_b32 v1, s10
+            0x7E04_020C, // v_mov_b32 v2, s12
+            0xF800_080F,
+            0x0202_0100, // exp mrt0 v0, v1, v2, v2 done
+            ENDPGM,
+        ]);
+        let meta = meta_with(&[rec(0, 3, 8, 0), rec(2, 0, 9, 1)]);
+        let constants = |p: &NativeProgram| {
+            p.layout
+                .iter()
+                .find(|r| r.root == RootType::Constants)
+                .map(|r| (r.user_data, r.sgprs))
+        };
+        let (p, _) = infer(HwStage::Ps, &code, &meta).unwrap();
+        assert_eq!(constants(&p), Some((9, 2)));
+        let c = container(HwStage::Ps, &code, &meta).unwrap();
+        let refused =
+            super::super::translate_with(&c, super::super::Options::default()).unwrap_err();
+        assert!(
+            refused.to_string().contains("a hardware SGPR input"),
+            "{refused}"
+        );
+
+        let c = container_with_inputs(HwStage::Ps, &code, &meta, None, Some(13)).unwrap();
+        let at = c.windows(4).position(|w| w == MAGIC).unwrap();
+        assert_eq!(constants(&program(&c[at..]).unwrap()), Some((9, 4)));
+        super::super::translate_with(&c, super::super::Options::default()).unwrap();
+        // With the input enables too, both ride in the part.
+        let c = container_with_inputs(HwStage::Ps, &code, &meta, Some(0x8080), Some(13)).unwrap();
+        let at = c.windows(4).position(|w| w == MAGIC).unwrap();
+        let p = program(&c[at..]).unwrap();
+        assert_eq!(constants(&p), Some((9, 4)));
+        let StageIo::Ps { input_addr, .. } = p.io else {
+            panic!("not PS");
+        };
+        assert_eq!(input_addr, 0x8080);
+    }
+
+    #[test]
     fn decoded_pixel_input_enables_replace_the_guess_and_declare_the_position() {
         // Reads v1 only: the guess takes it as the second barycentric VGPR.
         let code = words(&[0xF800_180F, 0x0101_0101, ENDPGM]); // exp mrt0 v1, v1, v1, v1 done vm
         let meta = [0u8; 0x10];
-        let (p, (ins, _)) = infer_with(HwStage::Ps, &code, &meta, Some(0x8080)).unwrap();
+        let (p, (ins, _)) = infer_with(HwStage::Ps, &code, &meta, Some(0x8080), None).unwrap();
         let StageIo::Ps { input_addr, .. } = p.io else {
             panic!("not PS");
         };
         assert_eq!(input_addr, 0x8080);
         assert!(ins.iter().any(|e| e.kind == 3 && e.name == "SV_Position"), "{ins:?}");
         // The enables ride in the container's FSPG part, after the metadata.
-        let c = container_with_inputs(HwStage::Ps, &code, &meta, Some(0x8080)).unwrap();
+        let c = container_with_inputs(HwStage::Ps, &code, &meta, Some(0x8080), None).unwrap();
         let at = c.windows(4).position(|w| w == MAGIC).unwrap();
         let StageIo::Ps { input_addr, .. } = program(&c[at..]).unwrap().io else {
             panic!("not PS");

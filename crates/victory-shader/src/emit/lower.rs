@@ -12,7 +12,9 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Module, Term, V, pred};
 use super::container::SigElement;
 use super::graphics;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_INTEGER, VIEW_MIN_LOD_STEPS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -184,10 +186,15 @@ pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, Sh
     // (built from scalars, shifted) only with the console's lanes: asked
     // for when the first try finds one used.
     let mut console = false;
+    // Pixel programs read their barycentric inputs as data from `SV_Barycentrics`: asked for
+    // when the first try is refused for one.
+    let mut barycentrics = false;
     loop {
         #[cfg(test)]
         PASSES.set(PASSES.get() + 1);
-        match Lower::new(parts, &bad, console, guessed).run() {
+        let mut lower = Lower::new(parts, &bad, console, guessed);
+        lower.barycentrics = barycentrics;
+        match lower.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(phis)) => {
                 for (v, why) in phis {
@@ -203,6 +210,13 @@ pub(crate) fn lower_graphics(parts: &Parts, guessed: bool) -> Result<Lowered, Sh
                 what: "an opaque lane mask" | "a constant lane mask",
                 ..
             })) if !console && parts.native.stage == HwStage::Cs => console = true,
+            Err(Stop::Fail(ShaderError::Unsupported { what: BARYCENTRICS_READ, .. }))
+                if !barycentrics && parts.native.stage == HwStage::Ps =>
+            {
+                barycentrics = true;
+                // Joins the first try gave up on for a barycentric have one now.
+                bad.retain(|_, why| *why != BARYCENTRICS_READ);
+            }
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
@@ -356,6 +370,8 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Barycentric inputs read as data come from `SV_Barycentrics` (`lower_graphics`).
+    barycentrics: bool,
     /// Console wave64 code on 32-lane host waves ([`Options::wave32_host`]).
     host32: bool,
     /// The same, where a console wave is two host waves and the program has
@@ -517,6 +533,18 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 14;
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
 /// reach that block, so the ballot misses none.
+/// The page after an access's first, for the dwords of the access that lie on it
+/// ([`Lower::memory_tail`]).
+#[derive(Clone, Copy)]
+struct Tail {
+    /// The access's title address, low dword.
+    lo: V,
+    /// The next page's view.
+    h: V,
+    /// The byte of that view the access's first dword would be at.
+    base: V,
+}
+
 /// A page table lookup ([`Lower::memory`]).
 struct MemoryEntry {
     handle: V,
@@ -643,6 +671,9 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
         .map(|o| (o.row, o.pack2))
         .collect()
 }
+
+/// Why a barycentric input has no value until a program reads it as data (`Lower::get`).
+const BARYCENTRICS_READ: Why = "barycentrics read directly";
 
 /// `buffer_atomic_sub` among the buffer atomics' DXIL operation numbers: no DXIL operation of its
 /// own, it is lowered as an add (0) of the negated data.
@@ -1042,6 +1073,15 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // A wave64 mesh program's `v_readfirstlane_b32` reads its console wave's first lane,
+            // which is in the other 32-lane host wave when the first one has no lane on (and
+            // the value can differ between the halves: meshlets packed several to a group give
+            // each lane its own meshlet's counts). Where every thread runs the block once, the
+            // two halves exchange their first lanes through group-shared memory (`halves.rs`).
+            if x.native.wave64 && insts().any(|i| i.name() == "v_readfirstlane_b32") {
+                once = once_blocks(p);
+                s.xchg_dwords = ms.threads.next_multiple_of(64);
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -1129,6 +1169,7 @@ impl<'a> Lower<'a> {
             heap: [false; 2],
             src0: None,
             console_lanes,
+            barycentrics: false,
             host32,
             halves,
             once,
@@ -1275,8 +1316,10 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let bytes = sub.map_or(4 * n, |(width, _)| width / 8);
+        let mut tail = None;
         let (h, off) = if a.param == MEMORY {
             let (lo, hi) = self.global_address(inst)?;
+            tail = self.memory_tail(lo, hi, bytes, false);
             let (h, off) = self.memory(lo, hi, bytes, false, guard);
             (Some(h), off)
         } else {
@@ -1293,6 +1336,7 @@ impl<'a> Lower<'a> {
                     bits: 0,
                     words: [0, 0],
                 };
+                tail = self.raw_view_tail(&src, off, bytes, false);
                 let (h, off) = self.raw_view((b, i), &src, off, bytes, (11, 0), false, guard)?;
                 (Some(h), off)
             }
@@ -1322,7 +1366,8 @@ impl<'a> Lower<'a> {
                 None => {
                     let four = self.s.m.i32(4 * k);
                     let at = self.s.m.bin(c, Bin::Add, off, four);
-                    dword(self, at)?
+                    let x = dword(self, at)?;
+                    self.tail_pick(tail, k, x)
                 }
                 Some((width, signed)) => {
                     // shortcut: the field is taken not to cross a dword.
@@ -1468,6 +1513,16 @@ impl<'a> Lower<'a> {
             (_, Some(r)) => r,
             _ => unreachable!(),
         };
+        let tail = match memory {
+            Some((lo, hi)) if ops.is_none() => self.memory_tail(lo, hi, 4 * u32::from(n), true),
+            _ => None,
+        };
+        if let Some(t) = tail {
+            self.tail_store(t, h, off, &vals);
+            self.mark_view_write(h, off, 4 * u32::from(n), None);
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         if name.starts_with("global_store_") {
             let mut args = vec![h, off, iu];
             args.extend(&vals);
@@ -1672,6 +1727,11 @@ impl<'a> Lower<'a> {
             Shape::ReadLane(v, _) if self.section_uniform(v) => return self.i32_of(v),
             Shape::ReadLane(v, lane) if self.section_lanes.contains_key(&(v, lane)) => {
                 return self.section_lanes[&(v, lane)];
+            }
+            // A lane only `v_writelane_b32` fills (an SGPR spill reloaded inside the section): the
+            // SGPR written there, with no lane read, as outside a section.
+            Shape::ReadLane(v, lane) if self.spill_slot(v, lane, &mut Vec::new(), false).is_ok() => {
+                return self.spill_slot(v, lane, &mut Vec::new(), true);
             }
             Shape::ReadLane(v, lane) => {
                 self.cross_lane(false, outside_compute!("v_readlane_b32 of a constant lane"))?;
@@ -2198,7 +2258,13 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            // From `SV_Barycentrics` only in a second pass, for a program the first refused for
+            // reading one as data (`lower_graphics`): the many that only interpolate with them
+            // keep their translation and declare no `SV_Barycentrics`.
+            Input::Barycentric { kind, index } if self.barycentrics => {
+                return self.barycentric(kind, index);
+            }
+            Input::Barycentric { .. } => return Val::Missing(BARYCENTRICS_READ),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -2405,6 +2471,49 @@ impl<'a> Lower<'a> {
         };
         self.loaded_inputs.insert((id, col), out);
         out
+    }
+
+    /// A barycentric the pixel program reads as data, not only through `v_interp_*`: `i` (index 0)
+    /// and `j` (1) weigh the triangle's second and third vertices (RDNA2 ISA, "Parameter
+    /// interpolation": P0 + i * P10 + j * P20). They are channels y and z of `SV_Barycentrics`,
+    /// declared with the interpolation of the console's pair (DXIL modes 2 to 7), one element per
+    /// mode as the program first reads it (D3D allows two). The pull model stays refused.
+    fn barycentric(&mut self, kind: crate::io::Barycentric, index: u8) -> Val {
+        use crate::io::Barycentric as B;
+        let interp = match kind {
+            B::PerspectiveCenter => 2,
+            B::PerspectiveCentroid => 3,
+            B::LinearCenter => 4,
+            B::LinearCentroid => 5,
+            B::PerspectiveSample => 6,
+            B::LinearSample => 7,
+            B::PerspectivePullModel => return Val::Missing(BARYCENTRICS_READ),
+        };
+        let id = match self.s.inputs.iter().position(|e| e.kind == 28 && e.interp == interp) {
+            Some(id) => id,
+            None => {
+                let n = self.s.inputs.iter().filter(|e| e.kind == 28).count() as u32;
+                if n == 2 {
+                    return Val::Missing("barycentrics of a third interpolation mode");
+                }
+                let row = self.s.inputs.iter().filter_map(|e| e.row).max().map_or(0, |r| r + 1);
+                self.s.inputs.push(super::container::SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: n,
+                    kind: 28,
+                    comp: 9,
+                    interp,
+                    row: Some(row),
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_input(id, index + 1)
     }
 
     /// The vertex id input (debugging).
@@ -6407,6 +6516,7 @@ impl<'a> Lower<'a> {
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
+            let tail = self.raw_view_tail(src, addr, 4 * count, false);
             let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
             let c = self.cur;
             for k in 0..count {
@@ -6424,6 +6534,7 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = self.tail_pick(tail, k, x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6548,12 +6659,25 @@ impl<'a> Lower<'a> {
                 _ => None,
             }
         };
+        // A heap index a waterfall loop reads from the first lane, as is or shifted left by a
+        // constant (the byte offset of whole descriptors): each lane's VGPR and the shift.
+        let lane_index = |v: Value| {
+            if let Some(s) = lane_source(v) {
+                return Some((s, 0));
+            }
+            let i = self.def_inst(v)?;
+            let Fields::Sop { src, .. } = &i.fields else { return None };
+            match src[..] {
+                [x, k] if i.name() == "s_lshl_b32" => Some((lane_source(sgpr_operand(i, x)?)?, scalar_constant(k)?)),
+                _ => None,
+            }
+        };
         let same = |a: &Address, b: &Address| {
             a.param == b.param
                 && a.offset == b.offset
                 && (a.dynamic == b.dynamic
-                    || a.dynamic.and_then(lane_source).is_some()
-                        && a.dynamic.and_then(lane_source) == b.dynamic.and_then(lane_source))
+                    || a.dynamic.and_then(lane_index).is_some()
+                        && a.dynamic.and_then(lane_index) == b.dynamic.and_then(lane_index))
         };
         let address = self.scalar.get(&site);
         let use_at = use_of(site).or_else(|| {
@@ -6661,7 +6785,21 @@ impl<'a> Lower<'a> {
                     k(self, 16),
                     k(self, 0x3FFF),
                 );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                let mut d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                // A null test of dword 1 (`s_cmp_eq_i32 d1, 0`, the compiler's guard before it
+                // sizes from it): the console's dword 1 is never 0 for a view, its format field
+                // (bits 20-28) being nonzero for every image format, and 0 for a null descriptor
+                // (all zeros), whose size the host reads as 0. When the code reads nothing else of
+                // the dword, set a format bit for a view and give 0 for a null one.
+                let d1_value = inst.write(Reg::S(code + first + 1));
+                if d1_value.is_some_and(|v| self.width_bits_or_null_test(v)) {
+                    let width = field(self, 0);
+                    let zero = k(self, 0);
+                    let null = self.s.m.cmp(c, pred::EQ, width, zero);
+                    let format = k(self, 1 << 20);
+                    let view = self.s.m.bin(c, Bin::Or, d1, format);
+                    d1 = self.s.m.select(c, null, zero, view);
+                }
                 let hi = self.s.m.bin(c, Bin::LShr, w, k2);
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
@@ -6755,11 +6893,13 @@ impl<'a> Lower<'a> {
         for (x, negative) in extra {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
+        let tail = self.memory_tail(lo, hi, 4 * count, false);
         let (h, off) = self.memory(lo, hi, 4 * count, false, None);
         for k in 0..count {
             let four = self.s.m.i32(4 * k);
             let at = self.s.m.bin(self.cur, Bin::Add, off, four);
             let x = self.raw_dword(h, at);
+            let x = self.tail_pick(tail, k, x);
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -7047,6 +7187,26 @@ impl<'a> Lower<'a> {
         self.s.m.bin(self.cur, Bin::And, word, bits)
     }
 
+    /// `lod` raised to the minimum LOD clamp of the texture view `h` names,
+    /// from the view-stride table ([`VIEW_MIN_LOD_STEPS`]); `lod` itself if
+    /// the handle's heap index is not known. For samples at an explicit
+    /// level: the host's entry carries the clamp too, but Metal applies it
+    /// only to samples that pick their own level.
+    fn view_min_lod(&mut self, h: V, lod: V) -> V {
+        let Some(&index) = self.s.texture_index.get(&h) else {
+            return lod;
+        };
+        let c = self.cur;
+        let past = self.s.m.i32(super::HEAP_VIEWS);
+        let at = self.s.m.bin(c, Bin::Add, index, past);
+        let q = self.view_word(at);
+        let q = self.s.m.cast(c, Cast::UiToFp, q, self.s.t.f32);
+        let step = self.s.m.f32((1.0 / VIEW_MIN_LOD_STEPS as f32).to_bits());
+        let clamp = self.s.m.bin(c, Bin::Mul, q, step);
+        // FMax.
+        self.binary(35, lod, clamp)
+    }
+
     /// Dword `index` of the view-stride table: the stride and the format
     /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`]).
     fn view_word(&mut self, index: V) -> V {
@@ -7088,8 +7248,14 @@ impl<'a> Lower<'a> {
     /// [`super::shader::MEMORY_SPACE`]; the root UAV `u0` there takes a bit
     /// per page written and per page or 256 MiB region missed. May end in a
     /// new block: callers take [`Lower::cur`] afresh.
-    // shortcut: one lookup per access, so its bytes are taken to lie in one
-    // host copy of title memory (any access within a 64 KiB page does).
+    // One lookup per access, so its bytes lie in one host copy of title
+    // memory. Accesses of more than one dword that may cross a 64 KiB page
+    // look up the page of their last dword too and use it for the dwords on
+    // it: raw buffer loads of root views (`title_load_tail`), global, scalar,
+    // scalar buffer and typed-format loads (`tail_pick`), global and raw
+    // buffer stores (`tail_store`). The rest cannot cross: single dwords and
+    // the bytes and halves inside one, atomics (aligned to their size), and
+    // BVH nodes (64-byte aligned, read 64 and 48 bytes at a time).
     pub(crate) fn memory(
         &mut self,
         lo: V,
@@ -7208,6 +7374,32 @@ impl<'a> Lower<'a> {
             l1,
             miss,
         }
+    }
+
+    /// Whether the code tests image descriptor dword 1 (value `v`) against 0 and reads it
+    /// otherwise only for its width bits (30-31, by `s_bfe_u32` or `s_lshr_b32`) or as an image
+    /// instruction's descriptor, and passes it through no join.
+    fn width_bits_or_null_test(&self, v: Value) -> bool {
+        let p = self.x.p;
+        let reads = |i: &&Inst| i.reads.iter().any(|r| r.1 == v);
+        let allowed = |i: &Inst| {
+            // An image instruction's descriptor operand: the view, which the host binds itself.
+            if matches!(i.fields, Fields::Image { .. }) {
+                return true;
+            }
+            let Fields::Sop { src, .. } = &i.fields else { return false };
+            let [a, b] = src[..] else { return false };
+            let other = if sgpr_operand(i, a) == Some(v) { b } else { a };
+            match (i.name(), scalar_constant(other)) {
+                ("s_bfe_u32", Some(k)) => k & 0x1F >= 30 && sgpr_operand(i, a) == Some(v),
+                ("s_lshr_b32", Some(k)) => k & 0x1F >= 30 && sgpr_operand(i, a) == Some(v),
+                ("s_cmp_eq_i32" | "s_cmp_lg_i32" | "s_cmp_eq_u32" | "s_cmp_lg_u32", Some(0)) => true,
+                _ => false,
+            }
+        };
+        p.blocks.iter().all(|b| {
+            b.phis.iter().all(|phi| !phi.args.contains(&v)) && b.insts.iter().filter(reads).all(allowed)
+        }) && p.blocks.iter().flat_map(|b| &b.insts).filter(reads).any(|i| i.name().starts_with("s_cmp_"))
     }
 
     /// A descriptor load from a table or heap whose dwords the program only
@@ -7467,7 +7659,7 @@ impl<'a> Lower<'a> {
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
     // bytes or more as dword-aligned.
-    fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
+    fn format_load(&mut self, h: V, off: V, tail: Option<Tail>, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
@@ -7498,7 +7690,8 @@ impl<'a> Lower<'a> {
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
-            load(self, off, total / 32)
+            let ws = load(self, off, total / 32);
+            (0..total / 32).map(|k| self.tail_pick(tail, k, ws[k as usize])).collect()
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
@@ -9320,6 +9513,33 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                // Two 32-bit integers saturated to 16 bits, src0 in the low half and src1 in the
+                // high one (RDNA2 ISA, VOP3 opcodes 0x36a and 0x36b; Mesa's ACO selects
+                // `pack_uint_2x16` and `pack_sint_2x16`, which NIR defines as clamping, to them).
+                let signed = name == "v_cvt_pk_i16_i32";
+                let mut halves = [self.s.m.i32(0); 2];
+                for (k, half) in halves.iter_mut().enumerate() {
+                    let a = s(self, k)?;
+                    let x = if signed {
+                        let (lo, hi) = (self.s.m.i32(-32768i32 as u32), self.s.m.i32(32767));
+                        let below = self.s.m.cmp(c, pred::SLT, a, lo);
+                        let a = self.s.m.select(c, below, lo, a);
+                        let above = self.s.m.cmp(c, pred::SGT, a, hi);
+                        self.s.m.select(c, above, hi, a)
+                    } else {
+                        let max = self.s.m.i32(0xFFFF);
+                        let above = self.s.m.cmp(c, pred::IUGT, a, max);
+                        self.s.m.select(c, above, max, a)
+                    };
+                    let low = self.s.m.i32(0xFFFF);
+                    *half = self.s.m.bin(c, Bin::And, x, low);
+                }
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+                let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+                int(self, r)
+            }
             "v_cvt_pknorm_u16_f32" | "v_cvt_pknorm_i16_f32" => {
                 // Two floats as 16-bit normalized integers, src0 in the low
                 // half and src1 in the high one: round(clamp(x, lo, 1) * max)
@@ -9591,6 +9811,16 @@ impl<'a> Lower<'a> {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
                 let a = s(self, 0)?;
                 int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if self.s.mesh.is_some()
+                    && self.s.xchg_dwords > 0
+                    && self.once.get(self.cur_ir).copied().unwrap_or(false) =>
+            {
+                let a = s(self, 0)?;
+                let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+                let r = self.mesh_first_lane(a, on);
+                int(self, r)
             }
             "v_readfirstlane_b32" if self.x.st.lockstep => {
                 // Lockstep: every thread runs, so the first lane is the wide EXEC's.
@@ -11557,6 +11787,7 @@ impl<'a> Lower<'a> {
                 // `n` have gone on. An arm inside a loop's body is no back edge.
                 k != n
                     && !self.dominates(b, preds[k])
+                    && !self.merge_keeps_edge(b, args, n, k)
                     && st.masks.get(arg).is_some_and(|&m| {
                         [true, false].into_iter().any(|set| {
                             let mut lanes = on_n.clone();
@@ -11580,6 +11811,79 @@ impl<'a> Lower<'a> {
                         differs(&self.lane_edge(from, q), known)
                     })
             })
+    }
+
+    /// Whether edge `k` into the join `b` brings the console compiler's merge of a boolean
+    /// into a lane mask, `s_andn2 t, old, exec` then `s_or d, t, vcc` with `vcc` a compare
+    /// under that EXEC, whose `old` is what edge `n` brings, as the wave runs from edge `n`'s
+    /// block to the merge. The lanes of edge `n` are outside that EXEC (they skip the merge's
+    /// block), where a compare writes 0, so `d` holds their bit of `old`: what edge `n` brings.
+    fn merge_keeps_edge(&self, b: usize, args: &[Value], n: usize, k: usize) -> bool {
+        let p = self.x.p;
+        let w = if self.x.native.wave64 { "_b64" } else { "_b32" };
+        let dwords = if self.x.native.wave64 { 2 } else { 1 };
+        let start = p.blocks[b].preds[n];
+        // Blocks the wave can run after edge `n`'s block before it reaches the join.
+        let mut after = vec![false; p.blocks.len()];
+        let mut stack = p.blocks[start].exit.successors();
+        while let Some(x) = stack.pop() {
+            if x != b && !std::mem::replace(&mut after[x], true) {
+                stack.extend(p.blocks[x].exit.successors());
+            }
+        }
+        let def = |v: Value| self.def_inst(v);
+        let scalar = |i: &Inst, s: usize| match i.fields {
+            Fields::Sop { ref src, .. } => match src.get(s) {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => Some(code),
+                _ => None,
+            },
+            _ => None,
+        };
+        // The one instruction writing every dword of the pair at `code` that `i` reads.
+        let pair_def = |i: &Inst, code: u8| -> Option<&Inst> {
+            let d = def(i.read(Reg::S(code))?)?;
+            (1..dwords)
+                .all(|h| i.read(Reg::S(code + h)).and_then(def).is_some_and(|x| std::ptr::eq(x, d)))
+                .then_some(d)
+        };
+        let exec = |i: &Inst| (0..dwords).map(|h| i.read(Reg::S(EXEC + h))).collect::<Vec<_>>();
+        // What `v` is, through copies and the joins the wave enters from edge `n`'s block on:
+        // at those, the one edge such a block brings it.
+        let resolve = |mut v: Value| {
+            for _ in 0..64 {
+                if let Some(c) = def(v).and_then(|i| crate::structure::copied(i, v, def)) {
+                    v = c;
+                    continue;
+                }
+                let Some(&(q, i)) = self.phi_at.get(&v).filter(|&&(q, _)| after[q]) else { break };
+                let mut from = p.blocks[q].preds.iter().enumerate().filter(|&(_, &x)| x == start || after[x]);
+                match (from.next(), from.next()) {
+                    (Some((e, _)), None) => v = p.blocks[q].phis[i].args[e],
+                    _ => break,
+                }
+            }
+            v
+        };
+        let Some(or) = def(args[k]).filter(|i| i.name() == format!("s_or{w}")) else { return false };
+        if !self.def_block.get(&args[k]).is_some_and(|&d| after[d]) || after[start] {
+            return false;
+        }
+        (0..2).any(|s| {
+            let (Some(t), Some(c)) = (scalar(or, s), scalar(or, 1 - s)) else { return false };
+            let (Some(t), Some(cmp)) = (pair_def(or, t), pair_def(or, c)) else { return false };
+            let Some(old) = scalar(t, 0) else { return false };
+            t.name() == format!("s_andn2{w}")
+                && scalar(t, 1) == Some(EXEC)
+                && cmp.name().starts_with("v_cmp_")
+                && matches!(cmp.fields, Fields::Valu(_))
+                && exec(cmp) == exec(t)
+                && (0..dwords).all(|h| {
+                    let want = if h == 0 { Some(args[n]) } else { self.pair_high(args[n]) };
+                    // A value made again on the way to the merge is another value there.
+                    want.is_some_and(|x| !self.def_block.get(&x).is_some_and(|&d| after[d]))
+                        && t.read(Reg::S(old + h)).map(resolve) == want
+                })
+        })
     }
 
     /// Whether IR block `b` dominates `q`: no path from the entry gets to `q` but through `b`.
@@ -12368,6 +12672,7 @@ impl<'a> Lower<'a> {
                     } else {
                         self.s.m.f32(0)
                     };
+                    let lod = self.view_min_lod(h, lod);
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
@@ -13375,6 +13680,7 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
+            let mut tail = None;
             // Where the write starts in the view, and how many bytes it may
             // cover (for its marks).
             let (byte, bytes);
@@ -13388,7 +13694,7 @@ impl<'a> Lower<'a> {
                 let element = index.unwrap_or(self.s.m.i32(0));
                 args.push(h);
                 args.extend([element, iu]);
-                for x in vals {
+                for &x in &vals {
                     args.push(self.as_float(x));
                 }
                 // A store of fewer channels (`_x`, `_xy`, `_xyz`) still
@@ -13424,6 +13730,7 @@ impl<'a> Lower<'a> {
                     }
                     None => {
                         let n = 4 * count;
+                        tail = self.raw_view_tail(src, off, n, true);
                         let (h, off) =
                             self.raw_view(site, src, off, n, (11 | u, 0), true, guard)?;
                         args.extend([h, off, iu]);
@@ -13440,7 +13747,10 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
-            self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            match tail {
+                Some(t) => self.tail_store(t, args[0], byte, &vals),
+                None => _ = self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args),
+            }
             self.mark_view_write(args[0], byte, bytes, None);
             self.end_guarded(at, &[]);
             return Ok(());
@@ -13449,11 +13759,13 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
+            let bytes = buffer_format(f).map_or(4, |(bits, _)| bits.iter().sum::<u32>() / 8);
+            let tail = self.raw_view_tail(src, off, bytes, false);
             let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let mut xs = self.format_load(h, off, f, count)?;
+            let mut xs = self.format_load(h, off, tail, f, count)?;
             if d16 {
                 xs = self.d16_channels(f, xs)?;
             }
@@ -13499,6 +13811,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let mut typed_h = None;
+        let mut split = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -13538,16 +13851,24 @@ impl<'a> Lower<'a> {
                 }
                 None => {
                     let bytes = 4 * count;
-                    let (h, off) =
+                    let first = self.root_address(src);
+                    let (h, at) =
                         self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
-                    self.s.op(
+                    let r = self.s.op(
                         self.cur,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, off, iu, mask, align],
-                    )
+                        &[h, at, iu, mask, align],
+                    );
+                    match first {
+                        Some((lo, hi)) if count > 1 && !d16 => {
+                            split = Some(self.title_load_tail(lo, hi, off, count, r, guard));
+                            r
+                        }
+                        _ => r,
+                    }
                 }
             }
         };
@@ -13594,11 +13915,144 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
+            let x = match &split {
+                Some(xs) => xs[k as usize],
+                None => self.s.m.extract(c, r, k),
+            };
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// A load of `count` dwords of title memory at `(hi:lo) + off` already made as `r` through
+    /// the page entry of its first byte: its channels, those on the next 64 KiB title page read
+    /// through that page's own entry. The title maps the next page anywhere in its pool, so the
+    /// first page's view goes on into other memory (a vertex whose x ends a page and y starts the
+    /// next read the wrong y: world meshes drawn as shards). The second lookup and load run only in
+    /// lanes whose access crosses a page.
+    fn title_load_tail(&mut self, lo: V, hi: V, off: V, count: u32, r: V, guard: Option<V>) -> Vec<V> {
+        let c = self.cur;
+        let (lo1, hi1) = self.add64(lo, hi, off, false);
+        let last = self.s.m.i32(4 * (count - 1));
+        let (lo2, hi2) = self.add64(lo1, hi1, last, false);
+        let (k16, zero) = (self.s.m.i32(16), self.s.m.i32(0));
+        // The page of a dword other than the first's: its address differs from the first's in bits
+        // 16 and up (a carry into the high dword changes bits 16-31 of the low one too).
+        let other = |l: &mut Self, at: V| {
+            let x = l.s.m.bin(l.cur, Bin::Xor, lo1, at);
+            let x = l.s.m.bin(l.cur, Bin::LShr, x, k16);
+            l.s.m.cmp(l.cur, pred::NE, x, zero)
+        };
+        let crosses = other(self, lo2);
+        let mine: Vec<V> = (0..count).map(|k| self.s.m.extract(c, r, k)).collect();
+        let lanes = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, crosses),
+            None => crosses,
+        };
+        let at = self.begin_guarded(Some(lanes));
+        let mask = self.s.m.i32(0xFFFF);
+        let hi2 = self.s.m.bin(self.cur, Bin::And, hi2, mask);
+        let (h2, o2) = self.memory(lo2, hi2, 4, false, guard);
+        // Dword 0 in the second page's view; the dwords before the page fall outside it (read as
+        // 0 by the bounds check) and are taken from the first load.
+        let base = self.s.m.bin(self.cur, Bin::Sub, o2, last);
+        let (iu, m, align) = (
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8((1u8 << count) - 1),
+            self.s.m.i32(4),
+        );
+        let r2 = self.s.op(
+            self.cur,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h2, base, iu, m, align],
+        );
+        let theirs: Vec<(V, V)> =
+            (0..count).map(|k| (self.s.m.extract(self.cur, r2, k), mine[k as usize])).collect();
+        let theirs = self.end_guarded(at, &theirs);
+        (0..count)
+            .map(|k| {
+                let step = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(self.cur, Bin::Add, lo1, step);
+                let on_next = other(self, a);
+                self.s.m.select(self.cur, on_next, theirs[k as usize], mine[k as usize])
+            })
+            .collect()
+    }
+
+    /// The next 64 KiB title page of an access of `bytes` bytes at title address `(hi:lo)`
+    /// (`hi` bits 32-47), looked up at its last dword, for accesses of more than one dword: see
+    /// [`Self::title_load_tail`]. Every lane looks it up; a lane whose access stays in one page
+    /// gets that page again and uses none of it.
+    fn memory_tail(&mut self, lo: V, hi: V, bytes: u32, write: bool) -> Option<Tail> {
+        if bytes <= 4 {
+            return None;
+        }
+        let last = self.s.m.i32(bytes - 4);
+        let (lo2, hi2) = self.add64(lo, hi, last, false);
+        let mask = self.s.m.i32(0xFFFF);
+        let hi2 = self.s.m.bin(self.cur, Bin::And, hi2, mask);
+        let e = self.memory_entry(lo2, hi2, write);
+        let base = self.s.m.bin(self.cur, Bin::Sub, e.offset, last);
+        Some(Tail { lo, h: e.handle, base })
+    }
+
+    /// [`Self::memory_tail`] of a root view access that [`Self::raw_view`] makes (`off` past the
+    /// root address); `None` for views that are not title memory.
+    fn raw_view_tail(&mut self, src: &Source, off: V, bytes: u32, write: bool) -> Option<Tail> {
+        let (lo, hi) = self.root_address(src)?;
+        let (lo, hi) = self.add64(lo, hi, off, false);
+        let mask = self.s.m.i32(0xFFFF);
+        let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
+        self.memory_tail(lo, hi, bytes, write)
+    }
+
+    /// Whether dword `k` of an access at title address low dword `lo` lies on the page after its
+    /// first dword's (its address differs from the first's in bits 16 and up).
+    fn on_next_page(&mut self, lo: V, k: u32) -> V {
+        let c = self.cur;
+        let (step, k16, zero) = (self.s.m.i32(4 * k), self.s.m.i32(16), self.s.m.i32(0));
+        let a = self.s.m.bin(c, Bin::Add, lo, step);
+        let x = self.s.m.bin(c, Bin::Xor, lo, a);
+        let x = self.s.m.bin(c, Bin::LShr, x, k16);
+        self.s.m.cmp(c, pred::NE, x, zero)
+    }
+
+    /// Dword `k` of an access, `x` as read through its first page's view: read through `t`'s
+    /// page instead where it lies on that one.
+    fn tail_pick(&mut self, t: Option<Tail>, k: u32, x: V) -> V {
+        let Some(t) = t else { return x };
+        let four = self.s.m.i32(4 * k);
+        let at = self.s.m.bin(self.cur, Bin::Add, t.base, four);
+        let y = self.raw_dword(t.h, at);
+        let next = self.on_next_page(t.lo, k);
+        self.s.m.select(self.cur, next, y, x)
+    }
+
+    /// Stores `vals` (dwords) at byte `off` of view `h`, the access's first page, with those
+    /// on `t`'s page stored there instead: one dword at a time, each written through one view
+    /// and sent out of bounds of the other (dropped by its bounds check).
+    fn tail_store(&mut self, t: Tail, h: V, off: V, vals: &[V]) {
+        let (iu, void) = (self.s.m.undef(self.s.t.i32), self.s.t.void);
+        let outside = self.s.m.i32(u32::MAX - 15);
+        for (k, &x) in vals.iter().enumerate() {
+            let k = k as u32;
+            let next = self.on_next_page(t.lo, k);
+            let c = self.cur;
+            let four = self.s.m.i32(4 * k);
+            let here = self.s.m.bin(c, Bin::Add, off, four);
+            let there = self.s.m.bin(c, Bin::Add, t.base, four);
+            let here = self.s.m.select(c, next, outside, here);
+            let there = self.s.m.select(c, next, there, outside);
+            for (view, at) in [(h, here), (t.h, there)] {
+                let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+                let args = [view, at, iu, x, iu, iu, iu, mask, align];
+                self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            }
+        }
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
@@ -15935,6 +16389,60 @@ mod tests {
             0xBF8C_3F70, // s_waitcnt vmcnt(0)
             0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
             0xBF89_FFF6, // s_cbranch_execnz L2
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_1000,
+            0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_and_uav_tables();
+        lower_wave(&words, layout, used, false).unwrap();
+    }
+
+    #[test]
+    fn a_waterfall_loop_that_sizes_by_a_shifted_index_takes_the_kind_of_the_sampled_one() {
+        // As above, but v7 holds the entry's index and each loop shifts the first lane's index
+        // left by 5 to the byte offset (`s_lshl_b32`, the title's form), and the sizing loop
+        // loads only four dwords, of which dword 2 has no view address: the two loads are of
+        // the same descriptor only through the shift.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x360E_0081, // v_and_b32 v7, 1, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E28_0507, // L1: v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0x8F14_8514, // s_lshl_b32 s20, s20, 5
+            0xF408_0302,
+            0x2800_0000, // s_load_dwordx4 s[12:15], s[4:5], s20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xD54E_0008,
+            0x0278_1A0E, // v_alignbit_b32 v8, s14, s13, 30
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF6, // s_cbranch_execnz L1
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E28_0507, // L2: v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0x8F14_8514, // s_lshl_b32 s20, s20, 5
+            0xF40C_0302,
+            0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF5, // s_cbranch_execnz L2
             0xBEFE_0317, // s_mov_b32 exec_lo, s23
             0xE070_1000,
             0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen

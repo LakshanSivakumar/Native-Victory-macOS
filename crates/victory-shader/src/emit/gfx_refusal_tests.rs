@@ -2702,6 +2702,26 @@ fn a_pixel_program_reads_back_an_sgpr_spilled_on_two_paths() {
     assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);
 }
 
+/// The same reload inside a whole-wave section (`s_or_saveexec_b32 -1` ... restore): the title's
+/// pixel programs reload a spilled SGPR there, before a reduction. The section's shape for it is
+/// a read of lane 3, which a pixel program cannot make; it is the spilled SGPR, as outside a
+/// section (it was refused as "v_readlane_b32 of a constant lane in a pixel program").
+#[test]
+fn a_pixel_program_reads_back_a_spilled_sgpr_inside_a_whole_wave_section() {
+    let code = [
+        0xBE94_03F2, // s_mov_b32 s20, 1.0
+        0xD761_000E, 0x0001_0614, // v_writelane_b32 v14, s20, 3
+        0xBE82_3DC1, // s_or_saveexec_b32 s2, -1
+        0xD760_0016, 0x0001_070E, // v_readlane_b32 s22, v14, 3
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        0x7E02_0216, // v_mov_b32 v1, s22
+        0xF800_180F, 0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let l = lower_ps(&code, false, vec![], vec![], 0, 0, vec![], false).expect("lowers");
+    assert!(l.wave_read_lane_calls.is_empty(), "{:?}", l.wave_read_lane_calls);
+}
+
 /// DPP8 in a pixel program stays refused under its own name. No open lowering (#259, #261,
 /// #262) takes it; whether to lower it waits for the op tally of current main on #4.
 #[test]
@@ -3158,4 +3178,93 @@ fn a_wave64_relay_skip_on_exec_lo_alone_does_not_make_an_edge_unneeded() {
     }
     let err = emit_wave64_cs(&w, 64, false).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(err.contains("lane-mask join") && err.contains("0x48"), "{err:?}");
+}
+/// A lane mask held as the saved EXEC (every lane), joined with data on the
+/// skip edge, is refused naming the exact case: the data is on the host's
+/// lanes (the synthetic GPU test runs this shape on Windows).
+#[test]
+fn a_saved_exec_mask_joined_with_data_names_the_host_lanes_case() {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBE86_0385, // s_mov_b32 s6, 5
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+        0xBF88_0002, // s_cbranch_execz +2
+        0xD4C4_0006,
+        0x0002_0088, // v_cmp_gt_u32 s6, 8, v0
+        0xBEFE_0308, // s_mov_b32 exec_lo, s8
+        0xD501_0003,
+        0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+        0xE070_1000,
+        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    // The saved EXEC instead of the compare: every lane, so the skipping
+    // lanes' bit would be 1 on the console.
+    words[10..12].copy_from_slice(&[0xBE86_0308, 0xBF80_0000]); // s_mov_b32 s6, s8; s_nop 0
+    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            range(ResourceType::Srv, 0, 8, 0),
+            range(ResourceType::Srv, 8, 4, 16),
+            range(ResourceType::Uav, 16, 4, 0),
+        ],
+        io: StageIo::Cs(ComputeIo { rsrc2: 1 << 1, threads: [32, 1, 1] }),
+        code: bytes_of(&words),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io");
+    let r = lower::lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: false,
+        zero_copy_memory: false,
+        view_marks: false,
+        rect_list: false,
+        copy_params: [0; 32],
+    });
+    let Err(ShaderError::Unsupported { what, .. }) = r else {
+        panic!("a saved-EXEC mask joined with data translated");
+    };
+    assert!(
+        what == "a lane-mask join of an untracked mask: data, on the host's lanes",
+        "{what}"
+    );
 }

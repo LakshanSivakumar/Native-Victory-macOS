@@ -273,8 +273,11 @@ pub extern "system" fn VirtualAlloc(
             set_error(ERROR_NOT_ENOUGH_MEMORY);
             return std::ptr::null_mut();
         };
-        // SAFETY: the title commits inside a reservation of its own.
-        unsafe { mem::commit(start as *mut u8, end - start, prot) }.map(|()| start as *mut u8)
+        // SAFETY: the title commits inside a reservation of its own; if `XMemVirtualAlloc` made
+        // the reservation without `MEM_COMMIT`, back the touched 64 KiB granules with a pool now.
+        crate::modules::xmem::commit_if_reserved(start, end, prot)
+            .unwrap_or_else(|| unsafe { mem::commit(start as *mut u8, end - start, prot) })
+            .map(|()| start as *mut u8)
     } else {
         set_error(ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
@@ -637,18 +640,22 @@ impl Waitable {
         self.wait(Some(Duration::ZERO))
     }
 
-    /// Undoes a take (a wait-all that could not take every object). A
-    /// manual-reset event was not changed by it, and setting it again is
-    /// a no-op.
-    fn give_back(&self) {
+    /// Undoes a take (a wait-all that could not take every object), returning
+    /// `true` when an object consumed by `try_take` became available to other
+    /// threads again. A manual-reset event was not consumed by `try_take`, so
+    /// leaving it untouched preserves any concurrent `ResetEvent`.
+    fn give_back(&self) -> bool {
         match self {
-            Waitable::Event(e) => e.set(),
-            Waitable::Semaphore(s) => {
-                s.release(1);
+            Waitable::Event(e) => {
+                if !e.is_manual() {
+                    e.set();
+                    true
+                } else {
+                    false
+                }
             }
-            Waitable::Mutex(m) => {
-                m.release();
-            }
+            Waitable::Semaphore(s) => s.release(1).is_some(),
+            Waitable::Mutex(m) => m.release() == Some(true),
         }
     }
 }
@@ -1235,6 +1242,26 @@ mod memory_tests {
         assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
     }
 
+    #[test]
+    fn virtual_alloc_commit_inside_xmem_reservation_backs_with_pool() {
+        use crate::modules::xmem::{XMemVirtualAlloc, pool_shown_at, pools};
+        let p = XMemVirtualAlloc(std::ptr::null_mut(), 2 * GRANULARITY, MEM_RESERVE, 3, 0x01);
+        assert!(!p.is_null());
+        assert_eq!(pool_shown_at(p as usize), None);
+
+        let second = p.cast::<u8>().wrapping_add(GRANULARITY).cast();
+        assert_eq!(VirtualAlloc(second, GRANULARITY, MEM_COMMIT, 0x04), second);
+        let pool = pool_shown_at(second as usize).expect("VirtualAlloc commit backed with pool");
+        let gpu = pools().iter().find(|info| info.id == pool).expect("live").base as *const u8;
+        // SAFETY: committed read-write; the pool's base mirrors `second`.
+        unsafe {
+            second.cast::<u8>().write(0xA5);
+            assert_eq!(gpu.read(), 0xA5);
+        }
+        assert_eq!(VirtualFree(p, 0, MEM_RELEASE), 1);
+        assert!(!pools().iter().any(|info| info.id == pool));
+    }
+
     /// `VirtualFree(MEM_DECOMMIT)` keeps the bytes of a physical page another address still
     /// shows: `XMemMapPhysicalPages` pages mapped twice, and `XMemVirtualAlloc` memory the GPU's
     /// page mapping (`map_alias`) shows elsewhere too (issue #15).
@@ -1440,5 +1467,59 @@ mod memory_tests {
         assert_eq!(GetLastError(), ERROR_INVALID_PARAMETER);
         assert_eq!(WaitForMultipleObjects(2, dup.as_ptr(), 0, 0), WAIT_OBJECT_0);
         assert_eq!(CloseHandle(ev), 1);
+    }
+
+    #[test]
+    fn wait_all_rollback_wakes_wait_any_and_preserves_manual_reset() {
+        // Manual-reset events are not consumed by `try_take`: rolling back a failed wait-all must
+        // not re-set one that another thread concurrently `ResetEvent`ed.
+        let manual = CreateEventW(std::ptr::null(), 1, 1, std::ptr::null());
+        let w = Waitable::of(manual).unwrap();
+        assert!(w.try_take());
+        assert_eq!(ResetEvent(manual), 1);
+        assert!(!w.give_back());
+        assert_eq!(WaitForSingleObject(manual, 0), WAIT_TIMEOUT);
+        assert_eq!(CloseHandle(manual), 1);
+
+        // When a `wait_all = 1` attempt consumes and rolls back an auto-reset event while a
+        // concurrent `wait_all = 0` waiter is parked on `EPOCH`, the rollback must wake the
+        // `wait_all = 0` waiter without making `wait_all = 1` busy-spin.
+        let auto_ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        let other_ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        let never_ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+        let (auto_raw, other_raw) = (auto_ev as usize, other_ev as usize);
+
+        let before = sync::multi_waiters();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let pair = [auto_raw as *mut c_void, other_raw as *mut c_void];
+            let got = WaitForMultipleObjects(2, pair.as_ptr(), 0, 5000);
+            tx.send(got).unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while sync::multi_waiters() <= before && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Arm `auto_ev`'s inner `Event` without bumping `EPOCH` (simulating `wait_any` having
+        // checked `auto_ev` while `wait_all` temporarily held it), then let `wait_all` take and
+        // roll it back.
+        event_of(auto_ev).unwrap().set();
+        let all_pair = [auto_ev, never_ev];
+        assert_eq!(
+            WaitForMultipleObjects(2, all_pair.as_ptr(), 1, 25),
+            WAIT_TIMEOUT
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("wait_all rollback did not wake wait_any"),
+            WAIT_OBJECT_0
+        );
+        waiter.join().unwrap();
+
+        assert_eq!(CloseHandle(auto_ev), 1);
+        assert_eq!(CloseHandle(other_ev), 1);
+        assert_eq!(CloseHandle(never_ev), 1);
     }
 }

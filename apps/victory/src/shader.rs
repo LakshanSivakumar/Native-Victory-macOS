@@ -401,3 +401,151 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
 }
+
+#[cfg(test)]
+mod sources_tests {
+    use super::{Container, Source, sources};
+
+    /// A minimal PC container: the 0x20-byte header, no parts. The digest is
+    /// not checked on parse.
+    fn container() -> Vec<u8> {
+        let mut out = b"DXBC".to_vec();
+        out.extend_from_slice(&[0; 16]);
+        out.extend_from_slice(&1u16.to_le_bytes()); // version 1.0
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0x20u32.to_le_bytes()); // total size
+        out.extend_from_slice(&0u32.to_le_bytes()); // part count
+        out
+    }
+
+    /// A stored (uncompressed) deflate block holding `payload`: BFINAL=1,
+    /// BTYPE=00, LEN, its one's complement, the bytes.
+    fn stored_deflate(payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u16;
+        let nlen = !len;
+        let mut out = vec![0x01, len as u8, (len >> 8) as u8, nlen as u8, (nlen >> 8) as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// An SGD5 record as the marker scan reads it: a length-prefixed name,
+    /// the kind byte, `n`, the 0x000DDCE7 marker, `n` again, the unpacked
+    /// size, then the packed stream.
+    fn sgd5_record(name: &str, kind: u8, payload: &[u8]) -> Vec<u8> {
+        let packed = stored_deflate(payload);
+        let n = (packed.len() + 12) as u32;
+        let mut out = vec![0xF4, 0x01, 0, 0, name.len() as u8 + 1];
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&[0, kind]);
+        for v in [n, 0x000D_DCE7, n, payload.len() as u32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&packed);
+        out
+    }
+
+    #[test]
+    fn input_without_shaders_yields_nothing() {
+        assert!(sources(&[]).is_empty());
+        assert!(sources(b"title bytes without magic").is_empty());
+        // The SGD5 magic alone is no record, and a "DXBC" with no header
+        // behind it is no container.
+        assert!(sources(b"SGD5\x00\x00\x00\x00").is_empty());
+        assert!(sources(b"DXBC").is_empty());
+        // A "DXBC" whose size field disagrees with the data is not a container…
+        let mut fake = container();
+        fake.truncate(0x18);
+        fake.extend_from_slice(&0xFFFFu32.to_le_bytes()); // total > data.len()
+        fake.extend_from_slice(&0u32.to_le_bytes()); // part count
+        assert!(sources(&fake).is_empty());
+        // …but a valid container after a fake magic is still found.
+        let at = fake.len();
+        fake.extend_from_slice(&container());
+        let found = sources(&fake);
+        assert_eq!(found.len(), 1);
+        assert!(matches!(&found[0], Source::Raw { offset, .. } if *offset == at));
+    }
+
+    #[test]
+    fn every_raw_container_in_a_file_is_found_in_order() {
+        let c = container();
+        let mut file = c.clone();
+        file.extend_from_slice(b"middle");
+        let second = file.len();
+        file.extend_from_slice(&c);
+        let found = sources(&file);
+        assert_eq!(found.len(), 2);
+        assert!(matches!(&found[0], Source::Raw { offset: 0, .. }));
+        assert!(matches!(&found[1], Source::Raw { offset, .. } if *offset == second));
+    }
+
+    #[test]
+    fn a_raw_source_keeps_the_whole_tail_and_labels_its_offset() {
+        let c = container();
+        let mut file = b"some prefix".to_vec();
+        let at = file.len();
+        file.extend_from_slice(&c);
+        file.extend_from_slice(b"and a suffix");
+        let found = sources(&file);
+        assert_eq!(found.len(), 1);
+        match &found[0] {
+            // `bytes` is the tail from the magic; `Container::parse` bounds it
+            // by the container's own size field.
+            Source::Raw { offset, data } => {
+                assert_eq!(*offset, at);
+                assert_eq!(*data, &file[at..]);
+            }
+            Source::Packed(_) => panic!("expected a raw source"),
+        }
+        assert_eq!(found[0].label(), format!("@{at:#x}"));
+        let bytes = found[0].bytes().unwrap();
+        assert_eq!(&bytes[..], &file[at..]);
+        assert!(Container::parse(&bytes).is_ok());
+    }
+
+    #[test]
+    fn an_sgd5_record_is_listed_and_unpacks_to_its_container() {
+        let c = container();
+        let mut file = b"SGD5".to_vec();
+        file.extend_from_slice(&[1, 2, 3, 4]); // no database table parses: the marker scan runs
+        file.extend_from_slice(&sgd5_record("PS_x", 0x32, &c));
+        let marker = memchr::memmem::find(&file, &0x000D_DCE7u32.to_le_bytes()).unwrap();
+        let inner = memchr::memmem::find(&file, b"DXBC").unwrap();
+
+        let found = sources(&file);
+        // The packed record first, then the raw scan, which also finds the
+        // container inside the stored-deflate payload.
+        assert_eq!(found.len(), 2);
+        match &found[0] {
+            Source::Packed(r) => {
+                assert_eq!(r.offset, marker);
+                assert_eq!(r.name, Some("PS_x"));
+            }
+            Source::Raw { .. } => panic!("expected the packed source first"),
+        }
+        assert_eq!(found[0].label(), format!("@{marker:#x} PS_x"));
+        assert_eq!(found[0].bytes().as_deref(), Some(&c[..]));
+        assert!(Container::parse(&found[0].bytes().unwrap()).is_ok());
+        match &found[1] {
+            Source::Raw { offset, .. } => assert_eq!(*offset, inner),
+            Source::Packed(_) => panic!("expected the raw source second"),
+        }
+    }
+
+    #[test]
+    fn a_corrupt_record_is_listed_but_yields_no_bytes() {
+        let payload = b"not deflate at all";
+        let mut file = b"SGD5".to_vec();
+        file.extend_from_slice(&[1, 2, 3, 4]);
+        let mut rec = sgd5_record("CS_y", 0x3c, payload);
+        let packed_at = rec.len() - stored_deflate(payload).len();
+        rec[packed_at] = 0xFF; // a reserved deflate block type: the stream fails
+        file.extend_from_slice(&rec);
+
+        let found = sources(&file);
+        assert_eq!(found.len(), 1);
+        assert!(matches!(&found[0], Source::Packed(_)));
+        assert_eq!(found[0].bytes(), None);
+        assert!(found[0].label().contains("CS_y"));
+    }
+}

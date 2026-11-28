@@ -133,7 +133,7 @@ lines 15, log span 12.0s, last frame 384
   no audio lines
 
 -- how it ended
-  no unhandled exception or watchdog line (killed by --seconds or clean exit)
+  no unhandled exception, fatal-signal or watchdog line (killed by --seconds or clean exit)
   last frame reached: 384
 
 OUT
@@ -175,6 +175,11 @@ grep -q "$esc" "$dir/out" && fail "colour codes in --compare output"
 row '^ended +time limit +SIGSEGV +changed$'
 row '^fps median +32\.0 +- +changed$'
 has 'refusals by cause'
+# A fatal-signal line (#474) names the fault in the ended row, where the exit status alone could
+# only say SIGSEGV.
+printf '# commit dddd444\n# exit code 139\nvictory: fatal signal 11 (code 1) at address 0x7ff8deadbeef\n' > "$dir/fatal.log"
+/bin/bash "$script" --compare "$dir/after.log" "$dir/fatal.log" > "$dir/out"
+row '^ended +time limit +fatal signal 11 \(code 1\) at 0x7ff8deadbeef +changed$'
 /bin/bash "$script" --compare "$dir/before.log" > "$dir/out" 2>&1 && fail "one log accepted"
 has 'usage:'
 

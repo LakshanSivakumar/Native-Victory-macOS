@@ -172,7 +172,168 @@ pub struct Queue(
     pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>,
     pub(crate) std::cell::Cell<u64>,
 );
-pub struct Fence(pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>);
+pub struct Fence(
+    /// Initial shared event (kept for Epoch 0 and direct `Owed` test helpers).
+    #[allow(dead_code)]
+    pub(crate) Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    std::sync::Mutex<FenceState>,
+);
+
+struct FenceEpoch {
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    /// `0` for CPU-initialised epochs (`raw == value`); `1` for GPU-rewound epochs (`raw == 0`
+    /// until the command buffer signals `first_target + 1`).
+    offset: u64,
+    first_target: u64,
+    last_target: u64,
+    waiters: Vec<u64>,
+}
+
+impl FenceEpoch {
+    fn landed_value(&self) -> Option<u64> {
+        let raw = self.event.signaledValue();
+        if raw < self.offset {
+            return None;
+        }
+        if raw >= (1 << 62) {
+            return Some(self.last_target);
+        }
+        Some(raw - self.offset)
+    }
+}
+
+struct FenceState {
+    epochs: std::collections::VecDeque<FenceEpoch>,
+    /// `(event, raw, want)` from superseded epochs whose waiters still wait on `event`.
+    carry_waiters: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64, u64)>,
+}
+
+impl FenceState {
+    fn gc_and_completed(&mut self) -> u64 {
+        let mut landed_idx = 0;
+        let mut current = 0;
+        for (i, ep) in self.epochs.iter().enumerate() {
+            if let Some(v) = ep.landed_value() {
+                landed_idx = i;
+                current = v;
+            }
+        }
+        if landed_idx > 0 {
+            self.epochs.drain(..landed_idx);
+        }
+        self.carry_waiters
+            .retain(|(ev, raw, _)| ev.signaledValue() < *raw);
+        current
+    }
+
+    fn retire_active_waiters(&mut self) {
+        if let Some(ep) = self.epochs.back_mut() {
+            let offset = ep.offset;
+            for want in ep.waiters.drain(..) {
+                let raw = want.saturating_add(offset);
+                if ep.event.signaledValue() < raw {
+                    self.carry_waiters.push((ep.event.clone(), raw, want));
+                }
+            }
+        }
+    }
+}
+
+impl Fence {
+    pub(crate) fn new(
+        event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+        initial: u64,
+    ) -> Fence {
+        event.setSignaledValue(initial);
+        let mut epochs = std::collections::VecDeque::with_capacity(2);
+        epochs.push_back(FenceEpoch {
+            event: event.clone(),
+            offset: 0,
+            first_target: initial,
+            last_target: initial,
+            waiters: Vec::new(),
+        });
+        Fence(
+            event,
+            std::sync::Mutex::new(FenceState {
+                epochs,
+                carry_waiters: Vec::new(),
+            }),
+        )
+    }
+
+    /// Returns the `(MTLSharedEvent, raw)` pairs a GPU signal of D3D12 `value` must signal,
+    /// starting a fresh `MTLSharedEvent` epoch whenever `value` rewinds or repeats.
+    pub(crate) fn encode_signal(
+        &self,
+        dev: &ProtocolObject<dyn MTLDevice>,
+        value: u64,
+    ) -> Result<Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)>, &'static str> {
+        let mut s = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        s.gc_and_completed();
+        let needs_new_epoch = s
+            .epochs
+            .back()
+            .is_none_or(|ep| value <= ep.last_target);
+        let mut out = Vec::with_capacity(2);
+        if needs_new_epoch {
+            s.retire_active_waiters();
+            let ev = crate::gfx::track_event(
+                dev.newSharedEvent().ok_or("newSharedEvent failed")?,
+            );
+            let raw = value.saturating_add(1);
+            out.push((ev.clone(), raw));
+            s.epochs.push_back(FenceEpoch {
+                event: ev,
+                offset: 1,
+                first_target: value,
+                last_target: value,
+                waiters: Vec::new(),
+            });
+        } else {
+            let ep = s.epochs.back_mut().unwrap();
+            ep.last_target = value;
+            ep.waiters.retain(|&w| w > value);
+            out.push((ep.event.clone(), value.saturating_add(ep.offset)));
+        }
+        s.carry_waiters.retain(|(ev, raw, want)| {
+            if value >= *want {
+                if ev.signaledValue() < *raw {
+                    out.push((ev.clone(), *raw));
+                }
+                false
+            } else {
+                ev.signaledValue() < *raw
+            }
+        });
+        Ok(out)
+    }
+
+    /// Returns the `(MTLSharedEvent, raw)` a GPU or CPU wait for `want` must wait on, or `None`
+    /// when `want` is already satisfied with no pending rewind or repeat at or below `want`.
+    pub(crate) fn encode_wait(
+        &self,
+        want: u64,
+    ) -> Option<(Retained<ProtocolObject<dyn MTLSharedEvent>>, u64)> {
+        if want == 0 {
+            return None;
+        }
+        let mut s = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        let current = s.gc_and_completed();
+        if current >= want && s.epochs.iter().skip(1).all(|ep| ep.first_target > want) {
+            return None;
+        }
+        let ep = s.epochs.back_mut()?;
+        let raw = want.saturating_add(ep.offset);
+        if ep.event.signaledValue() >= raw {
+            return None;
+        }
+        if !ep.waiters.contains(&want) {
+            ep.waiters.push(want);
+        }
+        Some((ep.event.clone(), raw))
+    }
+}
 pub struct Pipeline(
     pub(crate) Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// The shader's static samplers, which its argument buffer points at.
@@ -492,8 +653,7 @@ impl ComputeBackend for Metal {
 
     fn create_fence(&self, initial: u64) -> Result<Fence, String> {
         let e = crate::gfx::track_event(self.dev.newSharedEvent().ok_or("newSharedEvent failed")?);
-        e.setSignaledValue(initial);
-        Ok(Fence(e))
+        Ok(Fence::new(e, initial))
     }
 
     fn allocated_bytes(&self) -> u64 {
@@ -622,15 +782,63 @@ impl ComputeBackend for Metal {
     }
 
     fn signal(&self, fence: &Fence, value: u64) {
-        fence.0.setSignaledValue(value);
+        let mut s = fence.1.lock().unwrap_or_else(|e| e.into_inner());
+        s.gc_and_completed();
+        let can_advance_in_place = s.epochs.len() == 1
+            && s.epochs.back().is_some_and(|ep| {
+                let raw = value.saturating_add(ep.offset);
+                ep.event.signaledValue() <= raw
+            });
+        if can_advance_in_place {
+            let ep = s.epochs.back_mut().unwrap();
+            let raw = value.saturating_add(ep.offset);
+            if ep.event.signaledValue() < raw {
+                ep.event.setSignaledValue(raw);
+            }
+            ep.last_target = ep.last_target.max(value);
+            ep.waiters.retain(|&w| w > value);
+        } else {
+            while !s.epochs.is_empty() {
+                s.retire_active_waiters();
+                s.epochs.pop_back();
+            }
+            if let Some(ev) = self.dev.newSharedEvent() {
+                let ev = crate::gfx::track_event(ev);
+                ev.setSignaledValue(value);
+                s.epochs.push_back(FenceEpoch {
+                    event: ev,
+                    offset: 0,
+                    first_target: value,
+                    last_target: value,
+                    waiters: Vec::new(),
+                });
+            }
+        }
+        s.carry_waiters.retain(|(ev, raw, want)| {
+            if value >= *want {
+                if ev.signaledValue() < *raw {
+                    ev.setSignaledValue(*raw);
+                }
+                false
+            } else {
+                ev.signaledValue() < *raw
+            }
+        });
     }
 
     fn completed(&self, fence: &Fence) -> u64 {
-        fence.0.signaledValue()
+        fence
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .gc_and_completed()
     }
 
     fn wait(&self, fence: &Fence, value: u64, timeout_ms: u64) -> bool {
-        fence.0.waitUntilSignaledValue_timeoutMS(value, timeout_ms)
+        let Some((event, raw)) = fence.encode_wait(value) else {
+            return true;
+        };
+        event.waitUntilSignaledValue_timeoutMS(raw, timeout_ms)
     }
 }
 
@@ -703,6 +911,7 @@ mod tests {
                 .address(mem.gpu(m, dst)),
             resources: vec![&mem.buf],
             heaps: Default::default(),
+            heap_access: Default::default(),
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
             indirect: None,
@@ -884,5 +1093,92 @@ mod tests {
         let other = include_bytes!("../tests/fixtures/heap_rw.dxil");
         assert!(m.create_compute_pipeline_within(other, None, std::time::Duration::MAX).unwrap().is_some());
         assert!(m.compiling.borrow().is_empty());
+    }
+
+    /// A fence rewound to 0 on the CPU or GPU and signalled to 1 again keeps waiting for each new
+    /// command buffer even though `MTLSharedEvent.signaledValue` only increases.
+    #[test]
+    fn rewound_and_repeated_fence_signals_order_work_across_cycles() {
+        let Some(m) = backend() else { return };
+        let _flight = crate::gfx::FLIGHTS_IN_TESTS.read().unwrap_or_else(|e| e.into_inner());
+        let (qa, qb) = (m.create_queue().unwrap(), m.create_queue().unwrap());
+        let (gate, fence, done) = (
+            m.create_fence(0).unwrap(),
+            m.create_fence(5).unwrap(),
+            m.create_fence(0).unwrap(),
+        );
+        assert_eq!(m.completed(&fence), 5);
+        let p = m.create_compute_pipeline(AFFINE).unwrap();
+        let mem = Mem::new(&m);
+
+        for round in 1..=2u32 {
+            mem.set(0, |i| i as u32 + round);
+            mem.set(1, |_| 0);
+            mem.set(2, |_| 0);
+            m.signal(&gate, 0);
+            m.signal(&fence, 0);
+            m.signal(&done, 0);
+            assert_eq!(m.completed(&fence), 0, "round {round}: CPU rewind");
+
+            let a_work = [step(&m, &p, &mem, (0, 1), (2, round))];
+            let b_work = [step(&m, &p, &mem, (1, 2), (3, 0))];
+            m.submit(
+                &qa,
+                &Submission {
+                    waits: &[(&gate, 1)],
+                    dispatches: &a_work,
+                    signals: &[(&fence, 1)],
+                },
+            )
+            .unwrap();
+            m.submit(
+                &qb,
+                &Submission {
+                    waits: &[(&fence, 1)],
+                    dispatches: &b_work,
+                    signals: &[(&done, 1)],
+                },
+            )
+            .unwrap();
+            assert!(!m.wait(&fence, 1, 30), "round {round}: fence fired while gated");
+            assert!(!m.wait(&done, 1, 30), "round {round}: consumer ran before producer");
+            assert_eq!(m.completed(&fence), 0);
+
+            m.signal(&gate, 1);
+            assert!(m.wait(&done, 1, 5000), "round {round}: timed out");
+            assert_eq!(m.completed(&fence), 1);
+            assert!((0..N).all(|i| mem.get(2, i) == ((i as u32 + round) * 2 + round) * 3));
+        }
+
+        // Pipelined GPU rewind: Queue A rewinds `fence` to 0, then gated work signals 1 again.
+        m.signal(&gate, 0);
+        m.signal(&done, 0);
+        mem.set(2, |_| 0);
+        m.submit(&qa, &Submission { waits: &[], dispatches: &[], signals: &[(&fence, 0)] }).unwrap();
+        let a_work = [step(&m, &p, &mem, (0, 1), (4, 1))];
+        let b_work = [step(&m, &p, &mem, (1, 2), (2, 0))];
+        m.submit(&qa, &Submission { waits: &[(&gate, 1)], dispatches: &a_work, signals: &[(&fence, 1)] }).unwrap();
+        m.submit(&qb, &Submission { waits: &[(&fence, 1)], dispatches: &b_work, signals: &[(&done, 1)] }).unwrap();
+        assert!(!m.wait(&done, 1, 30), "consumer skipped pipelined GPU rewind");
+        m.signal(&gate, 1);
+        assert!(m.wait(&done, 1, 5000));
+        assert!((0..N).all(|i| mem.get(2, i) == ((i as u32 + 2) * 4 + 1) * 2));
+
+        // Consumer encodes Wait(1) before Producer queues Signal(0) then gated Signal(1):
+        // Signal(0) must not wake Wait(1) prematurely, and Signal(1) must wake it across epochs.
+        m.signal(&gate, 0);
+        m.signal(&fence, 0);
+        m.signal(&done, 0);
+        mem.set(1, |_| 0);
+        mem.set(2, |_| 0);
+        let a_work = [step(&m, &p, &mem, (0, 1), (5, 3))];
+        let b_work = [step(&m, &p, &mem, (1, 2), (2, 0))];
+        m.submit(&qb, &Submission { waits: &[(&fence, 1)], dispatches: &b_work, signals: &[(&done, 1)] }).unwrap();
+        m.submit(&qa, &Submission { waits: &[], dispatches: &[], signals: &[(&fence, 0)] }).unwrap();
+        m.submit(&qa, &Submission { waits: &[(&gate, 1)], dispatches: &a_work, signals: &[(&fence, 1)] }).unwrap();
+        assert!(!m.wait(&done, 1, 30), "Signal(0) woke pre-queued Wait(1) prematurely");
+        m.signal(&gate, 1);
+        assert!(m.wait(&done, 1, 5000), "carried waiter did not wake on Signal(1)");
+        assert!((0..N).all(|i| mem.get(2, i) == ((i as u32 + 2) * 5 + 3) * 2));
     }
 }

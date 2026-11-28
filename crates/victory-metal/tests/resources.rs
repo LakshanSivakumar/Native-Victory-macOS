@@ -37,6 +37,7 @@ fn srv_and_uav_through_a_descriptor_table() {
                 resource: Some(&heap),
                 sampler: None,
             },
+            heap_access: Default::default(),
             groups: [N / 64, 1, 1],
             threads_per_group: [64, 1, 1],
             indirect: None,
@@ -73,6 +74,17 @@ impl Grid<'_> {
     /// [`Self::run`], with the texture's entry cleared (`clear_entry`) before the dispatch when
     /// `cleared`.
     fn sample(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool) -> Vec<[f32; 4]> {
+        self.sample_with(tex, cleared, 0.0, 0.0)
+    }
+
+    /// [`Self::sample`] through an entry written with minimum LOD clamp `min_lod`.
+    fn sample_clamped(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool, min_lod: f32) -> Vec<[f32; 4]> {
+        self.sample_with(tex, cleared, min_lod, 0.0)
+    }
+
+    /// [`Self::sample`] with the texture's entry clamped at `min_lod` and the sampler's entry
+    /// biased by `lod_bias`.
+    fn sample_with(&self, tex: &<Metal as ResourceBackend>::Texture, cleared: bool, min_lod: f32, lod_bias: f32) -> Vec<[f32; 4]> {
         let m = self.m;
         let p = m.create_compute_pipeline(self.dxil).unwrap();
         let cells = self.g[0] as usize * self.g[1] as usize * self.z;
@@ -85,7 +97,7 @@ impl Grid<'_> {
         a.write(0, &vec![0xdead_beefu32; cells * 4]);
         let res = m.create_heap(HeapKind::Resource, 4).unwrap();
         let smp = m.create_heap(HeapKind::Sampler, 2).unwrap();
-        m.write_texture(&res, 0, tex, 0.0);
+        m.write_texture(&res, 0, tex, min_lod);
         if cleared {
             m.clear_entry(&res, 0);
         }
@@ -100,7 +112,7 @@ impl Grid<'_> {
                 max_anisotropy: 1,
             })
             .unwrap();
-        m.write_sampler(&smp, 0, &s, 0.0);
+        m.write_sampler(&smp, 0, &s, lod_bias);
         let w = [Dispatch {
             pipeline: &p,
             root: RootArgs::default()
@@ -112,6 +124,7 @@ impl Grid<'_> {
                 resource: Some(&res),
                 sampler: Some(&smp),
             },
+            heap_access: Default::default(),
             groups: [
                 self.g[0].div_ceil(4) as usize,
                 self.g[1].div_ceil(4) as usize,
@@ -262,6 +275,37 @@ fn sample_bc1_and_create_every_bc_format() {
     }
 }
 
+/// The alpha (and the one- and two-channel values) of block formats with it, one 4x4 block each:
+/// BC1 in its three-colour mode (colour0 <= colour1) with every index 3 is transparent black;
+/// BC3's alpha block with every index 0 is alpha0; BC4 and BC5 read their endpoint 0 (index 0),
+/// with alpha 1 and absent channels 0.
+#[test]
+fn bc_formats_decode_their_alpha() {
+    let Some(m) = backend() else { return };
+    let cases: [(Format, Vec<u8>, [f32; 4]); 4] = [
+        (Format::Bc1, vec![0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], [0.0; 4]),
+        (
+            Format::Bc3,
+            [&[0x40u8, 0, 0, 0, 0, 0, 0, 0][..], &[0xff, 0xff, 0, 0, 0, 0, 0, 0]].concat(),
+            [1.0, 1.0, 1.0, 64.0 / 255.0],
+        ),
+        (Format::Bc4, vec![0x80, 0, 0, 0, 0, 0, 0, 0], [128.0 / 255.0, 0.0, 0.0, 1.0]),
+        (
+            Format::Bc5,
+            [&[0x40u8, 0, 0, 0, 0, 0, 0, 0][..], &[0xc0, 0, 0, 0, 0, 0, 0, 0]].concat(),
+            [64.0 / 255.0, 192.0 / 255.0, 0.0, 1.0],
+        ),
+    ];
+    for (f, block, want) in cases {
+        let t = m.create_texture(&d2(f, 4, 4)).unwrap();
+        m.upload_texture(&t, 0, 0, &block, f.row_bytes(4), 0);
+        let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [4, 4], z: 1, filter: Filter::Nearest };
+        for (i, c) in g.run(&t).iter().enumerate() {
+            assert!((0..4).all(|k| near(c[k], want[k])), "{f:?} texel {i}: {c:?} != {want:?}");
+        }
+    }
+}
+
 /// One BC6H block, mode 11 (mode bits `00011`: one region, 10-bit endpoints, not transformed),
 /// endpoint 0 = (0x100, 0x300, 0), every index 0, so every texel is endpoint 0. Decoded as
 /// Microsoft's "BC6H Format" page and the reference decoder (DirectXTex `BC6HBC7.cpp`,
@@ -387,6 +431,49 @@ fn sampling_a_cleared_entry_reads_transparent_black() {
     };
     assert!(g.run(&t).iter().all(|c| near(c[0], 200.0 / 255.0)), "shown");
     assert_eq!(g.sample(&t, true), vec![[0.0; 4]; 4], "cleared");
+}
+
+/// An entry's minimum LOD clamp (`IRDescriptorTableSetTexture`'s `minLODClamp`, what the host
+/// writes for a view's `ResourceMinLODClamp`) keeps a sample at LOD 0 off the finer mips. The
+/// converter applies it only with `IRCompatibilityFlagTextureMinLODClamp`: without that flag the
+/// gradient sample here read mip 0 at every clamp. Measured, not asserted: a `SampleLevel` (an
+/// explicit LOD) reads mip 0 whatever the clamp, with or without the flag (M-series, macOS 26;
+/// Metal's `level()` sample takes no clamp).
+#[test]
+fn an_entrys_min_lod_clamp_keeps_samples_off_finer_mips() {
+    let Some(m) = backend() else { return };
+    let mut d = d2(Format::Rgba8Unorm, 4, 4);
+    d.mips = 3;
+    let t = m.create_texture(&d).unwrap();
+    for (mip, (w, v)) in [(4usize, 0u8), (2, 200), (1, 50)].into_iter().enumerate() {
+        m.upload_texture(&t, mip, 0, &vec![v; w * w * 4], w * 4, 0);
+    }
+    let g = Grid { m: &m, dxil: &fixture("sample2d_grad"), g: [2, 2], z: 1, filter: Filter::Nearest };
+    let at = |min_lod| g.sample_clamped(&t, false, min_lod);
+    assert!(at(0.0).iter().all(|c| near(c[0], 0.0)), "no clamp: mip 0");
+    assert!(at(1.0).iter().all(|c| near(c[0], 200.0 / 255.0)), "clamp 1: mip 1");
+    assert!(at(2.0).iter().all(|c| near(c[0], 50.0 / 255.0)), "clamp 2: mip 2");
+}
+
+/// A sampler entry's LOD bias (`IRDescriptorTableSetSampler`'s `lodBias`, what the host writes
+/// for a sampler's `MipLODBias`) moves a sample to a coarser mip. The converter applies it only
+/// with `IRCompatibilityFlagSamplerLODBias`: without that flag the `SampleLevel` here read mip 0
+/// at every bias. Measured, not asserted: a `SampleGrad` reads mip 0 whatever the bias, with or
+/// without the flag (Metal's gradient sample takes no bias).
+#[test]
+fn a_sampler_entrys_lod_bias_moves_samples_to_coarser_mips() {
+    let Some(m) = backend() else { return };
+    let mut d = d2(Format::Rgba8Unorm, 4, 4);
+    d.mips = 3;
+    let t = m.create_texture(&d).unwrap();
+    for (mip, (w, v)) in [(4usize, 0u8), (2, 200), (1, 50)].into_iter().enumerate() {
+        m.upload_texture(&t, mip, 0, &vec![v; w * w * 4], w * 4, 0);
+    }
+    let g = Grid { m: &m, dxil: &fixture("sample2d"), g: [2, 2], z: 1, filter: Filter::Nearest };
+    let at = |bias| g.sample_with(&t, false, 0.0, bias);
+    assert!(at(0.0).iter().all(|c| near(c[0], 0.0)), "no bias: mip 0");
+    assert!(at(1.0).iter().all(|c| near(c[0], 200.0 / 255.0)), "bias 1: mip 1");
+    assert!(at(2.0).iter().all(|c| near(c[0], 50.0 / 255.0)), "bias 2: mip 2");
 }
 
 #[test]
@@ -589,6 +676,7 @@ fn indirect_dispatch_reads_its_group_counts_from_title_memory() {
                 resource: Some(&heap),
                 sampler: None,
             },
+            heap_access: Default::default(),
             groups: [0, 0, 0],
             threads_per_group: [64, 1, 1],
             indirect: Some((&a.buf, a.at(record) as *const u8)),
@@ -616,6 +704,7 @@ fn indirect(m: &Metal, record: [u32; 3]) -> Vec<u32> {
         root: RootArgs::default().constants(&[5, 7]).address(m.heap_address(&heap, 5)),
         resources: vec![],
         heaps: victory_metal::backend::Heaps { resource: Some(&heap), sampler: None },
+        heap_access: Default::default(),
         groups: [0, 0, 0],
         threads_per_group: [64, 1, 1],
         indirect: Some((&a.buf, a.at(at) as *const u8)),
@@ -667,6 +756,7 @@ fn a_count_buffer_limits_the_indirect_dispatches_that_run() {
                         resource: Some(&heap),
                         sampler: None,
                     },
+                    heap_access: Default::default(),
                     groups: [0, 0, 0],
                     threads_per_group: [64, 1, 1],
                     indirect: Some((&a.buf, a.at(records + 12 * i as usize) as *const u8)),
@@ -703,6 +793,7 @@ fn zero_sized_dispatch_and_blit_do_not_fail_validation() {
                 resource: Some(&heap),
                 sampler: None,
             },
+            heap_access: Default::default(),
             groups: [0, 1, 1],
             threads_per_group: [64, 1, 1],
             indirect: None,
@@ -822,6 +913,7 @@ fn fill(m: &Metal, dxil: &[u8], tex: &<Metal as ResourceBackend>::Texture, k: &[
             root: root.address(m.heap_address(&res, 0)),
             resources: vec![],
             heaps: victory_metal::backend::Heaps { resource: Some(&res), sampler: None },
+            heap_access: Default::default(),
             groups: [w.div_ceil(g[0]), h.div_ceil(g[1]), 1],
             threads_per_group: g,
             indirect: None,

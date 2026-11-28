@@ -1999,3 +1999,42 @@ fn a_whole_wave_half_sum_reads_across_the_host_waves() {
     let want: Vec<u32> = (0..128).map(|i| if i < 40 { 0x0000_5380 } else { CANARY }).collect();
     assert_eq!(got, want, "60.0, and lane 63 (off) holds the identity");
 }
+
+/// `v_cvt_pk_u16_u32` and `v_cvt_pk_i16_i32` saturate each source to 16 bits, src0 in the low
+/// half and src1 in the high one. Lane `i` packs `i << 12` (from lane 16 past 0xffff) and
+/// `0x10002 - i` (past 0xffff in lanes 0 to 2) unsigned; and `(i << 12) - 0x10000` (below -32768
+/// in lanes 0 to 7, above 32767 from lane 24) and `0x10002 - i` signed. They were refused by name.
+#[test]
+fn integer_pairs_pack_to_16_bits_with_saturation() {
+    let program = |signed: bool| {
+        let mut w = vec![
+            0x3406_008C, // v_lshlrev_b32 v3, 12, v0
+            0x4C08_00FF,
+            0x0001_0002, // v_sub_nc_u32 v4, 0x10002, v0
+        ];
+        if signed {
+            w.extend([0x4A06_06FF, 0xFFFF_0000]); // v_add_nc_u32 v3, 0xffff0000, v3
+        }
+        w.extend([
+            if signed { 0xD76B_0002 } else { 0xD76A_0002 },
+            0x0002_0903, // v_cvt_pk_{u16_u32,i16_i32} v2, v3, v4
+            V_LSHLREV_V1_2_V0,
+            GLOBAL_STORE_V2_AT_V1[0],
+            GLOBAL_STORE_V2_AT_V1[1],
+            S_ENDPGM,
+        ]);
+        w
+    };
+    let got = run32(&program(false), 0);
+    if got.is_empty() {
+        return;
+    }
+    let u = |x: u32| x.min(0xFFFF);
+    let want: Vec<u32> = (0..32u32).map(|i| u(i << 12) | u(0x10002 - i) << 16).collect();
+    assert_eq!(got, want, "unsigned");
+    let got = run32(&program(true), 0);
+    let s = |x: i32| x.clamp(-32768, 32767) as u32 & 0xFFFF;
+    let want: Vec<u32> =
+        (0..32i32).map(|i| s((i << 12) - 0x10000) | s(0x10002 - i) << 16).collect();
+    assert_eq!(got, want, "signed");
+}

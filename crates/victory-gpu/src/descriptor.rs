@@ -616,6 +616,19 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
         .collect()
 }
 
+/// For each record (tag, index, generation): the view it names if that is current, as [`view`]
+/// would find it at the record's slot (one lock for them all).
+pub(crate) fn views_of(records: &[[u32; 3]]) -> Vec<Option<View>> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    records
+        .iter()
+        .map(|&[tag, i, generation]| {
+            let (view, current) = views.list.get(i as usize)?;
+            (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+        })
+        .collect()
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
