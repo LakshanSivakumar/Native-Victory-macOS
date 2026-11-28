@@ -946,15 +946,6 @@ pub extern "system" fn GetExitCodeThread(handle: *mut c_void, code: *mut u32) ->
 /// The function table `HostPolicy` consults on macOS.
 pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
     let dll = dll.to_ascii_lowercase();
-    if let Some(address) = system::lookup(&dll, name)
-        .or_else(|| ucrt::lookup(&dll, name))
-        .or_else(|| winsock::lookup(&dll, name))
-        .or_else(|| winhttp::lookup(&dll, name))
-        .or_else(|| mf::lookup(&dll, name))
-        .or_else(|| xaudio2::lookup(&dll, name))
-    {
-        return Some(address);
-    }
     // The API sets and kernelbase forward to kernel32's functions; the
     // exception functions are ntdll's (and `__C_specific_handler` the C
     // runtime's).
@@ -965,6 +956,35 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         || (dll.starts_with("vcruntime140")
             && victory_loader::native::dll::find(&dll).is_none())
         || dll.starts_with("api-ms-win-core-");
+    // TEB-only and constant functions run with the title's GS base and no bridge swap, so a
+    // call costs the call itself instead of the ~370 ns GS swap each way
+    // (docs/native-host.md). Intercepted before the module tables so they win everywhere.
+    if kernel {
+        let direct = |address: usize| {
+            native::declare_direct(address);
+            Some(address)
+        };
+        match name {
+            "GetLastError" => return direct(teb::direct_get_last_error_address()),
+            "SetLastError" => return direct(teb::direct_set_last_error_address()),
+            "TlsGetValue" => return direct(teb::direct_tls_get_value_address()),
+            "TlsSetValue" => return direct(teb::direct_tls_set_value_address()),
+            "GetCurrentThreadId" => return direct(teb::direct_get_current_thread_id_address()),
+            "GetCurrentProcessId" => return direct(teb::direct_get_current_process_id_address()),
+            "GetCurrentProcess" => return direct(teb::direct_get_current_process_address()),
+            "GetCurrentThread" => return direct(teb::direct_get_current_thread_address()),
+            _ => {}
+        }
+    }
+    if let Some(address) = system::lookup(&dll, name)
+        .or_else(|| ucrt::lookup(&dll, name))
+        .or_else(|| winsock::lookup(&dll, name))
+        .or_else(|| winhttp::lookup(&dll, name))
+        .or_else(|| mf::lookup(&dll, name))
+        .or_else(|| xaudio2::lookup(&dll, name))
+    {
+        return Some(address);
+    }
     if !kernel {
         return None;
     }
@@ -983,10 +1003,6 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         return Some(address);
     }
     table!(
-        GetLastError,
-        SetLastError,
-        GetCurrentThreadId,
-        GetCurrentProcessId,
         QueryPerformanceFrequency,
         QueryPerformanceCounter,
         GetTickCount,
@@ -997,8 +1013,6 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         VirtualProtect,
         TlsAlloc,
         TlsFree,
-        TlsGetValue,
-        TlsSetValue,
         CreateEventW,
         SetEvent,
         ResetEvent,
@@ -1521,5 +1535,36 @@ mod memory_tests {
         assert_eq!(CloseHandle(auto_ev), 1);
         assert_eq!(CloseHandle(other_ev), 1);
         assert_eq!(CloseHandle(never_ev), 1);
+    }
+
+    #[test]
+    fn teb_only_functions_are_bound_direct_so_the_title_needs_no_bridge_stub() {
+        for dll in [
+            "kernel32.dll",
+            "kernelbase.dll",
+            "ntdll.dll",
+            "api-ms-win-core-errorhandling-l1-1-0.dll",
+        ] {
+            let get = lookup(dll, "GetLastError").expect("GetLastError resolves");
+            let set = lookup(dll, "SetLastError").expect("SetLastError resolves");
+            assert_eq!(get, teb::direct_get_last_error_address(), "{dll}");
+            assert_eq!(set, teb::direct_set_last_error_address(), "{dll}");
+            let tls_get = lookup(dll, "TlsGetValue").expect("TlsGetValue resolves");
+            let tls_set = lookup(dll, "TlsSetValue").expect("TlsSetValue resolves");
+            assert_eq!(tls_get, teb::direct_tls_get_value_address(), "{dll}");
+            assert_eq!(tls_set, teb::direct_tls_set_value_address(), "{dll}");
+            let tid = lookup(dll, "GetCurrentThreadId").expect("GetCurrentThreadId resolves");
+            let pid = lookup(dll, "GetCurrentProcessId").expect("GetCurrentProcessId resolves");
+            assert_eq!(tid, teb::direct_get_current_thread_id_address(), "{dll}");
+            assert_eq!(pid, teb::direct_get_current_process_id_address(), "{dll}");
+            let hproc = lookup(dll, "GetCurrentProcess").expect("GetCurrentProcess resolves");
+            let hthread = lookup(dll, "GetCurrentThread").expect("GetCurrentThread resolves");
+            assert_eq!(hproc, teb::direct_get_current_process_address(), "{dll}");
+            assert_eq!(hthread, teb::direct_get_current_thread_address(), "{dll}");
+            // A direct function gets no stub: the binder hands the title the address itself.
+            for address in [get, set, tls_get, tls_set, tid, pid, hproc, hthread] {
+                assert_eq!(native::bridge::stub_for(address).unwrap(), address, "{dll}");
+            }
+        }
     }
 }

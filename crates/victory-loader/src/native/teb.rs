@@ -41,6 +41,133 @@ pub const OFF_IN_HOST_CTX: usize = 0x1F20;
 pub const OFF_IN_HOST_RBP: usize = 0x1F28;
 /// Modules with static TLS one thread can hold (the array's length).
 pub const MAX_TLS_MODULES: usize = 64;
+
+core::arch::global_asm!(
+    // GetLastError() and SetLastError(code), Windows ABI, for title code: both touch only the
+    // TEB at the caller's GS base, so they run with no bridge swap and cost the call itself
+    // instead of the ~370 ns GS swap each way. Bound with `bridge::declare_direct`.
+    ".p2align 4",
+    ".globl _victory_GetLastError",
+    "_victory_GetLastError:",
+    "mov eax, gs:[{last_error}]",
+    "ret",
+    ".p2align 4",
+    ".globl _victory_SetLastError",
+    "_victory_SetLastError:",
+    "mov gs:[{last_error}], ecx",
+    "ret",
+    // TlsGetValue(index) / TlsSetValue(index, value), same story: the 64 slots at
+    // gs:[OFF_TLS_SLOTS] plus LastError. An out-of-range index sets ERROR_INVALID_PARAMETER
+    // (87) and fails, as the bridged implementation does.
+    ".p2align 4",
+    ".globl _victory_TlsGetValue",
+    "_victory_TlsGetValue:",
+    "cmp ecx, {slots}",
+    "jae 1f",
+    "mov dword ptr gs:[{last_error}], 0",
+    "mov rax, gs:[rcx*8 + {tls_slots}]",
+    "ret",
+    "1:",
+    "mov dword ptr gs:[{last_error}], 87",
+    "xor eax, eax",
+    "ret",
+    ".p2align 4",
+    ".globl _victory_TlsSetValue",
+    "_victory_TlsSetValue:",
+    "cmp ecx, {slots}",
+    "jae 1f",
+    "mov gs:[rcx*8 + {tls_slots}], rdx",
+    "mov dword ptr gs:[{last_error}], 0",
+    "mov eax, 1",
+    "ret",
+    "1:",
+    "mov dword ptr gs:[{last_error}], 87",
+    "xor eax, eax",
+    "ret",
+    // GetCurrentThreadId() / GetCurrentProcessId(): the ids the TEB was made with
+    // (gs:[OFF_THREAD_ID] / gs:[OFF_PROCESS_ID]), so no swap needed either.
+    ".p2align 4",
+    ".globl _victory_GetCurrentThreadId",
+    "_victory_GetCurrentThreadId:",
+    "mov eax, gs:[{thread_id}]",
+    "ret",
+    ".p2align 4",
+    ".globl _victory_GetCurrentProcessId",
+    "_victory_GetCurrentProcessId:",
+    "mov eax, gs:[{process_id}]",
+    "ret",
+    // GetCurrentProcess() / GetCurrentThread(): the constant pseudo-handles -1 and -2.
+    ".p2align 4",
+    ".globl _victory_GetCurrentProcess",
+    "_victory_GetCurrentProcess:",
+    "mov rax, -1",
+    "ret",
+    ".p2align 4",
+    ".globl _victory_GetCurrentThread",
+    "_victory_GetCurrentThread:",
+    "mov rax, -2",
+    "ret",
+    last_error = const OFF_LAST_ERROR,
+    tls_slots = const OFF_TLS_SLOTS,
+    slots = const TLS_SLOT_COUNT,
+    thread_id = const OFF_THREAD_ID,
+    process_id = const OFF_PROCESS_ID,
+);
+
+unsafe extern "win64" {
+    fn victory_GetLastError() -> u32;
+    fn victory_SetLastError(code: u32);
+    fn victory_TlsGetValue(index: u32) -> usize;
+    fn victory_TlsSetValue(index: u32, value: usize) -> u32;
+    fn victory_GetCurrentThreadId() -> u32;
+    fn victory_GetCurrentProcessId() -> u32;
+    fn victory_GetCurrentProcess() -> isize;
+    fn victory_GetCurrentThread() -> isize;
+}
+
+/// The address title code calls for `GetLastError` with no bridge: reads `gs:[OFF_LAST_ERROR]`
+/// of the TEB its GS base points at.
+pub fn direct_get_last_error_address() -> usize {
+    victory_GetLastError as *const () as usize
+}
+
+/// The address title code calls for `SetLastError` with no bridge: writes `ecx` to
+/// `gs:[OFF_LAST_ERROR]` of that TEB.
+pub fn direct_set_last_error_address() -> usize {
+    victory_SetLastError as *const () as usize
+}
+
+/// The address title code calls for `TlsGetValue` with no bridge: the slot at
+/// `gs:[OFF_TLS_SLOTS + 8*index]`, or null with `LastError` 87 when `index >= TLS_SLOT_COUNT`.
+pub fn direct_tls_get_value_address() -> usize {
+    victory_TlsGetValue as *const () as usize
+}
+
+/// The address title code calls for `TlsSetValue` with no bridge: writes `rdx` to the slot
+/// above, or fails with `LastError` 87 when `index >= TLS_SLOT_COUNT`.
+pub fn direct_tls_set_value_address() -> usize {
+    victory_TlsSetValue as *const () as usize
+}
+
+/// The address title code calls for `GetCurrentThreadId` with no bridge: `gs:[OFF_THREAD_ID]`.
+pub fn direct_get_current_thread_id_address() -> usize {
+    victory_GetCurrentThreadId as *const () as usize
+}
+
+/// The address title code calls for `GetCurrentProcessId` with no bridge: `gs:[OFF_PROCESS_ID]`.
+pub fn direct_get_current_process_id_address() -> usize {
+    victory_GetCurrentProcessId as *const () as usize
+}
+
+/// The address title code calls for `GetCurrentProcess` with no bridge: always the pseudo-handle -1.
+pub fn direct_get_current_process_address() -> usize {
+    victory_GetCurrentProcess as *const () as usize
+}
+
+/// The address title code calls for `GetCurrentThread` with no bridge: always the pseudo-handle -2.
+pub fn direct_get_current_thread_address() -> usize {
+    victory_GetCurrentThread as *const () as usize
+}
 const PEB_SIZE: usize = 0x800;
 const OFF_PEB_IMAGE_BASE: usize = 0x10;
 
@@ -316,6 +443,76 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(block, 16) };
         assert_eq!(&bytes[..8], &init);
         assert_eq!(&bytes[8..16], &[0u8; 8]);
+    }
+
+    #[test]
+    fn direct_last_error_reads_and_writes_the_callers_gs_base() {
+        // SAFETY: swaps GS to `base` with the same machdep call the bridge uses.
+        unsafe fn set_gs(base: usize) {
+            #[allow(unused_unsafe)]
+            unsafe {
+                std::arch::asm!(
+                    "mov rdi, {base}",
+                    "mov eax, 0x3000003",
+                    "syscall",
+                    base = in(reg) base,
+                    out("rax") _,
+                    lateout("rcx") _,
+                    lateout("r11") _,
+                    options(nostack),
+                );
+            }
+        }
+        let mut fake = vec![0u8; TEB_SIZE];
+        fake[OFF_LAST_ERROR..OFF_LAST_ERROR + 4].copy_from_slice(&0xBEEFu32.to_le_bytes());
+        let fake_base = fake.as_mut_ptr() as usize;
+        let host_gs = host_tsd_base();
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: puts this thread's host GS base back.
+                unsafe { set_gs(self.0) };
+            }
+        }
+        let _restore = Restore(host_gs);
+        // A value in TLS slot 3, to read back through gs:.
+        fake[OFF_TLS_SLOTS + 3 * 8..OFF_TLS_SLOTS + 4 * 8].copy_from_slice(&0xABCDusize.to_le_bytes());
+        fake[OFF_THREAD_ID..OFF_THREAD_ID + 4].copy_from_slice(&0x7EADu32.to_le_bytes());
+        fake[OFF_PROCESS_ID..OFF_PROCESS_ID + 4].copy_from_slice(&0xC0DEu32.to_le_bytes());
+        let got;
+        let wrote;
+        let (tls_ok, tls_bad, tls_wrote, tls_err, tid, pid, hproc, hthread);
+        // SAFETY: GS points at `fake`, which outlives the calls, and is restored before any
+        // host code (TLS access) runs again.
+        unsafe {
+            set_gs(fake_base);
+            got = victory_GetLastError();
+            victory_SetLastError(0x1234);
+            wrote = u32::from_le_bytes(fake[OFF_LAST_ERROR..OFF_LAST_ERROR + 4].try_into().unwrap());
+            tls_ok = victory_TlsGetValue(3);
+            tls_wrote = victory_TlsSetValue(4, 0x5678);
+            tls_bad = victory_TlsGetValue(TLS_SLOT_COUNT as u32);
+            tls_err = u32::from_le_bytes(fake[OFF_LAST_ERROR..OFF_LAST_ERROR + 4].try_into().unwrap());
+            tid = victory_GetCurrentThreadId();
+            pid = victory_GetCurrentProcessId();
+            hproc = victory_GetCurrentProcess();
+            hthread = victory_GetCurrentThread();
+            set_gs(host_gs);
+        }
+        assert_eq!(got, 0xBEEF);
+        assert_eq!(wrote, 0x1234);
+        assert_eq!(tls_ok, 0xABCD);
+        assert_eq!(tls_wrote, 1);
+        assert_eq!(
+            usize::from_le_bytes(fake[OFF_TLS_SLOTS + 4 * 8..OFF_TLS_SLOTS + 5 * 8].try_into().unwrap()),
+            0x5678
+        );
+        assert_eq!(tls_bad, 0, "an out-of-range index returns null");
+        assert_eq!(tls_err, 87, "and sets ERROR_INVALID_PARAMETER");
+        assert_eq!(tid, 0x7EAD);
+        assert_eq!(pid, 0xC0DE);
+        assert_eq!(hproc, -1);
+        assert_eq!(hthread, -2);
     }
 
     #[test]
