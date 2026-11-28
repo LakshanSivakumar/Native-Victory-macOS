@@ -25,7 +25,6 @@ use victory_platform::thread;
 use super::{Object, files, lock, new_handle, set_error};
 
 const ERROR_FILE_NOT_FOUND: u32 = 2;
-const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_NOT_SUPPORTED: u32 = 50;
 const ERROR_INVALID_PARAMETER: u32 = 87;
@@ -933,13 +932,30 @@ pub extern "system" fn GetCurrentThread() -> isize {
     -2
 }
 
-pub extern "system" fn GetProcessId(_process: isize) -> u32 {
-    std::process::id()
+pub extern "system" fn GetProcessId(process: isize) -> u32 {
+    if super::is_current_process(process as *mut c_void) {
+        std::process::id()
+    } else {
+        set_error(ERROR_INVALID_HANDLE);
+        0
+    }
 }
 
-pub extern "system" fn OpenThread(_access: u32, _inherit: i32, _id: u32) -> *mut c_void {
-    set_error(ERROR_ACCESS_DENIED);
-    std::ptr::null_mut()
+pub extern "system" fn OpenThread(_access: u32, _inherit: i32, id: u32) -> *mut c_void {
+    if id == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return std::ptr::null_mut();
+    }
+    if id == thread::current_id() {
+        return new_handle(Object::Thread(super::current_thread_object()));
+    }
+    match super::thread_by_id(id) {
+        Some(t) => new_handle(Object::Thread(t)),
+        None => {
+            set_error(ERROR_INVALID_PARAMETER);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 pub extern "system" fn GetThreadPriority(_thread: *mut c_void) -> i32 {
@@ -1596,29 +1612,181 @@ pub extern "system" fn QueryDepthSList(head: *const usize) -> u16 {
     unsafe { head.add(1).read() as u16 }
 }
 
-/// `InitOnceExecuteOnce`: the word holds 0 (new), 1 (running) or the
-/// callback's context with 2 set (done).
+const INIT_ONCE_CHECK_ONLY: u32 = 0x1;
+const INIT_ONCE_ASYNC: u32 = 0x2;
+const INIT_ONCE_INIT_FAILED: u32 = 0x4;
+const ERROR_GEN_FAILURE: u32 = 31;
+
+pub extern "system" fn InitOnceInitialize(once: *mut AtomicU64) {
+    if !once.is_null() {
+        // SAFETY: the caller's pointer-sized `INIT_ONCE` word.
+        unsafe { (*once).store(0, Ordering::Release) };
+    }
+}
+
+/// `InitOnce` state machine over a 64-bit word: low two bits hold `0` (new), `1` (synchronous
+/// init running), `2` (done, context in `state & !3`), or `3` (`INIT_ONCE_ASYNC` running).
+pub extern "system" fn InitOnceBeginInitialize(
+    once: *mut AtomicU64,
+    flags: u32,
+    pending: *mut i32,
+    context: *mut *mut c_void,
+) -> i32 {
+    if once.is_null()
+        || pending.is_null()
+        || flags & !(INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC) != 0
+        || flags & (INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC)
+            == (INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC)
+    {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the caller's pointer-sized `INIT_ONCE` word.
+    let word = unsafe { &*once };
+    if flags & INIT_ONCE_CHECK_ONLY != 0 {
+        let state = word.load(Ordering::Acquire);
+        if state & 3 == 2 {
+            // SAFETY: validated non-null `pending`; optional `context`.
+            unsafe {
+                pending.write(0);
+                if !context.is_null() {
+                    context.write((state & !3) as *mut c_void);
+                }
+            }
+            return 1;
+        }
+        set_error(ERROR_GEN_FAILURE);
+        return 0;
+    }
+    if flags & INIT_ONCE_ASYNC != 0 {
+        loop {
+            let state = word.load(Ordering::Acquire);
+            if state & 3 == 2 {
+                // SAFETY: as above.
+                unsafe {
+                    pending.write(0);
+                    if !context.is_null() {
+                        context.write((state & !3) as *mut c_void);
+                    }
+                }
+                return 1;
+            }
+            if state & 3 == 1 {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            if state == 3
+                || word
+                    .compare_exchange_weak(0, 3, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                // SAFETY: validated non-null `pending`.
+                unsafe { pending.write(1) };
+                return 1;
+            }
+        }
+    }
+    loop {
+        let state = word.load(Ordering::Acquire);
+        if state & 3 == 2 {
+            // SAFETY: as above.
+            unsafe {
+                pending.write(0);
+                if !context.is_null() {
+                    context.write((state & !3) as *mut c_void);
+                }
+            }
+            return 1;
+        }
+        if state & 3 == 3 {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        if state == 0 {
+            if word
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // SAFETY: validated non-null `pending`.
+                unsafe { pending.write(1) };
+                return 1;
+            }
+            continue;
+        }
+        let in_progress = 1u64;
+        super::sync::WaitOnAddress(
+            once.cast(),
+            (&raw const in_progress).cast(),
+            8,
+            super::INFINITE,
+        );
+    }
+}
+
+pub extern "system" fn InitOnceComplete(
+    once: *mut AtomicU64,
+    flags: u32,
+    context: *mut c_void,
+) -> i32 {
+    if once.is_null()
+        || flags & !(INIT_ONCE_ASYNC | INIT_ONCE_INIT_FAILED) != 0
+        || flags & (INIT_ONCE_ASYNC | INIT_ONCE_INIT_FAILED)
+            == (INIT_ONCE_ASYNC | INIT_ONCE_INIT_FAILED)
+        || (flags & INIT_ONCE_INIT_FAILED != 0 && !context.is_null())
+        || (flags & INIT_ONCE_INIT_FAILED == 0 && (context as usize) & 3 != 0)
+    {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: the caller's pointer-sized `INIT_ONCE` word.
+    let word = unsafe { &*once };
+    if flags & INIT_ONCE_ASYNC != 0 {
+        return match word.compare_exchange(3, context as u64 | 2, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => 1,
+            Err(state) => {
+                set_error(if state & 3 == 2 {
+                    ERROR_GEN_FAILURE
+                } else {
+                    ERROR_INVALID_PARAMETER
+                });
+                0
+            }
+        };
+    }
+    let next = if flags & INIT_ONCE_INIT_FAILED != 0 {
+        0
+    } else {
+        context as u64 | 2
+    };
+    match word.compare_exchange(1, next, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            super::sync::WakeByAddressAll(once.cast());
+            1
+        }
+        Err(_) => {
+            set_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+/// `InitOnceExecuteOnce`: synchronous callback wrapper over [`InitOnceBeginInitialize`].
 pub extern "system" fn InitOnceExecuteOnce(
     once: *mut AtomicU64,
     init: usize,
     parameter: *mut c_void,
     context: *mut *mut c_void,
 ) -> i32 {
-    // SAFETY: the title's INIT_ONCE, a pointer-sized word.
-    let word = unsafe { &*once };
-    loop {
-        match word.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => break,
-            Err(state) if state & 3 == 2 => {
-                if !context.is_null() {
-                    // SAFETY: the title's output word.
-                    unsafe { context.write((state & !3) as *mut c_void) };
-                }
-                return 1;
-            }
-            Err(_) => std::thread::sleep(Duration::from_micros(200)),
-        }
+    let mut pending = 0;
+    if InitOnceBeginInitialize(once, 0, &mut pending, context) == 0 {
+        return 0;
     }
+    if pending == 0 {
+        return 1;
+    }
+    // SAFETY: validated non-null in `InitOnceBeginInitialize`.
+    let word = unsafe { &*once };
     let mut result: *mut c_void = std::ptr::null_mut();
     // SAFETY: the title's own init routine, `BOOL (INIT_ONCE *, PVOID, PVOID *)`.
     let ok = unsafe {
@@ -1629,93 +1797,234 @@ pub extern "system" fn InitOnceExecuteOnce(
     } as u32
         != 0;
     if ok {
-        word.store(result as u64 | 2, Ordering::Release);
+        word.store((result as u64 & !3) | 2, Ordering::Release);
+        super::sync::WakeByAddressAll(once.cast());
         if !context.is_null() {
             // SAFETY: the title's output word.
-            unsafe { context.write(result) };
+            unsafe { context.write((result as usize & !3) as *mut c_void) };
         }
         1
     } else {
         word.store(0, Ordering::Release);
+        super::sync::WakeByAddressAll(once.cast());
         0
     }
 }
 
-// Fiber local storage, per thread (a fiber is a thread here).
+// Fiber local storage, per thread (a fiber is a thread here), with `PFLS_CALLBACK_FUNCTION`
+// destructors invoked on `FlsFree` and at thread exit.
 
 const FLS_OUT_OF_INDEXES: u32 = 0xFFFF_FFFF;
 const FLS_SLOTS: usize = 4096;
 
-static FLS_USED: Mutex<Vec<bool>> = Mutex::new(Vec::new());
-
-/// Bumped each time a slot is handed out: a thread's value from an earlier owner of the slot
-/// reads 0, as Windows clears a freed slot in every thread.
-static FLS_GENERATION: [AtomicU32; FLS_SLOTS] = [const { AtomicU32::new(0) }; FLS_SLOTS];
-
-thread_local! {
-    /// Each slot's value and the generation it was set in.
-    static FLS_VALUES: std::cell::RefCell<Vec<(u32, usize)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+#[derive(Clone, Copy)]
+struct FlsSlot {
+    used: bool,
+    generation: u32,
+    callback: usize,
 }
 
-// shortcut: the destructor callback is not called (at thread end or `FlsFree`).
-pub extern "system" fn FlsAlloc(_callback: usize) -> u32 {
-    let mut used = lock(&FLS_USED);
-    let free = used.iter().position(|u| !u).unwrap_or(used.len());
+#[derive(Default)]
+struct FlsTable {
+    slots: Vec<FlsSlot>,
+    threads: std::collections::HashMap<u64, Arc<Mutex<Vec<(u32, usize)>>>>,
+}
+
+static FLS: LazyLock<Mutex<FlsTable>> = LazyLock::new(Default::default);
+static NEXT_FLS_THREAD: AtomicU64 = AtomicU64::new(1);
+
+/// Active generation for each allocated slot (`0` while unallocated), allowing lock-free
+/// fast-path checks in `FlsGetValue`.
+static FLS_GENERATION: [AtomicU32; FLS_SLOTS] = [const { AtomicU32::new(0) }; FLS_SLOTS];
+
+struct FlsThread {
+    id: u64,
+    values: Arc<Mutex<Vec<(u32, usize)>>>,
+    cleaned: std::cell::Cell<bool>,
+}
+
+impl Drop for FlsThread {
+    fn drop(&mut self) {
+        if !self.cleaned.replace(true) {
+            let _ = std::panic::catch_unwind(|| {
+                drain_fls_thread(self.id, &self.values);
+            });
+        }
+    }
+}
+
+thread_local! {
+    static FLS_THREAD: FlsThread = {
+        let id = NEXT_FLS_THREAD.fetch_add(1, Ordering::Relaxed);
+        let values = Arc::new(Mutex::new(Vec::new()));
+        lock(&FLS).threads.insert(id, values.clone());
+        FlsThread {
+            id,
+            values,
+            cleaned: std::cell::Cell::new(false),
+        }
+    };
+}
+
+fn drain_fls_thread(id: u64, values: &Arc<Mutex<Vec<(u32, usize)>>>) {
+    // Allow up to two passes in case an FLS callback writes another allocated slot.
+    for _ in 0..2 {
+        let len = lock(values).len();
+        let mut ran = false;
+        for index in 0..len {
+            let call = {
+                let table = lock(&FLS);
+                let mut vals = lock(values);
+                match (table.slots.get(index), vals.get_mut(index)) {
+                    (Some(slot), Some(entry))
+                        if slot.used && entry.0 == slot.generation && entry.1 != 0 =>
+                    {
+                        let value = entry.1;
+                        *entry = (0, 0);
+                        (slot.callback != 0).then_some((slot.callback, value))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((cb, value)) = call {
+                ran = true;
+                // SAFETY: `PFLS_CALLBACK_FUNCTION` (`void WINAPI(PVOID)`) in title/bridge ABI.
+                unsafe { native::call_win64(cb, &[value as u64]) };
+            }
+        }
+        if !ran {
+            break;
+        }
+    }
+    lock(&FLS).threads.remove(&id);
+}
+
+/// Runs FLS destructors on the exiting thread before its handle signals completion.
+pub(crate) fn fls_thread_exit() {
+    let _ = FLS_THREAD.try_with(|t| {
+        if !t.cleaned.replace(true) {
+            drain_fls_thread(t.id, &t.values);
+        }
+    });
+}
+
+pub extern "system" fn FlsAlloc(callback: usize) -> u32 {
+    let mut table = lock(&FLS);
+    let free = table
+        .slots
+        .iter()
+        .position(|s| !s.used)
+        .unwrap_or(table.slots.len());
     if free >= FLS_SLOTS {
         set_error(ERROR_INVALID_PARAMETER);
         return FLS_OUT_OF_INDEXES;
     }
-    if free == used.len() {
-        used.push(true);
+    if free == table.slots.len() {
+        table.slots.push(FlsSlot {
+            used: false,
+            generation: 0,
+            callback: 0,
+        });
     }
-    used[free] = true;
-    FLS_GENERATION[free].fetch_add(1, Ordering::Relaxed);
+    let slot = &mut table.slots[free];
+    slot.generation = slot.generation.wrapping_add(1).max(1);
+    slot.used = true;
+    slot.callback = callback;
+    FLS_GENERATION[free].store(slot.generation, Ordering::Release);
     free as u32
 }
 
 pub extern "system" fn FlsFree(index: u32) -> i32 {
-    match lock(&FLS_USED).get_mut(index as usize) {
-        Some(used) if *used => {
-            *used = false;
-            1
-        }
-        _ => {
+    let i = index as usize;
+    let (callback, pending) = {
+        let mut table = lock(&FLS);
+        let Some(slot) = table.slots.get_mut(i) else {
             set_error(ERROR_INVALID_PARAMETER);
-            0
+            return 0;
+        };
+        if !slot.used {
+            set_error(ERROR_INVALID_PARAMETER);
+            return 0;
         }
+        let generation = slot.generation;
+        let callback = std::mem::replace(&mut slot.callback, 0);
+        slot.used = false;
+        FLS_GENERATION[i].store(0, Ordering::Release);
+        let mut pending = Vec::new();
+        for values in table.threads.values() {
+            let mut vals = lock(values);
+            if let Some(entry) = vals.get_mut(i)
+                && entry.0 == generation
+            {
+                let v = entry.1;
+                *entry = (0, 0);
+                if callback != 0 && v != 0 {
+                    pending.push(v);
+                }
+            }
+        }
+        (callback, pending)
+    };
+    for value in pending {
+        // SAFETY: `PFLS_CALLBACK_FUNCTION` (`void WINAPI(PVOID)`) in title/bridge ABI.
+        unsafe { native::call_win64(callback, &[value as u64]) };
     }
+    1
 }
 
 pub extern "system" fn FlsGetValue(index: u32) -> usize {
     set_error(0);
-    let Some(generation) = FLS_GENERATION.get(index as usize) else {
+    let Some(slot_gen) = FLS_GENERATION.get(index as usize) else {
         return 0;
     };
-    let generation = generation.load(Ordering::Relaxed);
-    FLS_VALUES.with(|v| match v.borrow().get(index as usize) {
-        Some(&(set_in, value)) if set_in == generation => value,
-        _ => 0,
-    })
+    let generation = slot_gen.load(Ordering::Acquire);
+    if generation == 0 {
+        return 0;
+    }
+    FLS_THREAD
+        .try_with(|t| match lock(&t.values).get(index as usize) {
+            Some(&(set_in, value)) if set_in == generation => value,
+            _ => 0,
+        })
+        .unwrap_or(0)
 }
 
 pub extern "system" fn FlsSetValue(index: u32, value: usize) -> i32 {
-    if !lock(&FLS_USED).get(index as usize).is_some_and(|u| *u) {
+    // Ensure the thread's TEB is created before `FLS_THREAD` so TLS teardown runs `FlsThread`
+    // before `ThreadTeb`.
+    let _ = teb::current();
+    let generation = {
+        let table = lock(&FLS);
+        match table.slots.get(index as usize) {
+            Some(slot) if slot.used => slot.generation,
+            _ => {
+                set_error(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+        }
+    };
+    let ok = FLS_THREAD
+        .try_with(|t| {
+            if t.cleaned.get() {
+                t.cleaned.set(false);
+                lock(&FLS).threads.insert(t.id, t.values.clone());
+            }
+            let mut v = lock(&t.values);
+            if v.len() <= index as usize {
+                v.resize(index as usize + 1, (0, 0));
+            }
+            v[index as usize] = (generation, value);
+        })
+        .is_ok();
+    if !ok {
         set_error(ERROR_INVALID_PARAMETER);
         return 0;
     }
-    FLS_VALUES.with(|v| {
-        let mut v = v.borrow_mut();
-        if v.len() <= index as usize {
-            v.resize(index as usize + 1, (0, 0));
-        }
-        v[index as usize] = (FLS_GENERATION[index as usize].load(Ordering::Relaxed), value);
-    });
     1
 }
 
-// One worker per submission or timer arm. Callbacks use the Windows ABI
-// (instance, context, object).
+// Reusable 8 MiB workers for `SubmitThreadpoolWork`, and 8 MiB timer workers for
+// `SetThreadpoolTimer`. Callbacks use the Windows ABI `(instance, context, object)`.
 pub(crate) struct PoolObject {
     callback: usize,
     context: usize,
@@ -1751,6 +2060,48 @@ impl PoolState {
 /// What a callback gets as its instance: nothing it can use, but not null.
 static INSTANCE: u64 = 0;
 
+struct WorkPool {
+    state: Mutex<(std::collections::VecDeque<(&'static PoolObject, u64)>, usize)>,
+    ready: Condvar,
+}
+
+static WORK_POOL: WorkPool = WorkPool {
+    state: Mutex::new((std::collections::VecDeque::new(), 0)),
+    ready: Condvar::new(),
+};
+
+impl WorkPool {
+    fn submit(&'static self, object: &'static PoolObject, ticket: u64) {
+        let mut state = lock(&self.state);
+        state.0.push_back((object, ticket));
+        if state.0.len() > state.1 {
+            let _ = thread::spawn("win32-pool", super::MIN_STACK, move || {
+                self.work();
+                0
+            });
+        } else {
+            self.ready.notify_one();
+        }
+    }
+
+    fn work(&self) {
+        let mut state = lock(&self.state);
+        loop {
+            while state.0.is_empty() {
+                state.1 += 1;
+                state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+                state.1 -= 1;
+            }
+            let item = state.0.pop_front();
+            drop(state);
+            if let Some((object, ticket)) = item {
+                object.run_queued(ticket);
+            }
+            state = lock(&self.state);
+        }
+    }
+}
+
 fn new_pool_object(callback: usize, context: usize) -> *mut PoolObject {
     Box::into_raw(Box::new(PoolObject {
         callback,
@@ -1761,12 +2112,44 @@ fn new_pool_object(callback: usize, context: usize) -> *mut PoolObject {
 }
 
 impl PoolObject {
-    fn submit(&'static self, state: &mut PoolState, delay: Duration, period: Duration) {
+    fn invoke(&'static self) {
+        // SAFETY: the title's `TP_WORK_CALLBACK` or `TP_TIMER_CALLBACK`.
+        unsafe {
+            native::call_win64(
+                self.callback,
+                &[
+                    &raw const INSTANCE as u64,
+                    self.context as u64,
+                    self as *const Self as u64,
+                ],
+            )
+        };
+    }
+
+    fn run_queued(&'static self, ticket: u64) {
+        let mut state = lock(&self.state);
+        if !state.take_queued(ticket) {
+            return;
+        }
+        state.running += 1;
+        drop(state);
+        self.invoke();
+        let mut state = lock(&self.state);
+        state.running -= 1;
+        self.changed.notify_all();
+    }
+
+    fn submit_work(&'static self) {
+        let ticket = lock(&self.state).queue_callback();
+        WORK_POOL.submit(self, ticket);
+    }
+
+    fn submit_timer(&'static self, state: &mut PoolState, delay: Duration, period: Duration) {
         let generation = state.timer_generation;
         let armed = Instant::now();
         // An immediately due callback is queued before the submitting call returns.
         let mut ticket = delay.is_zero().then(|| state.queue_callback());
-        std::thread::spawn(move || {
+        let _ = thread::spawn("win32-timer", super::MIN_STACK, move || {
             let mut state = lock(&self.state);
             let mut delay = delay.saturating_sub(armed.elapsed());
             loop {
@@ -1778,7 +2161,7 @@ impl PoolObject {
                         .wait_timeout_while(state, delay, |s| s.timer_generation == generation)
                         .unwrap_or_else(|e| e.into_inner());
                     if state.timer_generation != generation {
-                        return;
+                        break;
                     }
                     // The waiting worker starts the callback directly at expiry.
                     true
@@ -1786,26 +2169,19 @@ impl PoolObject {
                 if run {
                     state.running += 1;
                     drop(state);
-                    // SAFETY: the title's TP_WORK_CALLBACK or TP_TIMER_CALLBACK.
-                    unsafe {
-                        native::call_win64(
-                            self.callback,
-                            &[
-                                &raw const INSTANCE as u64,
-                                self.context as u64,
-                                self as *const Self as u64,
-                            ],
-                        )
-                    };
+                    self.invoke();
                     state = lock(&self.state);
                     state.running -= 1;
                     self.changed.notify_all();
                 }
                 if period.is_zero() || state.timer_generation != generation {
-                    return;
+                    break;
                 }
                 delay = period;
             }
+            drop(state);
+            fls_thread_exit();
+            0
         });
     }
 
@@ -1835,7 +2211,7 @@ pub extern "system" fn CreateThreadpoolWork(
 pub extern "system" fn SubmitThreadpoolWork(work: *mut PoolObject) {
     // SAFETY: pool objects live for the life of the process.
     let o = unsafe { &*work };
-    o.submit(&mut lock(&o.state), Duration::ZERO, Duration::ZERO);
+    o.submit_work();
 }
 
 pub extern "system" fn WaitForThreadpoolWorkCallbacks(work: *mut PoolObject, cancel: i32) {
@@ -1870,7 +2246,7 @@ pub extern "system" fn SetThreadpoolTimer(
     if !due.is_null() {
         // SAFETY: the title's due time.
         let delay = until(unsafe { due.read_unaligned() });
-        o.submit(
+        o.submit_timer(
             &mut state,
             delay,
             Duration::from_millis(u64::from(period_ms)),
@@ -2519,6 +2895,9 @@ pub(super) fn lookup(dll: &str, name: &str) -> Option<usize> {
             InterlockedPopEntrySList,
             InterlockedFlushSList,
             QueryDepthSList,
+            InitOnceInitialize,
+            InitOnceBeginInitialize,
+            InitOnceComplete,
             InitOnceExecuteOnce,
             FlsAlloc,
             FlsFree,
@@ -3177,6 +3556,221 @@ mod tests {
         assert!(len >= 64);
         assert_eq!(GetLogicalProcessorInformation(std::ptr::null_mut(), std::ptr::null_mut()), 0);
         assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+    }
+
+    #[test]
+    fn init_once_begin_and_complete_cover_sync_retry_check_only_and_async() {
+        for dll in ["kernel32.dll", "api-ms-win-core-synch-l1-2-0.dll"] {
+            for sym in ["InitOnceInitialize", "InitOnceBeginInitialize", "InitOnceComplete"] {
+                assert!(super::super::lookup(dll, sym).is_some(), "missing {dll}!{sym}");
+            }
+        }
+
+        let once = Box::leak(Box::new(AtomicU64::new(99)));
+        InitOnceInitialize(once);
+        assert_eq!(once.load(Ordering::Acquire), 0);
+
+        let mut pending = -1;
+        let mut ctx = std::ptr::null_mut();
+        assert_eq!(InitOnceBeginInitialize(once, INIT_ONCE_CHECK_ONLY, &mut pending, &mut ctx), 0);
+        assert_eq!(super::super::GetLastError(), ERROR_GEN_FAILURE);
+        assert_eq!(
+            InitOnceBeginInitialize(
+                once,
+                INIT_ONCE_CHECK_ONLY | INIT_ONCE_ASYNC,
+                &mut pending,
+                &mut ctx
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_INVALID_PARAMETER);
+
+        // Failed synchronous init resets the word and wakes blocked contenders to take over.
+        assert_eq!(InitOnceBeginInitialize(once, 0, &mut pending, &mut ctx), 1);
+        assert_eq!(pending, 1);
+        let once_addr = once as *mut AtomicU64 as usize;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let once = once_addr as *mut AtomicU64;
+            let mut pending = 0;
+            let mut ctx = std::ptr::null_mut();
+            entered_tx.send(()).unwrap();
+            assert_eq!(InitOnceBeginInitialize(once, 0, &mut pending, &mut ctx), 1);
+            assert_eq!(pending, 1);
+            let chosen = 0x1234_5670usize as *mut c_void;
+            assert_eq!(InitOnceComplete(once, 0, chosen), 1);
+        });
+        entered_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(InitOnceComplete(once, INIT_ONCE_INIT_FAILED, std::ptr::null_mut()), 1);
+        waiter.join().unwrap();
+
+        assert_eq!(InitOnceBeginInitialize(once, INIT_ONCE_CHECK_ONLY, &mut pending, &mut ctx), 1);
+        assert_eq!((pending, ctx as usize), (0, 0x1234_5670));
+        assert_eq!(InitOnceBeginInitialize(once, 0, &mut pending, &mut ctx), 1);
+        assert_eq!((pending, ctx as usize), (0, 0x1234_5670));
+
+        // Async init allows multiple pending starters; the first completer wins.
+        let async_once = AtomicU64::new(0);
+        let (mut p1, mut p2) = (0, 0);
+        assert_eq!(
+            InitOnceBeginInitialize(&raw const async_once as *mut AtomicU64, INIT_ONCE_ASYNC, &mut p1, std::ptr::null_mut()),
+            1
+        );
+        assert_eq!(
+            InitOnceBeginInitialize(&raw const async_once as *mut AtomicU64, INIT_ONCE_ASYNC, &mut p2, std::ptr::null_mut()),
+            1
+        );
+        assert_eq!((p1, p2), (1, 1));
+        assert_eq!(
+            InitOnceComplete(
+                &raw const async_once as *mut AtomicU64,
+                INIT_ONCE_ASYNC,
+                0xABCD_0000usize as *mut c_void
+            ),
+            1
+        );
+        assert_eq!(
+            InitOnceComplete(
+                &raw const async_once as *mut AtomicU64,
+                INIT_ONCE_ASYNC,
+                0xDEAD_0000usize as *mut c_void
+            ),
+            0
+        );
+        assert_eq!(super::super::GetLastError(), ERROR_GEN_FAILURE);
+    }
+
+    #[test]
+    fn fls_destructors_duplicate_handle_open_thread_exit_thread_and_pooled_work() {
+        for sym in ["DuplicateHandle", "GetThreadId", "ExitThread", "OpenThread"] {
+            assert!(
+                super::super::lookup("kernel32.dll", sym).is_some(),
+                "missing kernel32!{sym}"
+            );
+        }
+
+        static DESTROYED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        static ACTIVE_SLOT: AtomicU32 = AtomicU32::new(0);
+
+        extern "C" fn on_fls_destroy(value: usize) {
+            let slot = ACTIVE_SLOT.load(Ordering::Acquire);
+            lock(&DESTROYED).push((value, FlsGetValue(slot)));
+        }
+
+        let cb = native::host_callbacks(&[(on_fls_destroy as *const () as usize, false)]).unwrap()[0];
+        let slot = FlsAlloc(cb);
+        ACTIVE_SLOT.store(slot, Ordering::Release);
+        lock(&DESTROYED).clear();
+
+        // `FlsFree` invokes the destructor for every live thread with a non-zero value and clears
+        // the slot beforehand so `FlsGetValue(slot)` reads 0 inside the destructor.
+        assert_eq!(FlsSetValue(slot, 0x11), 1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(FlsSetValue(slot, 0x22), 1);
+            ready_tx.send(()).unwrap();
+            hold_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        assert_eq!(FlsFree(slot), 1);
+        hold_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let mut got = lock(&DESTROYED).clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![(0x11, 0), (0x22, 0)]);
+
+        // `CreateThread` + `OpenThread` + `DuplicateHandle` + `ExitThread` + FLS exit destructor.
+        let exit_slot = FlsAlloc(cb);
+        ACTIVE_SLOT.store(exit_slot, Ordering::Release);
+        lock(&DESTROYED).clear();
+
+        extern "C" fn thread_entry(slot: usize) -> u32 {
+            assert_eq!(FlsSetValue(slot as u32, 0x77), 1);
+            super::super::ExitThread(0x42);
+        }
+
+        let entry =
+            native::host_callbacks(&[(thread_entry as *const () as usize, false)]).unwrap()[0];
+        let mut tid = 0u32;
+        let h = super::super::CreateThread(
+            std::ptr::null(),
+            0,
+            entry,
+            exit_slot as usize as *mut c_void,
+            super::super::CREATE_SUSPENDED,
+            &mut tid,
+        );
+        assert!(!h.is_null() && tid != 0);
+        assert_eq!(super::super::GetThreadId(h), tid);
+
+        let opened = OpenThread(0, 0, tid);
+        assert!(!opened.is_null());
+        assert_eq!(super::super::GetThreadId(opened), tid);
+
+        let proc = GetCurrentProcess() as *mut c_void;
+        let mut dup_thread = std::ptr::null_mut();
+        assert_eq!(
+            super::super::DuplicateHandle(proc, opened, proc, &mut dup_thread, 0, 0, 0x3),
+            1
+        );
+        assert_eq!(super::super::CloseHandle(opened), 0);
+        assert_eq!(super::super::ResumeThread(dup_thread), 1);
+        assert_eq!(super::super::WaitForSingleObject(dup_thread, 5_000), 0);
+        assert_eq!(lock(&DESTROYED).as_slice(), &[(0x77, 0)]);
+        let mut code = 0u32;
+        assert_eq!(super::super::GetExitCodeThread(h, &mut code), 1);
+        assert_eq!(code, 0x42);
+        assert_eq!(super::super::CloseHandle(dup_thread), 1);
+        assert_eq!(super::super::CloseHandle(h), 1);
+        assert_eq!(FlsFree(exit_slot), 1);
+
+        // `DuplicateHandle` on `GetCurrentProcess` and `GetCurrentThread`.
+        let mut dup_proc = std::ptr::null_mut();
+        let mut dup_self = std::ptr::null_mut();
+        assert_eq!(
+            super::super::DuplicateHandle(proc, proc, proc, &mut dup_proc, 0, 0, 0x2),
+            1
+        );
+        assert_eq!(GetProcessId(dup_proc as isize), std::process::id());
+        assert_eq!(
+            super::super::DuplicateHandle(
+                dup_proc,
+                GetCurrentThread() as *mut c_void,
+                dup_proc,
+                &mut dup_self,
+                0,
+                0,
+                0x2
+            ),
+            1
+        );
+        assert_eq!(super::super::GetThreadId(dup_self), thread::current_id());
+        assert_eq!(super::super::CloseHandle(dup_self), 1);
+        assert_eq!(super::super::CloseHandle(dup_proc), 1);
+
+        // `SubmitThreadpoolWork` runs on reusable >= 8 MiB worker threads.
+        static STACK_BYTES: AtomicU64 = AtomicU64::new(0);
+        static WORKER_TIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        extern "C" fn measure_work(_instance: usize, _context: usize, _work: usize) {
+            let (mut low, mut high) = (0usize, 0usize);
+            GetCurrentThreadStackLimits(&raw mut low, &raw mut high);
+            STACK_BYTES.store((high - low) as u64, Ordering::Release);
+            lock(&WORKER_TIDS).push(thread::current_id());
+        }
+        let work_cb =
+            native::host_callbacks(&[(measure_work as *const () as usize, false)]).unwrap()[0];
+        let work = CreateThreadpoolWork(work_cb, 0, std::ptr::null());
+        for _ in 0..2 {
+            SubmitThreadpoolWork(work);
+            WaitForThreadpoolWorkCallbacks(work, 0);
+        }
+        CloseThreadpoolWork(work);
+        assert!(STACK_BYTES.load(Ordering::Acquire) >= super::super::MIN_STACK as u64);
+        let tids = lock(&WORKER_TIDS).clone();
+        assert_eq!(tids.len(), 2);
+        assert_eq!(tids[0], tids[1]);
     }
 }
 

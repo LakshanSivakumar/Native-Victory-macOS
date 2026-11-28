@@ -442,6 +442,7 @@ pub extern "system" fn TlsSetValue(index: u32, value: *mut c_void) -> i32 {
 
 // Kernel objects: a handle table over `victory-platform`.
 
+#[derive(Clone)]
 pub(crate) enum Object {
     Event(Arc<Event>),
     Semaphore(Arc<Semaphore>),
@@ -450,6 +451,7 @@ pub(crate) enum Object {
     Find(Arc<Mutex<files::Find>>),
     Mutex(Arc<system::MutexObject>),
     Timer(Arc<system::TimerObject>),
+    Process,
 }
 
 /// A title thread: its end, its suspension count and its Mach port.
@@ -459,8 +461,62 @@ pub(crate) struct ThreadObject {
     /// Holds a thread created suspended before its first instruction.
     gate: Event,
     state: Mutex<ThreadState>,
+    tid: std::sync::atomic::AtomicU32,
     start: usize,
     param: usize,
+}
+
+static THREADS_BY_ID: LazyLock<Mutex<HashMap<u32, std::sync::Weak<ThreadObject>>>> =
+    LazyLock::new(Default::default);
+
+fn register_thread_id(id: u32, thread: &Arc<ThreadObject>) {
+    if id == 0 {
+        return;
+    }
+    thread
+        .tid
+        .store(id, std::sync::atomic::Ordering::Release);
+    let mut map = lock(&THREADS_BY_ID);
+    map.retain(|_, w| w.strong_count() > 0);
+    map.insert(id, Arc::downgrade(thread));
+}
+
+pub(crate) fn thread_by_id(id: u32) -> Option<Arc<ThreadObject>> {
+    lock(&THREADS_BY_ID).get(&id).and_then(std::sync::Weak::upgrade)
+}
+
+/// A `ThreadObject` for the calling thread (reusing its `CreateThread` record or creating a
+/// live record for `title-main` / host callback threads when duplicated via `GetCurrentThread`).
+pub(crate) fn current_thread_object() -> Arc<ThreadObject> {
+    thread_local! {
+        static SELF_THREAD: std::cell::RefCell<Option<Arc<ThreadObject>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let id = thread::current_id();
+    if let Some(existing) = thread_by_id(id) {
+        return existing;
+    }
+    SELF_THREAD.with(|slot| {
+        if let Some(existing) = slot.borrow().as_ref() {
+            return existing.clone();
+        }
+        let created = Arc::new(ThreadObject {
+            done: Arc::new(Event::new(true, false).expect("event")),
+            gate: Event::new(true, true).expect("event"),
+            state: Mutex::new(ThreadState {
+                suspend_count: 0,
+                running: true,
+                port: Some(native::threadctl::ThreadPort::current()),
+                exit_code: STILL_ACTIVE,
+            }),
+            tid: std::sync::atomic::AtomicU32::new(id),
+            start: 0,
+            param: 0,
+        });
+        register_thread_id(id, &created);
+        *slot.borrow_mut() = Some(created.clone());
+        created
+    })
 }
 
 struct ThreadState {
@@ -759,6 +815,63 @@ pub extern "system" fn CloseHandle(handle: *mut c_void) -> i32 {
     1
 }
 
+fn is_current_process(handle: *mut c_void) -> bool {
+    handle as isize == -1
+        || matches!(
+            lock(&HANDLES).get(&(handle as usize)),
+            Some(Object::Process)
+        )
+}
+
+pub extern "system" fn DuplicateHandle(
+    source_process: *mut c_void,
+    source_handle: *mut c_void,
+    target_process: *mut c_void,
+    target_handle: *mut *mut c_void,
+    _access: u32,
+    _inherit: i32,
+    options: u32,
+) -> i32 {
+    const DUPLICATE_CLOSE_SOURCE: u32 = 0x1;
+    const DUPLICATE_SAME_ACCESS: u32 = 0x2;
+
+    if options & !(DUPLICATE_CLOSE_SOURCE | DUPLICATE_SAME_ACCESS) != 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if target_handle.is_null() && options & DUPLICATE_CLOSE_SOURCE == 0 {
+        set_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if !is_current_process(source_process) || !is_current_process(target_process) {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    let duplicated = match source_handle as isize {
+        -1 => Object::Process,
+        -2 => Object::Thread(current_thread_object()),
+        _ => {
+            let mut handles = lock(&HANDLES);
+            let found = if options & DUPLICATE_CLOSE_SOURCE != 0 {
+                handles.remove(&(source_handle as usize))
+            } else {
+                handles.get(&(source_handle as usize)).cloned()
+            };
+            let Some(obj) = found else {
+                set_error(ERROR_INVALID_HANDLE);
+                return 0;
+            };
+            obj
+        }
+    };
+    if !target_handle.is_null() {
+        let out = new_handle(duplicated);
+        // SAFETY: the caller supplied a non-null output handle slot.
+        unsafe { target_handle.write(out) };
+    }
+    1
+}
+
 /// `CreateThread`: the start routine runs in title code, on a thread with
 /// its own TEB and static TLS, after the images' thread-attach notices.
 /// `CREATE_SUSPENDED` keeps it from running until `ResumeThread`.
@@ -780,6 +893,7 @@ pub extern "system" fn CreateThread(
             port: None,
             exit_code: STILL_ACTIVE,
         }),
+        tid: std::sync::atomic::AtomicU32::new(0),
         start,
         param: param as usize,
     });
@@ -793,6 +907,7 @@ pub extern "system" fn CreateThread(
             param as usize,
             // Before anything of the title's runs: park if suspended.
             move || {
+                register_thread_id(thread::current_id(), &me);
                 lock(&me.state).port = Some(native::threadctl::ThreadPort::current());
                 // A suspension that came in before the thread was up. The count is read and
                 // `running` set under one lock: a `SuspendThread` in between saw the thread not
@@ -810,6 +925,7 @@ pub extern "system" fn CreateThread(
                 }
             },
             move |code| {
+                system::fls_thread_exit();
                 if std::env::var_os("VICTORY_TRACE_HANDLES").is_some() {
                     tracing::warn!("title thread ends, code {code:#x}");
                 }
@@ -821,6 +937,7 @@ pub extern "system" fn CreateThread(
     };
     match started {
         Ok(t) => {
+            register_thread_id(t.id(), &object);
             if !thread_id.is_null() {
                 // SAFETY: the title passes a valid pointer or null.
                 unsafe { thread_id.write(t.id()) };
@@ -833,6 +950,22 @@ pub extern "system" fn CreateThread(
             std::ptr::null_mut()
         }
     }
+}
+
+pub extern "system" fn GetThreadId(handle: *mut c_void) -> u32 {
+    if handle as isize == -2 {
+        return thread::current_id();
+    }
+    let Some(t) = thread_of(handle) else {
+        set_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    t.tid.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub extern "system" fn ExitThread(code: u32) -> ! {
+    // SAFETY: called through the host stub from a title thread entry point.
+    unsafe { native::exit_title_thread(code) }
 }
 
 fn thread_of(handle: *mut c_void) -> Option<Arc<ThreadObject>> {
@@ -1009,7 +1142,10 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
         WaitForMultipleObjects,
         WaitForMultipleObjectsEx,
         CloseHandle,
+        DuplicateHandle,
         CreateThread,
+        GetThreadId,
+        ExitThread,
         SuspendThread,
         ResumeThread,
         GetThreadContext,
