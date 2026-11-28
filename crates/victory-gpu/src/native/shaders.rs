@@ -128,16 +128,15 @@ pub fn integer_targets(color: &[Format]) -> u8 {
     color.iter().enumerate().filter(|(n, f)| *n < 8 && f.is_integer()).fold(0, |m, (n, _)| m | 1 << n)
 }
 
-/// What the host cannot give a translated shader (the reason is the refusal's); `memory`: it can
-/// give the page table (compute and guessed graphics shaders). A shader that indexes the resource
-/// heap itself is not refused here: the bound heaps are at the converter's heap slots for every
-/// stage (`bind_root_render`, `bind_root` in `victory-metal`).
-pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
+/// What the host cannot give a translated shader (the reason is the refusal's). The page table
+/// is bound for every stage — compute and graphics, guessed and described alike
+/// (`Binding::memory`) — so a shader reading title memory through it is not refused here. A
+/// shader that indexes the resource heap itself is not refused either: the bound heaps are at
+/// the converter's heap slots for every stage (`bind_root_render`, `bind_root` in
+/// `victory-metal`). (#303)
+pub fn unsupported(shader: &HostShader) -> Option<&'static str> {
     if shader.memory_writes {
         return Some("marks the pages it writes (translated without zero_copy_memory)");
-    }
-    if shader.memory && !memory {
-        return Some("reads title memory through the page table in a graphics pipeline");
     }
     if shader.view_marks {
         return Some("needs write marks");
@@ -146,9 +145,9 @@ pub fn unsupported(shader: &HostShader, memory: bool) -> Option<&'static str> {
 }
 
 /// Why a vertex shader and pixel shader cannot be a pipeline of the host, if they cannot.
-fn refusal(vs: &HostShader, ps: Option<&HostShader>, memory: bool) -> Option<&'static str> {
+fn refusal(vs: &HostShader, ps: Option<&HostShader>) -> Option<&'static str> {
     for s in [Some(vs), ps].into_iter().flatten() {
-        if let Some(why) = unsupported(s, memory) {
+        if let Some(why) = unsupported(s) {
             return Some(why);
         }
     }
@@ -224,7 +223,7 @@ impl<B: PresentBackend> Title<B> {
     pub fn compute_pipe(&mut self, shader: &HostShader, name: &str) -> Pipe<B> {
         // Shaders indexing the heap themselves run: the heaps are bound for compute as for render
         // (`heap_tests::a_compute_shader_loads_a_texture_by_heap_index`).
-        if let Some(why) = unsupported(shader, true) {
+        if let Some(why) = unsupported(shader) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }
@@ -278,7 +277,7 @@ impl<B: PresentBackend> Title<B> {
         graphics: &Graphics,
         name: &str,
     ) -> Pipe<B> {
-        if let Some(why) = refusal(vs, ps, graphics.is_guessed()) {
+        if let Some(why) = refusal(vs, ps) {
             self.shaders.refuse(name, why.into());
             return Pipe::Refused;
         }

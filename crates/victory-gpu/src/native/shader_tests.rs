@@ -117,14 +117,8 @@ fn shaders_the_host_cannot_run_are_refused_and_counted() {
     assert_eq!(refused.len(), 2, "{refused:?}");
     assert!(refused.iter().any(|(why, _)| why.contains("marks the pages")));
     assert!(refused.iter().any(|(why, _)| why.contains("thread group") || why.contains("conversion")));
-    // Compute shaders get the page table; a graphics pipeline does not yet.
-    let mut vs = host_shader(HwStage::Vs, read("tests/fixtures/tri_vs.dxil"));
-    vs.memory = true;
-    let g = Graphics::default();
-    assert!(matches!(t.render_pipe(&vs, None, &g, "vs"), Pipe::Refused));
-    assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("graphics pipeline")));
     t.refused_translation("y", "no DXIL part".into());
-    assert_eq!(t.shaders.refusals(), 5, "{:?}", t.shaders.refused);
+    assert_eq!(t.shaders.refusals(), 4, "{:?}", t.shaders.refused);
 }
 
 /// A graphics pipeline from a vertex and pixel shader and a pipeline-state stream's state:
@@ -206,4 +200,11 @@ fn render_pipelines_come_from_the_translated_shaders_and_the_streams_state() {
     assert!(matches!(t.render_pipe(&vs, Some(&args), &g, "args"), Pipe::Refused));
     assert!(t.shaders.refused.iter().any(|(why, _)| why.starts_with("args") && why.contains("root signature")));
     assert!(t.shaders.refused.iter().any(|(why, _)| why.contains("layout lacks")));
+
+    // A vertex shader that reads title memory through the page table is not refused in a
+    // described pipeline either (#303): the page table is bound for every stage.
+    let mut paged = vs.clone();
+    paged.memory = true;
+    assert!(matches!(t.render_pipe(&paged, Some(&ps), &g, "paged tri"), Pipe::Render(..)));
+    assert!(!t.shaders.refused.iter().any(|(why, _)| why.contains("graphics pipeline")), "{:?}", t.shaders.refused);
 }
