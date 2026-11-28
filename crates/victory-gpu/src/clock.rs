@@ -86,3 +86,57 @@ pub(crate) fn ticks_from_counter(count: u64, frequency: u64) -> u64 {
 pub fn ticks(frequency: u64) -> u64 {
     ticks_from_counter(counter(), frequency)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_count_is_zero_ticks() {
+        assert_eq!(ticks_from_counter(0, 1), 0);
+        assert_eq!(ticks_from_counter(0, u64::MAX), 0);
+    }
+
+    #[test]
+    fn native_frequency_is_the_identity() {
+        let cf = counter_frequency();
+        assert!(cf > 0);
+        assert_eq!(ticks_from_counter(1, cf), 1);
+        assert_eq!(ticks_from_counter(cf, cf), cf);
+        assert_eq!(ticks_from_counter(u64::MAX / 2, cf), u64::MAX / 2);
+    }
+
+    #[test]
+    fn scales_by_the_frequency_ratio() {
+        let cf = counter_frequency();
+        assert_eq!(ticks_from_counter(10, cf * 2), 20);
+        assert_eq!(ticks_from_counter(cf, 3), 3);
+    }
+
+    #[test]
+    fn rounds_down_when_the_product_is_not_divisible() {
+        let cf = counter_frequency();
+        assert!(cf >= 2);
+        // count * frequency < cf: less than one tick.
+        assert_eq!(ticks_from_counter(1, cf - 1), 0);
+        // 1 * (cf + 1) / cf is between 1 and 2: one tick.
+        assert_eq!(ticks_from_counter(1, cf + 1), 1);
+    }
+
+    #[test]
+    fn saturates_at_u64_max() {
+        let cf = counter_frequency();
+        assert_eq!(ticks_from_counter(u64::MAX, u64::MAX), u64::MAX);
+        // (u64::MAX * 2 * cf) / cf = 2 * u64::MAX: clamped.
+        assert_eq!(ticks_from_counter(u64::MAX, cf * 2), u64::MAX);
+    }
+
+    #[test]
+    fn ticks_brackets_the_live_counter() {
+        let cf = counter_frequency();
+        let before = counter();
+        let t = ticks(cf);
+        let after = counter();
+        assert!(before <= t && t <= after);
+    }
+}
