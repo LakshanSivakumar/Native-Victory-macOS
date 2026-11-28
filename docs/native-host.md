@@ -634,6 +634,7 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_PEEK=rva,rva,...`: at the first-chance exception log, prints those qwords of the faulting image (an operand above `0x10000000` is an absolute address), the qwords `rcx` points at, and a call chain by the unwind tables. Use it with `llvm-objdump` on the title (analysis only).
 - `VICTORY_TRACE_OWNERS=1`: who made the memory that comes to share pages (#15), logged as a warning (`VICTORY_TRACE_OWNERS`) with both owners when it happens: a new physical page view over another view (`xmem_physical::record`; the mapping paths unmap first, so it should not happen), page numbers past the 25 bits Grand Theft Auto VI keeps (`number >> 4` in 21 bits) with the page whose number it would rebuild, `VirtualFree(MEM_DECOMMIT)` of a range that still shows views (`MEM_RELEASE` gives them back first, `forget_physical`), and a title mapping (`XMemMapPhysicalPages`, its scatter form, the GPU's `map_alias`) outside every region `VirtualAlloc` or `XMemVirtualAlloc` made (macOS only). Each owner is the public call that made it (the outermost one on that thread), its range, pool id and page index, a sequence number and the title's return address from the host call (`image+offset`; on other threads 0 or a stale one). Off, nothing is recorded: the cost is one read of the switch per view, allocation and free.
 - `VICTORY_DEBUG_PS=id`: every float export of every translated pixel program writes one colour, the low three bytes (red, green, blue) of the 32-bit FNV-1a hash of its console code (a container's `ACCC` code piece, as the `disasm` example takes it; alpha 1), so a target dump (`VICTORY_TRACE_PASSES`, `VICTORY_DUMP_TARGETS`) says which pixel program drew each pixel, and through the pass trace which draw and vertex program. Read a UNORM target (an sRGB one stores the encoded value). A translation switch (`VICTORY_DEBUG_PS` is in the cache key). Made for the world's G-buffer shards ("World geometry drawn as shards (open)"): the 40 pixel programs of the traced G-buffer draws have 40 different colours.
+- `VICTORY_DEBUG_MISSING=1`: while translating, every read of a value the translator has no source for (a `Val::Missing`) prints a `READ <instruction> <reason>` line on stderr where it stops the program, so the log names the instruction that consumes the missing value, not only the one that defined it. Made for the refusal families of #407: a descriptor word is often carried through `v_writelane_b32`/`v_readlane_b32`, a join or a branch, and the refusal's reason alone does not say which reader wants it. Not part of the translation (in the test's `NOT_TRANSLATION`), so no cache key changes. Cost: one line per stopped program, nothing when unset.
 - `VICTORY_TRACE_ROOT_SPAN[=<bytes>]`: root SRVs and UAVs whose title range stops being linear in its pool within `<bytes>` (default 1 MiB) of the root address (#15). A shader that does not read title memory reaches a root view through a view pair (`addr::root_view`): the pool from the mapping holding the address on, linearly, so past that mapping's end it reads and writes whatever the pool has next, not the title's next mapping. At each draw and dispatch a translated shader's root views are measured (`addr::linear_run`: following mappings that start where the last ended, in the same pool, at the next pool offset), and each one whose run is shorter is logged once per pipeline, root parameter and mapping (`a root view's range leaves its pool's linear run`, at most 2000): the pipeline's shader hashes, SRV or UAV, the dispatch's groups, the run, the first mapping, the mapping the title has where the run ends (`title_next`) and the title address of the pool bytes a pair view reaches there (`pool_next_is`). Root views of programs that read title memory (`through = "table"`) look each access up in the page table; they are logged too. Heap buffer views need no check: a range that is not linear in one pool wraps the title's own mapping instead (see "Heap buffer views not linear in one pool"). Off, the cost is one read of the switch per draw and dispatch. Run of 2026-11-26 (M5 Pro, Series S, crash at frame 2682): the 117 lines are all vertex shaders' root SRVs (root parameter 3, vertex fetch), and 30 of them do have a next title page elsewhere in pool 10 (pages mapped in descending pool order); no dispatch and no root UAV has a run under 1 MiB, so root views do not write the empty BVH nodes over other resources. Those vertex shaders read the wrong vertices past the first page, though: vertex and pixel programs now read root SRVs and UAVs through the page table (`root_memory` in `emit::lower`, with `zero_copy_memory`), one lookup per access, so they log as `through = "table"`; compute programs keep the views (no short run seen there). Tested by `a_vertex_root_view_follows_the_title_across_pages_apart_in_the_pool` (`addr_tests.rs`): a triangle whose first vertex ends one 64 KiB page and whose others start the next one, mapped elsewhere in the pool, was not drawn. Limit: the table has 64 KiB pages, so a page not wholly inside one mapping (mappings of 16 KiB) reads as zeros through it, where a view read it.
 - `VICTORY_TRACE_DESCRIPTORS=1`: how many descriptor records the title rewrites with plain stores, which no device call reports (#43). `NativeHost::remirror_tables` compares each bound table's records with those it last mirrored at every draw and dispatch; with the switch on, the frame log (`native draws so far`, every 64 frames) is followed by a `descriptor remirror` line with the records changed and checked since the previous one, per frame, per heap (by its first descriptor address, most changed first), and the most changed in one submission (`NativeHost::execute`). It counts only what that check sees: the first 16 entries of each bound table (more when the shader's metadata says so), at the draws that bind them; it does not say which code wrote the records. Off, the cost is one read of the switch per table and per submission. `VICTORY_TRACE_DESCRIPTORS=sites` also finds which title instructions store the records, for the choice between patching those store sites and remirroring: at each `ExecuteCommandLists` the pages of every descriptor heap's records (the title's own view, not the GPU's) are made read-only (`victory_platform::watch`). The loader's signal handler hands every write fault to the watch first, whoever wrote: a fault in a watched page makes that page writable again and the store runs again. It counts as a site (the instruction as an image offset) only when the instruction lies in the title image and the address in a heap's records, so the device's own view calls and title stores that only share the page go on unseen. The handler takes no lock and allocates nothing: a fixed table of 4096 sites (overflow counted), and the watched ranges (64 at most) in two tables behind sequence counts, so that a store faulting while a submission replaces the ranges is still the watch's: the handler reads the table in use and the one before it, and pages are opened only once neither holds them. Opened pages become read-write, which descriptor records' pages always are (the device's view calls write them). The frame log then adds a `descriptor store sites` line: the distinct sites so far and the 64 with the most stores, most first. Limit: a page stays writable until the next submission, so what is counted is the first store into each page per submission, not every store; a site that only stores after another one opened the page is seen less often, or not at all. A kernel write into a watched page (a `read` into it) would fail with `EFAULT` instead of faulting. Off, the handler's cost is one relaxed load per fault.
 - `VICTORY_WASAPI_WAV=<file>`: the audio device (`host_posix/wasapi.rs`) writes everything that reaches it as a float WAV — hearing exactly what the title's mixer produced, dry sound and (until #17 lands) silent reverb alike.
@@ -2064,13 +2065,14 @@ swizzle reads as the identity.
 ## Descriptor dwords read as data
 
 The console compiler computes sizes from descriptor bits instead of querying them; those fields
-are rebuilt from the host view (`Lower::descriptor_data`). Other dwords have no host value and
-were refused as "a descriptor's address or format read as data". That text is still followed by a
-colon and the dword for the ones left: "a buffer's base address (dword 0)", "a buffer's dword 1
-(address high bits, stride, swizzle)", "a buffer's dword 3 (format and type)", "an image's base
-address (dword 0)" or "a dword outside the descriptor". Nothing else is lowered: the native Metal
-host serves view addresses (see "View addresses on the native host") but no formats, and would
-have to first.
+are rebuilt from the host view (`Lower::descriptor_data`). A dword read as *data* is different: a
+view's address is what the host's view addresses hold, dword 0 (and, for a buffer, its high half
+in dword 1 bits 0-15 under the binding's stride, see "View addresses on the native host"), and
+both are served. The dwords with no host value are refused as "a descriptor's address or format
+read as data", followed by a colon and the dword: "a buffer's dword 3 (format and type)" or "a
+dword outside the descriptor" (dwords 1-3 of an image come from its size fields there). Nothing
+else is lowered: the native Metal host serves view addresses but no formats, and would have to
+first.
 `pipeline::pieces_tests::the_host_refuses_a_descriptor_dword_read_as_data_naming_it`
 (`victory-gpu`) checks the refusal on the native host's own path: the container made from the
 title's pieces, the host's options. The story-load log of issue #110 (Series S) has three
@@ -2108,20 +2110,30 @@ the MSAA word 5 (MAX_MIP is log2 of the sample count there) read 0. Tests:
 view and null entry, on hardware and WARP).
 
 A texture size query uses the four-dword shape, though, and dword 1 against 0 is what guards it:
-the console's dword 1 has a nonzero format field for every view and is 0 only for a null
-descriptor. The view-address table holds dword 1 as width bits only, so a texture of width
-4k + 1 gives 0 there and read as null. Guessed, since nothing documents the word: bit 0 of the
-table's dword 1 (always 0, the width being in bits 30-31) carries it instead. `Lower::
-image_size_half` takes a four-dword load at an index scaled to whole descriptors (`s_lshl_b32`,
-5) when every reader keeps only a size field (a constant `s_and_b32` or `s_bfe_u32` within width,
-height, first and last level) or tests dword 1 against 0; `view_addresses` sets that bit when the
-entry's dword 3 (an image's `0xFAC` and levels) is nonzero. The table gives a buffer's dwords 2
-and 3 as 0, so the image reading of a buffer entry would size it 0: the bit says "a texture" and
-a buffer reads as a null entry, taking the program's null branch rather than a wrong size. Any
-other reader keeps the buffer reading of the four dwords and its refusals. The 723 programs of the
-corpus refused with "a view address field the table gives as 0: a buffer's stride or swizzle" are
-of this shape. Tests: `gfx_refusal_tests::a_size_query_of_a_view_at_a_descriptor_index_reads_the_table`
+the console's dword 1 is never 0 for a view and only for a null descriptor. The table's dword 1 is
+a host encoding, guessed since nothing documents those bits: bit 0 (which an image's word leaves
+free, its address being above it) says the entry holds a texture, bits 1-15 its address's high
+half, and bits 30-31 the low two bits of its width less one, which the size queries read out of
+dword 1. `Lower::image_size_half` takes a four-dword load at an index scaled to whole descriptors
+(`s_lshl_b32`, 5) when every reader keeps only a size field (a constant `s_and_b32` or
+`s_bfe_u32` within width, height, first and last level) or tests dword 1 against 0;
+`view_addresses` sets bit 0 when the entry's dword 3 (an image's `0xFAC` and levels) is nonzero.
+The table gives a buffer's dwords 2 and 3 as 0, so the image reading of a buffer entry would size
+it 0: the bit says "a texture" and a buffer reads as a null entry, taking the program's null
+branch rather than a wrong size. Any other reader keeps the buffer reading of the four dwords and
+its refusals. The 723 programs of the corpus refused with "a view address field the table gives
+as 0: a buffer's stride or swizzle" are of this shape. Tests:
+`gfx_refusal_tests::a_size_query_of_a_view_at_a_descriptor_index_reads_the_table`
 and, on the host, `memory_tests::a_size_query_of_a_view_at_an_index_reads_its_size_fields`.
+
+The table entry is 32 bytes, as a heap record is, and holds eight dwords; both kinds' dword 0 is
+the view's address in title memory (the pointer the host itself uses: a buffer's or texture's
+data, as a buffer view's dword 0 always was). A buffer's dword 1 holds its address's high half in
+bits 0-15, and a four-dword load has the binding's stride put above it by the translator (bits
+16-29), which is a property of the draw, not of the record; an eight-dword load refuses the high
+half, the table putting 0 there. A null entry and anything not a heap view read all eight as 0.
+Tests: `gfx_refusal_tests::descriptor_dwords_read_as_data_say_which` and, on the host,
+`memory_tests::buffer_descriptor_address_words_read_as_data`.
 
 **Null tests of image dword 1.** Before it sizes an image from its descriptor the console
 compiler tests dword 1 against 0 (`s_cmp_eq_i32 d1, 0; s_cselect_b32 size, 0, size`): a null
