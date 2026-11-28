@@ -2098,8 +2098,11 @@ the console's `SQ_IMG_RSRC_WORD5-7`: a writable view's array pitch 1 with 0 othe
 which tells a bound volume from a whole one), the last level (MAX_MIP, the level count less one,
 bits 4-7) and the tuning value 4 (PERF_MOD, bits 20-22); dwords 6 and 7 hold the compression
 block sizes and metadata address, 0 for a view without compression. A null descriptor gives 0
-for all three. shortcut: MIN_LOD_WARN (word 5 bits 8-19) and the MSAA word 5 (MAX_MIP is log2 of
-the sample count there) read 0. Tests:
+for all three. Reading the family's eleven programs (offline, 28 November): every one masks dword
+5 with 15 and compares the array pitch to 1, to choose between a bound volume's depth and a layer
+count, as the drivers do; dwords 6 and 7 are compared, never used to place anything, and their
+compression fields are 0, which says no compression. shortcut: MIN_LOD_WARN (word 5 bits 8-19) and
+the MSAA word 5 (MAX_MIP is log2 of the sample count there) read 0. Tests:
 `gfx_refusal_tests::an_image_descriptors_tail_dwords_read_as_data_translate` (translation) and
 `memory_tests::a_view_descriptors_tail_dwords_are_the_arrays_fields` (the values, SRV, writable
 view and null entry, on hardware and WARP).
