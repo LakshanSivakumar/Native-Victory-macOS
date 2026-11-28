@@ -421,6 +421,8 @@ fn few_atoms(bools: &crate::structure::Bools, b: Bool) -> bool {
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+/// A spilled descriptor dword whose lane the edges of a join bring differently again.
+const SPILL: &str = "a spilled descriptor joined twice";
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -676,11 +678,13 @@ impl<'a> Tracer<'a> {
                             .or_else(|| self.cancel_xor(inst, k, &o))
                             .or_else(|| fold_scalar_pair(inst, k, &o))
                             .or_else(|| fold_scalar(inst, k, &o))
-                            .or_else(|| self.restored(inst))
                         {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => self.xor_undone(inst, k, &o).or(Some(Term::Value(v))),
+                            None => match self.restored(inst, &o) {
+                                Some(restored) => restored,
+                                None => self.xor_undone(inst, k, &o).or(Some(Term::Value(v))),
+                            },
                         };
                         if new.is_some() && new != o[v.0 as usize] {
                             o[v.0 as usize] = new;
@@ -1500,8 +1504,9 @@ impl<'a> Tracer<'a> {
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Option<Source>, &'static str> {
+        // A phi, or a read-back of an SGPR spill whose lane a VGPR join brings ([`Self::spill_phi`]).
         let phi_of = |w: &Term| match *w {
-            Term::Value(v) => self.phis[v.0 as usize],
+            Term::Value(v) => self.phis[v.0 as usize].or_else(|| self.spill_phi(v).map(|(b, i, _)| (b, i))),
             Term::Const(_) => None,
         };
         let Some((block, _)) = words.iter().find_map(phi_of) else {
@@ -1527,11 +1532,14 @@ impl<'a> Tracer<'a> {
         let edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
             let edge: Vec<Term> = words
                 .iter()
-                .map(|w| match phi_of(w) {
-                    Some((_, i)) => self.origin(phis[i].args[j]),
-                    None => *w,
+                .map(|w| match (phi_of(w), *w) {
+                    (Some((_, i)), Term::Value(v)) => match self.spill_phi(v) {
+                        Some((_, _, lane)) => self.slot(phis[i].args[j], lane, &mut Vec::new()).ok().flatten().ok_or(SPILL),
+                        None => Ok(self.origin(phis[i].args[j])),
+                    },
+                    _ => Ok(*w),
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             self.classify(&edge, joins, known)
         };
         let args = match taken.iter().position(|&t| t) {
@@ -1544,6 +1552,58 @@ impl<'a> Tracer<'a> {
         };
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
+    }
+
+    /// For a `v_readlane_b32` of a constant lane whose VGPR value, past `v_writelane_b32` of other
+    /// lanes, is a phi: that phi's block and index, and the lane. The SGPR spilled there is what
+    /// each edge's VGPR holds in that lane ([`Self::slot`]).
+    fn spill_phi(&self, v: Value) -> Option<(usize, usize, u32)> {
+        let read = self.def(v).filter(|i| i.name() == "v_readlane_b32")?;
+        let Fields::Valu(f) = &read.fields else { return None };
+        let [Operand::Vector { reg, .. }, lane] = f.src[..] else { return None };
+        let lane = lane_of(lane)?;
+        let mut x = read.read(Reg::V(reg))?;
+        loop {
+            if let Some((b, i)) = self.phis[x.0 as usize] {
+                return Some((b, i, lane));
+            }
+            let w = self.def(x).filter(|i| i.name() == "v_writelane_b32")?;
+            let Fields::Valu(f) = &w.fields else { return None };
+            let (Some(Operand::Vector { reg, .. }), [_, at]) = (f.dst, &f.src[..]) else { return None };
+            if lane_of(*at)? == lane {
+                return None;
+            }
+            x = w.read(Reg::V(reg))?;
+        }
+    }
+
+    /// The origin of what lane `lane` of VGPR value `v` holds when only `v_writelane_b32` fills
+    /// it: the SGPR (or constant) written there, the same through every edge of a join.
+    fn slot(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Term>, ()> {
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            // A loop's back edge brings what the loop entered with.
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &a in &self.p.blocks[b].phis[i].args {
+                if let Some(t) = self.slot(a, lane, seen)? {
+                    if found.is_some_and(|f| f != t) {
+                        return Err(());
+                    }
+                    found = Some(t);
+                }
+            }
+            return Ok(found);
+        }
+        let w = self.def(v).filter(|i| i.name() == "v_writelane_b32").ok_or(())?;
+        let Fields::Valu(f) = &w.fields else { return Err(()) };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (f.dst, &f.src[..]) else { return Err(()) };
+        if lane_of(*at).ok_or(())? != lane {
+            return self.slot(w.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        self.term(w, value).map(Some).ok_or(())
     }
 
     /// Whether some lane goes from block `q` to `b` (true without the
@@ -2834,8 +2894,6 @@ impl Tracer<'_> {
         found
     }
 
-    /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
-    /// lane, found by following the VGPR's `v_writelane_b32` writes.
     /// What dword `k` of `s_xor_b32/b64 d, x, y` leaves when `x` is `a ^ b` and `y` holds what `b`
     /// (or `a`) does: the other one. The title's compiler swaps descriptor dwords between SGPRs in
     /// three XORs.
@@ -2871,7 +2929,10 @@ impl Tracer<'_> {
         None
     }
 
-    fn restored(&self, inst: &Inst) -> Option<Moved> {
+    /// For `v_readlane_b32` of a constant lane: the origin, in `o`, of the SGPR spilled to that
+    /// lane, found by following the VGPR's `v_writelane_b32` writes. `None` if `inst` restores no
+    /// spilled SGPR, `Some(None)` while what it restores has no origin yet.
+    fn restored(&self, inst: &Inst, o: &[Option<Term>]) -> Option<Option<Term>> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
@@ -2881,14 +2942,22 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, o, &mut Vec::new())
             .ok()
-            .flatten()
     }
 
-    /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
+    /// The origin in `o` of what lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
+    /// `seen` (already being resolved) or a spilled value with no origin yet, `Err` if not a
+    /// spilled SGPR. A phi's arguments agree when their origins do, not only when they are the
+    /// same value: the title's compiler restores a spilled descriptor inside a loop and spills
+    /// it again, so the loop's edge spills another value that holds the same descriptor.
+    fn spilled(
+        &self,
+        v: Value,
+        lane: u32,
+        o: &[Option<Term>],
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Term>, ()> {
         if let Some((b, i)) = self.phis[v.0 as usize] {
             if seen.contains(&v) {
                 return Ok(None);
@@ -2896,7 +2965,7 @@ impl Tracer<'_> {
             seen.push(v);
             let mut found = None;
             for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
+                if let Some(m) = self.spilled(a, lane, o, seen)? {
                     if found.is_some_and(|f| f != m) {
                         return Err(());
                     }
@@ -2916,17 +2985,16 @@ impl Tracer<'_> {
             return Err(());
         }
         if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, o, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Moved::Value)
+                inst.read(Reg::S(code)).map(|s| o[s.0 as usize])
             }
-            Operand::Literal(x) => Some(Moved::Const(x)),
-            Operand::Const(c) => inline(c).map(Moved::Const),
+            Operand::Literal(x) => Some(Some(Term::Const(x))),
+            Operand::Const(c) => inline(c).map(|c| Some(Term::Const(c))),
             _ => None,
         }
-        .map(Some)
         .ok_or(())
     }
 }
@@ -3439,6 +3507,59 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    #[test]
+    fn a_descriptor_spilled_again_in_a_loop_is_still_the_load() {
+        // The descriptor is spilled to lanes 3-6 of v0 before the loop. In the loop it is
+        // restored, used, and spilled again, so the loop's phi of v0 joins two spills of
+        // different values that hold the same dwords.
+        let r = track_words(
+            &[
+                0xBE82_0309, // 0x00 s_mov_b32 s2, s9
+                0xBE83_0380, // 0x04 s_mov_b32 s3, 0
+                0xF408_0101,
+                0xFA00_0000, // 0x08 s_load_dwordx4 s[4:7], s[2:3], null
+                0xD761_0000,
+                0x0001_0604, // 0x10 v_writelane_b32 v0, s4, 3
+                0xD761_0000,
+                0x0001_0805, // 0x18 v_writelane_b32 v0, s5, 4
+                0xD761_0000,
+                0x0001_0A06, // 0x20 v_writelane_b32 v0, s6, 5
+                0xD761_0000,
+                0x0001_0C07, // 0x28 v_writelane_b32 v0, s7, 6
+                0xD760_0010,
+                0x0001_0700, // 0x30 v_readlane_b32 s16, v0, 3
+                0xD760_0011,
+                0x0001_0900, // 0x38 v_readlane_b32 s17, v0, 4
+                0xD760_0012,
+                0x0001_0B00, // 0x40 v_readlane_b32 s18, v0, 5
+                0xD760_0013,
+                0x0001_0D00, // 0x48 v_readlane_b32 s19, v0, 6
+                0xF420_0508,
+                0xFA00_0000, // 0x50 s_buffer_load_dword s20, s[16:19], null
+                0xD761_0000,
+                0x0001_0610, // 0x58 v_writelane_b32 v0, s16, 3
+                0xD761_0000,
+                0x0001_0811, // 0x60 v_writelane_b32 v0, s17, 4
+                0xD761_0000,
+                0x0001_0A12, // 0x68 v_writelane_b32 v0, s18, 5
+                0xD761_0000,
+                0x0001_0C13, // 0x70 v_writelane_b32 v0, s19, 6
+                0xBF06_8001, // 0x78 s_cmp_eq_u32 s1, 0
+                0xBF84_FFEC, // 0x7c s_cbranch_scc0 -> 0x30
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let [d] = &r.descriptors[..] else {
+            panic!("{:?}", r.descriptors)
+        };
+        let Source::Loaded { load, first: 0 } = d.source else {
+            panic!("{:?}", d.source)
+        };
+        assert_eq!(r.scalar, [(load, at(0, 0))]);
     }
 
     #[test]

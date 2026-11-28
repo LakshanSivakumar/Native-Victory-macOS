@@ -892,6 +892,220 @@ fn a_size_query_of_a_writable_image_reads_its_size() {
     drop(records);
 }
 
+/// The title's guard before it sizes an image from its descriptor: dword 1 tested against 0 (a
+/// null descriptor), 1 stored for a view and 0 for a null one. The image is written so the load
+/// is a descriptor the program uses.
+const CS_NULL_TEST: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF40C_0405, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[10:11], 0x20
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7E0C_0280, // v_mov_b32 v6, 0
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0x7E10_0280, // v_mov_b32 v8, 0
+    0x7E12_0280, // v_mov_b32 v9, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF020_1F08, 0x0004_0600, // image_store v[6:9], v[0:1], s[16:23] dmask:0xf dim:2D unorm
+    0xBF00_8011, // s_cmp_eq_i32 s17, 0
+    0x8518_8180, // s_cselect_b32 s24, 0, 1
+    0x7E08_0218, // v_mov_b32 v4, s24
+    0xE070_0000, 0x8003_0400, // buffer_store_dword v4, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+/// An image 5 wide is no null descriptor: its dword 1 (width - 1 in bits 30-31, 0 here) was 0 as
+/// rebuilt, so the program took it for null and sized it 0 (the console's dword 1 holds a nonzero
+/// format as well).
+#[test]
+fn an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut image = [0u8; 32];
+    image[0] = 0x41;
+    image[4..6].copy_from_slice(&[3, 3]);
+    image[8] = 8;
+    image[16] = 1;
+    image[20..23].copy_from_slice(&[8, 4, 1]);
+    let c = crate::pipeline::test_compute_container(CS_NULL_TEST, &[uav, image], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    // Entry 0: a raw buffer UAV of 64 dwords at `VA_A`; entry 1: a 5x8 RGBA8 texture UAV.
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+    assert!(t.host.mirror(start).unwrap());
+    let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 5, 8);
+    desc.unordered_access = true;
+    let tex = t.host.texture(&desc).unwrap();
+    let key = 0x4EA9_0200;
+    t.host.register_texture(key, &tex);
+    let mut uav_desc = [0u32; 10];
+    (uav_desc[0], uav_desc[1]) = (28, 4);
+    crate::descriptor::create_uav(std::ptr::null(), key as _, std::ptr::null(), &uav_desc, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "null test") else { panic!("{:?}", t.shaders) };
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    assert_eq!(f.get(0x2_0000, 1), [1], "a view, not a null descriptor");
+    drop(records);
+}
+
+/// [`CS_NULL_TEST`] with no image instruction: the descriptor is only read as data, so its words
+/// come from the heap's view addresses.
+const CS_NULL_TEST_DATA: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF40C_0405, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[10:11], 0x20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF00_8011, // s_cmp_eq_i32 s17, 0
+    0x8518_8180, // s_cselect_b32 s24, 0, 1
+    0x7E08_0218, // v_mov_b32 v4, s24
+    0xE070_0000, 0x8003_0400, // buffer_store_dword v4, off, s[12:15], 0
+    0xBF81_0000, // s_endpgm
+];
+
+/// The null test of [`an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor`] on a
+/// descriptor read only as data (the view-address table): a 5x8 view is no null descriptor, an
+/// entry never written is one.
+#[test]
+fn a_null_test_of_view_addresses_tells_a_view_from_an_empty_entry() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let c = crate::pipeline::test_compute_container(CS_NULL_TEST_DATA, &[uav], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+    assert!(t.host.mirror(start).unwrap());
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "null test data") else { panic!("{:?}", t.shaders) };
+    let test = |t: &Title<Metal>| {
+        f.put(0x2_0000, &[super::addr_tests::CANARY]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        f.get(0x2_0000, 1)
+    };
+    assert_eq!(test(&t), [0], "an entry never written");
+    // A 5x8 RGBA8 texture placed at 0x12000 (its view's size fields come from these words).
+    let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 5, 8)).unwrap();
+    let mut resource = [0u32; 14];
+    (resource[0], resource[4], resource[6], resource[7], resource[9]) = (3, 5, 8, 1 | 1 << 16, 1);
+    t.host.register_texture(crate::native::textures::placed_key(0x12000, &resource), &tex);
+    let mut srv = [0u32; 16];
+    (srv[0], srv[1], srv[5], srv[10]) = (28, 4, 1, 0x12000);
+    crate::descriptor::create_placed_srv(std::ptr::null_mut(), &resource, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    assert_eq!(test(&t), [1], "a view");
+    drop(records);
+}
+
+/// The size query of the texture at table entry 1 (`image_get_resinfo`), width and height stored.
+const CS_SIZE: &[u32] = &[
+    0xBE8A_0304, // s_mov_b32 s10, s4
+    0xBE8B_0380, // s_mov_b32 s11, 0
+    0xF408_0305, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0x0
+    0xF40C_0405, 0xFA00_0020, // s_load_dwordx8 s[16:23], s[10:11], 0x20
+    0x7E00_0280, // v_mov_b32 v0, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xF038_1308, 0x0004_0200, // image_get_resinfo v[2:3], v0, s[16:23] dmask:0x3 dim:2D unorm
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_0000, 0x8003_0200, // buffer_store_dword v2, off, s[12:15], 0
+    0xE070_0004, 0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0 offset:4
+    0xBF81_0000, // s_endpgm
+];
+
+/// What the host reports as the size of a texture entry no view was ever written to (the heap's
+/// zeroed entry, as also left by a released or evicted texture), and of one a view of no resource
+/// (D3D12's null descriptor) was written to over a texture's view: 0 by 0, the size the null-test
+/// rule of `Lower::descriptor_data` takes for a null view. The view of no resource used to leave
+/// the entry as it was, showing the texture's size.
+#[test]
+fn a_texture_entry_never_written_or_null_has_size_0() {
+    let mut uav = [0u8; 32];
+    uav[0] = 0x41;
+    uav[4..6].copy_from_slice(&[3, 3]);
+    uav[16] = 1;
+    uav[20..23].copy_from_slice(&[4, 4, 0]);
+    let mut image = [0u8; 32];
+    image[0] = 0x41;
+    image[4..6].copy_from_slice(&[0, 3]);
+    image[8] = 8;
+    image[16] = 1;
+    image[20..23].copy_from_slice(&[8, 4, 1]);
+    let c = crate::pipeline::test_compute_container(CS_SIZE, &[uav, image], 7);
+    let cs = shaders::translate(&c).unwrap();
+    let Some(mut t) = title() else { return };
+    let f = super::addr_tests::Fixture::new(&t);
+    let records = vec![0u32; 8 * 2];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 2).unwrap();
+    let mut resource = [0u32; 14];
+    resource[0] = 1;
+    let mut view = [0u32; 16];
+    (view[1], view[4], view[8]) = (1, 64, 1);
+    [view[10], view[11]] = super::addr_tests::halves(super::addr_tests::VA_A);
+    crate::descriptor::create_placed_uav(std::ptr::null_mut(), &resource, &view, start);
+    assert!(t.host.mirror(start).unwrap());
+    let canary = super::addr_tests::CANARY;
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "null size") else { panic!("{:?}", t.shaders) };
+    let size = |t: &Title<Metal>| {
+        f.put(0x2_0000, &[canary; 2]);
+        let mut l = NativeList::default();
+        l.set_heaps(Some(&heap), None);
+        l.set_compute_pipeline(&pso);
+        l.set_compute_root_table(0, &heap, 0);
+        l.dispatch(1, 1, 1).unwrap();
+        super::run(&t.host, &[&l]);
+        f.get(0x2_0000, 2)
+    };
+    assert_eq!(size(&t), [0, 0], "an entry never written");
+    // A 5x8 texture's view there, then a view of no resource (D3D12's null descriptor).
+    let tex = t.host.texture(&TextureDesc::d2(Format::Rgba8Unorm, 5, 8)).unwrap();
+    let key = 0x4EA9_0300;
+    t.host.register_texture(key, &tex);
+    let mut srv = [0u32; 10];
+    (srv[0], srv[1], srv[5]) = (28, 4, 1);
+    crate::descriptor::create_srv(std::ptr::null(), key as _, &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    assert_eq!(size(&t), [5, 8], "a view");
+    crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), &srv, start + 32);
+    assert!(t.host.mirror(start + 32).unwrap());
+    assert_eq!(size(&t), [0, 0], "a view of no resource");
+    drop(records);
+}
+
 /// `buffer_store_format_xyzw` and `buffer_load_format_xyzw` with `idxen` through a 16-byte
 /// structured writable buffer view, an `R32G32B32A32_UINT` typed writable buffer view, an
 /// `R32G32B32A32_FLOAT` view, and an `R8G8B8A8_UNORM` view write and read back through the same

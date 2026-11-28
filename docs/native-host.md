@@ -708,6 +708,49 @@ now numbers: copies of an EXEC mask in `0ef1184e45342d20`, of a constant-buffer 
 vertex programs), and 137 compute programs move on to "a descriptor read only as data". Tests: `gfx_refusal_tests::a_join_of_swapped_copies_of_one_value_is_that_value`,
 `a_join_of_copies_of_two_values_stays_refused`.
 
+Three more forms of a per-lane join, ported from VIctory-macOS 6f8fe556 (the ray-traced shadow
+traces' BVH walks, `CS_RTShadowTrace32*`):
+- An edge that brings a join of masks (a loop's back edge carrying what an inner region left in
+  the register: that region's compare for the lanes that ran it, the header's mask for the
+  others), or a mask spilled to VGPR lanes and read back, is that join (`Lower::restored_mask`).
+- An edge whose lanes are in none of the masks the other edges bring, those masks being joins of
+  masks a region made, reads 0 (`no_mask_lane_through_joins`): `no_mask_lane_on_edge` through
+  joins, with the same reasoning (the compiler merges no value for those lanes, so where the
+  whole wave skips the region the data there is a reused register).
+- In compute, wave32, data written along the edge only (a region the other lanes skip reused
+  the register for a constant-buffer or descriptor-table dword) is no mask for that edge's lanes:
+  with the console's lanes, the lane's bit of the number, as at a uniform join, else 0. Only data
+  made from no mask counts (`made_without_masks`: loads, inputs, and scalar work on them); data
+  from before the region (it dominates the join, `dominates_join`) stays refused, and so does a
+  mask XORed with data (`split_wave_tests::a_mask_swapped_into_a_pair_by_64_bit_xors_in_a_32_lane_wave_is_that_mask_at_a_join`).
+Guesses: in the second form, where the whole wave skips the region, the data the skipping lanes
+bring is never read as a mask; in the third, the mask was dead where the compiler reused its
+register, so what the other edges' lanes read from it (their mask here; on the console, where the
+region's write is the whole wave's, the data's bits) changes no result. Neither was checked on the
+GPU against the console.
+On the r81 corpus (19,127 containers, Series S, the native host's options), 22 more compute
+programs translate (19,011 to 19,033): 19 by the first form (`0a5ecfee6b79e13b`,
+`17af15c4015cb4b6`, `a53a7977fe762268`, ...) and 3 of the 7 traces, which need all three
+(`534b3645dd344ab2`, `d50c03da6d935d87`, `ffd9788ba9fec033`); none regress and no output
+changes. Two other traces now stop at a later join. Tests (`emit::lower::tests`):
+`a_loops_mask_its_back_edge_brings_as_a_join_of_masks_lowers`,
+`a_join_of_masks_a_region_made_is_no_mask_for_the_lanes_that_skipped_it`,
+`a_mask_register_reused_for_data_a_region_loads_is_no_mask_for_its_lanes` (each fails without its
+arm), and `a_mask_joined_with_a_reused_registers_data_lowers` (data from before the region stays
+refused).
+
+The resource tracer follows a descriptor spilled to VGPR lanes the same way (`Tracer::restored`,
+`spilled`). When the VGPR is a phi, its edges agree when the values they spilled have one origin
+in the copy propagation, not only when they are one value. The title's compiler restores a
+spilled descriptor inside a loop and spills it again, so the loop's edge spills the restored copy:
+another value with the same dwords. Comparing values refused all of these as "a descriptor
+neither loaded nor built" (#400): 309 shaders of a 21,556-shader corpus (305 compute, 4 vertex).
+With origins, 8 vertex programs translate (4 of these and 4 that were "a descriptor outside the
+heaps"), none regress and no output changes. The 305 compute programs move on to "a view address
+field the table gives as 0: a buffer's stride or swizzle" (290), "a descriptor's address or
+format read as data" (14) and "a register joining a lane mask and data, read as data" (1). Test:
+`resource::tests::a_descriptor_spilled_again_in_a_loop_is_still_the_load`.
+
 In a mesh shader, a uniform branch can skip a block that replaces a scalar mask with a
 vector compare result. At the join each mesh thread uses its group index modulo the console
 wave size to read its bit. Wave64 takes lanes 32–63 from the high dword on the same edge.
@@ -2526,9 +2569,90 @@ passes the stale value on as scalar arithmetic does, and a result the path fixes
 holds nothing of it. Corpus: 651 programs gained (493 pixel, 158 vertex), 0 lost, 0 changed; of
 the world run's 14,508 pixel draws dropped for these two reasons, 12,156 were of pipelines whose
 every stage now translates. Tests (`victory-gpu`, Metal): `stale_tests`. Still refused, rightly
-for now: texture size queries in a waterfall loop that test dword 1 against 0 for a null view
-(the view-address table holds dword 1 as width bits only, so a texture of width 4k + 1 would
-read as null); buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+for now (null tests of dword 1 were fixed later, "Null tests of image dword 1"): buffer dwords 2-3 and image dwords 5-7, which no host table holds.
+
+**Null tests of image dword 1.** Before it sizes an image from its descriptor the console
+compiler tests dword 1 against 0 (`s_cmp_eq_i32 d1, 0; s_cselect_b32 size, 0, size`): a null
+descriptor is all zeros, and a view's dword 1 is never 0, since its format field (bits 20-28) is
+nonzero for every image format (RDNA2 `IMG_FORMAT` 0 is invalid). The rebuilt dword 1 of
+`Lower::descriptor_data` held only the width bits (30-31, width - 1), so a view of width 4k + 1
+read as null and was sized 0, and a null view (host size 0) read as one of width 65,536. When the
+code tests the dword against 0 and otherwise reads only its width bits (`s_bfe_u32` or
+`s_lshr_b32` from bit 30) or passes it to an image instruction as the descriptor, and no join
+takes it (`Lower::width_bits_or_null_test`), dword 1 is now 0 for a view of size 0 and has
+format bit 20 set otherwise: exact for such code, which sees no other bit. Anything else that
+reads it keeps the old dword. The view-address table path (`view_addresses`, a whole image
+loaded only to read its size fields) does the same from the table's four dwords: dword 1 is 0
+when the entry's dword 3 is 0 and has bit 20 set otherwise. The host writes dword 3 of every
+texture entry with the identity swizzle (`descriptor::image_words`, 0xFAC), and a null, never
+written or buffer entry as 0. Test (`victory-gpu`, Metal):
+`heap_tests::a_null_test_of_view_addresses_tells_a_view_from_an_empty_entry` (a 5x8 placed view
+read as null before; corpus: 0 outputs changed, no program reaches it today). Test (`victory-gpu`,
+Metal): `heap_tests::an_image_whose_width_bits_in_dword_1_are_0_is_no_null_descriptor` (a 5x8 image
+read as null before). Corpus (tmi-agent, 21,600): 0 newly translated, 0 regressed, 2,739 outputs
+changed (94 compute, 589 pixel, 2,056 vertex), each a program whose rebuilt dword 1 is tested
+against 0.
+
+**A size-only waterfall loop over a shifted heap index.** Many world compute programs (light and
+volume passes) size a 1D image in one waterfall loop and read it in a second: each loop reads the
+first lane's heap index (`v_readfirstlane_b32`), shifts it left by 5 to the byte offset of whole
+descriptors (`s_lshl_b32 s, s, 5`) and loads the descriptor at that offset, the sizing loop only
+its first four dwords. A load read only as data takes its view kind from another load of the
+same descriptor; the two were the same only when the offset was the first-lane read itself, so
+the sizing load fell to the view-address table, which holds no dword 2 or 3 for a four-dword
+load, and the program was refused ("a descriptor read only as data", 705 compute programs). Two
+offsets are now the same also when each is the first-lane read of one VGPR value shifted left by
+one constant: every lane of both loops then names the same heap entry. Test:
+`lower::tests::a_waterfall_loop_that_sizes_by_a_shifted_index_takes_the_kind_of_the_sampled_one`.
+Corpus against the null-test commit: 358 newly translated (355 compute, 3 pixel), 0 regressed, 6
+compute outputs changed (sizes now from the view itself, not the view-address table), 350 refused
+for another reason (153 "a lane-mask join of an untracked mask: data, at a join of several
+edges", 93 "a lane mask holding lanes elsewhere read as data: a program input", 74 "an image's
+dwords N to N", 28 "a value the translation could not make", 2 others). Of the windowed world
+run's 677 dropped compute dispatches a frame (20261127-235056), the 85 programs now translated
+made 181.
+
+**What the host reports as a null image's size.** A texture entry of a resource heap that no
+view was written to is the zeroed entry the backend made the heap with (`create_heap`), as is
+one whose texture was released or evicted (`clear_entry`); a size query of it reads 0 by 0 on
+Metal, which is what the null test above takes for a null view. A view of no resource
+(`create_srv` with a null resource, D3D12's null descriptor) used to leave the entry as it was,
+so a size query read the size of the texture shown there before; `NativeHost::mirror` now clears
+the entry for it. Test (Metal): `heap_tests::a_texture_entry_never_written_or_null_has_size_0`
+(0 by 0 never written, 5 by 8 for a view, 0 by 0 again after a null view; the last refused to
+mirror before). Still not 0: a record the title zeroes with plain stores keeps its old entry
+(as for buffers, see the stride table), so a size query there reads the old view's size.
+
+**Descriptors spilled on several paths.** The console compiler spills descriptor dwords to lanes
+of a VGPR (`v_writelane_b32`) and reads them back (`v_readlane_b32`) after joins where the arms
+spilled different descriptors to the same lanes (a register allocator's spill slots: one VGPR
+holds hundreds). `restored` takes a read-back only when every edge brings one SGPR value, so
+these were "a descriptor neither loaded nor built" (305 compute programs, 111 of the world's,
+210 dispatches a frame). `Tracer::phi` now takes a read-back whose VGPR, past writes to other
+lanes, is a phi (`spill_phi`) as a phi of that block too: on each edge the dword is the SGPR
+written to that lane on the edge's path (`slot`; a further join must agree on it, else "a
+spilled descriptor joined twice"), and the descriptor is classified per edge as for SGPR phis,
+which lowering then joins as a heap index at the join. Not a guess: `v_writelane_b32` writes the
+lane whatever EXEC is and `v_readlane_b32` reads it, so the dword read back is the SGPR the path
+taken spilled there, as for SGPR joins. Tests:
+`lower::tests::a_descriptor_spilled_on_two_paths_is_the_one_of_the_path_taken` (refused without
+the rule) and `a_descriptor_spilled_on_only_one_path_stays_refused`. Corpus against the
+shifted-index commit: 4 vertex programs newly translated, 0 regressed, 0 outputs changed, and
+the 305 compute programs now stop later: 123 "an image's dwords N to N", 114 "a lane mask
+holding lanes elsewhere read as data: a program input", 65 "a buffer's dword 1", 3 "a register
+joining a lane mask and data".
+
+**Spilled dwords the host has no value for.** World compute programs that size an image from its
+descriptor (so `Lower::descriptor_data` rebuilds dwords 1-4) also spill the whole descriptor to
+VGPR lanes and reload it before the image instruction. Dwords 5-7 (and a buffer's address) have
+no host value, so the `v_writelane_b32` of them failed and took the whole spill VGPR, read for
+its other lanes, with it: refused as "an image's dwords 5 to 7". The lane now keeps its old value
+when nothing reads it but `v_readlane_b32` that the structure pass restores to the spilled SGPR
+(`Lower::spill_of_missing`: through joins and writes of other lanes; any other read of the VGPR,
+a per-lane copy say, keeps the refusal), and such a reload is that SGPR, still with no value, so
+reading it as data stays refused and only the image instruction (whose descriptor the host binds)
+uses it. Tests: `lower::tests::a_descriptor_dword_with_no_host_value_spilled_and_restored_is_no_data_read`
+(refused without the rule) and `a_descriptor_dword_with_no_host_value_spilled_and_read_per_lane_stays_refused`.
 
 ## The device's own memory ceiling, logged at native host startup (issue #8)
 

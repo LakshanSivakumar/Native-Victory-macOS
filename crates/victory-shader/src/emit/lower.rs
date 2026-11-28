@@ -2743,6 +2743,52 @@ impl<'a> Lower<'a> {
         Err("a value defined after its use")
     }
 
+    /// Whether lane `lane` of VGPR value `r` (just written by `v_writelane_b32` of an SGPR with
+    /// no host value) is read only by `v_readlane_b32` that the tracer restores to an SGPR
+    /// (`restored`) on every way on: through joins and lane writes of other lanes, the VGPR
+    /// read by nothing else. Then the lane need not hold the dword.
+    fn spill_of_missing(&self, r: Value, lane: u32) -> bool {
+        let p = self.x.p;
+        let (mut work, mut seen) = (vec![r], Set::default());
+        while let Some(v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            for b in &p.blocks {
+                work.extend(b.phis.iter().filter(|ph| ph.args.contains(&v)).map(|ph| ph.value));
+                for i in b.insts.iter().filter(|i| i.reads.iter().any(|r| r.1 == v)) {
+                    let Fields::Valu(w) = &i.fields else { return false };
+                    if w.sdwa.is_some() || w.dpp.is_some() {
+                        return false;
+                    }
+                    let (Some(Operand::Vector { reg, .. }), Some(l)) = (
+                        w.src.first().copied().filter(|_| i.name() == "v_readlane_b32").or(w.dst),
+                        w.src.get(1).and_then(|&l| crate::resource::lane_of(l)),
+                    ) else {
+                        return false;
+                    };
+                    match i.name() {
+                        // Another lane's write keeps this one; this lane's ends it.
+                        "v_writelane_b32" if i.read(Reg::V(reg)) == Some(v) => {
+                            if let Some(&(_, x)) = i.writes.first()
+                                && l != lane
+                            {
+                                work.push(x);
+                            }
+                        }
+                        "v_readlane_b32" if i.read(Reg::V(reg)) == Some(v) => {
+                            if l == lane && !i.writes.first().is_some_and(|w| self.x.st.restored.contains_key(&w.1)) {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
@@ -6805,12 +6851,25 @@ impl<'a> Lower<'a> {
                 _ => None,
             }
         };
+        // A heap index a waterfall loop reads from the first lane, as is or shifted left by a
+        // constant (the byte offset of whole descriptors): each lane's VGPR and the shift.
+        let lane_index = |v: Value| {
+            if let Some(s) = lane_source(v) {
+                return Some((s, 0));
+            }
+            let i = self.def_inst(v)?;
+            let Fields::Sop { src, .. } = &i.fields else { return None };
+            match src[..] {
+                [x, k] if i.name() == "s_lshl_b32" => Some((lane_source(sgpr_operand(i, x)?)?, scalar_constant(k)?)),
+                _ => None,
+            }
+        };
         let same = |a: &Address, b: &Address| {
             a.param == b.param
                 && a.offset == b.offset
                 && (a.dynamic == b.dynamic
-                    || a.dynamic.and_then(lane_source).is_some()
-                        && a.dynamic.and_then(lane_source) == b.dynamic.and_then(lane_source))
+                    || a.dynamic.and_then(lane_index).is_some()
+                        && a.dynamic.and_then(lane_index) == b.dynamic.and_then(lane_index))
         };
         let address = self.scalar.get(&site);
         let use_at = use_of(site).or_else(|| {
@@ -6918,7 +6977,21 @@ impl<'a> Lower<'a> {
                     k(self, 16),
                     k(self, 0x3FFF),
                 );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                let mut d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                // A null test of dword 1 (`s_cmp_eq_i32 d1, 0`, the compiler's guard before it
+                // sizes from it): the console's dword 1 is never 0 for a view, its format field
+                // (bits 20-28) being nonzero for every image format, and 0 for a null descriptor
+                // (all zeros), whose size the host reads as 0. When the code reads nothing else of
+                // the dword, set a format bit for a view and give 0 for a null one.
+                let d1_value = inst.write(Reg::S(code + first + 1));
+                if d1_value.is_some_and(|v| self.width_bits_or_null_test(v)) {
+                    let width = field(self, 0);
+                    let zero = k(self, 0);
+                    let null = self.s.m.cmp(c, pred::EQ, width, zero);
+                    let format = k(self, 1 << 20);
+                    let view = self.s.m.bin(c, Bin::Or, d1, format);
+                    d1 = self.s.m.select(c, null, zero, view);
+                }
                 let hi = self.s.m.bin(c, Bin::LShr, w, k2);
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
@@ -7495,6 +7568,32 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether the code tests image descriptor dword 1 (value `v`) against 0 and reads it
+    /// otherwise only for its width bits (30-31, by `s_bfe_u32` or `s_lshr_b32`) or as an image
+    /// instruction's descriptor, and passes it through no join.
+    fn width_bits_or_null_test(&self, v: Value) -> bool {
+        let p = self.x.p;
+        let reads = |i: &&Inst| i.reads.iter().any(|r| r.1 == v);
+        let allowed = |i: &Inst| {
+            // An image instruction's descriptor operand: the view, which the host binds itself.
+            if matches!(i.fields, Fields::Image { .. }) {
+                return true;
+            }
+            let Fields::Sop { src, .. } = &i.fields else { return false };
+            let [a, b] = src[..] else { return false };
+            let other = if sgpr_operand(i, a) == Some(v) { b } else { a };
+            match (i.name(), scalar_constant(other)) {
+                ("s_bfe_u32", Some(k)) => k & 0x1F >= 30 && sgpr_operand(i, a) == Some(v),
+                ("s_lshr_b32", Some(k)) => k & 0x1F >= 30 && sgpr_operand(i, a) == Some(v),
+                ("s_cmp_eq_i32" | "s_cmp_lg_i32" | "s_cmp_eq_u32" | "s_cmp_lg_u32", Some(0)) => true,
+                _ => false,
+            }
+        };
+        p.blocks.iter().all(|b| {
+            b.phis.iter().all(|phi| !phi.args.contains(&v)) && b.insts.iter().filter(reads).all(allowed)
+        }) && p.blocks.iter().flat_map(|b| &b.insts).filter(reads).any(|i| i.name().starts_with("s_cmp_"))
+    }
+
     /// A descriptor load from a table or heap whose dwords the program only
     /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
     /// as a pointer to title memory: the BVH's address in its SRV) or, for
@@ -7564,6 +7663,26 @@ impl<'a> Lower<'a> {
             let word = (a.offset / 4 + k) % 8;
             let written = inst.write(Reg::S(code + k as u8));
             let val = match known.get(word as usize) {
+                // Dword 1 only null-tested or read for its width bits: rebuilt below.
+                Some(_) if word == 1 && count == 8 && written.is_some_and(|v| self.width_bits_or_null_test(v)) => {
+                    let index = self.heap_index(site, k as u8, false)?;
+                    let c = self.cur;
+                    let four = self.s.m.i32(4);
+                    let at = self.s.m.bin(c, Bin::Shl, index, four);
+                    let d1 = self.s.m.i32(4);
+                    let d1 = self.s.m.bin(c, Bin::Add, at, d1);
+                    let d1 = self.raw_dword(views, d1);
+                    let d3 = self.s.m.i32(12);
+                    let d3 = self.s.m.bin(c, Bin::Add, at, d3);
+                    let d3 = self.raw_dword(views, d3);
+                    // As in `descriptor_data`: the table holds a view's dword 1 as width bits
+                    // only, and a view's dword 3 is never 0 (its swizzle) where a null entry's
+                    // four words are.
+                    let (zero, format) = (self.s.m.i32(0), self.s.m.i32(1 << 20));
+                    let null = self.s.m.cmp(c, pred::EQ, d3, zero);
+                    let view = self.s.m.bin(c, Bin::Or, d1, format);
+                    Val::I32(self.s.m.select(c, null, zero, view))
+                }
                 Some(&(held, why))
                     if written.is_some_and(|v| self.seen_bits(v, 4) & !held != 0) =>
                 {
@@ -9798,7 +9917,13 @@ impl<'a> Lower<'a> {
                     .first()
                     .is_some_and(|w| self.x.st.restored.contains_key(&w.1)) =>
             {
-                let a = self.i32_of(self.x.st.restored[&inst.writes[0].1])?;
+                let w = inst.writes[0].1;
+                // A spilled dword the host has no value for (`spill_of_missing`) is still none.
+                if let Val::Missing(why) = self.get(self.x.st.restored[&w])? {
+                    self.vals.insert(w, Val::Missing(why));
+                    return Ok(());
+                }
+                let a = self.i32_of(self.x.st.restored[&w])?;
                 int(self, a)
             }
             "v_writelane_b32"
@@ -9809,6 +9934,28 @@ impl<'a> Lower<'a> {
                         .is_some() =>
             {
                 Err("a VGPR of spilled SGPRs read per lane")
+            }
+            // An SGPR with no host value (a descriptor's address or metadata dwords) spilled to a
+            // lane: the lane keeps its old value, as nothing reads it but reloads of that SGPR.
+            "v_writelane_b32"
+                if let [Operand::Scalar { code, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(x) = inst.read(Reg::S(code))
+                    // (A lane mask has a number: the generic arm takes its ballot.)
+                    && !self.x.st.masks.contains_key(&x)
+                    && !self.x.st.highs.contains_key(&x)
+                    && let Some(&Val::Missing(why)) = self.vals.get(&x)
+                    && let Some(Operand::Vector { reg, .. }) = v.dst =>
+            {
+                let r = inst.write(Reg::V(reg)).ok_or(why)?;
+                if !self.spill_of_missing(r, lane) {
+                    return Err(why);
+                }
+                let old = match inst.read(Reg::V(reg)) {
+                    Some(o) => self.i32_of(o)?,
+                    None => self.s.m.i32(0),
+                };
+                int(self, old)
             }
             // A constant lane of a VGPR only `v_writelane_b32` fills on every path: the SGPR (or
             // constant) last written there, a phi where paths wrote different ones.
@@ -11805,6 +11952,242 @@ impl<'a> Lower<'a> {
                     .all(|a| matches!(a, Atom::Uniform(v) if uniform_scc(*v))),
                 _ => true,
             })
+    }
+
+    /// The mask a lane-mask phi (phi `i` of block `b`) gets along edge `n`
+    /// where the register holds no tracked mask but one the pass can
+    /// follow: a mask spilled to VGPR lanes and read back (`v_readlane_b32`
+    /// of the lanes `v_writelane_b32` filled), or a join of masks (a loop
+    /// whose back edge brings the mask an inner join or a restore left).
+    /// In wave64 both dwords must be the pair's. (Port of VIctory-macOS 6f8fe556.)
+    fn restored_mask(
+        &mut self,
+        b: usize,
+        i: usize,
+        n: usize,
+        at: usize,
+    ) -> Option<Result<V, Why>> {
+        let (p, st) = (self.x.p, self.x.st);
+        let phi = &p.blocks[b].phis[i];
+        let (mut lo, mut hi) = (phi.args[n], None);
+        if self.x.native.wave64 {
+            let Reg::S(c) = phi.reg else { return None };
+            let high = p.blocks[b].phis.iter().find(|q| q.reg == Reg::S(c + 1))?;
+            hi = Some(high.args[n]);
+        }
+        // Through restores to the value spilled.
+        for _ in 0..8 {
+            let Some(&r) = st.restored.get(&lo) else { break };
+            lo = r;
+            if let Some(h) = hi {
+                hi = Some(*st.restored.get(&h)?);
+            }
+        }
+        if hi.is_some() && self.pair_high(lo) != hi {
+            return None;
+        }
+        if let Some(&m) = st.masks.get(&lo) {
+            return Some(self.boolean(m, at));
+        }
+        (self.phi_at.contains_key(&lo) && self.joins_masks(lo, &mut Vec::new()))
+            .then(|| self.atom(Atom::Phi(lo), at))
+    }
+
+    /// Whether value `v` is defined in a block dominating block `b` (an
+    /// input, or a value from before every path to `b`). `idom` caches the
+    /// immediate dominators.
+    fn dominates_join(&self, v: Value, b: usize, idom: &mut Vec<usize>) -> bool {
+        let p = self.x.p;
+        let def = match (self.def_block.get(&v), self.phi_at.get(&v)) {
+            (Some(&d), _) | (_, Some(&(d, _))) => d,
+            _ => return true,
+        };
+        if idom.is_empty() {
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            *idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
+        }
+        let mut d = b;
+        loop {
+            if d == def {
+                return true;
+            }
+            match idom.get(d) {
+                Some(&up) if up != d && up != usize::MAX => d = up,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether scalar value `v` is data no mask is made of, followed `depth` scalar steps back: a
+    /// dword a scalar memory load gives, a program input, or scalar ALU work on such values
+    /// (constants moved in, shifts of a loaded pointer). A tracked mask, EXEC, SCC, a join or a
+    /// lane read (a mask may be read back from VGPR lanes) is not, nor anything made from one (a
+    /// mask XORed with data, say).
+    fn made_without_masks(&self, v: Value, depth: u8) -> bool {
+        let st = self.x.st;
+        if st.masks.contains_key(&v) || st.highs.contains_key(&v) || st.restored.contains_key(&v) {
+            return false;
+        }
+        let Some(inst) = self.def_inst(v) else {
+            return self.x.p.inputs.iter().any(|&(reg, x)| x == v && matches!(reg, Reg::S(_)));
+        };
+        match &inst.fields {
+            Fields::Smem { .. } => true,
+            Fields::Sop { .. } if depth > 0 => inst.reads.iter().all(|&(reg, r)| match reg {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
+                Reg::S(_) => self.made_without_masks(r, depth - 1),
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+
+    /// Whether phi value `v` joins a tracked mask (directly, through
+    /// restores of spilled lanes or through other phis).
+    fn joins_masks(&self, v: Value, seen: &mut Vec<Value>) -> bool {
+        let st = self.x.st;
+        if st.masks.contains_key(&v) {
+            return true;
+        }
+        if let Some(&r) = st.restored.get(&v) {
+            return self.joins_masks(r, seen);
+        }
+        let Some(&(b, i)) = self.phi_at.get(&v) else {
+            return false;
+        };
+        if seen.contains(&v) || seen.len() > 64 {
+            return false;
+        }
+        seen.push(v);
+        self.x.p.blocks[b].phis[i]
+            .args
+            .iter()
+            .any(|&a| self.joins_masks(a, seen))
+    }
+
+    /// [`Self::no_mask_lane_on_edge`] where the masks of the other edges
+    /// may be joins of masks or masks spilled and read back: each mask
+    /// they are made of is clear in every lane of edge `n` (data among
+    /// them, as data on another edge there, does not count).
+    fn no_mask_lane_through_joins(&self, b: usize, args: &[Value], n: usize) -> bool {
+        let on_n = self.lane_edge(self.x.p.blocks[b].preds[n], b);
+        let mut some = false;
+        for (k, &arg) in args.iter().enumerate() {
+            if k == n || !self.joins_masks(arg, &mut Vec::new()) {
+                continue;
+            }
+            some = true;
+            let budget = std::cell::Cell::new(4096);
+            if !self.mask_clear_in(arg, &on_n, &mut Vec::new(), &budget) {
+                return false;
+            }
+        }
+        some
+    }
+
+    /// Whether every lane meeting `lanes` reads 0 from mask value `v`: its
+    /// tracked mask cannot hold such a lane, or it is a join (or a restore)
+    /// of masks that each cannot. A join met again on a cycle adds no mask
+    /// (by induction over the iterations). `budget` bounds the steps.
+    fn mask_clear_in(
+        &self,
+        v: Value,
+        lanes: &[(Bool, bool)],
+        seen: &mut Vec<Value>,
+        budget: &std::cell::Cell<u32>,
+    ) -> bool {
+        let st = self.x.st;
+        if budget.get() == 0 {
+            return false;
+        }
+        budget.set(budget.get() - 1);
+        if let Some(&m) = st.masks.get(&v) {
+            let mut l = lanes.to_vec();
+            l.push((m, true));
+            if !st.bools.meet(&l) {
+                return true;
+            }
+        }
+        if let Some(&r) = st.restored.get(&v) {
+            return self.mask_clear_in(r, lanes, seen, budget);
+        }
+        if seen.contains(&v) {
+            return true;
+        }
+        if let Some(inst) = self.def_inst(v) {
+            if seen.len() > 64 {
+                return false;
+            }
+            seen.push(v);
+            return self.made_clear_in(inst, v, lanes, seen, budget);
+        }
+        let Some(&(b, i)) = self.phi_at.get(&v) else {
+            return false;
+        };
+        if seen.len() > 64 {
+            return false;
+        }
+        seen.push(v);
+        self.x.p.blocks[b].phis[i].args.iter().all(|&a| {
+            !self.joins_masks(a, &mut Vec::new()) && !st.masks.contains_key(&a)
+                || self.mask_clear_in(a, lanes, seen, budget)
+        })
+    }
+
+    /// [`Self::mask_clear_in`] for the mask `v` that `inst` writes, by what
+    /// it is made of: a compare (and a carry) holds only lanes EXEC holds
+    /// there; an AND is clear where either side is, an OR or a select where
+    /// both are, a copy where its source is; `s_*_saveexec` saves EXEC and
+    /// `s_andn2_wrexec` keeps lanes of its source only.
+    fn made_clear_in(
+        &self,
+        inst: &Inst,
+        v: Value,
+        lanes: &[(Bool, bool)],
+        seen: &[Value],
+        budget: &std::cell::Cell<u32>,
+    ) -> bool {
+        let clear = |r: Option<Value>| {
+            r.is_some_and(|x| self.mask_clear_in(x, lanes, &mut seen.to_vec(), budget))
+        };
+        let exec = || clear(inst.read(Reg::S(EXEC)));
+        if matches!(inst.fields, Fields::Valu(_)) {
+            let n = inst.name();
+            let carry = ["v_add_co", "v_sub_co", "v_subrev_co"];
+            let mask = n.starts_with("v_cmp") || carry.iter().any(|c| n.starts_with(c));
+            return mask && exec();
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        let width = if self.x.native.wave64 { "_b64" } else { "_b32" };
+        let Some(op) = inst.name().strip_prefix("s_").and_then(|o| o.strip_suffix(width)) else {
+            return false;
+        };
+        let operand = |k: usize| match src.get(k) {
+            Some(&Operand::Scalar { code: NULL, .. }) | Some(&Operand::Const(128)) => true,
+            Some(&Operand::Scalar { code, .. }) => clear(inst.read(Reg::S(code))),
+            _ => false,
+        };
+        if let Some(f) = op.strip_suffix("_saveexec") {
+            if inst.write(Reg::S(EXEC)) != Some(v) {
+                return exec();
+            }
+            return match f {
+                "and" => operand(0) || exec(),
+                "andn2" => operand(0),
+                "andn1" => exec(),
+                "or" => operand(0) && exec(),
+                _ => false,
+            };
+        }
+        match op {
+            "andn2_wrexec" | "mov" | "andn2" => operand(0),
+            "andn1_wrexec" => exec(),
+            "and" => operand(0) || operand(1),
+            "or" | "xor" | "cselect" => operand(0) && operand(1),
+            _ => false,
+        }
     }
 
     /// Whether no lane goes from IR block `q` to `b`.
@@ -15515,6 +15898,7 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(phi, incoming);
         }
         let mut mesh_split = None;
+        let mut idom = Vec::new();
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -15568,6 +15952,17 @@ impl<'a> Lower<'a> {
                     self.x.st.mask_bits(arg, high.map(|h| h.args[n]))
                 } else {
                     self.x.st.masks.get(&arg).copied()
+                };
+                // A spilled and restored mask, or a join of masks (made before the match, which
+                // borrows the values).
+                let restored = if mask.is_none()
+                    && !self.unneeded_edges().contains(&(phi.value, n))
+                    && !(number && matches!(self.vals.get(&arg), Some(&Val::I32(_))))
+                    && !(!uniform && self.no_mask_lane_on_edge(b, &phi.args, n))
+                {
+                    self.restored_mask(b, i, n, qb)
+                } else {
+                    None
                 };
                 let x = match (mask, self.vals.get(&arg)) {
                     (Some(m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
@@ -15623,6 +16018,43 @@ impl<'a> Lower<'a> {
                             }) =>
                     {
                         self.boolean(m, qb).map_err(|w| unsupported(offset, w))?
+                    }
+                    // A mask spilled to VGPR lanes and read back, or a join of masks (VIctory-macOS
+                    // 6f8fe556).
+                    (None, _) if let Some(r) = restored => r.map_err(|w| unsupported(offset, w))?,
+                    // As `no_mask_lane_on_edge`, through joins of masks (a region's mask its
+                    // inner join made, the saved EXEC of an inner region): every mask they join
+                    // is clear in the lanes of this edge.
+                    // Guess, as there: where the whole wave skips the region, the data this edge
+                    // brings is a reused register the code never reads as a mask.
+                    (None, _) if !uniform && self.no_mask_lane_through_joins(b, &phi.args, n) => {
+                        self.s.m.bool(false)
+                    }
+                    // A per-lane join in compute where the register holds data written along
+                    // this edge only (a descriptor, a constant, a constant-buffer dword loaded in
+                    // a region the other lanes skip: the compiler reused a register the mask was
+                    // dead in, so lanes coming along it read no mask from it). With console lanes
+                    // the lane's bit of the number, as at a uniform join; else, or where it is no
+                    // number, 0. Only data made from no mask (`made_without_masks`) counts. Data
+                    // from before the region (an old value the region's mask replaces for every
+                    // lane on the console, the saved EXEC say) stays refused.
+                    // VIctory-macOS 6f8fe556 (the ray-traced shadows' BVH walks).
+                    // Guess: the mask was dead where the compiler reused its register, so what the
+                    // other edges' lanes read from it (their mask here; on the console, where the
+                    // region's write is the whole wave's, the data's bits) changes no result.
+                    (None, v)
+                        if self.mask_data == MaskData::Console
+                            && !self.x.native.wave64
+                            && !uniform
+                            && self.made_without_masks(arg, 8)
+                            && !self.dominates_join(arg, b, &mut idom) =>
+                    {
+                        match v {
+                            Some(&Val::I32(word)) if self.console_lanes => {
+                                self.lane_bit(qb, word, None)
+                            }
+                            _ => self.s.m.bool(false),
+                        }
                     }
                     // Data that is all lanes or none (`s_mov_b64 s, -1`) is that bit on any lanes.
                     (None, Some(&Val::I32(word)))
@@ -16171,6 +16603,135 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_joined_with_a_reused_registers_data_lowers() {
+        // s20 holds a compare's mask, then (in a branch some lanes take) a
+        // sampler dword; after the join it is read as a mask (compute
+        // 43ce3255529b200a; port of VIctory-macOS 6f8fe556).
+        let body = [
+            0xD4C5_0014, // v_cmp_ne_u32 s20, 0, v1
+            0x0002_0280,
+            0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0xB014_0092, // s_movk_i32 s20, 0x92
+            0xBEFE_0315, // s_mov_b32 exec_lo, s21
+            0xD501_0000, // v_cndmask_b32 v0, 0, 1, s20
+            0x0051_0280,
+        ];
+        assert_eq!(refusal(lowers_valu(&body)), None);
+        // The old value on the skip edge instead, the region's mask the
+        // saved EXEC (every lane, the skipping ones included, on the
+        // console): refused (`synthetic_tests::
+        // a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there`).
+        let body = [
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7D88_0290, // v_cmp_gt_u32 vcc_lo, 16, v1
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0xBE86_030C, // s_mov_b32 s6, s12
+            0xBEFE_030C, // s_mov_b32 exec_lo, s12
+            0xD501_0000, // v_cndmask_b32 v0, 0, 1, s6
+            0x0019_0280,
+        ];
+        let what = refusal(lowers_valu(&body)).expect("the saved EXEC joined with data");
+        assert!(what.contains("lane-mask join"), "{what}");
+    }
+
+    #[test]
+    fn a_mask_register_reused_for_data_a_region_loads_is_no_mask_for_its_lanes() {
+        // s20 holds a compare's mask; in a region some lanes take the compiler reuses it for a
+        // constant-buffer dword or a descriptor-table dword (`s_buffer_load_dword`,
+        // `s_load_dword`), and after the join reads it as a mask: the ray-traced shadows' BVH
+        // walks (`CS_RTShadowTrace32HQ_TiledFarOnly` 534b3645dd344ab2). Port of VIctory-macOS
+        // 6f8fe556.
+        let body = |load: [u32; 2]| {
+            let mut w = vec![
+                0xD4C5_0014,
+                0x0202_0280, // v_cmp_ne_u32_e64 s20, 0, v1
+                0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+                0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+                0xBF88_0003, // s_cbranch_execz JOIN
+            ];
+            w.extend(load);
+            w.extend([
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xBEFE_0315, // JOIN: s_mov_b32 exec_lo, s21
+                0xD501_0000,
+                0x0051_0280, // v_cndmask_b32_e64 v0, 0, 1, s20
+            ]);
+            w
+        };
+        let buffer = [0xF420_0504, 0xFA00_0010]; // s_buffer_load_dword s20, s[8:11], 0x10
+        let table = [0xF400_0502, 0xFA00_0010]; // s_load_dword s20, s[4:5], 0x10
+        for load in [buffer, table] {
+            assert_eq!(refusal(lowers_valu(&body(load))), None, "{load:x?}");
+        }
+        // Data from before the region (the saved EXEC joined with data) stays refused:
+        // `a_mask_joined_with_a_reused_registers_data_lowers`; data made from a mask (XORed with
+        // another pair) too: `victory-gpu`'s
+        // `a_mask_swapped_into_a_pair_by_64_bit_xors_in_a_32_lane_wave_is_that_mask_at_a_join`.
+    }
+
+    #[test]
+    fn a_loops_mask_its_back_edge_brings_as_a_join_of_masks_lowers() {
+        // s20 is a compare's mask on entry to a loop and is read as a mask in it; the back edge
+        // brings what an inner region left there: its own compare's mask for the lanes that ran
+        // it, the header's for the others, a join of masks and no mask itself. The header's join
+        // takes it as that join (`restored_mask`). Port of VIctory-macOS 6f8fe556; 19 of the
+        // title's compute programs join a mask so.
+        let body = [
+            0xD4C5_0014,
+            0x0002_0280, // v_cmp_ne_u32_e64 s20, 0, v1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xD501_0000,
+            0x0051_0280, // HEADER: v_cndmask_b32_e64 v0, 0, 1, s20
+            0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0002, // s_cbranch_execz INNER
+            0xD4C5_0014,
+            0x0002_0680, // v_cmp_ne_u32_e64 s20, 0, v3
+            0xBEFE_0315, // INNER: s_mov_b32 exec_lo, s21
+            0x8007_8107, // s_add_u32 s7, s7, 1
+            0xBF0A_8207, // s_cmp_lt_u32 s7, 2
+            0xBF85_FFF5, // s_cbranch_scc1 HEADER
+        ];
+        assert_eq!(refusal(lowers_valu(&body)), None);
+    }
+
+    #[test]
+    fn a_join_of_masks_a_region_made_is_no_mask_for_the_lanes_that_skipped_it() {
+        // s20 holds data (5) before a region of the lanes with v2 != 0; inside it, a compare's
+        // mask, then in an inner region another compare's: after the inner region s20 is a join
+        // of masks, and after the outer one a join of that with the data the skipping lanes
+        // bring. Every mask joined there was made inside the region, so no lane that skipped it
+        // is in any: s20 reads 0 for them (the ray-traced shadows' BVH walks,
+        // `CS_RTShadowTrace32HQ_TiledFarOnly` 534b3645dd344ab2). Port of VIctory-macOS 6f8fe556.
+        let body = [
+            0xBE94_0385, // s_mov_b32 s20, 5
+            0x7D8A_0480, // v_cmp_ne_u32 vcc_lo, 0, v2
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF88_0008, // s_cbranch_execz JOIN
+            0xD4C2_0014,
+            0x0002_0280, // v_cmp_eq_u32_e64 s20, 0, v1
+            0x7D8A_0680, // v_cmp_ne_u32 vcc_lo, 0, v3
+            0xBE96_3C6A, // s_and_saveexec_b32 s22, vcc_lo
+            0xBF88_0002, // s_cbranch_execz INNER
+            0xD4C5_0014,
+            0x0002_0880, // v_cmp_ne_u32_e64 s20, 0, v4
+            0xBEFE_0316, // INNER: s_mov_b32 exec_lo, s22
+            0xBEFE_0315, // JOIN: s_mov_b32 exec_lo, s21
+            0xD501_0000,
+            0x0051_0280, // v_cndmask_b32_e64 v0, 0, 1, s20
+        ];
+        assert_eq!(refusal(lowers_valu(&body)), None);
+    }
+
+    /// What a lowering was refused for, if it was.
+    fn refusal<T>(r: Result<T, crate::ShaderError>) -> Option<String> {
+        r.err().map(|e| e.to_string())
+    }
+
+    #[test]
     fn the_24_bit_multiplies_lower_both_halves() {
         // VOP2 `op v0, v1, v2`: v_mul_i32_i24 and v_mul_u32_u24 (the low
         // dword) and v_mul_hi_i32_i24 and v_mul_hi_u32_u24 (the high one).
@@ -16511,6 +17072,196 @@ mod tests {
         ];
         let (layout, used) = texture_and_uav_tables();
         lower_wave(&words, layout, used, false).unwrap();
+    }
+
+    #[test]
+    fn a_waterfall_loop_that_sizes_by_a_shifted_index_takes_the_kind_of_the_sampled_one() {
+        // As above, but v7 holds the entry's index and each loop shifts the first lane's index
+        // left by 5 to the byte offset (`s_lshl_b32`, the title's form), and the sizing loop
+        // loads only four dwords, of which dword 2 has no view address: the two loads are of
+        // the same descriptor only through the shift.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x360E_0081, // v_and_b32 v7, 1, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E28_0507, // L1: v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0x8F14_8514, // s_lshl_b32 s20, s20, 5
+            0xF408_0302,
+            0x2800_0000, // s_load_dwordx4 s[12:15], s[4:5], s20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xD54E_0008,
+            0x0278_1A0E, // v_alignbit_b32 v8, s14, s13, 30
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF6, // s_cbranch_execnz L1
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xBE95_037E, // s_mov_b32 s21, exec_lo
+            0x7E28_0507, // L2: v_readfirstlane_b32 s20, v7
+            0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+            0x8F14_8514, // s_lshl_b32 s20, s20, 5
+            0xF40C_0302,
+            0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+            0xBF89_FFF5, // s_cbranch_execnz L2
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xE070_1000,
+            0x800A_0810, // buffer_store_dword v8, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_and_uav_tables();
+        lower_wave(&words, layout, used, false).unwrap();
+    }
+
+    /// Buffer descriptor 0 or 1 of the table at s0, chosen by the root constant in s1, spilled to
+    /// lanes 0-3 of v5 on each arm and read back after the join for a load.
+    const SPILLED_ON_TWO_PATHS: [u32; 42] = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_000C, // s_cbranch_scc1 ELSE
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD761_0005,
+        0x0001_0008, // v_writelane_b32 v5, s8, 0
+        0xD761_0005,
+        0x0001_0209, // v_writelane_b32 v5, s9, 1
+        0xD761_0005,
+        0x0001_040A, // v_writelane_b32 v5, s10, 2
+        0xD761_0005,
+        0x0001_060B, // v_writelane_b32 v5, s11, 3
+        0xBF82_000B, // s_branch JOIN
+        0xF408_0202,
+        0xFA00_0010, // ELSE: s_load_dwordx4 s[8:11], s[4:5], 0x10
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD761_0005,
+        0x0001_0008, // v_writelane_b32 v5, s8, 0
+        0xD761_0005,
+        0x0001_0209, // v_writelane_b32 v5, s9, 1
+        0xD761_0005,
+        0x0001_040A, // v_writelane_b32 v5, s10, 2
+        0xD761_0005,
+        0x0001_060B, // v_writelane_b32 v5, s11, 3
+        0xD760_000C,
+        0x0001_0105, // JOIN: v_readlane_b32 s12, v5, 0
+        0xD760_000D,
+        0x0001_0305, // v_readlane_b32 s13, v5, 1
+        0xD760_000E,
+        0x0001_0505, // v_readlane_b32 s14, v5, 2
+        0xD760_000F,
+        0x0001_0705, // v_readlane_b32 s15, v5, 3
+        0xE030_2000,
+        0x8003_0102, // buffer_load_dword v1, v2, s[12:15], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+
+    /// Two structured buffers of dwords at table dwords 0 and 4 of s0; a root constant at s1.
+    fn two_buffers() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let used = |at, slot| UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot,
+        };
+        (vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)], vec![used(0, 0), used(4, 1)])
+    }
+
+    #[test]
+    fn a_descriptor_spilled_on_two_paths_is_the_one_of_the_path_taken() {
+        let (layout, used) = two_buffers();
+        lower_with(&SPILLED_ON_TWO_PATHS, layout, used).unwrap();
+    }
+
+    /// [`SPILLED_ON_TWO_PATHS`] with the else arm writing its dword 0 to lane 4: lane 0 holds
+    /// descriptor 0's dword 0 on one path and what it held on entry on the other, and stays refused.
+    #[test]
+    fn a_descriptor_spilled_on_only_one_path_stays_refused() {
+        let mut w = SPILLED_ON_TWO_PATHS;
+        w[21] = 0x0001_0808; // v_writelane_b32 v5, s8, 4
+        let (layout, used) = two_buffers();
+        assert!(lower_with(&w, layout, used).is_err());
+    }
+
+    /// The image descriptor of the table at s0, its width bits (dword 1) read as data, dword 5
+    /// (no host value) spilled to lane 0 of v7 and read back into its register before the
+    /// image load: only the reload that restores it reads the lane.
+    const SPILLED_WITH_NO_VALUE: [u32; 29] = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x9014_9E0D, // s_lshr_b32 s20, s13, 30
+        0x7E0C_0214, // v_mov_b32 v6, s20
+        0xD761_0007,
+        0x0001_0011, // v_writelane_b32 v7, s17, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0002, // s_cbranch_scc1 RELOAD
+        0xD761_0007,
+        0x0001_0201, // v_writelane_b32 v7, s1, 1
+        0xD760_0011, // RELOAD:
+        0x0001_0107, // v_readlane_b32 s17, v7, 0
+        0xD760_0015,
+        0x0001_0307, // v_readlane_b32 s21, v7, 1 (written on one path only)
+        0x7E14_0215, // v_mov_b32 v10, s21
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xF000_1F08,
+        0x0003_0200, // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xD834_0000,
+        0x0000_0200, // ds_write_b32 v0, v2
+        0xD834_0000,
+        0x0000_0600, // ds_write_b32 v0, v6
+        0xD834_0000,
+        0x0000_0A00, // ds_write_b32 v0, v10
+    ];
+
+    #[test]
+    fn a_descriptor_dword_with_no_host_value_spilled_and_restored_is_no_data_read() {
+        let (layout, used) = texture_tables();
+        lower_with(&[&SPILLED_WITH_NO_VALUE[..], &[S_ENDPGM]].concat(), layout, used).unwrap();
+    }
+
+    /// The same with the VGPR also read per lane (`v_mov_b32 v8, v7`): lane 0 would give its
+    /// old value for the dword, so the spill stays refused.
+    #[test]
+    fn a_descriptor_dword_with_no_host_value_spilled_and_read_per_lane_stays_refused() {
+        let more = [
+            0x7E10_0307, // v_mov_b32 v8, v7
+            0xD834_0000,
+            0x0000_0800, // ds_write_b32 v0, v8
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        let Err(err) = lower_with(&[&SPILLED_WITH_NO_VALUE[..], &more].concat(), layout, used) else {
+            panic!("lowered");
+        };
+        assert!(format!("{err:?}").contains("dwords 5 to 7"), "{err:?}");
     }
 
     #[test]
