@@ -2120,3 +2120,94 @@ impl<B: GraphicsBackend> NativeList<B> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_signed_is_zigzag() {
+        assert_eq!(decode_signed(0), 0);
+        assert_eq!(decode_signed(1), 0); // -0
+        assert_eq!(decode_signed(2), 1);
+        assert_eq!(decode_signed(3), -1);
+        assert_eq!(decode_signed(4), 2);
+        assert_eq!(decode_signed(5), -2);
+        assert_eq!(decode_signed(u64::MAX), i64::MIN + 1);
+        // Round trip: encoding n is (n << 1) for n >= 0, ((-n) << 1) | 1 for n < 0.
+        for n in [0i64, 1, -1, 42, -42, i64::MAX, i64::MIN + 1] {
+            let raw = if n >= 0 { (n as u64) << 1 } else { (((-n) as u64) << 1) | 1 };
+            assert_eq!(decode_signed(raw), n, "raw {raw:#x}");
+        }
+    }
+
+    /// A minimal DXBC container with one DXIL part whose bitcode starts with the BC magic.
+    fn dxbc_with_bitcode(bc: &[u8]) -> Vec<u8> {
+        // Part = [fourcc "DXIL", body size][body]: body[8..12] = program type "DXIL",
+        // body[16..20] = bitcode offset relative to the part header, body[20..24] = bitcode size.
+        let mut part = vec![0u8; 32];
+        part[..4].copy_from_slice(b"DXIL");
+        part[4..8].copy_from_slice(&((24 + bc.len()) as u32).to_le_bytes());
+        part[16..20].copy_from_slice(b"DXIL"); // body[8..12]
+        part[24..28].copy_from_slice(&16u32.to_le_bytes()); // body[16..20]: bc_off = 8 + 16 = 24 -> body[24] = part[32]
+        part[28..32].copy_from_slice(&(bc.len() as u32).to_le_bytes()); // body[20..24]
+        part.extend_from_slice(bc); // bitcode payload at part[32]
+        let mut dxil = vec![0u8; 36];
+        dxil[..4].copy_from_slice(b"DXBC");
+        dxil[28..32].copy_from_slice(&1u32.to_le_bytes()); // one part
+        dxil[32..36].copy_from_slice(&36u32.to_le_bytes()); // part at 36
+        dxil.extend_from_slice(&part);
+        dxil
+    }
+
+    #[test]
+    fn dxil_bitcode_finds_the_bc_magic_in_a_dxil_part() {
+        let bc: &[u8] = &[0x42, 0x43, 0xC0, 0xDE, 0x01, 0x02, 0x03, 0x04];
+        let c = dxbc_with_bitcode(bc);
+        assert_eq!(dxil_bitcode(&c), Some(&bc[4..]));
+    }
+
+    #[test]
+    fn dxil_bitcode_rejects_bad_containers() {
+        assert_eq!(dxil_bitcode(b""), None);
+        assert_eq!(dxil_bitcode(b"DXBC"), None, "too short for the header");
+        let mut no_dxbc = dxbc_with_bitcode(&[0x42, 0x43, 0xC0, 0xDE, 0x00, 0x00, 0x00, 0x00]);
+        no_dxbc[..4].copy_from_slice(b"XXXX");
+        assert_eq!(dxil_bitcode(&no_dxbc), None, "bad magic");
+        let mut bad_parts = dxbc_with_bitcode(&[0x42, 0x43, 0xC0, 0xDE, 0x00, 0x00, 0x00, 0x00]);
+        bad_parts[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(dxil_bitcode(&bad_parts), None, "part count past the end");
+        let mut no_dxil = dxbc_with_bitcode(&[0x42, 0x43, 0xC0, 0xDE, 0x00, 0x00, 0x00, 0x00]);
+        no_dxil[36..40].copy_from_slice(b"XXXX");
+        assert_eq!(dxil_bitcode(&no_dxil), None, "part without a DXIL tag");
+        let bad_bc = dxbc_with_bitcode(&[0x58, 0x58, 0x59, 0x59, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(dxil_bitcode(&bad_bc), None, "bitcode without the BC magic");
+    }
+
+    #[test]
+    fn dedup_stage_elems_keeps_one_per_kind_slot_offset_and_merges_writes() {
+        let mut elems = vec![
+            StageHeapElem::Table { slot: 1, offset: 8, writes: false },
+            StageHeapElem::Table { slot: 1, offset: 8, writes: true },
+            StageHeapElem::Table { slot: 1, offset: 16, writes: false },
+            StageHeapElem::Pairs { writes: false },
+            StageHeapElem::Pairs { writes: true },
+            StageHeapElem::Fixed { index: 3, writes: true },
+            StageHeapElem::Fixed { index: 3, writes: false },
+        ];
+        dedup_stage_elems(&mut elems);
+        let mut keys: Vec<_> = elems.iter().map(|e| match *e {
+            StageHeapElem::Table { slot, offset, .. } => (0u8, slot as u32, offset),
+            StageHeapElem::Pairs { .. } => (1, 0, 0),
+            StageHeapElem::Fixed { index, .. } => (2, 0, index),
+        }).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![(0, 1, 8), (0, 1, 16), (1, 0, 0), (2, 0, 3)], "one per (kind, slot, offset)");
+        // The sort key ends in !writes, so writes=true sorts first and dedup keeps it.
+        let table = elems.iter().find_map(|e| match *e {
+            StageHeapElem::Table { slot: 1, offset: 8, writes } => Some(writes),
+            _ => None,
+        }).unwrap();
+        assert!(table, "writes=true sorts first (key ends in !writes), so it is the one kept");
+    }
+}
