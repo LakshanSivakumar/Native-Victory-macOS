@@ -13,7 +13,9 @@ use std::sync::Once;
 
 use super::context::*;
 use super::dispatch::entry_address;
-use crate::native::teb::OFF_SELF;
+use crate::native::teb::{
+    OFF_EMERGENCY_BASE, OFF_EMERGENCY_LIMIT, OFF_SELF, OFF_STACK_BASE, OFF_STACK_LIMIT,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -83,16 +85,56 @@ const T_RSP: usize = 7;
 const T_RIP: usize = 16;
 const T_RFLAGS: usize = 17;
 
-/// Whether GS is a TEB: slot 6 of the host's thread-specific data (the
-/// TEB's `Self` offset) is zero in a host thread.
-fn gs_is_teb() -> bool {
+/// The active TEB if GS currently points to one: slot 6 of the host's
+/// thread-specific data (the TEB's `Self` offset) is zero in a host thread.
+fn gs_teb() -> Option<usize> {
     let teb: usize;
     // SAFETY: reads the word at gs:[0x30], which exists in either layout.
     unsafe {
         std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags))
     };
     // SAFETY: a non-zero word there is a TEB, whose `Self` points back.
-    teb != 0 && unsafe { ((teb + OFF_SELF) as *const usize).read() } == teb
+    (teb != 0 && unsafe { ((teb + OFF_SELF) as *const usize).read() } == teb).then_some(teb)
+}
+
+/// Minimum stack room required below `entry_rsp` so `victory_exception_entry`
+/// and `dispatch` (plus any vectored or unhandled filter) never hit the guard page.
+const DISPATCH_HEADROOM: usize = 32 << 10;
+
+fn place_below(base_rsp: usize, here: usize) -> Option<(usize, usize, usize)> {
+    let mut top = base_rsp.checked_sub(0x100)?;
+    if here < base_rsp && base_rsp - here < 0x2_0000 {
+        top = top.min(here.checked_sub(0x2000)?);
+    }
+    let ctx_at = top.checked_sub(size_of::<Context>())? & !0xF;
+    let rec_at = ctx_at.checked_sub(size_of::<ExceptionRecord>())? & !0xF;
+    let entry_rsp = rec_at.checked_sub(0x20)? & !0xF;
+    Some((ctx_at, rec_at, entry_rsp))
+}
+
+fn choose_dispatch_stack(
+    rsp: usize,
+    here: usize,
+    stack: (usize, usize),
+    emergency: (usize, usize),
+) -> Option<(usize, usize, usize)> {
+    let fits = |(limit, base): (usize, usize), candidate_rsp: usize, entry_rsp: usize| {
+        limit < base
+            && candidate_rsp <= base
+            && entry_rsp >= limit.saturating_add(DISPATCH_HEADROOM)
+    };
+    if let Some(placed @ (_, _, entry_rsp)) = place_below(rsp, here)
+        && (fits(stack, rsp, entry_rsp) || fits(emergency, rsp, entry_rsp))
+    {
+        return Some(placed);
+    }
+    if emergency.0 < emergency.1
+        && let Some(placed @ (_, _, entry_rsp)) = place_below(emergency.1, here)
+        && entry_rsp >= emergency.0
+    {
+        return Some(placed);
+    }
+    place_below(rsp, here)
 }
 
 /// For `clzero; add rax, 0x40; cmp rax, <reg>; jb clzero` (12 bytes), the
@@ -273,10 +315,19 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             return;
         }
     }
-    if !gs_is_teb() {
+    let Some(teb) = gs_teb() else {
         // SAFETY: the same arguments.
         return unsafe { chain(signal, info, uc) };
-    }
+    };
+    // SAFETY: inside this thread's validated TEB block.
+    let (stack_base, stack_limit, emerg_base, emerg_limit) = unsafe {
+        (
+            ((teb + OFF_STACK_BASE) as *const usize).read(),
+            ((teb + OFF_STACK_LIMIT) as *const usize).read(),
+            ((teb + OFF_EMERGENCY_BASE) as *const usize).read(),
+            ((teb + OFF_EMERGENCY_LIMIT) as *const usize).read(),
+        )
+    };
     // SAFETY: the kernel's machine context for this signal.
     let mc = unsafe { uc.add(UC_MCONTEXT).cast::<*mut u8>().read() };
     let word = |i: usize| -> u64 {
@@ -410,7 +461,12 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
             } else {
                 si_addr
             };
-            rec.code = EXCEPTION_ACCESS_VIOLATION;
+            let is_stack_guard = stack_limit > 0 && at < stack_limit && stack_limit - at <= 0x10_0000;
+            rec.code = if is_stack_guard {
+                EXCEPTION_STACK_OVERFLOW
+            } else {
+                EXCEPTION_ACCESS_VIOLATION
+            };
             rec.number_parameters = 2;
             // 0 read, 1 write (bit 1 of the page-fault error code), 8 execute.
             rec.information[0] = if at == rip as usize {
@@ -451,20 +507,22 @@ unsafe extern "C" fn on_signal(signal: i32, info: *mut u8, uc: *mut u8) {
         }
     }
 
-    // Where to put them: below the interrupted rsp (Windows code has no red
-    // zone, but ours might), and below this handler's own frame if it runs
-    // on that stack.
+    // Place `CONTEXT` and `EXCEPTION_RECORD` below the interrupted `rsp` when enough stack
+    // headroom remains, or switch onto the TEB's emergency stack when `rsp` hit the guard page
+    // or left `[stack_limit, stack_base)`.
     let rsp = word(T_RSP) as usize;
     let marker = 0u8;
     let here = std::ptr::from_ref(&marker) as usize;
-    let mut top = rsp.wrapping_sub(0x100);
-    if here < rsp && rsp - here < 0x2_0000 {
-        top = top.min(here - 0x2000);
-    }
-    let ctx_at = (top - size_of::<Context>()) & !0xF;
-    let rec_at = (ctx_at - size_of::<ExceptionRecord>()) & !0xF;
-    let entry_rsp = (rec_at - 0x20) & !0xF;
-    // SAFETY: the thread's own stack below its rsp.
+    let Some((ctx_at, rec_at, entry_rsp)) = choose_dispatch_stack(
+        rsp,
+        here,
+        (stack_limit, stack_base),
+        (emerg_limit, emerg_base),
+    ) else {
+        // SAFETY: no writable dispatch stack available; chain to previous handler.
+        return unsafe { chain(signal, info, uc) };
+    };
+    // SAFETY: inside a validated writable stack range (`stack` or `emergency`).
     unsafe {
         (ctx_at as *mut Context).write(ctx);
         (rec_at as *mut ExceptionRecord).write(rec);
@@ -715,5 +773,77 @@ mod watch_tests {
         assert_eq!(protection(p + page), Protect::READ_WRITE);
         // SAFETY: the allocation above.
         unsafe { mem::release(p as *mut u8, 2 * page) }.unwrap();
+    }
+
+    #[test]
+    fn guard_page_and_invalid_rsp_faults_dispatch_on_the_teb_emergency_stack() {
+        use super::super::context::{
+            EXCEPTION_ACCESS_VIOLATION, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_STACK_OVERFLOW,
+            ExceptionPointers, RBX, RSP,
+        };
+        use super::super::dispatch::{Handler, add_vectored_handler, remove_vectored_handler};
+        use crate::native::bridge::call_win64;
+        use crate::native::teb::{self, OFF_STACK_LIMIT};
+
+        static SEEN: std::sync::Mutex<Vec<(u32, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+        extern "C" fn catch_bad_rsp(ptrs: *mut ExceptionPointers) -> i32 {
+            // SAFETY: valid `EXCEPTION_POINTERS` supplied by `seh::dispatch`.
+            unsafe {
+                let rec = &*(*ptrs).record;
+                let ctx = &mut *(*ptrs).context;
+                if rec.code != EXCEPTION_STACK_OVERFLOW && rec.code != EXCEPTION_ACCESS_VIOLATION {
+                    return 0;
+                }
+                SEEN.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((rec.code, ctx.gpr[RSP], rec.information[1]));
+                ctx.gpr[RSP] = ctx.gpr[RBX];
+                ctx.rip += 8;
+                EXCEPTION_CONTINUE_EXECUTION
+            }
+        }
+
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        SEEN.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let page = mem::page_size();
+        // push rbx; mov rbx, rsp; mov rsp, rcx; mov qword ptr [rsp], 0; mov eax, 0x77; pop rbx; ret
+        let code: [u8; 21] = [
+            0x53, 0x48, 0x89, 0xE3, 0x48, 0x89, 0xCC, 0x48, 0xC7, 0x04, 0x24, 0x00, 0x00, 0x00,
+            0x00, 0xB8, 0x77, 0x00, 0x00, 0x00, 0x5B,
+        ];
+        // SAFETY: fresh executable page for the test stub.
+        let stub = unsafe {
+            let p = mem::alloc(None, page, Protect::READ_WRITE).unwrap();
+            std::ptr::copy_nonoverlapping(code.as_ptr(), p, code.len());
+            p.add(code.len()).write(0xC3);
+            mem::protect(p, page, Protect::READ_EXECUTE).unwrap();
+            p as usize
+        };
+        let veh = add_vectored_handler(true, Handler::Host(catch_bad_rsp));
+        let worker = victory_platform::thread::spawn("seh-emerg-probe", 1 << 20, move || {
+            let teb = teb::current() as usize;
+            // SAFETY: inside this thread's TEB.
+            let stack_limit = unsafe { ((teb + OFF_STACK_LIMIT) as *const usize).read() };
+            let guard_rsp = (stack_limit - 64) as u64;
+            // SAFETY: `stub` follows the Windows ABI and the VEH resumes past the fault.
+            let r1 = unsafe { call_win64(stub, &[guard_rsp]) };
+            // SAFETY: as above, with an unmapped low `rsp`.
+            let r2 = unsafe { call_win64(stub, &[0x100]) };
+            assert_eq!((r1, r2), (0x77, 0x77));
+            guard_rsp as u32
+        })
+        .unwrap();
+        let low_guard = worker.join();
+        assert!(remove_vectored_handler(veh));
+        // SAFETY: allocated above.
+        unsafe { mem::release(stub as *mut u8, page) }.unwrap();
+
+        let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(seen.len(), 2, "{seen:x?}");
+        assert_eq!(seen[0].0, EXCEPTION_STACK_OVERFLOW);
+        assert_eq!(seen[0].1 as u32, low_guard);
+        assert_eq!(seen[0].2 as u64, seen[0].1);
+        assert_eq!(seen[1], (EXCEPTION_ACCESS_VIOLATION, 0x100, 0x100));
     }
 }

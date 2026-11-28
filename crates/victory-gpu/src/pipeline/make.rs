@@ -256,6 +256,7 @@ fn queue(p: Arc<Pending>, now: bool) {
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
                     .name(format!("victory-pipelines-{i}"))
+                    .stack_size(8 << 20)
                     .spawn(work);
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
