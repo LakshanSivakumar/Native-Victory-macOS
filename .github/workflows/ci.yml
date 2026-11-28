@@ -27,6 +27,8 @@ jobs:
         run: /bin/bash tools/macos/tests/console-default.sh
       - name: find_rustup PATH handling (Bash 3.2)
         run: /bin/bash tools/macos/tests/rustup-path.sh
+      - name: run-native.sh argument and missing-game checks (Bash 3.2)
+        run: /bin/bash tools/macos/tests/run-native-args.sh
       - name: verify.sh picks the host target off a Mac (Bash 3.2)
         run: /bin/bash tools/macos/tests/verify-target.sh
 

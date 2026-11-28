@@ -22,7 +22,12 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${2:-}" && "$2" != -* ]] || { echo "--console requires a model" >&2; exit 2; }
       console="$2"; shift 2 ;;
     --console=) echo "--console requires a model" >&2; exit 2 ;;
-    --console=*) console="${1#--console=}"; shift ;;
+    --console=*)
+      # The same rule as the space form: a value starting with `-` is the next switch, not a
+      # model, so a forgotten model is refused here rather than by the game's own parser later.
+      console="${1#--console=}"
+      [[ "$console" != -* ]] || { echo "--console requires a model" >&2; exit 2; }
+      shift ;;
     -h|--help) sed -n 2,9p "$0"; exit 0 ;;
     *) break ;;
   esac
