@@ -939,24 +939,49 @@ static FUNCTIONS: Table<24> = {
 /// 30-31, dword 2 bits 0-13 and 14-29), dword 3 an identity swizzle, the
 /// view's first and last level (bits 12-15, 16-19) and the image type (bits
 /// 28-31). `None` for buffers and samplers.
-// shortcut: the address, format and tiling fields read 0 (no translated
-// shader reads them: the shader refuses such reads where it can tell),
-// and the swizzle is the identity whatever the view's component mapping.
-pub(crate) fn texture_words(view: &View) -> Option<[u32; 4]> {
-    let (resource, desc, unordered) = match view {
-        View::Shader(r, desc) => (crate::resource::texture_desc(*r as crate::object::This)?, *desc, false),
-        View::Unordered(r, _, desc) => (crate::resource::texture_desc(*r as crate::object::This)?, *desc, true),
-        View::Placed(unordered, resource, desc) if resource[0] != 1 => {
-            (*resource, desc[..10].try_into().ok(), *unordered)
-        }
+// shortcut: the format and tiling fields read 0 (no translated shader
+// reads them: the shader refuses such reads where it can tell), the address
+// is the view's in title memory, and the swizzle is the identity whatever
+// the view's component mapping.
+pub(crate) fn texture_words(view: &View) -> Option<[u32; 8]> {
+    let (resource, desc, unordered, at) = match view {
+        View::Shader(r, desc) => (
+            crate::resource::texture_desc(*r as crate::object::This)?,
+            *desc,
+            false,
+            texture_memory(*r as crate::object::This)?,
+        ),
+        View::Unordered(r, _, desc) => (
+            crate::resource::texture_desc(*r as crate::object::This)?,
+            *desc,
+            true,
+            texture_memory(*r as crate::object::This)?,
+        ),
+        View::Placed(unordered, resource, desc) if resource[0] != 1 => (
+            *resource,
+            desc[..10].try_into().ok(),
+            *unordered,
+            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+        ),
         _ => return None,
     };
-    Some(image_words(&resource, desc.as_ref(), unordered))
+    Some(image_words(&resource, desc.as_ref(), unordered, at))
+}
+
+/// A texture's title address: where the view's bytes are.
+pub(crate) fn texture_memory(at: crate::object::This) -> Option<u64> {
+    Some(crate::resource::texture_memory(at)?.0 as u64)
 }
 
 /// [`texture_words`] of a texture of resource description `resource` (as
-/// words) through a view of description `desc` (none: the resource's own).
-pub(crate) fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool) -> [u32; 4] {
+/// words) at title address `at` through a view of description `desc` (none:
+/// the resource's own).
+pub(crate) fn image_words(
+    resource: &[u32; 14],
+    desc: Option<&[u32; 10]>,
+    unordered: bool,
+    at: u64,
+) -> [u32; 8] {
     let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
     let height = resource[6];
     let (depth, mips) = (resource[7] & 0xFFFF, resource[7] >> 16);
@@ -992,10 +1017,19 @@ pub(crate) fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unorde
     let (w, h) = (width.saturating_sub(1) as u32, height.saturating_sub(1));
     let last = first + count.max(1) - 1;
     [
-        0,
-        (w & 3) << 30,
+        at as u32,
+        // A host encoding, not the console's word (see the translator's "View addresses"): bit 0
+        // says the entry holds a texture, the address high starts one bit up, and bits 30-31 keep
+        // the low two bits of the width less one, which the size queries read out of dword 1.
+        ((at >> 32) as u32 & 0x7FFF) << 1 | 1 | (w & 3) << 30,
         (w >> 2 & 0x3FFF) | (h & 0xFFFF) << 14,
         0xFAC | (first & 0xF) << 12 | (last & 0xF) << 16 | ty << 28,
+        // The array's fields (the translator's "View addresses"): a writable view's array
+        // pitch, the last level relative to the first (MAX_MIP) and the tuning value 4.
+        0,
+        u32::from(unordered) | (count.max(1) - 1) << 4 | 4 << 20,
+        0,
+        0,
     ]
 }
 

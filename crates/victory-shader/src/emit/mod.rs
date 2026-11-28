@@ -883,6 +883,7 @@ mod tests {
             "VICTORY_WARP",
             "VICTORY_PC_DXC",
             "VICTORY_DXIL",
+            "VICTORY_DEBUG_MISSING",
         ];
         fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -1011,7 +1012,7 @@ mod tests {
     #[test]
     fn thread_count_translation_preserves_compute_refusals() {
         for wave32 in [true, false] {
-            let c = branching_compute(wave32, &[0x7E00_0208]); // v_mov_b32 v0, s8 (UAV address)
+            let c = branching_compute(wave32, &[0x7E00_020B]); // v_mov_b32 v0, s11 (UAV dword 3)
             for thread_counts in [false, true] {
                 let options = Options {
                     thread_counts,
@@ -1022,7 +1023,7 @@ mod tests {
                     matches!(
                         expected,
                         ShaderError::Unsupported {
-                            what: "a descriptor's address or format read as data: a buffer's base address (dword 0)",
+                            what: "a descriptor's address or format read as data: a buffer's dword 3 (format and type)",
                             ..
                         }
                     ),

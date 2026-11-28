@@ -120,11 +120,7 @@ fn program() -> HostShader {
         w.extend(buffer_store_dword(5, 8, at));
     }
     w.push(S_ENDPGM);
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 10,
-        layout: vec![
+    let layout = vec![
             RootParam {
                 root: RootType::Constants,
                 table_offset_dwords: 0,
@@ -149,8 +145,8 @@ fn program() -> HostShader {
                 user_data: 6,
                 slot: 2,
             },
-        ],
-        used: vec![
+    ];
+    let used = vec![
             UsedResource {
                 kind: ResourceType::Uav,
                 root: RootType::Table,
@@ -171,7 +167,26 @@ fn program() -> HostShader {
                 user_data: 6,
                 slot: 2,
             },
-        ],
+    ];
+    let (shader, memory) = lowered(&w, 10, layout, used);
+    assert_eq!(memory, 11, "every access through the pointer is title memory");
+    shader
+}
+
+/// `w` lowered as a compute program of `vgprs` VGPRs with `layout` and `used`, and the
+/// number of scalar accesses the resource tracker calls title memory.
+fn lowered(
+    w: &[u32],
+    vgprs: u32,
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+) -> (HostShader, usize) {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: vgprs as u16,
+        layout,
+        used,
         io: StageIo::Cs(ComputeIo {
             rsrc2: 8 << 1,
             threads: [1, 1, 1],
@@ -182,7 +197,6 @@ fn program() -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
-    assert_eq!(memory, 11, "every access through the pointer is title memory");
     let io = io::raise(&p, &native).expect("io::raise");
     let l = lower::lower(&lower::Parts {
         native: &native,
@@ -227,7 +241,7 @@ fn program() -> HostShader {
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
     }
-    shader
+    (shader, memory)
 }
 
 /// The page table for one copy of title memory at [`TITLE`] whose views
@@ -267,10 +281,10 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let value = 0xCAFE_F00D;
     // Heap index 1 (the memory's view) has the title address, index 2 a
     // texture's size fields.
-    let mut view_addresses = vec![0u32; 4 * 5];
-    view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
-    let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
-    view_addresses[9..12].copy_from_slice(&image);
+    let mut view_addresses = vec![0u32; 8 * 5];
+    view_addresses[8] = TITLE as u32;
+    let image = [0x1122_3344, 1, 0xC000_0000, 0x0957_C0F9, 0x9004_2FAC, 0, 0x0040_0000, 0];
+    view_addresses[18..26].copy_from_slice(&image);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -885,6 +899,345 @@ fn computed_buffer_subword_loads_preserve_values_and_bounds() {
                         "{label}: op={op} bounds={bounds} base={base:#x} index={index} offset={offset} scalar={scalar}");
                 }
             }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A size query of the view at a descriptor index (#407): the program scales the index to whole
+/// descriptors, loads the four dwords of the entry and keeps only the size fields of dwords 1-3,
+/// guarded by the null test of dword 1. A buffer's table dword 1 is 0, so the translator serves
+/// 0 for it whenever the entry's dword 3 says it is no texture (a null entry, a buffer): such an
+/// entry reads as 0 and the program takes its null branch instead of a size of 0. Bit 0 of an
+/// image's dword 1 says nothing but the marker.
+#[test]
+fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
+    let mut w = vec![s_mov_b32(5, 0)]; // s[4:5]: the table at s4, high half 0
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV (table dword 0)
+    w.extend([0x8F02_8500]); // s_lshl_b32 s2, s0, 5 (the descriptor index, a root constant)
+    w.extend([0x8002_0402]); // s_add_u32 s2, s4, s2
+    w.extend([0x8003_FDFF, 0x0000_0000]); // s_add_u32 s3, scc, 0
+    w.extend(s_load(2, 16, 2, 0)); // s[16:19]: dwords 0-3 of the entry
+    w.push(S_WAITCNT_ALL);
+    w.extend([0xBF00_8011]); // s_cmp_eq_i32 s17, 0 (a null entry)
+    w.extend([0x8514_8011]); // s_cselect_b32 s20, 0, s17
+    w.push(v_mov_b32(1, 20));
+    w.extend(buffer_store_dword(1, 8, 0));
+    w.push(v_mov_b32(1, 18));
+    w.extend(buffer_store_dword(1, 8, 4));
+    w.push(v_mov_b32(1, 19));
+    w.extend(buffer_store_dword(1, 8, 8));
+    w.push(S_ENDPGM);
+    let layout = vec![
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        },
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let used = vec![
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        },
+        UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 32,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let (shader, _memory) = lowered(&w, 4, layout, used);
+    assert!(shader.view_addresses);
+    // Heap index 1 holds a 64x32 image, index 2 a null entry, index 3 a buffer (address only).
+    let texel = [[0.0f32; 4]];
+    let mut view_addresses = vec![0u32; 8 * 4];
+    view_addresses[8..16].copy_from_slice(&[
+        0xAAAA_1111, 0xC000_0001, 0x0007_C00F, 0x9000_0FAC, 0, 0, 0, 0,
+    ]);
+    view_addresses[24..32].copy_from_slice(&[0x1234_5678, 0, 0, 0, 0, 0, 0, 0]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = 0;
+        }
+        for (index, want) in [
+            (1, [0xC000_0001, 0x0007_C00F, 0x9000_0FAC]),
+            (2, [0, 0, 0]),
+            (3, [0, 0, 0]),
+        ] {
+            ud[0] = index;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud.clone())),
+                            (1, Root::View { srv: true, data: vec![0; 12] }),
+                            (2, Root::View { srv: true, data: view_addresses.clone() }),
+                        ],
+                        views: &[View::RawUav(9), View::Texture(64, 32, &texel), View::NullPair],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(out[0][..3], want, "{label}: index {index}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A buffer descriptor's dwords 0 and 1 read as data (#407): dword 0 is the view's address, of
+/// which the table holds the low half, and dword 1 holds its high half in bits 0-15 with the
+/// binding's stride above them (bits 16-29), as the console's `V#` puts them and as the programs
+/// that rebuild a resource descriptor from these words expect (`s_and_b32 dword1, 0xc000ffff`
+/// then a store through it). The stride comes from the binding, not from the descriptor.
+#[test]
+fn buffer_descriptor_address_words_read_as_data() {
+    let mut w = vec![s_mov_b32(5, 0)]; // s[4:5]: the table at s4, high half 0
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV (table dword 0)
+    w.extend([0x8F02_8500]); // s_lshl_b32 s2, s0, 5 (the descriptor index, a root constant)
+    w.extend([0x8002_0402]); // s_add_u32 s2, s4, s2
+    w.extend([0x8003_FDFF, 0x0000_0000]); // s_add_u32 s3, scc, 0
+    w.extend(s_load(1, 16, 2, 0)); // s[16:17]: dwords 0-1 of the entry
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(1, 16));
+    w.extend(buffer_store_dword(1, 8, 0));
+    w.push(v_mov_b32(1, 17));
+    w.extend(buffer_store_dword(1, 8, 4));
+    w.push(S_ENDPGM);
+    let layout = vec![
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        },
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let used = vec![
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        },
+        UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 32,
+            lower_bound: 0,
+            stride: 16,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let (shader, _memory) = lowered(&w, 4, layout, used);
+    assert!(shader.view_addresses);
+    // Heap index 1 is a buffer view at 0x1234_AABB_CCDD: the table holds its low half, the
+    // high half in the next dword's low bits.
+    let mut view_addresses = vec![0u32; 8 * 2];
+    view_addresses[8..16].copy_from_slice(&[0xAABB_CCDD, 0x1234, 0, 0, 0, 0, 0, 0]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        ud[0] = 1;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: vec![0; 8] }),
+                        (2, Root::View { srv: true, data: view_addresses.clone() }),
+                    ],
+                    views: &[View::RawUav(9), View::NullPair, View::NullPair],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        // The address low half, then its high half beside the binding's stride of 16 bytes.
+        assert_eq!(out[0][..2], [0xAABB_CCDD, 0x1234 | 16 << 16], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// An image descriptor's tail dwords (5-7) read as data, beside the view's use: dword 5 is the
+/// console's array pitch (1 for a writable view, 0 otherwise, which tells a bound volume from a
+/// whole one), the last level (MAX_MIP, the level count less one) and the tuning value 4 (bits
+/// 20-22, which the console compiler sets). Dwords 6 and 7 hold the compression block sizes and
+/// metadata address of a compressed view: 0 for one without compression, and 0 for all three
+/// when the descriptor is null.
+#[test]
+fn a_view_descriptors_tail_dwords_are_the_arrays_fields() {
+    const KINDS: [ResourceType; 2] = [ResourceType::Srv, ResourceType::Uav];
+    let program = |kind: ResourceType| {
+        let mut w = vec![s_mov_b32(5, 0)]; // s[4:5]: the table at s4, high half 0
+        w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV (table dword 0)
+        w.extend([0x8F02_8500]); // s_lshl_b32 s2, s0, 5 (the descriptor index, a root constant)
+        w.extend([0x8002_0402]); // s_add_u32 s2, s4, s2
+        w.extend([0x8003_FDFF, 0x0000_0000]); // s_add_u32 s3, scc, 0
+        w.extend(s_load(3, 12, 2, 0)); // s[12:19]: the whole entry
+        w.push(S_WAITCNT_ALL);
+        w.extend((0..2).map(|v| v_mov_b32(v, 0)));
+        // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        w.extend([0xF000_1F08, 0x0003_0200]);
+        w.push(S_WAITCNT_ALL);
+        for (v, s, at) in [(1, 17, 0), (1, 18, 4), (1, 19, 8)] {
+            w.push(v_mov_b32(v, s));
+            w.extend(buffer_store_dword(v, 8, at));
+        }
+        w.push(S_ENDPGM);
+        let layout = vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind,
+                root: RootType::Table,
+                table_offset_dwords: 32,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+        ];
+        lowered(&w, 4, layout, used).0
+    };
+    let shaders: Vec<_> = KINDS.iter().map(|&k| program(k)).collect();
+    // Heap index 1 holds the view, index 2 a null entry.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let psos: Vec<_> = shaders
+            .iter()
+            .map(|s| host.compute_pipeline(s).expect("pipeline"))
+            .collect();
+        // Table entries: 0 the result UAV, 1 a 64x32 view of three levels, 2 and 3 null.
+        for (index, shader, view, want) in [
+            // Three levels: MAX_MIP 2, SRV array pitch 0, the tuning value in bits 20-22.
+            (1, 0, View::Levels(64, 3), [0x0040_0020, 0, 0]),
+            // One level of a storage view: MAX_MIP 0, UAV array pitch 1.
+            (2, 1, View::TextureUav(64, 32), [0x0040_0001, 0, 0]),
+            // A null entry: 0 for all three.
+            (3, 0, View::NullPair, [0, 0, 0]),
+        ] {
+            let (root, pso) = (&psos[shader].0, &psos[shader].1);
+            let shader = &shaders[shader];
+            let views = [View::RawUav(9), view, View::NullPair, View::NullPair];
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = 0;
+            }
+            ud[0] = index as u32;
+            let out = host
+                .dispatch(
+                    root,
+                    pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: vec![0; 12] }),
+                            (2, Root::View { srv: true, data: vec![0; 12] }),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(out[0][..3], want, "{label}: index {index}");
         }
         ran += 1;
     }

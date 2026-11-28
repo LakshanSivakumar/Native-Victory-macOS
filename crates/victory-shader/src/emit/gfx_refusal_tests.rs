@@ -78,7 +78,8 @@ fn joins_without_a_value_are_found_in_one_pass() {
     };
     for joins in [1, 32] {
         translate_with(&program(joins), Options::default()).unwrap();
-        assert_eq!(lower::PASSES.get(), 2, "{joins} joins");
+        // The dword's value is a table read, so the joins need no further pass.
+        assert_eq!(lower::PASSES.get(), 1, "{joins} joins");
     }
 }
 
@@ -831,8 +832,9 @@ fn refusal1_console_layout_dependent_masks_remain_refused() {
 // Refusal #2: "a pixel system input the signature lacks"
 // =========================================================================
 
-/// A buffer descriptor's dword that is no size, read as data, is refused naming it: the host
-/// has no value for the base address, the high address bits and stride, or the format.
+/// A descriptor's dword that is no size, read as data, is refused naming it: the host has no
+/// value for the high address bits and stride, or the format (dword 0 is the view's address in
+/// title memory and is served).
 #[test]
 fn descriptor_dwords_read_as_data_say_which() {
     use crate::native::tests::{fspx, fspx_resource};
@@ -859,18 +861,19 @@ fn descriptor_dwords_read_as_data_say_which() {
         crate::dxbc::build(&[(FourCC::ACCC, &part)])
     };
     let prefix = "a descriptor's address or format read as data: ";
-    for (read, why) in [
-        (0x7E04_020C, "a buffer's base address (dword 0)"),
-        (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
-        (0x7E04_020F, "a buffer's dword 3 (format and type)"),
-    ] {
-        let err = translate_with(&program(read), Options::default()).err();
-        assert!(
-            matches!(err, Some(ShaderError::Unsupported { what, .. })
-                if what.strip_prefix(prefix) == Some(why)),
-            "{err:?}"
-        );
+    // Dwords 0 and 1 are the view's address in memory, which the table holds and the
+    // translator's binding completes: both are served.
+    for read in [0x7E04_020C, 0x7E04_020D] {
+        let ok = translate_with(&program(read), Options::default());
+        assert!(ok.as_ref().is_ok_and(|s| s.view_addresses), "{read:x}: {:?}", ok.err());
     }
+    // Its dword 3 (format and type) is not.
+    let err = translate_with(&program(0x7E04_020F), Options::default()).err();
+    assert!(
+        matches!(err, Some(ShaderError::Unsupported { what, .. })
+            if what.strip_prefix(prefix) == Some("a buffer's dword 3 (format and type)")),
+        "{err:?}"
+    );
 }
 
 /// A descriptor read only as data takes its dwords from the view addresses (`t1`), which hold a
@@ -910,7 +913,9 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
     // s_lshr_b64 s[20:21], s[12:13], 8, then s_and_b32 s20, s21, mask: dword 1 bits 8 on.
     let shifted = |mask: u32| vec![0x9094_880C, 0x8714_FF15, mask];
     let accepted = [
+        // Both kinds' dword 0 is the view's address in title memory.
         (false, mov(12)),
+        (true, mov(12)),
         (false, and(13, 0xFFFF)),
         (false, shifted(0xFF)),
         (true, and(13, 0xC000_0000)),
@@ -926,13 +931,12 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
         );
     }
     let prefix = "a view address field the table gives as 0: ";
-    let dword_1 = "an image's base address, minimum level or format (dword 1)";
+    let dword_1 = "an image's minimum level or format (dword 1)";
     let refused = [
         (false, mov(13), "a buffer's stride or swizzle"),
         (false, and(13, 0x3FFF_0000), "a buffer's stride or swizzle"),
         (false, shifted(0xFFFF), "a buffer's stride or swizzle"),
         (false, mov(14), "a buffer's record count or format"),
-        (true, mov(12), "an image's base address"),
         (true, and(13, 0xFF), dword_1),
         (true, and(13, 0x1FF0_0000), dword_1),
         (true, mov(14), "an image's dword 2"),
@@ -947,6 +951,124 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
             "{read:x?}: {err:?}"
         );
     }
+}
+
+#[test]
+fn a_size_query_of_a_view_at_a_descriptor_index_reads_the_table() {
+    use crate::native::tests::{fspx, fspx_resource};
+    // The view addresses at table dword 8 (`s[8:11]`, a buffer's four dwords in a table at
+    // s[4:5]). A size query scales a descriptor index to whole descriptors into s12 and adds it
+    // to the table, loading dwords 0-3 into s[24:27]; `read` leaves what it keeps in s20, which
+    // is stored.
+    let code_of = |read: &[u32], scaled: bool| {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0 (the table's high half)
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBE8C_0381, // s_mov_b32 s12, 1 (the descriptor index)
+        ];
+        code.extend_from_slice(if scaled {
+            &[0x8F0C_850C] // s_lshl_b32 s12, s12, 5
+        } else {
+            &[0xBE8C_03FF, 0x0000_0004] // s_mov_b32 s12, 4 (a dword into the descriptor)
+        });
+        code.extend_from_slice(&[
+            0x8006_040C, // s_add_u32 s6, s4, s12
+            0x8007_FDFF,
+            0x0000_0000, // s_add_u32 s7, scc, 0
+            0xF408_0603,
+            0xFA00_0000, // s_load_dwordx4 s[24:27], s[6:7], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ]);
+        code.extend_from_slice(read);
+        code.extend_from_slice(&[
+            0x7E02_0214, // v_mov_b32 v1, s20
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        code
+    };
+    let program = |read: &[u32], scaled: bool| {
+        let resources = [
+            fspx_resource(3, 3, 0, 0, 4, 0),
+            fspx_resource(0, 3, 8, 0, 4, 0),
+        ];
+        let part = fspx(&bytes_of(&code_of(read, scaled)), 5 << 1, [32, 1, 1], true, &resources);
+        crate::dxbc::build(&[(FourCC::ACCC, &part)])
+    };
+    let and = |src: u32, mask: u32| vec![0x8714_FF00 | src, mask]; // s_and_b32 s20, s<src>, mask
+    // A size query's readers: dword 1's width bits, dword 2's width and height, dword 3's
+    // levels, and the null test of dword 1 against 0 that decides whether to size at all.
+    let accepted = [
+        // Dword 1's low bits are a buffer's, the table gives them as 0: the buffer reading.
+        and(25, 0xFF),
+        and(25, 0xC000_0000),
+        and(26, 0x3FFF_FFFF),
+        and(27, 0xF00F_FFFF),
+        vec![0xBF00_8019, 0x8514_8081], // s_cmp_eq_i32 s25, 0; s_cselect_b32 s20, 1, 0
+        vec![0xBF00_8019, 0x8714_FF1A, 0x3FFF_FFFF], // null test, then the height of dword 2
+    ];
+    for read in accepted {
+        let shader = translate_with(&program(&read, true), Options::default());
+        assert!(shader.as_ref().is_ok_and(|s| s.view_addresses), "{read:x?}: {:?}", shader.err());
+    }
+    // A reader the table cannot feed keeps the refusal, and so does a load of the second half
+    // of the descriptor (dwords 1-4): the kind of view is not known.
+    let prefix = "a view address field the table gives as 0: ";
+    for (read, scaled, why) in [
+        (and(25, 0x1FFF_FFFF), true, "a buffer's stride or swizzle"),
+        (and(25, 0x3FFF_FFFF), true, "a buffer's stride or swizzle"),
+        (and(26, 0x3FFF_FFFF), false, "a buffer's record count or format"),
+    ] {
+        let err = translate_with(&program(&read, scaled), Options::default()).err();
+        assert!(
+            matches!(err, Some(ShaderError::Unsupported { what, .. })
+                if what.strip_prefix(prefix) == Some(why)),
+            "{read:x?}: {err:?}"
+        );
+    }
+}
+
+/// The tail dwords of an image descriptor the program also samples from (a whole eight-dword
+/// load used by `image_load`) are built from the view beside its size fields: dword 5 carries
+/// the array pitch, the last level and the tuning value, dwords 6 and 7 the compression fields
+/// (0 here). The console compiler re-loads a descriptor it samples with to size from it, so a
+/// program that reads those dwords as data used to be refused.
+#[test]
+fn an_image_descriptors_tail_dwords_read_as_data_translate() {
+    use crate::native::tests::{fspx, fspx_resource};
+    // The view at table dword 8, whole: dwords 0-7 into s[24:31], then sampled and dword 5
+    // read as data to s20, which is stored.
+    let code = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (the result UAV)
+        0xBE8C_0388, // s_mov_b32 s12, 8 (the descriptor's byte offset)
+        0x8006_040C, // s_add_u32 s6, s4, s12
+        0x8007_FDFF,
+        0x0000_0000, // s_add_u32 s7, scc, 0
+        0xF40C_0603,
+        0xFA00_0000, // s_load_dwordx8 s[24:31], s[6:7], 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E00_0281, // v_mov_b32 v0, 0
+        0x7E02_0282, // v_mov_b32 v1, 0
+        0xF000_1F08,
+        0x0006_0200, // image_load v[2:5], v[0:1], s[24:31] dmask:0xf dim:2D unorm
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_021D, // v_mov_b32 v1, s29 (dword 5)
+        0xE070_0000,
+        0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let resources = [
+        fspx_resource(3, 3, 0, 0, 4, 0),
+        fspx_resource(0, 3, 8, 0, 4, 0),
+    ];
+    let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+    let program = crate::dxbc::build(&[(FourCC::ACCC, &part)]);
+    let shader = translate_with(&program, Options::default());
+    assert!(shader.is_ok(), "{:?}", shader.err());
 }
 
 #[test]
