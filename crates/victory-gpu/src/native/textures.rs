@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::resources::*;
+use rayon::prelude::*;
 use victory_formats::texture::{Dimension, Layout};
 
 /// `D3D12_RESOURCE_FLAGS`.
@@ -855,6 +856,17 @@ fn probe_read(
 ) {
     if whole || size <= PROBE_PAGES * PROBE_SAMPLE {
         const CHUNK: usize = 1 << 20;
+        if size > CHUNK {
+            // A big whole probe reads its chunks on the rayon pool (they are independent), then
+            // hands the bytes to `seen` in one go; hashing the whole equals hashing chunk by
+            // chunk in order.
+            let mut all = vec![0u8; size];
+            all.par_chunks_mut(CHUNK).enumerate().for_each(|(i, chunk)| {
+                let _ = read_bytes(memory, at + i * CHUNK, chunk, known_partial);
+            });
+            seen(&all);
+            return;
+        }
         let cap = size.min(CHUNK);
         if scratch.len() < cap {
             scratch.resize(cap, 0);
@@ -2282,6 +2294,17 @@ mod tests {
         rest.sort_unstable();
         assert!(first.iter().copied().eq(0..20_000));
         assert!(rest.iter().copied().eq(20_000..30_000));
+    }
+
+    #[test]
+    fn probe_hash_whole_matches_blake3_for_big_buffers() {
+        // Over the 1 MiB chunk cutoff (parallel read path) and well past it.
+        for len in [(1 << 20) + 1, 3 * (1 << 20) + 7] {
+            let src: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
+            let mut scratch = Vec::new();
+            let h = probe_hash(None, src.as_ptr() as usize, len, None, true, false, &mut scratch);
+            assert_eq!(h, blake3::hash(&src), "len {len}");
+        }
     }
 
     fn watched(entries: impl Into<HashMap<usize, (usize, usize, bool, u64)>>) -> Watched {
