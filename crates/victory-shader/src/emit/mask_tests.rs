@@ -1023,3 +1023,43 @@ fn a_mesh_program_reads_sgprs_past_its_user_data_as_zero() {
     let err = read(39).err().expect("refused");
     assert!(err.to_string().contains("a hardware SGPR input"), "{err}");
 }
+
+#[test]
+fn split_32bit_wave64_mask_halves_and_partial_updates_lower_as_data() {
+    // 1. Split 32-bit `s_not_b32` pair forming a wave64 mask `(s20, s21)` read both as a mask
+    // (`v_cndmask_b32`) and as data (`s_bcnt1_i32_b64`), plus `SCC` of a 32-bit `s_and_b32` on
+    // the high half `s21`.
+    let split_not = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE94_076A, // s_not_b32 s20, vcc_lo
+        0xBE95_076B, // s_not_b32 s21, vcc_hi
+        0xD501_0003,
+        0x0051_0280, // v_cndmask_b32_e64 v3, 0, 1, s[20:21]
+        0xBE96_1014, // s_bcnt1_i32_b64 s22, s[20:21]
+        0x8715_FF15,
+        0x0000_0F00, // s_and_b32 s21, s21, 0xf00 (sets SCC on high half)
+        0xD501_0004,
+        0x0051_0280, // v_cndmask_b32_e64 v4, 0, 1, s[20:21]
+        0x8517_8387, // s_cselect_b32 s23, 7, 3
+        0x8016_1716, // s_add_u32 s22, s22, s23
+        0x7E02_0216, // v_mov_b32 v1, s22
+    ];
+    // 2. 64-bit `s_not_b64 s[8:9], vcc` followed by a partial 32-bit update `s_mov_b32 s8, 15`:
+    // reading `s[8:9]` as data must evaluate `s8` via its 32-bit writer and `s9` via its own
+    // 64-bit writer rather than a clobbered `st.highs[&s9]`.
+    let partial_lo = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE88_086A, // s_not_b64 s[8:9], vcc
+        0xBE88_038F, // s_mov_b32 s8, 15
+        0xD501_0003,
+        0x0021_0280, // v_cndmask_b32_e64 v3, 0, 1, s[8:9]
+        0xBE98_1008, // s_bcnt1_i32_b64 s24, s[8:9]
+        0x7E02_0218, // v_mov_b32 v1, s24
+    ];
+    for body in [&split_not[..], &partial_lo[..]] {
+        for host32 in [false, true] {
+            let r = lowered(body, 64, host32);
+            assert!(r.is_ok(), "{host32}: {:?}", r.err());
+        }
+    }
+}

@@ -54,9 +54,9 @@ pub enum Atom {
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
-    /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// EXEC write it does not follow): the lane's bit of the `(lo, hi)`
+    /// value pair (`lo == hi` in wave32).
+    Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -461,6 +461,7 @@ pub struct Structured {
     pub other: Map<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    paired_other: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: Map<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -482,6 +483,17 @@ impl Structured {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
             None => self.masks.get(&low),
+        }
+        .copied()
+    }
+
+    pub(crate) fn mask_or_other(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        match high {
+            Some(high) => self
+                .paired_masks
+                .get(&(low, high))
+                .or_else(|| self.paired_other.get(&(low, high))),
+            None => self.masks.get(&low).or_else(|| self.other.get(&low)),
         }
         .copied()
     }
@@ -1036,6 +1048,11 @@ impl<'a> Lanes<'a> {
             } else {
                 Map::default()
             },
+            paired_other: if self.p.wave64 {
+                self.other
+            } else {
+                Map::default()
+            },
             active: self.active,
             restored: self.restored,
             discards: kill_lanes,
@@ -1077,7 +1094,7 @@ impl<'a> Lanes<'a> {
         self.b
             .support(b)
             .iter()
-            .any(|a| matches!(a, Atom::Opaque(_)))
+            .any(|a| matches!(a, Atom::Opaque(..)))
     }
 
     fn half_const(op: &Operand) -> Option<u32> {
@@ -1554,8 +1571,8 @@ impl<'a> Lanes<'a> {
                     let (m, d) = self.mask(src);
                     (m, d || exec_w)
                 } else {
-                    let born = self.born(k.0);
-                    (self.b.atom(Atom::Opaque(k.0), born), exec_w)
+                    let born = self.born(k.0).max(self.born(k.1));
+                    (self.b.atom(Atom::Opaque(k.0, k.1), born), exec_w)
                 }
             }
         };
@@ -1885,8 +1902,9 @@ impl<'a> Lanes<'a> {
                     for (k, m) in r.dst.into_iter().chain(r.exec) {
                         self.masks.insert(k, m);
                         // EXEC itself holds the lanes that run here.
-                        if r.exec.is_some_and(|e| e.0 == k)
-                            || exec.is_some_and(|e| self.b.implies(m, e))
+                        if (r.exec.is_some_and(|e| e.0 == k)
+                            || exec.is_some_and(|e| self.b.implies(m, e)))
+                            && inst.writes.iter().any(|w| w.1 == k.0)
                         {
                             self.active.insert(k.0);
                         }
@@ -2546,7 +2564,7 @@ mod tests {
                 s.bools
                     .support(b)
                     .iter()
-                    .any(|a| matches!(a, Atom::Opaque(_)))
+                    .any(|a| matches!(a, Atom::Opaque(..)))
             })
     }
 
