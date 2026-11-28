@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use victory_backend::resources::*;
+use rayon::prelude::*;
 use victory_formats::texture::{Dimension, Layout};
 
 /// `D3D12_RESOURCE_FLAGS`.
@@ -293,6 +294,19 @@ pub fn read_memory(at: *const u8, len: usize) -> Vec<u8> {
 /// Fills `out` from title memory at `at`, with zeros where it cannot be read; whether some of it
 /// could not be read at once (`VICTORY_TRACE_TEXTURE_SYNC=1` counts those textures).
 fn read_into(memory: Option<&PoolTable>, at: usize, out: &mut [u8], known_partial: bool) -> bool {
+    // A big buffer is read chunk by chunk on the rayon pool: the chunks are independent, and one
+    // thread copying a 4K texture's 32 MiB is the sync's other serialized cost. `PoolTable`'s
+    // lock only walks the maps; the copies themselves run outside it.
+    const CHUNK: usize = 1 << 20;
+    if out.len() > CHUNK {
+        let unreadable = std::sync::atomic::AtomicBool::new(false);
+        out.par_chunks_mut(CHUNK).enumerate().for_each(|(i, chunk)| {
+            if !read_bytes(memory, at + i * CHUNK, chunk, known_partial) {
+                unreadable.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        return unreadable.load(std::sync::atomic::Ordering::Relaxed);
+    }
     !read_bytes(memory, at, out, known_partial)
 }
 
@@ -606,14 +620,22 @@ fn scan_round(watched: &Watched, buf: &mut [u8]) {
         }) else {
             continue;
         };
-        let mut h = blake3::Hasher::new();
-        let mut unreadable = false;
-        for off in (0..size).step_by(buf.len()) {
-            let n = buf.len().min(size - off);
-            unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
-            h.update(&buf[..n]);
-        }
-        let h = h.finalize();
+        // A big texture is read whole in one call (chunk-parallel inside `read_into`) and hashed
+        // in one go; a small one streams through `buf`, chunk by chunk.
+        let (h, unreadable) = if size >= buf.len() && size > (1 << 20) {
+            let mut whole = vec![0u8; size];
+            let unreadable = read_into(pool.as_deref(), at, &mut whole, was_partial);
+            (blake3::hash(&whole), unreadable)
+        } else {
+            let mut h = blake3::Hasher::new();
+            let mut unreadable = false;
+            for off in (0..size).step_by(buf.len()) {
+                let n = buf.len().min(size - off);
+                unreadable |= !read_bytes(pool.as_deref(), at + off, &mut buf[..n], was_partial);
+                h.update(&buf[..n]);
+            }
+            (h.finalize(), unreadable)
+        };
         watch_in(watched, |w| {
             // Released, or begun/applied by a submission while it was hashed here: this reading is
             // the older one, and the next round compares with the submission's.
@@ -2282,6 +2304,18 @@ mod tests {
         rest.sort_unstable();
         assert!(first.iter().copied().eq(0..20_000));
         assert!(rest.iter().copied().eq(20_000..30_000));
+    }
+
+    #[test]
+    fn read_into_parallel_chunks_match_the_source_byte_for_byte() {
+        // Above the 1 MiB chunk cutoff (parallel path), at the cutoff boundary, and below it.
+        for len in [(1 << 20) + 1, 1 << 20, (1 << 20) - 1, 3 * (1 << 20) + 123] {
+            let src: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+            let mut out = vec![0xa5u8; len];
+            let unreadable = read_into(None, src.as_ptr() as usize, &mut out, false);
+            assert!(!unreadable, "len {len}");
+            assert_eq!(out, src, "len {len}");
+        }
     }
 
     fn watched(entries: impl Into<HashMap<usize, (usize, usize, bool, u64)>>) -> Watched {
