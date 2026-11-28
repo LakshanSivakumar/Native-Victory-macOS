@@ -1,5 +1,6 @@
 //! Translates every shader container of a folder as the native host does, one line each:
 //! `cargo run --release -p victory-shader --example sweep -- <folder> [-j N] [--list FILE] [--show] [--timeout SECONDS] > sweep.tsv`.
+//! `VICTORY_PAIRED_WAVES=1` sweeps with lockstep's paired form, as the native host translates with it.
 //! A line is `<file> \t ok|refused|panic|timeout|missing \t <output fingerprint or reason> \t <ms>`;
 //! `tools/corpus/compare.sh` tallies one sweep or compares two (docs/native-host.md, "Sweeping a
 //! shader corpus"). The folder holds game data: keep it and `--show` output outside the repo.
@@ -48,8 +49,14 @@ fn main() {
     names.dedup();
     // A translation that panics is a line of the sweep, not a message for each on stderr.
     std::panic::set_hook(Box::new(|_| {}));
-    // The native host's options (`victory-gpu`, `native::shaders::translate`).
-    let options = Options { wave32_host: true, zero_copy_memory: true, ..Default::default() };
+    // The native host's options (`victory-gpu`, `native::shaders::translate`), with its
+    // translation switches read the same way: VICTORY_PAIRED_WAVES=1 (#527).
+    let options = Options {
+        wave32_host: true,
+        zero_copy_memory: true,
+        paired_waves: std::env::var("VICTORY_PAIRED_WAVES").is_ok_and(|v| v.trim() == "1"),
+        ..Default::default()
+    };
     let lines = sweep(dir, names, jobs, Duration::from_secs(limit), show, move |c| translate_with(c, options));
     let mut text = String::new();
     let mut counts = std::collections::BTreeMap::new();
