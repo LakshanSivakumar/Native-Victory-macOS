@@ -561,7 +561,8 @@ unsafe fn noncontinuable(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
 static FATAL_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// Sets what runs once, on the faulting thread, before the process ends on an unhandled
-/// exception (the title's filter, its exit, or the abort that follows): the app stops the GPU's
+/// exception: after the title's filter has answered, before the exit it asks for or the abort
+/// that follows, and not when it resumes the title ([`after_filter`]). The app stops the GPU's
 /// work there, as it does on a signal, so a fatal fault does not leave the GPU's memory allocated.
 pub fn set_fatal_hook(hook: fn()) {
     let _ = FATAL_HOOK.set(hook);
@@ -576,6 +577,32 @@ fn run_fatal_hook() {
     });
 }
 
+/// What follows the unhandled-exception filter's answer (`None`: no filter).
+#[derive(Debug, PartialEq)]
+enum AfterFilter {
+    /// `EXCEPTION_CONTINUE_EXECUTION`: the title goes on.
+    Resume,
+    /// `EXCEPTION_EXECUTE_HANDLER`: the process exits with the code.
+    Exit,
+    /// Anything else, or no filter: the process aborts.
+    Abort,
+}
+
+/// The step after the filter's answer, running `ending` (the fatal hook) first when the process
+/// is about to end, and only then: a title that resumes keeps its GPU work, which the hook stops
+/// (it raises every event and empties the residency sets).
+fn after_filter(answer: Option<i32>, ending: impl FnOnce()) -> AfterFilter {
+    let next = match answer {
+        Some(EXCEPTION_CONTINUE_EXECUTION) => AfterFilter::Resume,
+        Some(EXCEPTION_EXECUTE_HANDLER) => AfterFilter::Exit,
+        _ => AfterFilter::Abort,
+    };
+    if next != AfterFilter::Resume {
+        ending();
+    }
+    next
+}
+
 /// Nobody took the exception: the unhandled-exception filter, then the end.
 unsafe fn unhandled(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     let filter = *UNHANDLED.lock().unwrap_or_else(|e| e.into_inner());
@@ -583,21 +610,21 @@ unsafe fn unhandled(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
     let (code, address) = unsafe { ((*rec).code, (*rec).address) };
     // Before the filter, which may end the process.
     super::super::dump::report_at_fault(code, true);
-    run_fatal_hook();
-    if let Some(handler) = filter {
+    let answer = filter.map(|handler| {
         let mut ptrs = ExceptionPointers {
             record: rec,
             context: ctx,
         };
         // SAFETY: `ptrs` is ours.
-        match unsafe { handler.call(&mut ptrs) } {
-            EXCEPTION_CONTINUE_EXECUTION => {
-                // SAFETY: as above.
-                unsafe { resume(ctx) }
-            }
-            EXCEPTION_EXECUTE_HANDLER => std::process::exit(code as i32),
-            _ => {}
+        unsafe { handler.call(&mut ptrs) }
+    });
+    match after_filter(answer, run_fatal_hook) {
+        AfterFilter::Resume => {
+            // SAFETY: as above.
+            unsafe { resume(ctx) }
         }
+        AfterFilter::Exit => std::process::exit(code as i32),
+        AfterFilter::Abort => {}
     }
     let place = match unwind::image_base_of(address) {
         Some(base) => format!("image+{:#x}", address - base),
@@ -909,6 +936,21 @@ mod fatal_hook_tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static RUNS: AtomicU32 = AtomicU32::new(0);
+
+    /// The fatal hook runs only when the process ends after the filter: not when the filter
+    /// resumes the title (its GPU work must go on), and before an exit or an abort.
+    #[test]
+    fn the_fatal_hook_runs_only_when_the_filter_ends_the_process() {
+        use super::{AfterFilter, after_filter};
+        let runs = std::cell::Cell::new(0);
+        let count = || runs.set(runs.get() + 1);
+        assert_eq!(after_filter(Some(super::EXCEPTION_CONTINUE_EXECUTION), count), AfterFilter::Resume);
+        assert_eq!(runs.get(), 0, "a filter that resumes the title does not stop the GPU");
+        assert_eq!(after_filter(Some(super::EXCEPTION_EXECUTE_HANDLER), count), AfterFilter::Exit);
+        assert_eq!(after_filter(Some(0), count), AfterFilter::Abort);
+        assert_eq!(after_filter(None, count), AfterFilter::Abort);
+        assert_eq!(runs.get(), 3);
+    }
 
     /// The hook a fatal fault runs (the app's GPU stop) runs once, however many threads fault.
     #[test]
