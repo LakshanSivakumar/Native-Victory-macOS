@@ -588,6 +588,12 @@ difference `S0 - S1`, wrapping, negated when negative as a signed number, and SC
 result is not 0. `addr_tests::absdiff_is_the_magnitude_of_the_signed_difference_on_the_gpu`
 (`victory-gpu`) runs it on Metal, wrapping cases included.
 
+## Doubles (#531)
+
+Apple GPUs run no 64-bit floats, so a console instruction on doubles cannot become a DXIL double operation the host would run. `v_cvt_f32_f64` (one refused shader in #531's run, until now refused as "v_cvt_f32_f64 is not supported") is lowered on the double's bits as 64-bit integers (`Lower::f64_bits_to_f32_bits`). It rounds to nearest even, carries a mantissa that rounds over into the next exponent, gives infinity past the largest float, and keeps float denormals (gradual underflow). A NaN keeps its sign and the top 22 bits of its payload, quieted, as RDNA2 converts NaNs to narrower floats. The source's `neg` and `abs` act on bit 63 (`Lower::src_f64`, which also reads an inline float constant as that double and a literal as the double's high dword). The result goes through the shared float result path, so `clamp` and `omod` act as for every float result: a denormal or -0 clamps to +0.
+
+Guess: the console's MODE could flush f32 denormal results or round otherwise. This follows the IEEE default, which is also what DXIL's `fptrunc` means and what Leonida's translator (ProjectLeonida/mandy, `v_cvt_f32_f64`) chose; there too the flush-to-zero form waits on a check of the console's mode. Other double instructions (`v_add_f64`, `v_mul_f64`, the f64 compares) are still refused. Tests: victory-gpu `double_tests::a_double_rounds_to_the_nearest_float_with_its_modifiers` (Metal: about 60 edge doubles with each sign, plus 4,096 random ones over every float exponent, each plain, negated, absolute and clamped, bit for bit against Rust's conversion), victory-shader `valu_tests::v_cvt_f32_f64_rounds_a_double_to_the_nearest_float` (Windows: the hardware GPU and WARP).
+
 ## 16-bit reads of inputs not marked 16-bit
 
 A pixel shader that interpolates an attribute with `v_interp_p1ll_f16`/`v_interp_p2_f16`, or

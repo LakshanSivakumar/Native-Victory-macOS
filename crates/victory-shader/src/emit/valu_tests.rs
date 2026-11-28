@@ -2025,3 +2025,49 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// `v_cvt_f32_f64` (#531), rounded on the double's bits since Apple GPUs run no doubles: the same
+/// as Rust's conversion (round to nearest even, denormals kept, too large an infinity), and a NaN
+/// keeps its sign and the top 22 bits of its payload, quieted. The Metal side, with many more
+/// doubles and the modifiers: victory-gpu `double_tests`.
+#[test]
+fn v_cvt_f32_f64_rounds_a_double_to_the_nearest_float() {
+    // v_cvt_f32_f64 v0, v[1:2]: the double's low dword in s0, its high dword in s1.
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(1))]);
+    let max = f64::from(f32::MAX).to_bits();
+    let doubles: Vec<u64> = vec![
+        0,
+        1 << 63,
+        1.0f64.to_bits(),
+        (-2.5f64).to_bits(),
+        0.1f64.to_bits(),
+        std::f64::consts::PI.to_bits(),
+        f64::from(f32::MIN_POSITIVE).to_bits() - 1, // rounds up to the smallest normal
+        f64::from(f32::from_bits(1)).to_bits(),     // the smallest denormal
+        2.0f64.powi(-150).to_bits(),                // a tie between 0 and it: even, 0
+        2.0f64.powi(-150).to_bits() + 1,            // just above: the smallest denormal
+        (1.0f64 + 2.0f64.powi(-24)).to_bits(),      // a tie: even, 1.0
+        (1.0f64 + 3.0 * 2.0f64.powi(-24)).to_bits(), // a tie: even, up
+        max,
+        max + (1 << 28) - 1, // just below halfway to 2^128: f32::MAX
+        max + (1 << 28),     // halfway: infinity
+        f64::MAX.to_bits(),
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        0x7FF4_5678_9ABC_DEF0, // a signalling NaN with a payload
+        0xFFF8_0000_0000_0001, // a negative quiet NaN
+        1e-300f64.to_bits(),
+    ];
+    let want = |x: u64| -> u32 {
+        let d = f64::from_bits(x);
+        if d.is_nan() {
+            (x >> 32) as u32 & 0x8000_0000 | 0x7FC0_0000 | (x >> 29) as u32 & 0x3F_FFFF
+        } else {
+            (d as f32).to_bits()
+        }
+    };
+    let cases: Vec<[u32; 4]> = doubles.iter().map(|&x| [x as u32, (x >> 32) as u32, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        assert_eq!(got, want(doubles[i]), "{backend}: {:#018x}", doubles[i]);
+    });
+}

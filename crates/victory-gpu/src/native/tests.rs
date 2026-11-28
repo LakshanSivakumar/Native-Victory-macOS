@@ -20,6 +20,8 @@ mod addr_tests;
 mod heap_tests;
 #[path = "legacy_fma_tests.rs"]
 mod legacy_fma_tests;
+#[path = "double_tests.rs"]
+mod double_tests;
 #[path = "mesh_tests.rs"]
 mod mesh_tests;
 #[path = "scaled_vertex_tests.rs"]

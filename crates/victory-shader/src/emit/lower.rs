@@ -3437,6 +3437,84 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// The bits of the float nearest the double whose bits are the i64 `x`,
+    /// rounded to nearest even on integers: a result too small for a normal
+    /// float is a float denormal (gradual underflow, as IEEE 754 and DXIL's
+    /// `fptrunc` have it), one too large an infinity; a NaN keeps the top 22
+    /// bits of its payload, quieted, and the sign.
+    // Guess (docs/native-host.md, "Doubles"): the console's MODE may flush
+    // f32 denormal results and may round otherwise; this follows IEEE
+    // round-to-nearest-even with denormals kept, the default MODE of RDNA2
+    // compute and what Leonida's translator (ProjectLeonida/mandy) chose.
+    fn f64_bits_to_f32_bits(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let k = |l: &mut Self, v: i64| l.s.m.int_const(i64t, v);
+        let sign = k(self, i64::MIN);
+        let sign = self.s.m.bin(c, Bin::And, x, sign);
+        let k32 = k(self, 32);
+        let sign = self.s.m.bin(c, Bin::LShr, sign, k32);
+        let magnitude = k(self, i64::MAX);
+        let a = self.s.m.bin(c, Bin::And, x, magnitude);
+        let (one, k29) = (k(self, 1), k(self, 29));
+        // Normal floats: the exponent rebased from 1023 to 127, 29 mantissa
+        // bits rounded away; a carry into the exponent is right, and one past
+        // the largest float gives the infinity's bits.
+        let rebase = k(self, 896 << 52);
+        let r = self.s.m.bin(c, Bin::Sub, a, rebase);
+        let lsb = self.s.m.bin(c, Bin::LShr, r, k29);
+        let lsb = self.s.m.bin(c, Bin::And, lsb, one);
+        let half = k(self, (1 << 28) - 1);
+        let up = self.s.m.bin(c, Bin::Add, r, half);
+        let up = self.s.m.bin(c, Bin::Add, up, lsb);
+        let normal = self.s.m.bin(c, Bin::LShr, up, k29);
+        let infinity = k(self, 0x7F80_0000);
+        let over = self.s.m.cmp(c, pred::IUGE, normal, infinity);
+        let normal = self.s.m.select(c, over, infinity, normal);
+        // Below the smallest normal float (exponent under 897): the mantissa
+        // with its hidden bit, in units of 2^-149, is M >> (926 - e).
+        let k52 = k(self, 52);
+        let e = self.s.m.bin(c, Bin::LShr, a, k52);
+        let frac = k(self, (1 << 52) - 1);
+        let mant = self.s.m.bin(c, Bin::And, a, frac);
+        let hidden = k(self, 1 << 52);
+        let mant = self.s.m.bin(c, Bin::Or, mant, hidden);
+        let k926 = k(self, 926);
+        let shift = self.s.m.bin(c, Bin::Sub, k926, e);
+        let k63 = k(self, 63);
+        let far = self.s.m.cmp(c, pred::IUGT, shift, k63);
+        let shift = self.s.m.select(c, far, k63, shift);
+        let q = self.s.m.bin(c, Bin::LShr, mant, shift);
+        let below = self.s.m.bin(c, Bin::Sub, shift, one);
+        let halfway = self.s.m.bin(c, Bin::LShr, mant, below);
+        let halfway = self.s.m.bin(c, Bin::And, halfway, one);
+        let rest = self.s.m.bin(c, Bin::Shl, one, below);
+        let rest = self.s.m.bin(c, Bin::Sub, rest, one);
+        let rest = self.s.m.bin(c, Bin::And, mant, rest);
+        let zero = k(self, 0);
+        let sticky = self.s.m.cmp(c, pred::NE, rest, zero);
+        let sticky = self.s.m.cast(c, Cast::ZExt, sticky, i64t);
+        let odd = self.s.m.bin(c, Bin::And, q, one);
+        let tie = self.s.m.bin(c, Bin::Or, sticky, odd);
+        let up = self.s.m.bin(c, Bin::And, halfway, tie);
+        let tiny = self.s.m.bin(c, Bin::Add, q, up);
+        let min_normal = k(self, 897 << 52);
+        let small = self.s.m.cmp(c, pred::IULT, a, min_normal);
+        let r = self.s.m.select(c, small, tiny, normal);
+        // NaN: quiet, the payload's top bits.
+        let inf64 = k(self, 0x7FF << 52);
+        let is_nan = self.s.m.cmp(c, pred::IUGT, a, inf64);
+        let payload = self.s.m.bin(c, Bin::LShr, a, k29);
+        let low22 = k(self, (1 << 22) - 1);
+        let payload = self.s.m.bin(c, Bin::And, payload, low22);
+        let quiet = k(self, 0x7FC0_0000);
+        let nan = self.s.m.bin(c, Bin::Or, payload, quiet);
+        let r = self.s.m.select(c, is_nan, nan, r);
+        let r = self.s.m.bin(c, Bin::Or, r, sign);
+        self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32)
+    }
+
     /// `f` as an f16 in the low bits, rounded as the program's MODE says at
     /// this point: toward zero where it set that for 16-bit results (the
     /// title does around its 16-bit interpolation), else to nearest even;
@@ -9611,6 +9689,14 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // The host has no doubles (Apple GPUs run no fp64), so the
+                // rounding is done on the bits.
+                let x = self.src_f64(inst, 0)?;
+                let r = self.f64_bits_to_f32_bits(x);
+                let r = self.as_float(r);
+                float(self, r)
+            }
             "v_cvt_f32_f16" if v.opsel == 0 => {
                 let a = s(self, 0)?;
                 let r = self
@@ -9929,7 +10015,59 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
+            return Err("64-bit operand modifiers");
+        }
+        self.src64_bits(inst, k)
+    }
+
+    /// Source `k` of a double operation, as the i64 of its bits: abs and neg
+    /// act on the sign bit (bit 63); an inline float constant is that value
+    /// as a double, and a literal is the double's high dword (its low dword
+    /// zero), as the hardware reads them for 64-bit float operands.
+    fn src_f64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let i64t = self.s.m.int(64);
+        let c = self.cur;
+        let constant = |x: f64| x.to_bits() as i64;
+        let mut x = match v.src.get(k) {
+            Some(Operand::Const(240)) => self.s.m.int_const(i64t, constant(0.5)),
+            Some(Operand::Const(241)) => self.s.m.int_const(i64t, constant(-0.5)),
+            Some(Operand::Const(242)) => self.s.m.int_const(i64t, constant(1.0)),
+            Some(Operand::Const(243)) => self.s.m.int_const(i64t, constant(-1.0)),
+            Some(Operand::Const(244)) => self.s.m.int_const(i64t, constant(2.0)),
+            Some(Operand::Const(245)) => self.s.m.int_const(i64t, constant(-2.0)),
+            Some(Operand::Const(246)) => self.s.m.int_const(i64t, constant(4.0)),
+            Some(Operand::Const(247)) => self.s.m.int_const(i64t, constant(-4.0)),
+            // 1/(2 pi) as RDNA2 encodes it for 64-bit operands (LLVM's
+            // AMDGPU inline constants).
+            Some(Operand::Const(248)) => self.s.m.int_const(i64t, 0x3FC4_5F30_6DC9_C882),
+            Some(Operand::Const(240..=255)) => return Err("a special 64-bit float constant"),
+            Some(&Operand::Literal(hi)) => {
+                self.s.flags |= flags::INT64;
+                self.s.m.int_const(i64t, (u64::from(hi) << 32) as i64)
+            }
+            _ => self.src64_bits(inst, k)?,
+        };
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.int_const(i64t, i64::MAX);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.int_const(i64t, i64::MIN);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        Ok(x)
+    }
+
+    /// Source `k` as an i64 of two dwords, with no float modifiers.
+    fn src64_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
             return Err("64-bit operand modifiers");
         }
         let c = self.cur;
