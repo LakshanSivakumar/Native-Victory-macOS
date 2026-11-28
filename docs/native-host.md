@@ -2187,9 +2187,11 @@ land near `ir_seconds * 48000`, or something else) and replace this guess with t
 `StreamDesc::ir` to `<dir>/stream<n>_ir.f32` (the title's bytes, not the synthetic tail; capped at
 16 Mi floats, logged as truncated if longer), and each `XDspSubmitCommand` appends the command's
 gains and input block to `<dir>/stream<n>_blocks.f32` and the block the stream wrote — silence, or
-the `VICTORY_GUESS_DSP` result — to `<dir>/stream<n>_out.f32`. A run with both set captures what
-the title sends and hears, to validate the guess against the real effect once the hardware's
-partitioned IR layout is known.
+the `VICTORY_GUESS_DSP` result — to `<dir>/stream<n>_out.f32`, until each stream's block and
+output capture reaches 64 MiB (about a few minutes at 48 kHz; one line when it stops). A run with
+both set captures what the title sends and hears, to validate the guess against the real effect
+once the hardware's partitioned IR layout is known. The capture files are the title's own audio
+data: never commit, attach or post them, as for the shader dumps.
 
 Tests (`modules::dsp::tests`): `convolve_merged_is_a_causal_fir_per_channel_scaled_by_gain` and
 `convolve_merged_reads_history_as_the_frames_before_the_block` (the convolution math against
