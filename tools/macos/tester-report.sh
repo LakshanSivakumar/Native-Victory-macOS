@@ -41,6 +41,7 @@ scrub_list=$(
 scrub() {
   SCRUB="$scrub_list" awk '
 BEGIN {
+  esc = sprintf("%c", 27)
   m = split(ENVIRON["SCRUB"], rows, "\n")
   for (i = 1; i <= m; i++) {
     t = index(rows[i], "\t"); v = substr(rows[i], 1, t - 1)
@@ -56,7 +57,12 @@ BEGIN {
   for (i = 1; i <= n; i++) {
     v = val[i]; o = ""
     while ((p = index(s, v)) > 0) {
-      pre = (p > 1) ? substr(s, p - 1, 1) : substr(o, length(o), 1)
+      before = (p > 1) ? substr(s, 1, p - 1) : o
+      pre = substr(before, length(before), 1)
+      # A colour escape ends in "m", which is not a word character before the
+      # value: without this a host or user name right after one is never
+      # scrubbed, because the "m" looks like a longer word around it.
+      if (before ~ esc "\\[[0-9;]*m$") pre = ""
       post = substr(s, p + length(v), 1)
       if (pre ~ /[A-Za-z0-9]/ && v ~ /^[A-Za-z0-9]/ || post ~ /[A-Za-z0-9]/ && v ~ /[A-Za-z0-9]$/)
         o = o substr(s, 1, p + length(v) - 1)

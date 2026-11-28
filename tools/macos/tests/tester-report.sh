@@ -33,6 +33,7 @@ console        Series S
 @ESC@[2m2026-01-01T00:00:00.100000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_metal::msc: metal: shader converter 3.0.4 (from VICTORY_MSC_DYLIB)
 @ESC@[2m2026-01-01T00:00:00.100100Z@ESC@[0m  @ESC@[33mWARN@ESC@[0m victory_metal::msc: metal: the shader converter is not /usr/local/lib/libmetalirconverter.dylib; a copy other than Apple's package may convert shaders differently
 @ESC@[2m2026-01-01T00:00:01.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_hle::host: host=@HOST@ name="@COMPUTER@" bonjour=@LOCAL@.local release build
+@ESC@[2m2026-01-01T00:00:01.500000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m @ESC@[2mvictory_hle::host_posix::winsock@ESC@[0m@ESC@[2m:@ESC@[0m network name lookup blocked @ESC@[3mname@ESC@[0m@ESC@[2m=@ESC@[0m@LOCAL@.local
 @ESC@[2m2026-01-01T00:00:02.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::glue: native draws so far frame=64 recorded=1
 @ESC@[2m2026-01-01T00:00:04.000000Z@ESC@[0m  @ESC@[32mINFO@ESC@[0m victory_gpu::native::glue: native draws so far frame=128 recorded=1
 LOG
@@ -58,6 +59,7 @@ for secret in "$home" "$user" "$host" "$computer" "$local_host"; do
 done
 grep -F 'path=<home>/Games/game_scarlett_master.exe user=<user>' "$root/scrubbed" >/dev/null || fail "home or user placeholder missing"
 grep -F 'host=<host> name="<host>" bonjour=<host>.local release build' "$root/scrubbed" >/dev/null || fail "host placeholders or word boundaries wrong"
+grep -F 'network name lookup blocked' "$root/scrubbed" | grep -F '<host>.local' >/dev/null || fail "a value straight after a colour escape was not scrubbed"
 
 # Every template section, and the facts the maintainer asks for.
 labels=$(sed -n 's/^ *label: *//p' "$repo/.github/ISSUE_TEMPLATE/tester-report.yml")
