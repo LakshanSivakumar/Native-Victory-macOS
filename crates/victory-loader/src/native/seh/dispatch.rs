@@ -376,6 +376,46 @@ unsafe fn dispatch(ctx: *mut Context, rec: *mut ExceptionRecord) -> ! {
         // SAFETY: forwarded from the caller.
         unsafe { resume(ctx) };
     }
+    // The FSR dispatch's ring-slot divide faults when the title-side period was never
+    // initialised (VICTORY_METALFX=1, image+0x28f03e8: counter / period into the jitter
+    // ring; the constructor at image+0x26fdf7c fills it from a caller whose jitter config
+    // object reads zero): write a jitter phase count and let the divide re-execute. Once
+    // per object; a second fault falls through to the title's own handling.
+    {
+        // SAFETY: both are ours for this dispatch.
+        let (c, r) = unsafe { (&*ctx, &*rec) };
+        if r.code == 0xc0000094
+            && unwind::image_base_of(c.rip as usize)
+                .is_some_and(|b| c.rip as usize - b == 0x28f0_3e8)
+        {
+            let rdi = c.gpr[6] as usize;
+            let period = (rdi + 0x10c) as *mut u32;
+            // SAFETY: rdi points into mapped title memory (the faulting divide reads it).
+            if unsafe { period.read_unaligned() } == 0 {
+                static FIXED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+                    std::sync::Mutex::new(std::collections::BTreeSet::new());
+                let fresh = FIXED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(rdi);
+                if fresh {
+                    let phases: u32 = std::env::var("VICTORY_METALFX_PERIOD")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(8);
+                    // SAFETY: as above.
+                    unsafe { period.write_unaligned(phases) };
+                    tracing::warn!(
+                        rdi = format_args!("{rdi:#x}"),
+                        phases,
+                        "FSR: the dispatch's period was zero; wrote a jitter phase count and resumed the divide"
+                    );
+                    // SAFETY: forwarded from the caller.
+                    unsafe { resume(ctx) };
+                }
+            }
+        }
+    }
     // First-chance log: the title's own handlers may hide where a fault started.
     // SAFETY: both are ours for this dispatch.
     unsafe {
