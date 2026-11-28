@@ -41,9 +41,21 @@ struct Notice {
 }
 
 static THREAD_NOTICES: Mutex<Vec<Notice>> = Mutex::new(Vec::new());
+/// Mapped image bases that called `DisableThreadLibraryCalls` (including during
+/// `DllMain(DLL_PROCESS_ATTACH)` before [`register_dll_thread_notices`] runs).
+static DISABLED_THREAD_CALLS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 fn notices() -> std::sync::MutexGuard<'static, Vec<Notice>> {
     THREAD_NOTICES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn disabled_set() -> std::sync::MutexGuard<'static, Vec<usize>> {
+    DISABLED_THREAD_CALLS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(super) fn forget_image(base: usize) {
+    disabled_set().retain(|&b| b != base);
+    notices().retain(|n| n.base != base);
 }
 
 /// Has `image`'s TLS callbacks told of every title thread from now on.
@@ -65,7 +77,8 @@ fn register(image: &NativeImage, dll_main: bool) {
         .as_ref()
         .map(|t| t.callback_rvas.clone())
         .unwrap_or_default();
-    let dll_main = dll_main
+    let quiet = disabled_set().contains(&image.base());
+    let dll_main = (dll_main && !quiet)
         .then(|| image.info().entry_rva)
         .filter(|&rva| rva != 0);
     if tls_callbacks.is_empty() && dll_main.is_none() {
@@ -78,27 +91,52 @@ fn register(image: &NativeImage, dll_main: bool) {
     });
 }
 
-/// `DisableThreadLibraryCalls`: the DLL at `base` no longer hears of threads
-/// in its `DllMain` (its TLS callbacks still do). False if it is not one
-/// that was registered.
-pub fn disable_thread_calls(base: usize) -> bool {
-    let mut notices = notices();
-    let mut found = false;
-    for n in notices.iter_mut().filter(|n| n.base == base) {
-        found |= n.dll_main.take().is_some();
+/// `DisableThreadLibraryCalls` for a mapped [`NativeImage`]: `None` if `base`
+/// is not one; `Some(false)` if the image has static TLS (as Windows refuses);
+/// `Some(true)` once its `DllMain` is silenced for future thread notices.
+pub fn disable_thread_calls(base: usize) -> Option<bool> {
+    if super::image::has_tls(base)? {
+        return Some(false);
     }
-    found
+    {
+        let mut set = disabled_set();
+        if !set.contains(&base) {
+            set.push(base);
+        }
+    }
+    let mut notices = notices();
+    for n in notices.iter_mut().filter(|n| n.base == base) {
+        n.dll_main = None;
+    }
+    Some(true)
 }
 
-/// Calls every registered callback with `reason`, on the calling thread.
+/// Calls every registered callback with `reason`, on the calling thread:
+/// load order (TLS callbacks, then `DllMain`) for `DLL_THREAD_ATTACH`, and
+/// reverse load order (`DllMain`, then TLS callbacks) for `DLL_THREAD_DETACH`.
 fn notify_threads(reason: u32) {
-    let calls: Vec<(usize, Vec<u32>)> = notices()
-        .iter()
-        .map(|n| {
-            let rvas = n.tls_callbacks.iter().chain(&n.dll_main).copied();
-            (n.base, rvas.collect())
-        })
-        .collect();
+    let detach = reason == DLL_THREAD_DETACH;
+    let calls: Vec<(usize, Vec<u32>)> = {
+        let guard = notices();
+        if detach {
+            guard
+                .iter()
+                .rev()
+                .map(|n| {
+                    let rvas = n.dll_main.iter().chain(&n.tls_callbacks).copied();
+                    (n.base, rvas.collect())
+                })
+                .collect()
+        } else {
+            guard
+                .iter()
+                .map(|n| {
+                    let rvas = n.tls_callbacks.iter().chain(&n.dll_main).copied();
+                    (n.base, rvas.collect())
+                })
+                .collect()
+        }
+    };
     for (base, rvas) in calls {
         for rva in rvas {
             // SAFETY: a callback of an image registered by its owner.

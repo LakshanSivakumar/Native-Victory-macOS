@@ -6,12 +6,59 @@
 //! Nothing here runs title code and nothing is x86-64 specific, so an arm64
 //! host (the recompiler's) maps images the same way.
 
+use std::sync::Mutex;
+
 use anyhow::{Context, Result, bail};
 use victory_pe::layout::{self, dir};
-use victory_pe::{ImageInfo, ImportSymbol};
+use victory_pe::{ExportInfo, ImageInfo, ImportSymbol};
 use victory_platform::mem::{self, Protect};
 
 use super::seh;
+
+struct MappedMeta {
+    base: usize,
+    has_tls: bool,
+    exports: Vec<ExportInfo>,
+}
+
+static MAPPED: Mutex<Vec<MappedMeta>> = Mutex::new(Vec::new());
+
+fn mapped() -> std::sync::MutexGuard<'static, Vec<MappedMeta>> {
+    MAPPED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether `base` is a currently mapped [`NativeImage`], and if so whether it
+/// has a static TLS directory.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn has_tls(base: usize) -> Option<bool> {
+    mapped().iter().find(|m| m.base == base).map(|m| m.has_tls)
+}
+
+/// Export lookup result on a mapped [`NativeImage`].
+pub(super) enum MappedExport {
+    Address(usize),
+    Forward(String),
+    Missing,
+}
+
+/// Looks up `symbol` in the mapped [`NativeImage`] at `base`, or `None` if no
+/// image is mapped at `base`.
+pub(super) fn export_at(base: usize, symbol: &ImportSymbol) -> Option<MappedExport> {
+    let guard = mapped();
+    let meta = guard.iter().find(|m| m.base == base)?;
+    let found = match symbol {
+        ImportSymbol::Name { name, .. } => meta
+            .exports
+            .iter()
+            .find(|e| e.name.as_deref() == Some(name.as_str())),
+        ImportSymbol::Ordinal(o) => meta.exports.iter().find(|e| e.ordinal == *o),
+    };
+    Some(match found.map(|f| (f.rva, f.forward.as_deref())) {
+        Some((Some(rva), _)) => MappedExport::Address(base + rva as usize),
+        Some((None, Some(forward))) => MappedExport::Forward(forward.to_owned()),
+        _ => MappedExport::Missing,
+    })
+}
 
 const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
@@ -93,6 +140,15 @@ impl NativeImage {
             )
         });
         seh::unwind::add_image(image.base, image.len, pdata);
+        {
+            let mut guard = mapped();
+            guard.retain(|m| m.base != image.base);
+            guard.push(MappedMeta {
+                base: image.base,
+                has_tls: image.info.tls.is_some(),
+                exports: image.info.exports.clone(),
+            });
+        }
         tracing::info!(
             base = format_args!("{:#x}", image.base),
             preferred = format_args!("{preferred:#x}"),
@@ -314,6 +370,9 @@ impl NativeImage {
     /// # Safety
     /// No title code may run or hold pointers into it afterwards.
     pub unsafe fn unmap(self) {
+        mapped().retain(|m| m.base != self.base);
+        #[cfg(target_arch = "x86_64")]
+        super::run::forget_image(self.base);
         seh::unwind::remove_image(self.base);
         // SAFETY: forwarded from the caller.
         unsafe { mem::release(self.base as *mut u8, self.len) }.ok();
@@ -435,5 +494,168 @@ mod tests {
         assert!(image.tls().is_none());
         // SAFETY: no title code ran.
         unsafe { image.unmap() };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn disable_thread_calls_and_thread_detach_order_follow_windows() {
+        use crate::native::{
+            disable_thread_calls, register_dll_thread_notices, register_thread_callbacks,
+            spawn_title_thread,
+        };
+
+        // Build a relocatable PE32+ image with code at RVA 0x1000 (`DllMain` at 0x1000, TLS
+        // callback at 0x1040, optional static TLS directory at 0x1080).
+        fn callback_pe(id: u8, with_tls: bool, log_addr: usize, count_addr: usize) -> Vec<u8> {
+            let mut pe = vec![0u8; 0x600];
+            let put16 = |d: &mut [u8], at: usize, v: u16| d[at..at + 2].copy_from_slice(&v.to_le_bytes());
+            let put32 = |d: &mut [u8], at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            let put64 = |d: &mut [u8], at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+            pe[0..2].copy_from_slice(b"MZ");
+            put32(&mut pe, 0x3C, 0x40);
+            pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+            put16(&mut pe, 0x44, victory_pe::MACHINE_AMD64);
+            put16(&mut pe, 0x46, 1);
+            put16(&mut pe, 0x54, 240);
+            put16(&mut pe, 0x56, 0x2022);
+            let opt = 0x58;
+            put16(&mut pe, opt, 0x20B);
+            put32(&mut pe, opt + 16, 0x1000); // AddressOfEntryPoint = 0x1000
+            put64(&mut pe, opt + 24, 0x1_8000_0000);
+            put32(&mut pe, opt + 32, 0x1000);
+            put32(&mut pe, opt + 36, 0x200);
+            put32(&mut pe, opt + 56, 0x2000);
+            put32(&mut pe, opt + 60, 0x200);
+            put32(&mut pe, opt + 108, 16);
+            put32(&mut pe, opt + 112 + dir::BASERELOC * 8, 0x1100);
+            put32(&mut pe, opt + 112 + dir::BASERELOC * 8 + 4, 8);
+            if with_tls {
+                put32(&mut pe, opt + 112 + 9 * 8, 0x1080);
+                put32(&mut pe, opt + 112 + 9 * 8 + 4, 40);
+            }
+            let sec = opt + 240;
+            pe[sec..sec + 5].copy_from_slice(b".text");
+            put32(&mut pe, sec + 8, 0x400);
+            put32(&mut pe, sec + 12, 0x1000);
+            put32(&mut pe, sec + 16, 0x400);
+            put32(&mut pe, sec + 20, 0x200);
+            put32(&mut pe, sec + 36, SCN_MEM_READ | SCN_MEM_WRITE | SCN_MEM_EXECUTE);
+
+            // Stub (`rcx = base, edx = reason`):
+            //   mov r8, count_addr; mov r9, log_addr
+            //   mov eax, 1; lock xadd [r8], eax
+            //   shl edx, 16; or edx, (id << 8 | kind)
+            //   mov [r9 + rax*4], edx; mov eax, 1; ret
+            let emit_stub = |d: &mut [u8], at: usize, kind: u8| {
+                let mut code = Vec::new();
+                code.extend_from_slice(&[0x49, 0xB8]);
+                code.extend_from_slice(&(count_addr as u64).to_le_bytes());
+                code.extend_from_slice(&[0x49, 0xB9]);
+                code.extend_from_slice(&(log_addr as u64).to_le_bytes());
+                code.extend_from_slice(&[0xB8, 1, 0, 0, 0]); // mov eax, 1
+                code.extend_from_slice(&[0xF0, 0x41, 0x0F, 0xC1, 0x00]); // lock xadd [r8], eax
+                code.extend_from_slice(&[0xC1, 0xE2, 16]); // shl edx, 16
+                code.extend_from_slice(&[0x81, 0xCA, kind, id, 0, 0]); // or edx, imm32
+                code.extend_from_slice(&[0x41, 0x89, 0x14, 0x81]); // mov [r9 + rax*4], edx
+                code.extend_from_slice(&[0xB8, 1, 0, 0, 0, 0xC3]); // mov eax, 1; ret
+                d[at..at + code.len()].copy_from_slice(&code);
+            };
+            emit_stub(&mut pe, 0x200, 1); // DllMain (kind = 1) at RVA 0x1000
+            emit_stub(&mut pe, 0x240, 2); // TLS callback (kind = 2) at RVA 0x1040
+
+            if with_tls {
+                // IMAGE_TLS_DIRECTORY64 at RVA 0x1080 (file 0x280), callback array at RVA 0x10B0 (file 0x2B0).
+                let pref = 0x1_8000_0000u64;
+                put64(&mut pe, 0x280, pref + 0x10C0); // StartAddressOfRawData
+                put64(&mut pe, 0x288, pref + 0x10C4); // EndAddressOfRawData
+                put64(&mut pe, 0x290, pref + 0x10C8); // AddressOfIndex
+                put64(&mut pe, 0x298, pref + 0x10B0); // AddressOfCallBacks
+                put64(&mut pe, 0x2B0, pref + 0x1040); // callback[0] = RVA 0x1040
+                put64(&mut pe, 0x2B8, 0); // terminator
+                // Relocate the 5 absolute VAs at RVA 0x1080..0x1098 and 0x10B0.
+                put32(&mut pe, opt + 112 + dir::BASERELOC * 8 + 4, 20);
+                put32(&mut pe, 0x300, 0x1000);
+                put32(&mut pe, 0x304, 20);
+                for (k, off) in [0x80u16, 0x88, 0x90, 0x98, 0xB0, 0].into_iter().enumerate() {
+                    let entry = if off == 0 { 0 } else { (REL_DIR64 << 12) | off };
+                    put16(&mut pe, 0x308 + k * 2, entry);
+                }
+            } else {
+                put32(&mut pe, 0x300, 0x1000);
+                put32(&mut pe, 0x304, 8);
+            }
+            pe
+        }
+
+        let log = Box::new([0u32; 64]);
+        let count = Box::new(0u32);
+        let log_addr = log.as_ptr() as usize;
+        let count_addr = (&*count) as *const u32 as usize;
+
+        assert_eq!(disable_thread_calls(0x1234), None);
+
+        // DLL A (no static TLS): calls `disable_thread_calls` BEFORE `register_dll_thread_notices`,
+        // just as a real DLL does inside `DllMain(DLL_PROCESS_ATTACH)`.
+        let dll_a = NativeImage::map(&callback_pe(0xA, false, log_addr, count_addr), None).unwrap();
+        dll_a.finalize().unwrap();
+        assert_eq!(disable_thread_calls(dll_a.base()), Some(true));
+        register_dll_thread_notices(&dll_a);
+
+        // DLL B (has static TLS + TLS callback + DllMain): `disable_thread_calls` fails with `Some(false)`.
+        let dll_b = NativeImage::map(&callback_pe(0xB, true, log_addr, count_addr), None).unwrap();
+        dll_b.finalize().unwrap();
+        assert_eq!(disable_thread_calls(dll_b.base()), Some(false));
+        register_dll_thread_notices(&dll_b);
+
+        // DLL C (no static TLS, keeps DllMain enabled) + separate TLS-callback-only image D after B.
+        let dll_c = NativeImage::map(&callback_pe(0xC, false, log_addr, count_addr), None).unwrap();
+        dll_c.finalize().unwrap();
+        register_dll_thread_notices(&dll_c);
+
+        let exe_d = NativeImage::map(&callback_pe(0xD, true, log_addr, count_addr), None).unwrap();
+        exe_d.finalize().unwrap();
+        register_thread_callbacks(&exe_d);
+
+        extern "win64" fn thread_noop(_: usize) -> u32 {
+            0
+        }
+        // SAFETY: `thread_noop` is a valid win64 entry point.
+        let worker = unsafe {
+            spawn_title_thread("notice-order-probe", 1 << 20, thread_noop as *const () as usize, 0, |_| {})
+                .unwrap()
+        };
+        assert_eq!(worker.join(), 0);
+
+        let total = unsafe { (count_addr as *const u32).read_volatile() } as usize;
+        let events: Vec<(u32, u8, u8)> = log[..total]
+            .iter()
+            .map(|&w| (w >> 16, (w >> 8) as u8, w as u8))
+            .filter(|&(_, id, _)| matches!(id, 0xA | 0xB | 0xC | 0xD))
+            .collect();
+
+        // DLL A was silenced before registration, so zero 0xA events fired;
+        // attach (reason 2): B.tls(2), B.main(1), C.main(1), D.tls(2);
+        // detach (reason 3): D.tls(2), C.main(1), B.main(1), B.tls(2) (reverse load order, DllMain before TLS).
+        assert_eq!(
+            events,
+            vec![
+                (2, 0xB, 2),
+                (2, 0xB, 1),
+                (2, 0xC, 1),
+                (2, 0xD, 2),
+                (3, 0xD, 2),
+                (3, 0xC, 1),
+                (3, 0xB, 1),
+                (3, 0xB, 2),
+            ]
+        );
+
+        // SAFETY: worker thread has exited; unmapping cleans `MAPPED`, `THREAD_NOTICES`, and `DISABLED`.
+        unsafe {
+            exe_d.unmap();
+            dll_c.unmap();
+            dll_b.unmap();
+            dll_a.unmap();
+        }
     }
 }

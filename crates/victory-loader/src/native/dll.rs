@@ -190,6 +190,44 @@ impl TitleDll {
     }
 }
 
+/// Resolves an export of any mapped [`NativeImage`] at `base` (including the
+/// title's main executable as well as title DLLs), following forwarded exports
+/// through `inner` and mapped title DLLs. Returns `None` if `base` is not a
+/// mapped [`NativeImage`].
+pub fn resolve_mapped_export(
+    base: usize,
+    symbol: &ImportSymbol,
+    inner: &dyn ImportResolver,
+) -> Option<Resolution> {
+    if let Some(dll) = find_base(base) {
+        return Some(dll.resolve_export(symbol, inner));
+    }
+    let current = super::image::export_at(base, symbol)?;
+    let mut seen = HashSet::new();
+    while let super::image::MappedExport::Forward(forward) = current {
+        if !seen.insert(forward.clone()) {
+            return Some(Resolution::Missing);
+        }
+        let Some((dll, target)) = forward_target(&forward) else {
+            return Some(Resolution::Missing);
+        };
+        match inner.resolve(&dll, &target) {
+            Resolution::Missing => match find(&dll) {
+                Some(d) => return Some(d.resolve_export(&target, inner)),
+                None => return Some(Resolution::Missing),
+            },
+            found => return Some(found),
+        }
+    }
+    Some(match current {
+        super::image::MappedExport::Address(address) => Resolution::Found {
+            address,
+            provenance: Provenance::Title,
+        },
+        _ => Resolution::Missing,
+    })
+}
+
 /// `"dll.name"` or `"dll.#7"`, as an export forwards to it.
 fn forward_target(forward: &str) -> Option<(String, ImportSymbol)> {
     let (dll, name) = forward.rsplit_once('.')?;
