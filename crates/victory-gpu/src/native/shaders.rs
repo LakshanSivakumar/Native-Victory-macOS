@@ -182,11 +182,6 @@ pub fn threads_of(dxil: &[u8]) -> Option<[usize; 3]> {
     Some([n(0), n(1), n(2)]).filter(|t| t.iter().all(|&n| n > 0))
 }
 
-/// Metal's per-threadgroup mesh output limit. The Wine/D3DMetal measure
-/// includes alignment between signature elements; the packed component count
-/// alone misses e.g. a 34,816-byte layout that hangs the queue.
-const METAL_MESH_OUTPUT_BYTES: u32 = 32_768;
-
 /// Port of `pipeline/host.rs::metal_mesh_bytes` from the Wine build, using
 /// the container parser for bounds checks. Keep the larger of the aligned
 /// layout and packed component count, as the Wine pipeline guard does.
@@ -635,7 +630,7 @@ mod mesh_tests {
         outputs.extend([(0, 15); 15]);
         assert_eq!(
             metal_mesh_bytes(&mesh(128, 0, &outputs, &[])),
-            Some(METAL_MESH_OUTPUT_BYTES)
+            Some(victory_shader::emit::METAL_MESH_OUTPUT_BYTES)
         );
         assert_eq!(metal_mesh_bytes(&mesh(129, 0, &outputs, &[])), Some(33_024));
         let mut aligned = vec![(1, 15)];

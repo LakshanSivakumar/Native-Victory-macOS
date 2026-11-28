@@ -3,6 +3,10 @@
 use crate::dxbc::u32_at;
 use crate::{Container, FourCC};
 
+/// Metal's per-threadgroup mesh output limit. The Wine/D3DMetal measure
+/// includes alignment between signature elements; the packed component count
+/// alone misses e.g. a 34,816-byte layout that hangs the queue (on the Wine route:
+/// a reason to keep the guard on by default, `mesh_guard_on`).
 pub const METAL_MESH_OUTPUT_BYTES: u32 = 32_768;
 
 /// Whether the 32 KiB mesh output guard is on: `VICTORY_MESH_OVER_LIMIT=1` turns it off, for
