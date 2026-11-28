@@ -182,3 +182,73 @@ pub const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 // Language handler dispositions.
 pub const EXCEPTION_CONTINUE_EXECUTION_DISPOSITION: u32 = 0;
 pub const EXCEPTION_CONTINUE_SEARCH_DISPOSITION: u32 = 1;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A thread state with a distinct value per word, so every mapping is
+    /// visible: t[i] = 0x1000 + i.
+    fn thread_state() -> [u64; 21] {
+        let mut t = [0u64; 21];
+        for (i, w) in t.iter_mut().enumerate() {
+            *w = 0x1000 + i as u64;
+        }
+        t
+    }
+
+    #[test]
+    fn thread_state_lands_in_the_context_gpr_order() {
+        let mut ctx = Context::zeroed();
+        ctx.set_from_thread_state(&thread_state());
+        // Darwin order rax, rbx, rcx, rdx, rdi, rsi, rbp, rsp, r8-r15 maps to
+        // the CONTEXT order rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8-r15.
+        let t = thread_state();
+        let want = [
+            t[0], t[2], t[3], t[1], t[7], t[6], t[5], t[4], t[8], t[9], t[10], t[11], t[12],
+            t[13], t[14], t[15],
+        ];
+        assert_eq!(ctx.gpr, want);
+        assert_eq!(ctx.rip, t[16]);
+        assert_eq!(ctx.rsp(), t[7]);
+    }
+
+    #[test]
+    fn control_and_segment_registers_follow_the_state() {
+        let mut t = thread_state();
+        t[17] = 0x1_0000_0202; // rflags: only the low 32 bits survive
+        t[18] = 0x1_002B; // cs
+        t[19] = 0x1_0000; // fs
+        t[20] = 0x1_0063; // gs
+        let mut ctx = Context::zeroed();
+        ctx.set_from_thread_state(&t);
+        assert_eq!(ctx.eflags, 0x202);
+        assert_eq!(ctx.seg_cs, 0x2B);
+        assert_eq!(ctx.seg_fs, 0);
+        assert_eq!(ctx.seg_gs, 0x63);
+        // ds, es and ss are not in the Mach state; the decoder fixes them.
+        assert_eq!(ctx.seg_ds, 0x2B);
+        assert_eq!(ctx.seg_es, 0x2B);
+        assert_eq!(ctx.seg_ss, 0x2B);
+    }
+
+    #[test]
+    fn set_mxcsr_writes_the_field_and_the_fxsave_image() {
+        let mut ctx = Context::zeroed();
+        ctx.set_mxcsr(0x1F80);
+        assert_eq!(ctx.mx_csr, 0x1F80);
+        assert_eq!(&ctx.flt[1][8..12], &0x1F80u32.to_le_bytes());
+    }
+
+    #[test]
+    fn xmm_addresses_the_fxsave_slots() {
+        let mut ctx = Context::zeroed();
+        for i in 0..16 {
+            *ctx.xmm_mut(i) = [i as u8; 16];
+        }
+        for i in 0..16 {
+            assert_eq!(ctx.xmm(i), &[i as u8; 16]);
+            assert_eq!(ctx.flt[XMM0_SLOT + i], [i as u8; 16]);
+        }
+    }
+}
