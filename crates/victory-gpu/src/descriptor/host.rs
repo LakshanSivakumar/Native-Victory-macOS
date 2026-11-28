@@ -564,7 +564,7 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 32)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -1010,18 +1010,17 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s words into the view addresses at `data`, 16 bytes
-/// a slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
-/// high), a texture view's size fields ([`texture_words`]), zeros for
-/// anything else.
+/// Writes slot `index`'s words into the view addresses at `data`, 32 bytes
+/// a slot: a view's title address (dword 0), a texture view's address high,
+/// size and array fields ([`texture_words`]), zeros for anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
     let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
     let words = match view.and_then(texture_words) {
         Some(words) => words,
-        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
+        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0, 0, 0, 0, 0],
     };
-    // SAFETY: the mapped view addresses hold 16 bytes per title slot.
-    unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+    // SAFETY: the mapped view addresses hold 32 bytes per title slot.
+    unsafe { ((data + 32 * index) as *mut [u32; 8]).write_unaligned(words) };
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -2097,16 +2096,28 @@ mod tests {
         let mut view = [0u32; 10];
         // Levels 2-4 of the texture: width - 1 = 999 (0b11_1110_0111).
         (view[1], view[4], view[5]) = (4, 2, 3);
-        let words = image_words(&texture, Some(&view), false);
-        assert_eq!(words, [0, 3 << 30, 249 | 599 << 14, 0xFAC | 2 << 12 | 4 << 16 | 9 << 28]);
+        let words = image_words(&texture, Some(&view), false, 0x1234_5678_9ABC);
+        assert_eq!(
+            words,
+            [
+                0x5678_9ABC,
+                (0x1234 & 0x7FFF) << 1 | 1 | 3 << 30,
+                3 << 30,
+                249 | 599 << 14,
+                0xFAC | 2 << 12 | 4 << 16 | 9 << 28,
+                0,
+                3 << 4 | 4 << 20,
+                0,
+            ]
+        );
         // Its whole chain from level 1.
         (view[4], view[5]) = (1, u32::MAX);
-        assert_eq!(image_words(&texture, Some(&view), false)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
+        assert_eq!(image_words(&texture, Some(&view), false, 0)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
         // An unordered view of level 3: that level alone.
         let uav = [0, 4, 0, 0, 3, 0, 0, 0, 0, 0];
-        assert_eq!(image_words(&texture, Some(&uav), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
+        assert_eq!(image_words(&texture, Some(&uav), true, 0)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
         // The array's own view: a 2D array, levels 0-10.
-        let words = image_words(&array, None, false);
-        assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
+        let words = image_words(&array, None, false, 0);
+        assert_eq!(words[2..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28, 0, 10 << 4 | 4 << 20, 0, 0]);
     }
 }

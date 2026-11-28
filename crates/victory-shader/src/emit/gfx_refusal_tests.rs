@@ -78,7 +78,8 @@ fn joins_without_a_value_are_found_in_one_pass() {
     };
     for joins in [1, 32] {
         translate_with(&program(joins), Options::default()).unwrap();
-        assert_eq!(lower::PASSES.get(), 2, "{joins} joins");
+        // The dword's value is a table read, so the joins need no further pass.
+        assert_eq!(lower::PASSES.get(), 1, "{joins} joins");
     }
 }
 
@@ -831,8 +832,9 @@ fn refusal1_console_layout_dependent_masks_remain_refused() {
 // Refusal #2: "a pixel system input the signature lacks"
 // =========================================================================
 
-/// A buffer descriptor's dword that is no size, read as data, is refused naming it: the host
-/// has no value for the base address, the high address bits and stride, or the format.
+/// A descriptor's dword that is no size, read as data, is refused naming it: the host has no
+/// value for the high address bits and stride, or the format (dword 0 is the view's address in
+/// title memory and is served).
 #[test]
 fn descriptor_dwords_read_as_data_say_which() {
     use crate::native::tests::{fspx, fspx_resource};
@@ -859,18 +861,19 @@ fn descriptor_dwords_read_as_data_say_which() {
         crate::dxbc::build(&[(FourCC::ACCC, &part)])
     };
     let prefix = "a descriptor's address or format read as data: ";
-    for (read, why) in [
-        (0x7E04_020C, "a buffer's base address (dword 0)"),
-        (0x7E04_020D, "a buffer's dword 1 (address high bits, stride, swizzle)"),
-        (0x7E04_020F, "a buffer's dword 3 (format and type)"),
-    ] {
-        let err = translate_with(&program(read), Options::default()).err();
-        assert!(
-            matches!(err, Some(ShaderError::Unsupported { what, .. })
-                if what.strip_prefix(prefix) == Some(why)),
-            "{err:?}"
-        );
+    // Dwords 0 and 1 are the view's address in memory, which the table holds and the
+    // translator's binding completes: both are served.
+    for read in [0x7E04_020C, 0x7E04_020D] {
+        let ok = translate_with(&program(read), Options::default());
+        assert!(ok.as_ref().is_ok_and(|s| s.view_addresses), "{read:x}: {:?}", ok.err());
     }
+    // Its dword 3 (format and type) is not.
+    let err = translate_with(&program(0x7E04_020F), Options::default()).err();
+    assert!(
+        matches!(err, Some(ShaderError::Unsupported { what, .. })
+            if what.strip_prefix(prefix) == Some("a buffer's dword 3 (format and type)")),
+        "{err:?}"
+    );
 }
 
 /// A descriptor read only as data takes its dwords from the view addresses (`t1`), which hold a
@@ -910,7 +913,9 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
     // s_lshr_b64 s[20:21], s[12:13], 8, then s_and_b32 s20, s21, mask: dword 1 bits 8 on.
     let shifted = |mask: u32| vec![0x9094_880C, 0x8714_FF15, mask];
     let accepted = [
+        // Both kinds' dword 0 is the view's address in title memory.
         (false, mov(12)),
+        (true, mov(12)),
         (false, and(13, 0xFFFF)),
         (false, shifted(0xFF)),
         (true, and(13, 0xC000_0000)),
@@ -926,13 +931,12 @@ fn view_address_fields_the_table_gives_as_0_are_refused() {
         );
     }
     let prefix = "a view address field the table gives as 0: ";
-    let dword_1 = "an image's base address, minimum level or format (dword 1)";
+    let dword_1 = "an image's minimum level or format (dword 1)";
     let refused = [
         (false, mov(13), "a buffer's stride or swizzle"),
         (false, and(13, 0x3FFF_0000), "a buffer's stride or swizzle"),
         (false, shifted(0xFFFF), "a buffer's stride or swizzle"),
         (false, mov(14), "a buffer's record count or format"),
-        (true, mov(12), "an image's base address"),
         (true, and(13, 0xFF), dword_1),
         (true, and(13, 0x1FF0_0000), dword_1),
         (true, mov(14), "an image's dword 2"),

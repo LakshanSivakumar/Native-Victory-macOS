@@ -281,10 +281,10 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let value = 0xCAFE_F00D;
     // Heap index 1 (the memory's view) has the title address, index 2 a
     // texture's size fields.
-    let mut view_addresses = vec![0u32; 4 * 5];
-    view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
-    let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
-    view_addresses[9..12].copy_from_slice(&image);
+    let mut view_addresses = vec![0u32; 8 * 5];
+    view_addresses[8] = TITLE as u32;
+    let image = [0x1122_3344, 1, 0xC000_0000, 0x0957_C0F9, 0x9004_2FAC, 0, 0x0040_0000, 0];
+    view_addresses[18..26].copy_from_slice(&image);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -907,10 +907,10 @@ fn computed_buffer_subword_loads_preserve_values_and_bounds() {
 
 /// A size query of the view at a descriptor index (#407): the program scales the index to whole
 /// descriptors, loads the four dwords of the entry and keeps only the size fields of dwords 1-3,
-/// guarded by the null test of dword 1. The table's dword 1 bit 0 is always 0, so the translator
-/// carries "this entry holds a texture" there, from the entry's dword 3: an image reads back with
-/// its size fields and the bit, a null entry and a buffer (whose table size fields are 0) read as
-/// 0, taking the program's null branch instead of a size of 0.
+/// guarded by the null test of dword 1. A buffer's table dword 1 is 0, so the translator serves
+/// 0 for it whenever the entry's dword 3 says it is no texture (a null entry, a buffer): such an
+/// entry reads as 0 and the program takes its null branch instead of a size of 0. Bit 0 of an
+/// image's dword 1 says nothing but the marker.
 #[test]
 fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
     let mut w = vec![s_mov_b32(5, 0)]; // s[4:5]: the table at s4, high half 0
@@ -973,9 +973,11 @@ fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
     assert!(shader.view_addresses);
     // Heap index 1 holds a 64x32 image, index 2 a null entry, index 3 a buffer (address only).
     let texel = [[0.0f32; 4]];
-    let mut view_addresses = vec![0u32; 4 * 4];
-    view_addresses[4..8].copy_from_slice(&[0, 0xC000_0000, 0x0007_C00F, 0x9000_0FAC]);
-    view_addresses[12..16].copy_from_slice(&[0x1234_5678, 0x0000_9ABC, 0, 0]);
+    let mut view_addresses = vec![0u32; 8 * 4];
+    view_addresses[8..16].copy_from_slice(&[
+        0xAAAA_1111, 0xC000_0001, 0x0007_C00F, 0x9000_0FAC, 0, 0, 0, 0,
+    ]);
+    view_addresses[24..32].copy_from_slice(&[0x1234_5678, 0, 0, 0, 0, 0, 0, 0]);
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -993,7 +995,7 @@ fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
         for (index, want) in [
             (1, [0xC000_0001, 0x0007_C00F, 0x9000_0FAC]),
             (2, [0, 0, 0]),
-            (3, [0x0000_9ABC, 0, 0]),
+            (3, [0, 0, 0]),
         ] {
             ud[0] = index;
             let out = host
@@ -1014,6 +1016,106 @@ fn a_size_query_of_a_view_at_an_index_reads_its_size_fields() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(out[0][..3], want, "{label}: index {index}");
         }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A buffer descriptor's dwords 0 and 1 read as data (#407): dword 0 is the view's address, of
+/// which the table holds the low half, and dword 1 holds its high half in bits 0-15 with the
+/// binding's stride above them (bits 16-29), as the console's `V#` puts them and as the programs
+/// that rebuild a resource descriptor from these words expect (`s_and_b32 dword1, 0xc000ffff`
+/// then a store through it). The stride comes from the binding, not from the descriptor.
+#[test]
+fn buffer_descriptor_address_words_read_as_data() {
+    let mut w = vec![s_mov_b32(5, 0)]; // s[4:5]: the table at s4, high half 0
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV (table dword 0)
+    w.extend([0x8F02_8500]); // s_lshl_b32 s2, s0, 5 (the descriptor index, a root constant)
+    w.extend([0x8002_0402]); // s_add_u32 s2, s4, s2
+    w.extend([0x8003_FDFF, 0x0000_0000]); // s_add_u32 s3, scc, 0
+    w.extend(s_load(1, 16, 2, 0)); // s[16:17]: dwords 0-1 of the entry
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(1, 16));
+    w.extend(buffer_store_dword(1, 8, 0));
+    w.push(v_mov_b32(1, 17));
+    w.extend(buffer_store_dword(1, 8, 4));
+    w.push(S_ENDPGM);
+    let layout = vec![
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        },
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let used = vec![
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        },
+        UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 32,
+            lower_bound: 0,
+            stride: 16,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        },
+    ];
+    let (shader, _memory) = lowered(&w, 4, layout, used);
+    assert!(shader.view_addresses);
+    // Heap index 1 is a buffer view at 0x1234_AABB_CCDD: the table holds its low half, the
+    // high half in the next dword's low bits.
+    let mut view_addresses = vec![0u32; 8 * 2];
+    view_addresses[8..16].copy_from_slice(&[0xAABB_CCDD, 0x1234, 0, 0, 0, 0, 0, 0]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        ud[0] = 1;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: vec![0; 8] }),
+                        (2, Root::View { srv: true, data: view_addresses.clone() }),
+                    ],
+                    views: &[View::RawUav(9), View::NullPair, View::NullPair],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        // The address low half, then its high half beside the binding's stride of 16 bytes.
+        assert_eq!(out[0][..2], [0xAABB_CCDD, 0x1234 | 16 << 16], "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

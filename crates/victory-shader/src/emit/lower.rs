@@ -426,6 +426,7 @@ struct Lower<'a> {
     def_block: Map<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
+    here: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -1206,6 +1207,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            here: 0,
             sections: HashMap::new(),
             section_out: Set::default(),
             section_lane_reads: Set::default(),
@@ -2649,6 +2651,10 @@ impl<'a> Lower<'a> {
             return Ok(any);
         }
         if let Some(Val::Missing(w)) = found {
+            if std::env::var_os("VICTORY_DEBUG_MISSING").is_some() {
+                let i = &self.x.p.blocks[self.cur_ir].insts[self.here];
+                eprintln!("READ {} {w}", i.name());
+            }
             return Err(w);
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
@@ -5476,6 +5482,7 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+        self.here = i;
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
@@ -6616,14 +6623,8 @@ impl<'a> Lower<'a> {
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         // What the host has no value for, by dword, so a refusal log says which is read.
-        const BUFFER_ADDRESS: Why =
-            "a descriptor's address or format read as data: a buffer's base address (dword 0)";
-        const BUFFER_DWORD1: Why = "a descriptor's address or format read as data: a buffer's \
-                                    dword 1 (address high bits, stride, swizzle)";
         const BUFFER_FORMAT: Why =
             "a descriptor's address or format read as data: a buffer's dword 3 (format and type)";
-        const IMAGE_ADDRESS: Why =
-            "a descriptor's address or format read as data: an image's base address (dword 0)";
         const OUTSIDE: Why =
             "a descriptor's address or format read as data: a dword outside the descriptor";
         let Fields::Smem {
@@ -6743,6 +6744,14 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
+        // Dword 0 is the view's address in title memory, which the view address table holds
+        // (a buffer's own readers follow it there, so an image's is the same kind of value).
+        let views = self.s.view_addresses_handle();
+        let index = self.heap_index(site, first, false)?;
+        let c0 = self.cur;
+        let five = self.s.m.i32(5);
+        let at = self.s.m.bin(c0, Bin::Shl, index, five);
+        let d0 = self.raw_dword(views, at);
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -6818,9 +6827,29 @@ impl<'a> Lower<'a> {
                 let d5 = self.s.m.bin(c, Bin::Or, pitch, mip);
                 let d5 = self.s.m.bin(c, Bin::Or, d5, perf);
                 let d5 = self.s.m.select(c, null, zero, d5);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth), (5, d5), (6, zero), (7, zero)]
+                vec![
+                    (0, d0),
+                    (1, d1),
+                    (2, d2),
+                    (3, d3),
+                    (4, depth),
+                    (5, d5),
+                    (6, zero),
+                    (7, zero),
+                ]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                // A buffer's dword 1: its address high (the table's) and the stride of the
+                // view, which is a property of the binding and not of the descriptor.
+                let four = self.s.m.i32(4);
+                let hi_at = self.s.m.bin(c0, Bin::Add, at, four);
+                let hi = self.raw_dword(views, hi_at);
+                let k16 = self.s.m.i32(16);
+                let st = self.s.m.i32(used.map_or(0, |u| u.stride));
+                let d1 = self.s.m.bin(c0, Bin::Shl, st, k16);
+                let d1 = self.s.m.bin(c0, Bin::Or, d1, hi);
+                vec![(0, d0), (1, d1), (2, field(self, 0))]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -6828,10 +6857,7 @@ impl<'a> Lower<'a> {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     let why = match (image.is_some(), rel) {
-                        (false, 0) => BUFFER_ADDRESS,
-                        (false, 1) => BUFFER_DWORD1,
                         (false, 3) => BUFFER_FORMAT,
-                        (true, 0) => IMAGE_ADDRESS,
                         _ => OUTSIDE,
                     };
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
@@ -7420,8 +7446,8 @@ impl<'a> Lower<'a> {
     // shortcut: the readers say the program sizes a view; a buffer query of the same four
     // dwords reads its record count whole, which the buffer path refuses as a field.
     fn image_size_half(&self, inst: &Inst, code: u8, count: u32, a: &Address) -> Option<bool> {
-        // The size fields of dwords 1-3 the table holds; dword 0 is the base address.
-        const HELD: [u32; 4] = [0, 0xC000_0001, 0x3FFF_FFFF, 0xF00F_FFFF];
+        // The address of dword 0 and the size fields of dwords 1-3 the table holds.
+        const HELD: [u32; 4] = [!0, 0xC000_0001, 0x3FFF_FFFF, 0xF00F_FFFF];
         if count != 4 || !a.offset.is_multiple_of(4) {
             return None;
         }
@@ -7500,17 +7526,17 @@ impl<'a> Lower<'a> {
     }
 
     /// A descriptor load from a table or heap whose dwords the program only
-    /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
-    /// as a pointer to title memory: the BVH's address in its SRV) or, for
-    /// a whole image descriptor (eight dwords), also the size fields of
-    /// dwords 1-3 (width, height, first and last level, type: size queries
-    /// of a texture the program never samples). They come from the host's
-    /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four dwords
-    /// per heap index. The table gives every other field as 0, so a program
-    /// that can see one of their bits (`seen_bits`) is refused: a buffer's
-    /// stride and swizzle (dword 1 bits 16-31) and dwords 2-3, an image's
-    /// base address, minimum level and format (dword 0, dword 1 bits 0-29),
-    /// dword 2 bits 30-31, tiling (dword 3 bits 20-27) and dwords 4-7.
+    /// reads as numbers: the base address of a buffer view (dword 0, as a
+    /// pointer into memory: the BVH's address in its SRV) or, for a whole
+    /// image descriptor (eight dwords), also the size fields of dwords 1-3
+    /// (width, height, first and last level, type: size queries of a texture
+    /// the program never samples). They come from the host's view addresses,
+    /// `t1` in [`super::shader::MEMORY_SPACE`]: eight dwords per heap index.
+    /// The table gives every other field as 0, so a program that can see one
+    /// of their bits (`seen_bits`) is refused: a buffer's dword 1 high half
+    /// (stride and swizzle) and dwords 2-3, an image's minimum level and
+    /// format (dword 1 bits 1-29), dword 2 bits 30-31, tiling (dword 3 bits
+    /// 20-27) and dwords 4-7.
     // shortcut: the swizzle reads as the identity; the kind of view is the
     // load's (eight dwords at a whole descriptor: an image) and the table
     // offset's computed part is taken as whole descriptors (32-byte
@@ -7527,14 +7553,11 @@ impl<'a> Lower<'a> {
         const BUFFER_REST: Why =
             "a view address field the table gives as 0: a buffer's record count or format";
         const IMAGE: [(u32, Why); 4] = [
-            (
-                0,
-                "a view address field the table gives as 0: an image's base address",
-            ),
+            (!0, ""),
             (
                 0xC000_0000,
-                "a view address field the table gives as 0: an image's base address, minimum \
-                 level or format (dword 1)",
+                "a view address field the table gives as 0: an image's minimum level or format \
+                 (dword 1)",
             ),
             (
                 0x3FFF_FFFF,
@@ -7566,8 +7589,8 @@ impl<'a> Lower<'a> {
                 let word = (first + k) % 8;
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
-                let four = self.s.m.i32(4);
-                let at = self.s.m.bin(c, Bin::Shl, index, four);
+                let five = self.s.m.i32(5);
+                let at = self.s.m.bin(c, Bin::Shl, index, five);
                 let w = self.s.m.i32(4 * word);
                 let at = self.s.m.bin(c, Bin::Add, at, w);
                 vals.push(self.raw_dword(views, at));
@@ -7576,17 +7599,14 @@ impl<'a> Lower<'a> {
                 // Whether the entry holds a texture: an image's dword 3 has `0xFAC` and the
                 // levels, a null entry is all 0, and a buffer's dword 3 is 0 too (its table
                 // dwords 2 and 3 are, so the image reading of a buffer would give it a size of
-                // 0). The program then takes its null branch for a buffer, as if it were empty.
-                // Bit 0 of the table's dword 1 is always 0 (the width is in bits 30-31), so it
-                // carries the answer.
+                // 0). A buffer's table dword 1 (the address high) is 0 as well, so dword 1
+                // serves 0 for one and the program takes its null branch, as if it were empty.
                 let c = self.cur;
                 let at = |dword: u32| (dword - first) as usize;
                 let zero = self.s.m.i32(0);
-                let one = self.s.m.i32(1);
                 let view = self.s.m.cmp(c, pred::NE, vals[at(3)], zero);
-                let view = self.s.m.select(c, view, one, zero);
-                let d1 = self.s.m.bin(c, Bin::Or, vals[at(1)], view);
-                vals[at(1)] = d1;
+                let img = self.s.m.select(c, view, vals[at(1)], zero);
+                vals[at(1)] = img;
             }
             for (k, val) in vals.into_iter().enumerate() {
                 if let Some(v) = inst.write(Reg::S(code + k as u8)) {

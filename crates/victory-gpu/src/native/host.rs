@@ -2053,24 +2053,30 @@ impl<B: GraphicsBackend> NativeHost<B> {
         Ok(())
     }
 
-    /// The four dwords of a heap entry in the view addresses: a buffer view's title address
-    /// (dword 0, and dword 1 bits 0-15), a texture view's size fields
-    /// ([`crate::descriptor::texture_words`]), zeros for anything else.
-    fn address_words(&self, view: Option<&crate::descriptor::View>) -> [u32; 4] {
-        let Some(view) = view else { return [0; 4] };
+    /// The eight dwords of a heap entry in the view addresses: a view's title address in
+    /// dword 0, then a texture view's size and array fields
+    /// ([`crate::descriptor::texture_words`]) or a buffer view's address high; zeros for
+    /// anything else. Bit 0 of dword 1 says the entry holds a texture, so a buffer's address
+    /// high starts one bit up.
+    fn address_words(&self, view: Option<&crate::descriptor::View>) -> [u32; 8] {
+        let Some(view) = view else { return [0; 8] };
         if let Some(words) = crate::descriptor::texture_words(view) {
             return words;
         }
         match decode(view, &self.resources.borrow()) {
-            Some(Decoded::Buffer { addr, .. }) => [addr as u32, (addr >> 32) as u32 & 0xFFFF, 0, 0],
-            _ => [0; 4],
+            // A buffer's dword 1 holds its address high in bits 0-15; its stride is a
+            // property of the view, which the translator knows and ORs in.
+            Some(Decoded::Buffer { addr, .. }) => {
+                [addr as u32, (addr >> 32) as u32 & 0xFFFF, 0, 0, 0, 0, 0, 0]
+            }
+            _ => [0; 8],
         }
     }
 
     /// The view addresses of `heap` (the translator's root SRV `t1` of the memory space,
     /// `victory_shader::emit`, "View addresses"): per title entry, four dwords of the console
     /// descriptor as far as the host knows them ([`Self::address_words`]), so a shader that walks
-    /// a BVH from its SRV's address, or sizes a texture from its descriptor, reads them. 16 bytes
+    /// a BVH from its SRV's address, or sizes a texture from its descriptor, reads them. 32 bytes
     /// an entry. Made at first use from the heap as the title's memory has it now and kept
     /// current by [`Self::mirror`]. shortcut: an entry the title copied as bytes outside a bound
     /// table keeps its old words until it is mirrored.
@@ -2078,12 +2084,12 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if let Some(made) = &*heap.addresses.borrow() {
             return Ok(made.clone());
         }
-        let pages = Rc::new(Pages::new(&self.backend, heap.count.max(1) * 16)?);
+        let pages = Rc::new(Pages::new(&self.backend, heap.count.max(1) * 32)?);
         let step = Self::step(heap.kind);
         for index in 0..heap.count {
             let view = crate::descriptor::view(heap.start + index as u64 * step);
             if view.is_some() {
-                pages.write_at(4 * index, &self.address_words(view.as_ref()));
+                pages.write_at(8 * index, &self.address_words(view.as_ref()));
             }
         }
         *heap.addresses.borrow_mut() = Some(pages.clone());
