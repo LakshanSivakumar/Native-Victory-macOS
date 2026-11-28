@@ -25,6 +25,9 @@ pub fn options() -> Options {
     Options {
         wave32_host: true,
         zero_copy_memory: true,
+        // VICTORY_PAIRED_WAVES=1: lockstep in the paired form for compute groups of several
+        // console waves (#376; off by default). Part of the options, so of the shader cache key.
+        paired_waves: std::env::var("VICTORY_PAIRED_WAVES").is_ok_and(|v| v.trim() == "1"),
         ..Options::default()
     }
 }

@@ -475,6 +475,9 @@ pub struct Structured {
     pub discards: Map<(usize, usize), Bool>,
     /// Made by [`lockstep`]: the lowering runs the console wave's one PC in every lane.
     pub lockstep: bool,
+    /// Lockstep in the paired form (`emit/lockstep.rs`): each host thread runs two console
+    /// lanes, so a console wave of 64 is one host wave of 32. Set by the lockstep retry.
+    pub paired: bool,
 }
 
 impl Structured {
@@ -1044,6 +1047,7 @@ impl<'a> Lanes<'a> {
             guards,
             reach: cond.to_vec(),
             lockstep: self.lockstep,
+            paired: false,
         })
     }
 

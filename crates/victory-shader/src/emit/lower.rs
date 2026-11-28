@@ -25,6 +25,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
 mod halves;
+mod paired;
 mod rect;
 
 type Why = &'static str;
@@ -381,6 +382,14 @@ struct Lower<'a> {
     /// With `halves`, blocks where both halves of a console wave arrive
     /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
+    /// Lockstep's paired form (`lower/paired.rs`): two console lanes a host thread.
+    paired: bool,
+    /// In the paired form, whether the lane being lowered is the upper one (`n + 32`).
+    upper: bool,
+    /// In the paired form, the other lane's per-lane state.
+    twin: Option<Box<paired::Twin>>,
+    /// In the paired form, whether the last LDS access was a write (fences before the next).
+    lds_last: Option<bool>,
     /// Why the program cannot run on a 32-lane host.
     refuse: Option<Why>,
     /// The group's lane in console order, made in the entry block.
@@ -971,6 +980,7 @@ impl<'a> Lower<'a> {
             || (x.zero_copy_memory && x.native.stage != HwStage::Cs);
         let mut console_lanes = console;
         let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
+        let mut paired = false;
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -1040,15 +1050,23 @@ impl<'a> Lower<'a> {
             // width only where wave operations need it, or LDS is not synced.
             let fits = x.narrow_waves && (synced || lanes <= 32);
             if host32 {
+                // Lockstep's paired form for several console waves (`lower/paired.rs`): one host
+                // wave per console wave, nothing exchanged between host waves.
+                paired = x.st.paired && !one_wave && lanes.is_multiple_of(64);
+                if paired {
+                    s.host_threads = Some([lanes / 2, 1, 1]);
+                }
                 // Whole-wave sections are reductions over the console's
                 // 64 lanes (`halves.rs`).
-                halves = lanes > 32 && (console_lanes || super::wave::has_sections(p) || x.st.lockstep);
+                halves = !paired
+                    && lanes > 32
+                    && (console_lanes || super::wave::has_sections(p) || x.st.lockstep);
                 // No host wave is 64 lanes: LDS a wave shares unsynced
                 // cannot run.
                 if one_wave && lanes > 32 && s.lds_dwords > 0 && !synced {
                     refuse = Some(SPLIT_LDS);
                 }
-                console_lanes |= halves;
+                console_lanes |= halves || paired;
                 if console_lanes {
                     s.wave_size = Some(32);
                 }
@@ -1173,6 +1191,10 @@ impl<'a> Lower<'a> {
             host32,
             halves,
             once,
+            paired,
+            upper: false,
+            twin: paired.then(Box::default),
+            lds_last: None,
             console_flat: None,
             refuse,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -1945,7 +1967,7 @@ impl<'a> Lower<'a> {
             self.run_rect_by_id(&order, vid_val)?;
         } else {
             self.lower_blocks(&order, self.s.entry)?;
-            self.fill_phis()?;
+            self.each_lane(|l| l.fill_phis())?;
         }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -2059,10 +2081,13 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = entry_block;
-        self.inputs()?;
-        if p.thread_counts {
-            self.launched();
-        }
+        self.each_lane(|l| {
+            l.inputs()?;
+            if p.thread_counts {
+                l.launched();
+            }
+            Ok(())
+        })?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -2077,23 +2102,26 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
-            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
-                let val = match phi.reg {
-                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
-                    Reg::Scc => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i1);
-                        self.data_phis.push((v, b, i));
-                        Val::Bit(v)
-                    }
-                    _ => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i32);
-                        self.data_phis.push((v, b, i));
-                        Val::I32(v)
-                    }
-                };
-                self.vals.insert(phi.value, val);
-            }
+            self.each_lane(|l| {
+                for (i, phi) in p.blocks[b].phis.iter().enumerate() {
+                    let val = match phi.reg {
+                        Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                        _ if l.bad.contains_key(&phi.value) => Val::Missing(l.bad[&phi.value]),
+                        Reg::Scc => {
+                            let v = l.s.m.phi(l.cur, l.s.t.i1);
+                            l.data_phis.push((v, b, i));
+                            Val::Bit(v)
+                        }
+                        _ => {
+                            let v = l.s.m.phi(l.cur, l.s.t.i32);
+                            l.data_phis.push((v, b, i));
+                            Val::I32(v)
+                        }
+                    };
+                    l.vals.insert(phi.value, val);
+                }
+                Ok(())
+            })?;
             self.begin_rect_block(b, &preds);
             let mut i = 0;
             self.mode16 = self.round16[b];
@@ -2111,7 +2139,11 @@ impl<'a> Lower<'a> {
                 if self.split_barriers.contains(&(b, i)) {
                     self.group_barrier();
                 }
-                self.inst(b, i)?;
+                if self.paired {
+                    self.paired_inst(b, i)?;
+                } else {
+                    self.inst(b, i)?;
+                }
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -2860,6 +2892,15 @@ impl<'a> Lower<'a> {
                 };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
+                }
+                if self.paired {
+                    // Both lanes' bits: the lower lanes are the console's bits 0-31, the upper
+                    // ones 32-63 (`lower/paired.rs`).
+                    let xy = self.paired_ballot(at, |l| l.boolean(m, at));
+                    self.balloting.remove(&lo);
+                    let xy = xy?;
+                    self.ballots.insert(lo, xy);
+                    return Ok(if high { xy.1 } else { xy.0 });
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
@@ -4811,6 +4852,9 @@ impl<'a> Lower<'a> {
     /// first lane's flat id rounded down to the host wave size, plus the
     /// host lane.
     fn console_flat(&mut self) -> V {
+        if self.paired {
+            return self.paired_console_flat();
+        }
         if let Some(f) = self.console_flat {
             return f;
         }
@@ -4945,7 +4989,7 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
-        if self.halves {
+        if self.halves || self.paired {
             let f = self.console_flat();
             let m = self.s.m.i32(63);
             return self.s.m.bin(at, Bin::And, f, m);

@@ -160,6 +160,9 @@ pub(crate) struct Shader {
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
+    /// The thread-group size the host runs, where it is not [`Self::threads`] (the console's):
+    /// lockstep's paired form runs two console lanes a thread, so half as many threads.
+    pub host_threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
@@ -229,6 +232,7 @@ impl Shader {
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
+            host_threads: None,
             wave_size: None,
             lds_dwords: 0,
             lds: None,
@@ -904,7 +908,7 @@ impl Shader {
             let f = self.m.int_const(i64t, self.flags as i64);
             props.push(self.m.md_value(f));
         }
-        if let Some(threads) = self.threads {
+        if let Some(threads) = self.host_threads.or(self.threads) {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
             let t = self.m.md_node(t.to_vec());
             match self.mesh {
@@ -1031,7 +1035,7 @@ impl Shader {
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
             gs: self.gs,
             bindings: &bindings,
-            threads: self.threads.unwrap_or_default(),
+            threads: self.host_threads.or(self.threads).unwrap_or_default(),
             wave_size: self.wave_size,
         });
         let hash = container::shader_hash(&dxil);

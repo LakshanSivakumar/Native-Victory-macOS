@@ -43,10 +43,18 @@ pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -
         && native.stage == HwStage::Cs
         && native.wave64
         && !st.lockstep
-        && cs.threads.iter().product::<u32>() <= 64
+        && {
+            let lanes = cs.threads.iter().product::<u32>();
+            lanes <= 64 || options.paired_waves && lanes.is_multiple_of(64)
+        }
         // VICTORY_NO_LOCKSTEP=1: refuse as the fast path does (for comparisons).
         && std::env::var_os("VICTORY_NO_LOCKSTEP").is_none()
 }
+
+/// A title barrier in a block a group of several console waves may reach unevenly: each wave
+/// follows its own program counter, so only a barrier every thread reaches once is safe.
+pub(crate) const UNEVEN_BARRIER: &str =
+    "an s_barrier the console waves of a lockstep group may reach unevenly";
 
 /// The lockstep translation of `p` (see the module).
 pub(super) fn retry(
@@ -58,7 +66,21 @@ pub(super) fn retry(
     options: Options,
 ) -> Result<HostShader, ShaderError> {
     let q = branches(p);
-    let st = structure::lockstep(&q)?;
+    let mut st = structure::lockstep(&q)?;
+    if let StageIo::Cs(cs) = &native.io
+        && cs.threads.iter().product::<u32>() > 64
+    {
+        // Several console waves: the paired form (`Lower`'s `paired`). Each wave follows its own
+        // program counter, so a title barrier is safe only where every thread arrives once.
+        st.paired = true;
+        let once = super::lower::once_blocks(&q);
+        if let Some(offset) = (0..q.blocks.len()).find_map(|b| {
+            let at = q.blocks[b].insts.iter().find(|i| i.name() == "s_barrier")?;
+            (!once[b]).then_some(at.machine.offset)
+        }) {
+            return Err(ShaderError::Unsupported { offset, what: UNEVEN_BARRIER });
+        }
+    }
     if let Some(offset) = divergent(&q, &st) {
         return Err(ShaderError::Unsupported { offset, what: NOT_UNIFORM });
     }

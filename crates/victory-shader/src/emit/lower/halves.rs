@@ -175,6 +175,10 @@ impl Lower<'_> {
 
     /// `x` of console lane `lane` (the low six bits count).
     pub(super) fn wide_read_lane(&mut self, x: V, lane: V) -> Result<V, Why> {
+        if self.paired {
+            // The paired form reads lanes through `paired_cross`, with both lanes' values.
+            return Err("a lane read the paired form does not take");
+        }
         if !self.host32 {
             return Ok(self.read_lane(x, lane));
         }
