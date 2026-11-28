@@ -965,3 +965,67 @@ fn barycentrics_read_as_data_weigh_the_second_and_third_corners() {
         assert_eq!(&p[2..], &[0, 255], "texel {n}");
     }
 }
+
+/// A mesh program (`HwStage::Ms`) builds a 4-dword V# buffer descriptor in SGPRs from a root SRV
+/// GPU address (`s[8:9]`, slot 0) plus 16 bytes, a runtime byte count in root constant `s10`
+/// (slot 1), and a control word formed by constant scalar ALU (`s_or_b32`), then loads each
+/// corner's scale from title memory (`Pool`) via `buffer_load_dword`: 12 bytes in bounds draws the
+/// whole target, while 4 bytes puts corners 1 and 2 out of range (0.0) and draws nothing (#552).
+#[test]
+fn a_mesh_program_loads_from_a_computed_buffer_descriptor_in_title_memory() {
+    let mut words = TRIANGLE.to_vec();
+    let at = words.iter().position(|&w| w == 0x7E08_0280).unwrap(); // before v_mov_b32 v4, 0
+    words.splice(at..at, [
+        0x8010_9008, // s_add_u32 s16, s8, 16
+        0x8211_8009, // s_addc_u32 s17, s9, 0
+        0x8711_FF11, 0x0000_FFFF, // s_and_b32 s17, s17, 0xffff
+        0xBE92_030A, // s_mov_b32 s18, s10
+        0xBE93_03FF, 0x1101_4FAC, // s_mov_b32 s19, 0x11014fac
+        0x8813_FF13, 0x2000_0000, // s_or_b32 s19, s19, 0x20000000 (mode 3: byte count)
+        0x3418_0282, // v_lshlrev_b32 v12, 2, v1
+        0xE030_1000, 0x8004_0D0C, // buffer_load_dword v13, v12, s[16:19], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x1004_050D, // v_mul_f32 v2, v13, v2
+        0x1006_070D, // v_mul_f32 v3, v13, v3
+    ]);
+    let mut meta = [0u8; 0x50];
+    meta[12..15].copy_from_slice(&[0x40, 0, 2]);
+    // Record 0: RootType::Descriptor SRV in slot 0, user_data 0 (`s8, s9`).
+    meta[0x10] = 0x41;
+    meta[0x14] = 0; // ResourceType::Srv
+    meta[0x15] = 1; // RootType::Descriptor
+    meta[0x24] = 4; // dwords
+    meta[0x25] = 0; // user_data 0
+    meta[0x26] = 0; // slot 0
+    // Record 1: RootType::Constants in slot 1, user_data 2 (`s10`).
+    meta[0x30] = 0x41;
+    meta[0x34] = 2; // ResourceType::Cbv
+    meta[0x35] = 0; // RootType::Constants
+    meta[0x45] = 2; // user_data 2
+    meta[0x46] = 1; // slot 1
+
+    let ms = translate_with(HwStage::Vs, &words, &meta);
+    assert_eq!(ms.stage, HwStage::Ms);
+    assert!(ms.memory, "mesh program reads title memory through the page table");
+    let ps = translate(HwStage::Ps, RED);
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "mesh-computed-buf") else {
+        panic!("{:?}", t.shaders);
+    };
+    let f = super::addr_tests::Fixture::new(&t);
+    f.put(0x2_0000 + 16, &[1.0f32.to_bits(); 3]);
+    let red = [255, 128, 128, 255];
+    for (bytes, want) in [(12u32, red), (4u32, [0; 4])] {
+        let (color, mut list) = list_into(&t, &pso, binding.clone());
+        list.set_graphics_root_view(0, super::addr_tests::VA_A);
+        list.set_graphics_root_constants(1, &[bytes]);
+        list.dispatch_mesh(1, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        assert!(
+            pixels(&t, &color).iter().all(|p| *p == want),
+            "bytes = {bytes}: {:?}",
+            pixels(&t, &color)
+        );
+    }
+}

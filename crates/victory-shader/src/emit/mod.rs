@@ -707,8 +707,10 @@ fn emit_fast(
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
+            let computed_buffers =
+                (guessed || native.stage == HwStage::Cs) && options.zero_copy_memory;
             let res = resource::track_graphics(
-                p, &native.layout, native.stage, Some(&st), guessed && options.zero_copy_memory,
+                p, &native.layout, native.stage, Some(&st), computed_buffers,
             )?;
             lower::lower_graphics(&parts(&st, &res), guessed)?
         }
@@ -2226,5 +2228,214 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn pixel_spilled_descriptor_phi_and_compute_root_descriptor_dynamic_count_emit() {
+        use crate::native::{ComputeIo, ResourceType, RootParam, RootType, StageIo, UsedResource};
+
+        // 1. Pixel shader: two descriptors spilled to v0 lanes 3-6 on an if/else and restored
+        // after the join via `v_readlane_b32` must lower without marking v0 as a per-lane read.
+        let ps_words: &[u32] = &[
+            0xBE82_030A, // s_mov_b32 s2, s10
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBF06_8009, // s_cmp_eq_u32 s9, 0
+            0xBF84_000B, // s_cbranch_scc0 -> arm B
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], 0x0
+            0xD761_0000,
+            0x0001_0604, // v_writelane_b32 v0, s4, 3
+            0xD761_0000,
+            0x0001_0805, // v_writelane_b32 v0, s5, 4
+            0xD761_0000,
+            0x0001_0A06, // v_writelane_b32 v0, s6, 5
+            0xD761_0000,
+            0x0001_0C07, // v_writelane_b32 v0, s7, 6
+            0xBF82_000A, // s_branch -> join
+            0xF408_0201,
+            0xFA00_0020, // s_load_dwordx4 s[8:11], s[2:3], 0x20
+            0xD761_0000,
+            0x0001_0608, // v_writelane_b32 v0, s8, 3
+            0xD761_0000,
+            0x0001_0809, // v_writelane_b32 v0, s9, 4
+            0xD761_0000,
+            0x0001_0A0A, // v_writelane_b32 v0, s10, 5
+            0xD761_0000,
+            0x0001_0C0B, // v_writelane_b32 v0, s11, 6
+            0xD760_0010,
+            0x0001_0700, // v_readlane_b32 s16, v0, 3
+            0xD760_0011,
+            0x0001_0900, // v_readlane_b32 s17, v0, 4
+            0xD760_0012,
+            0x0001_0B00, // v_readlane_b32 s18, v0, 5
+            0xD760_0013,
+            0x0001_0D00, // v_readlane_b32 s19, v0, 6
+            0xF420_0508,
+            0xFA00_0000, // s_buffer_load_dword s20, s[16:19], null
+            0x7E02_0214, // v_mov_b32 v1, s20
+            0xF800_180F,
+            0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 9,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 10,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 10,
+                slot: 1,
+            }],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            false,
+        );
+        let ps_c_bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let ps_c = super::Container::parse(&ps_c_bytes).unwrap();
+        let ps_p = crate::ir::build(&ps_native.code, false, ps_native.vgprs).unwrap();
+        let ps_st = crate::structure::structure(&ps_p).unwrap();
+        let ps_res =
+            crate::resource::track_graphics(&ps_p, &ps_native.layout, HwStage::Ps, Some(&ps_st), true)
+                .unwrap();
+        let ps_io = crate::io::raise(&ps_p, &ps_native).unwrap();
+        let ps_host = super::emit_with(
+            &ps_c,
+            &ps_native,
+            &ps_p,
+            &ps_st,
+            &ps_io,
+            &ps_res,
+            super::Options {
+                wave32_host: true,
+                zero_copy_memory: true,
+                ..Default::default()
+            },
+        )
+        .expect("spilled descriptor phi in PS should emit");
+        assert!(!ps_host.dxil.is_empty());
+
+        // 2. Compute shader: RootType::Descriptor (`s[0:1]`) + dynamic `num_records` (`s2`)
+        // lowers as `BuiltMemory` with `root_memory` exposing the 64-bit root SRV address.
+        let cs_words: &[u32] = &[
+            0xBE88_0300, // s_mov_b32 s8, s0
+            0x8709_FF01,
+            0x0000_FFFF, // s_and_b32 s9, s1, 0xffff
+            0xBE8A_0302, // s_mov_b32 s10, s2
+            0xBE8B_03FF,
+            0x3101_4FAC, // s_mov_b32 s11, 0x31014fac
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xE030_1000,
+            0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xDC70_8000,
+            0x0003_0201, // global_store_dword v1, v2, s[3:4]
+            0xBF81_0000, // s_endpgm
+        ];
+        let cs_native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 3,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: cs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let empty = crate::dxbc::build(&[]);
+        let cs_c = super::Container::parse(&empty).unwrap();
+        let cs_p = crate::ir::build(&cs_native.code, false, cs_native.vgprs).unwrap();
+        let cs_st = crate::structure::structure(&cs_p).unwrap();
+        let cs_res =
+            crate::resource::track_graphics(&cs_p, &cs_native.layout, HwStage::Cs, Some(&cs_st), true)
+                .unwrap();
+        let cs_io = crate::io::raise(&cs_p, &cs_native).unwrap();
+        let cs_host = super::emit_with(
+            &cs_c,
+            &cs_native,
+            &cs_p,
+            &cs_st,
+            &cs_io,
+            &cs_res,
+            super::Options {
+                wave32_host: true,
+                zero_copy_memory: true,
+                ..Default::default()
+            },
+        )
+        .expect("compute RootType::Descriptor with dynamic num_records should emit");
+        assert!(cs_host.memory);
+        assert!(
+            cs_host
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Descriptor && u.dword == 0)
+        );
+        assert!(
+            cs_host
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Descriptor && u.dword == 1)
+        );
     }
 }

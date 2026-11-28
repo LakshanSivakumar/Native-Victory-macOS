@@ -962,6 +962,10 @@ impl<'a> Lower<'a> {
             .scalar
             .iter()
             .any(|s| matches!(s.1.param, MEMORY | USER_DATA))
+            || x.res
+                .descriptors
+                .iter()
+                .any(|d| matches!(d.source, Source::BuiltMemory { .. }))
             || insts().any(|i| i.name().starts_with("image_bvh"))
             // A view of the title's own memory from a root address on is linear in the pool past
             // the title page it starts in, and the title maps the next pages anywhere in the pool
@@ -2580,6 +2584,59 @@ impl<'a> Lower<'a> {
             _ => return Err(NOT),
         };
         Ok(self.s.m.i32(c))
+    }
+
+    /// When every path into `lane` of VGPR `v` fills it with `v_writelane_b32`, and at least one
+    /// spilled scalar carries `Val::Missing(why)` (such as a spilled descriptor dword), returns
+    /// that `why` so `v_readlane_b32` propagates it without marking `v` as a per-lane VGPR read.
+    fn spill_missing(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Option<Why> {
+        self.spill_missing_inner(v, lane, seen).ok().flatten()
+    }
+
+    fn spill_missing_inner(
+        &self,
+        v: Value,
+        lane: u32,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Why>, ()> {
+        let p = self.x.p;
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut why = None;
+            for &a in &p.blocks[b].phis[i].args {
+                if let Some(w) = self.spill_missing_inner(a, lane, seen)?
+                    && why.is_none()
+                {
+                    why = Some(w);
+                }
+            }
+            return Ok(why);
+        }
+        let inst = self.def_inst(v).ok_or(())?;
+        let Fields::Valu(w) = &inst.fields else { return Err(()) };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" || w.sdwa.is_some() || w.dpp.is_some() {
+            return Err(());
+        }
+        if crate::resource::lane_of(*at).ok_or(())? != lane {
+            return self.spill_missing_inner(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match *value {
+            Operand::Scalar { code: NULL, .. } | Operand::Literal(_) => Ok(None),
+            Operand::Const(c) => crate::resource::inline(c).map(|_| None).ok_or(()),
+            Operand::Scalar { code, .. } => match self.vals.get(&inst.read(Reg::S(code)).ok_or(())?)
+            {
+                Some(&Val::Missing(why)) => Ok(Some(why)),
+                Some(&Val::Bit(_)) => Ok(Some("an SCC read as 32-bit")),
+                Some(&Val::I32(_)) | None => Ok(None),
+            },
+            _ => Err(()),
+        }
     }
 
     /// The DXIL form of an IR value.
@@ -9748,6 +9805,14 @@ impl<'a> Lower<'a> {
             {
                 let a = self.spill_slot(x, lane, &mut Vec::new(), true)?;
                 int(self, a)
+            }
+            "v_readlane_b32"
+                if let [Operand::Vector { reg, .. }, at] = v.src[..]
+                    && let Some(lane) = crate::resource::lane_of(at)
+                    && let Some(x) = inst.read(Reg::V(reg))
+                    && let Some(why) = self.spill_missing(x, lane, &mut Vec::new()) =>
+            {
+                Err(why)
             }
             "v_readlane_b32"
                 if let Some(Operand::Vector { reg, .. }) = v.src.first()
