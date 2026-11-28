@@ -1010,6 +1010,78 @@ fn a_merge_of_another_mask_is_no_merge_of_the_old_one() {
 }
 
 
+#[test]
+fn lane_mask_phis_and_post_loop_ballots_lower_and_reject_unsound_divergent_joins() {
+    // 1. Multi-exit per-lane loop (`s_cbranch_execz oend` + `s_cbranch_execnz loop` fallthrough)
+    // joining `s[10:11]` at `oend` (`phi(s_break1, s_break2)`) and reading `s_bcnt1_i32_b64`
+    // at `oend`: lowers on both console wave64 and 128-lane split-wave64 (`wave32_host: true`).
+    const MULTI_OEND: &[u32] = &[
+        0x3606_00BF, // v_and_b32 v3, 63, v0
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0x7D88_068A, // loop: v_cmp_gt_u32 vcc, 10, v3
+        0x888A_6A0A, // s_or_b64 s[10:11], s[10:11], vcc
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF88_0005, // s_cbranch_execz oend
+        0x4E06_0694, // v_subrev_nc_u32 v3, 20, v3
+        0x7D88_068A, // v_cmp_gt_u32 vcc, 10, v3
+        0x888A_6A0A, // s_or_b64 s[10:11], s[10:11], vcc
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFF7, // s_cbranch_execnz loop
+        0x88FE_0A7E, // oend: s_or_b64 exec, exec, s[10:11]
+        0xBE86_100A, // s_bcnt1_i32_b64 s6, s[10:11]
+        0x7E04_0206, // v_mov_b32 v2, s6
+    ];
+    for wave32_host in [false, true] {
+        let r = lowered(MULTI_OEND, 128, wave32_host);
+        assert!(r.is_ok(), "wave32_host={wave32_host}: {:?}", r.err());
+    }
+
+    // 2. Negative: `s_not_b64` inside a per-lane loop flips bits of lanes that already exited,
+    // so the post-loop ballot does not match the console's scalar register and must be refused.
+    const NOT_IN_LOOP: &[u32] = &[
+        0xD4C4_000A, 0x0202_0090, // v_cmp_gt_u32 s[10:11], 16, v0
+        0xBE8C_0480, // s_mov_b64 s[12:13], 0
+        0x3606_0081, // v_and_b32 v3, 1, v0
+        0xBE8A_080A, // loop: s_not_b64 s[10:11], s[10:11]
+        0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x888C_6A0C, // s_or_b64 s[12:13], s[12:13], vcc
+        0x8AFE_0C7E, // s_andn2_b64 exec, exec, s[12:13]
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0xBE86_100A, // s_bcnt1_i32_b64 s6, s[10:11]
+        0x7E02_0206, // v_mov_b32 v1, s6
+    ];
+    let err = lowered(NOT_IN_LOOP, 128, true).err().expect("s_not in loop must be refused");
+    assert!(
+        err.to_string().contains("divergent join"),
+        "expected divergent join refusal, got: {err}"
+    );
+
+    // 3. Negative: an `else` arm that ORs `exec` into the pre-`if` `s[8:9] = 0` instead of the
+    // `then` arm's `s[10:11]` clobbers the `then` lanes on the console when both arms run, so
+    // balloting `Atom::Phi` at the join must be refused.
+    const SIBLING_BYPASS: &[u32] = &[
+        0xBE88_0480, // s_mov_b64 s[8:9], 0
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+        0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+        0xBF88_0001, // s_cbranch_execz else_arm
+        0x888A_7E08, // s_or_b64 s[10:11], s[8:9], exec
+        0x8AFE_7E0E, // else_arm: s_andn2_b64 exec, s[14:15], exec
+        0xBF88_0001, // s_cbranch_execz join_arm
+        0x888A_7E08, // s_or_b64 s[10:11], s[8:9], exec (reads s[8:9], bypassing then's s[10:11]!)
+        0xBEFE_040E, // join_arm: s_mov_b64 exec, s[14:15]
+        0xBE86_100A, // s_bcnt1_i32_b64 s6, s[10:11]
+        0x7E02_0206, // v_mov_b32 v1, s6
+    ];
+    let err = lowered(SIBLING_BYPASS, 128, true).err().expect("sibling bypass must be refused");
+    assert!(
+        err.to_string().contains("divergent join"),
+        "expected divergent join refusal, got: {err}"
+    );
+}
+
 /// A mesh program (the NGG stage) gets eight system SGPRs and at most 32 user SGPRs from s8,
 /// so an SGPR from s40 up that it reads before writing holds what the last wave left: zero, as
 /// in compute. The world's mesh programs read such registers on paths only an empty EXEC

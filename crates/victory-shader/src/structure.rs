@@ -888,46 +888,203 @@ impl<'a> Lanes<'a> {
     /// ballot at the block gives it.
     fn exec_copies_at_joins(&mut self) {
         let p = self.p;
-        let same = |a: Value, e: Value, reg: Reg| -> bool {
-            if a == e {
+        let def_inst = |v: Value| self.defs.get(&v).map(|&(b, i)| &p.blocks[b].insts[i]);
+        let strip = |mut v: Value| -> Value {
+            for _ in 0..64 {
+                let next = self
+                    .restored
+                    .get(&v)
+                    .copied()
+                    .or_else(|| copied(def_inst(v)?, v, def_inst));
+                match next {
+                    Some(c) if c != v => v = c,
+                    _ => break,
+                }
+            }
+            v
+        };
+        let same = |a: Value, e: Value, reg: Reg, eq: &Set<(Value, Value)>| -> bool {
+            let (ca, ce) = (strip(a), strip(e));
+            if ca == ce || eq.contains(&(ca, ce)) {
                 return true;
             }
-            let Some(&(b, i)) = self.defs.get(&a) else { return false };
+            // `s_*_wrexec_*`: the destination and EXEC get the same result.
+            let Reg::S(ec) = reg else { return false };
+            let half = ec - EXEC;
+            let Some(&(b, i)) = self.defs.get(&ca) else { return false };
+            if self.defs.get(&ce) != Some(&(b, i)) {
+                return false;
+            }
             let inst = &p.blocks[b].insts[i];
-            // `s_mov` of EXEC: the copy reads the incoming value itself.
-            let copy = matches!(inst.name(), "s_mov_b64" | "s_mov_b32") && inst.read(reg) == Some(e);
-            // `s_*_wrexec_b64`: the destination and EXEC get the same result.
-            let both = inst.name().contains("_wrexec_") && inst.write(reg) == Some(e);
-            copy || both
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code, .. }),
+                ..
+            } = &inst.fields
+            else {
+                return false;
+            };
+            let (dw, ew) = (inst.write(Reg::S(code + half)), inst.write(reg));
+            inst.name().contains("_wrexec_")
+                && ((dw == Some(ca) && ew == Some(ce)) || (dw == Some(ce) && ew == Some(ca)))
         };
-        let mut found = Vec::new();
+        struct Cand {
+            b: usize,
+            lo: usize,
+            hi: usize,
+            elo: usize,
+            ehi: usize,
+            key: Key,
+            exec: Key,
+        }
+        let mut cands = Vec::new();
         for b in 0..p.blocks.len() {
             let phis = &p.blocks[b].phis;
-            let find = |r: Reg| phis.iter().find(|ph| ph.reg == r);
+            let find = |r: Reg| phis.iter().position(|ph| ph.reg == r);
             let Some(elo) = find(Reg::S(EXEC)) else { continue };
             let ehi = if p.wave64 { find(Reg::S(EXEC + 1)) } else { Some(elo) };
             let Some(ehi) = ehi else { continue };
-            let exec = (elo.value, ehi.value);
-            for lo in phis {
+            let exec = (phis[elo].value, phis[ehi].value);
+            for (lo_i, lo) in phis.iter().enumerate() {
                 let Reg::S(code) = lo.reg else { continue };
                 if code == EXEC || code == EXEC + 1 || (p.wave64 && code % 2 == 1) {
                     continue;
                 }
-                let hi = if p.wave64 { find(Reg::S(code + 1)) } else { Some(lo) };
-                let Some(hi) = hi else { continue };
-                let all = (0..lo.args.len()).all(|n| {
-                    same(lo.args[n], elo.args[n], Reg::S(EXEC))
-                        && (!p.wave64 || same(hi.args[n], ehi.args[n], Reg::S(EXEC + 1)))
-                });
-                if all && lo.args.len() == elo.args.len() {
-                    found.push(((lo.value, hi.value), exec));
+                let hi_i = if p.wave64 { find(Reg::S(code + 1)) } else { Some(lo_i) };
+                let Some(hi_i) = hi_i else { continue };
+                if lo.args.len() == phis[elo].args.len() {
+                    cands.push(Cand {
+                        b,
+                        lo: lo_i,
+                        hi: hi_i,
+                        elo,
+                        ehi,
+                        key: (lo.value, phis[hi_i].value),
+                        exec,
+                    });
                 }
             }
         }
-        for (k, exec) in found {
-            let m = self.mask(exec).0;
-            self.masks.insert(k, m);
-            self.active.insert(k.0);
+        loop {
+            let eq: Set<(Value, Value)> = cands
+                .iter()
+                .flat_map(|c| {
+                    [
+                        (strip(c.key.0), strip(c.exec.0)),
+                        (strip(c.key.1), strip(c.exec.1)),
+                    ]
+                })
+                .collect();
+            let before = cands.len();
+            cands.retain(|c| {
+                let phis = &p.blocks[c.b].phis;
+                let (lo, hi, elo, ehi) = (&phis[c.lo], &phis[c.hi], &phis[c.elo], &phis[c.ehi]);
+                (0..lo.args.len()).all(|n| {
+                    same(lo.args[n], elo.args[n], Reg::S(EXEC), &eq)
+                        && (!p.wave64 || same(hi.args[n], ehi.args[n], Reg::S(EXEC + 1), &eq))
+                })
+            });
+            if cands.len() == before {
+                break;
+            }
+        }
+        for c in cands {
+            let m = self.mask(c.exec).0;
+            self.masks.insert(c.key, m);
+            self.active.insert(c.key.0);
+        }
+        // A loop join resolved to `false` by `self.joins` holds `0` only in lanes still looping,
+        // not in lanes that exited on earlier iterations: an accumulator built from it (`s_or`
+        // with `vcc`, etc.) holds lanes outside `EXEC` and cannot be balloted as `st.active`
+        // inside the loop.
+        let mut exited_false: Set<Value> = self
+            .joins
+            .iter()
+            .filter(|j| {
+                !j.value
+                    && self.incoming[j.block]
+                        .iter()
+                        .any(|&(q, _)| self.index[j.block] <= self.index[q])
+            })
+            .map(|j| j.id)
+            .collect();
+        if !exited_false.is_empty() {
+            let w = if p.wave64 { "_b64" } else { "_b32" };
+            loop {
+                let before = exited_false.len();
+                for block in &p.blocks {
+                    for ph in &block.phis {
+                        if !matches!(ph.reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                            && ph.args.iter().any(|a| exited_false.contains(a))
+                        {
+                            exited_false.insert(ph.value);
+                        }
+                    }
+                    for inst in &block.insts {
+                        let Fields::Sop {
+                            dst: Some(Operand::Scalar { code, .. }),
+                            src,
+                            ..
+                        } = &inst.fields
+                        else {
+                            continue;
+                        };
+                        if *code == EXEC || *code == NULL {
+                            continue;
+                        }
+                        let Some(lo) = inst.write(Reg::S(*code)) else {
+                            continue;
+                        };
+                        let src_val = |k: usize| match src.get(k) {
+                            Some(&Operand::Scalar { code: sc, .. }) if sc != NULL => {
+                                inst.read(Reg::S(sc)).map(|v| (v, sc))
+                            }
+                            _ => None,
+                        };
+                        let active_op = |(v, sc): (Value, u8)| {
+                            sc == EXEC || self.active.contains(&v) && !exited_false.contains(&v)
+                        };
+                        let op = inst
+                            .name()
+                            .strip_prefix("s_")
+                            .and_then(|n| n.strip_suffix(w))
+                            .map(|o| {
+                                o.strip_suffix("_saveexec")
+                                    .or_else(|| o.strip_suffix("_wrexec"))
+                                    .unwrap_or(o)
+                            });
+                        let carries = match op {
+                            Some("and") => {
+                                !src_val(0).is_some_and(active_op)
+                                    && !src_val(1).is_some_and(active_op)
+                                    && (src_val(0).is_some_and(|(v, _)| exited_false.contains(&v))
+                                        || src_val(1)
+                                            .is_some_and(|(v, _)| exited_false.contains(&v)))
+                            }
+                            Some("andn2") => {
+                                !src_val(0).is_some_and(active_op)
+                                    && src_val(0).is_some_and(|(v, _)| exited_false.contains(&v))
+                            }
+                            Some("andn1") => {
+                                !src_val(1).is_some_and(active_op)
+                                    && src_val(1).is_some_and(|(v, _)| exited_false.contains(&v))
+                            }
+                            _ => inst.reads.iter().any(|&(r, v)| {
+                                matches!(r, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                                    && exited_false.contains(&v)
+                            }),
+                        };
+                        if carries {
+                            exited_false.insert(lo);
+                        }
+                    }
+                }
+                if exited_false.len() == before {
+                    break;
+                }
+            }
+            for v in exited_false {
+                self.active.remove(&v);
+            }
         }
     }
 
