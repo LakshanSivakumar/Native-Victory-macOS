@@ -1181,6 +1181,148 @@ fn a_descriptor_made_raw_serves_a_typed_load_of_its_own_format() {
 }
 
 #[test]
+fn indexed_tbuffer_format_and_subword_buffer_loads_and_stores_lower_and_reject_bad_strides() {
+    use crate::native::{ComputeIo, ResourceType, UsedResource};
+    use crate::native::tests::{fspx, fspx_resource};
+
+    // 1. FSPX / cleared-stride `tbuffer_load_format_x` with `idxen` translates (both plain via
+    // `VIEW_STRIDES` and with `s_and_b32 s13, s13, 0xc000ffff` dropping `idxen`).
+    for clear in [false, true] {
+        let mut code = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        if clear {
+            code.extend([0x870D_FF0D, 0xC000_FFFF]); // s_and_b32 s13, s13, 0xc000ffff
+        }
+        code.extend([
+            0xE868_2000,
+            0x8003_0100, // tbuffer_load_format_x v1, v0, s[12:15], 0 format:[BUF_FMT_16_FLOAT] idxen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_0000,
+            0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let resources = [fspx_resource(3, 3, 0, 0, 4, 0), fspx_resource(0, 3, 8, 0, 4, 0)];
+        let part = fspx(&bytes_of(&code), 5 << 1, [32, 1, 1], true, &resources);
+        translate_with(&crate::dxbc::build(&[(FourCC::ACCC, &part)]), Options::default())
+            .unwrap_or_else(|e| panic!("clear={clear}: {e}"));
+    }
+
+    // 2. Structured table SRV/UAV (`used.stride > 0`): indexed `tbuffer_load_format_xyzw`,
+    // `buffer_load_{ubyte,sbyte,ushort,sshort}`, and `buffer_store_{byte,short}` translate when
+    // `stride` is a multiple of 4 covering the load, and refuse odd / too-narrow strides.
+    let run_structured = |srv_stride: u32, uav_stride: u32, wide_fmt: bool| {
+        let tbuf_word0 = if wide_fmt {
+            0xEA5B_2000 // tbuffer_load_format_xyzw ... format:[BUF_FMT_32_32_32_32_UINT] idxen (16 B)
+        } else {
+            0xE9E3_2000 // tbuffer_load_format_xyzw ... format:[BUF_FMT_8_8_8_8_UINT] idxen (4 B)
+        };
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (SRV)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (UAV)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            tbuf_word0,
+            0x8002_0200, // tbuffer_load_format_xyzw v[2:5], v0, s[8:11], 0 idxen
+            0xE020_2001,
+            0x8002_0600, // buffer_load_ubyte v6, v0, s[8:11], 0 idxen offset:1
+            0xE02C_2002,
+            0x8002_0700, // buffer_load_sshort v7, v0, s[8:11], 0 idxen offset:2
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A04_0D02, // v_add_nc_u32 v2, v2, v6
+            0x4A04_0F02, // v_add_nc_u32 v2, v2, v7
+            0xE060_2000,
+            0x8003_0200, // buffer_store_byte v2, v0, s[12:15], 0 idxen
+            0xE068_2002,
+            0x8003_0300, // buffer_store_short v3, v0, s[12:15], 0 idxen offset:2
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            }],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: srv_stride,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: uav_stride,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 0,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [32, 1, 1] }),
+            code: bytes_of(&words),
+        };
+        let p = ir::build(&native.code, false, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        lower::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            wave32_host: false,
+            zero_copy_memory: true,
+            view_marks: false,
+            rect_list: false,
+            copy_params: [0; 32],
+        })
+    };
+
+    run_structured(12, 8, false).expect("4B tbuffer + subword loads/stores on 12B/8B structs");
+    run_structured(16, 8, true).expect("16B tbuffer load on 16B struct");
+
+    // Odd SRV or UAV strides, and a 16-byte tbuffer load on an 8-byte struct, stay refused.
+    for (srv_s, uav_s, wide) in [(6, 8, false), (12, 6, false), (8, 8, true)] {
+        let err = run_structured(srv_s, uav_s, wide)
+            .err()
+            .expect("must refuse invalid structured stride")
+            .to_string();
+        assert!(
+            err.contains("a structured buffer of unknown stride"),
+            "({srv_s}, {uav_s}, {wide}): {err}"
+        );
+    }
+}
+
+#[test]
 fn refusal2_missing_pixel_system_inputs_remain_refused() {
     let read_v0 = [
         0xF800_180F,

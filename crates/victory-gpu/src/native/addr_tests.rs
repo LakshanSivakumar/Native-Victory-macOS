@@ -1347,6 +1347,234 @@ fn lds_append_consume_and_addtid_follow_m0_on_the_gpu() {
     assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
 }
 
+const INDEXED_TBUFFER_AND_SUBWORD: &[u32] = &[
+    0xBE82_0304, // s_mov_b32 s2, s4
+    0xBE83_0380, // s_mov_b32 s3, 0
+    0xF408_0201, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], 0x0
+    0xF408_0301, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[2:3], 0x20
+    0xF408_0401, 0xFA00_0040, // s_load_dwordx4 s[16:19], s[2:3], 0x40
+    0xF408_0501, 0xFA00_0060, // s_load_dwordx4 s[20:23], s[2:3], 0x60
+    0xBE98_0306, // s_mov_b32 s24, s6
+    0x8719_FF07, 0x0000_FFFF, // s_and_b32 s25, s7, 0xffff
+    0x8819_FF19, 0x0008_0000, // s_or_b32 s25, s25, 0x80000 (stride = 8)
+    0xBE9A_03C1, // s_mov_b32 s26, -1
+    0xBE9B_03FF, 0x3101_4000, // s_mov_b32 s27, 0x31014000
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBE9C_0308, // s_mov_b32 s28, s8
+    0x871D_FF09, 0xC000_FFFF, // s_and_b32 s29, s9, 0xc000ffff
+    0xBE9E_030A, // s_mov_b32 s30, s10
+    0xBE9F_030B, // s_mov_b32 s31, s11
+    0x3402_0082, // v_lshlrev_b32_e32 v1, 2, v0
+    0xE9E3_2004, 0x8002_0200, // tbuffer_load_format_xyzw v[2:5], v0, s[8:11], 0 format:[BUF_FMT_8_8_8_8_UINT] idxen offset:4
+    0xE8D9_2004, 0x8003_0600, // tbuffer_load_format_xy v[6:7], v0, s[12:15], 0 format:[BUF_FMT_16_16_UINT] idxen offset:4
+    0xE8A0_2004, 0x8006_0800, // tbuffer_load_format_x v8, v0, s[24:27], 0 format:[BUF_FMT_32_UINT] idxen offset:4
+    0xE8A0_3000, 0x8007_0900, // tbuffer_load_format_x v9, v[0:1], s[28:31], 0 format:[BUF_FMT_32_UINT] idxen offen
+    0xE020_2001, 0x8002_0A00, // buffer_load_ubyte v10, v0, s[8:11], 0 idxen offset:1
+    0xE024_2002, 0x8002_0B00, // buffer_load_sbyte v11, v0, s[8:11], 0 idxen offset:2
+    0xE028_2008, 0x8002_0C00, // buffer_load_ushort v12, v0, s[8:11], 0 idxen offset:8
+    0xE02C_200A, 0x8002_0D00, // buffer_load_sshort v13, v0, s[8:11], 0 idxen offset:10
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x2C1C_0082, // v_lshrrev_b32_e32 v14, 2, v0
+    0x361E_0083, // v_and_b32_e32 v15, 3, v0
+    0x4A20_00A1, // v_add_nc_u32_e32 v16, 33, v0
+    0xE060_3000, 0x8004_100E, // buffer_store_byte v16, v[14:15], s[16:19], 0 idxen offen
+    0x3622_0081, // v_and_b32_e32 v17, 1, v0
+    0x7DA4_2280, // v_cmpx_eq_u32_e32 0, v17
+    0x4A1E_1E84, // v_add_nc_u32_e32 v15, 4, v15
+    0x3420_0088, // v_lshlrev_b32_e32 v16, 8, v0
+    0x3820_20FF, 0x0000_0055, // v_or_b32_e32 v16, 0x55, v16
+    0xE068_3000, 0x8004_100E, // buffer_store_short v16, v[14:15], s[16:19], 0 idxen offen
+    0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+    0x3406_0688, // v_lshlrev_b32_e32 v3, 8, v3
+    0x3408_0890, // v_lshlrev_b32_e32 v4, 16, v4
+    0x340A_0A98, // v_lshlrev_b32_e32 v5, 24, v5
+    0x3804_0702, // v_or_b32_e32 v2, v2, v3
+    0x3808_0B04, // v_or_b32_e32 v4, v4, v5
+    0x3804_0902, // v_or_b32_e32 v2, v2, v4
+    0x340E_0E90, // v_lshlrev_b32_e32 v7, 16, v7
+    0x3806_0F06, // v_or_b32_e32 v3, v6, v7
+    0x7E08_0308, // v_mov_b32_e32 v4, v8
+    0x7E0A_0309, // v_mov_b32_e32 v5, v9
+    0x3402_0085, // v_lshlrev_b32_e32 v1, 5, v0
+    0xE078_1000, 0x8005_0201, // buffer_store_dwordx4 v[2:5], v1, s[20:23], 0 offen
+    0xE078_1010, 0x8005_0A01, // buffer_store_dwordx4 v[10:13], v1, s[20:23], 0 offen offset:16
+    0x7E04_020A, // v_mov_b32_e32 v2, s10
+    0xE070_0400, 0x8005_0200, // buffer_store_dword v2, off, s[20:23], 0 offset:1024
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn indexed_tbuffer_format_and_subword_buffer_ops_run_on_the_gpu() {
+    use victory_shader::native::{ResourceType, UsedResource};
+    let Some(mut t) = title() else { return };
+    let f = Fixture::new(&t);
+
+    // Entry 0 (`VA_A + 0x1000`): 32 elements x 12 bytes (`used.stride = 12`).
+    let mut src0 = Vec::with_capacity(96);
+    for e in 0..32u32 {
+        let b0 = 0x10 + e;
+        let b1 = 0xA0 + e;
+        let b2 = (-32 + e as i32) as u8 as u32;
+        let w0 = b0 | (b1 << 8) | (b2 << 16) | (0x5A << 24);
+        let w1 = 0xD0C0_B000u32.wrapping_add(e.wrapping_mul(0x0101_0101));
+        let lo16 = 0x9000 + e;
+        let hi16 = (-1000 + e as i32) as u16 as u32;
+        let w2 = lo16 | (hi16 << 16);
+        src0.extend([w0, w1, w2]);
+    }
+    f.put(0x2_1000, &src0);
+
+    // Entry 1 (`VA_A + 0x2000`): 32 elements x 8 bytes (`used.stride = 0`, `VIEW_STRIDES` = 8).
+    let src1: Vec<u32> = (0..32u32)
+        .flat_map(|e| [0xDEAD_0000 | e, ((0x3000 + e) << 16) | (0x1000 + e)])
+        .collect();
+    f.put(0x2_2000, &src1);
+
+    // Entry 2 (`VA_A + 0x3000`): 8 elements x 12 bytes (`used.stride = 12` `RWStructuredBuffer`).
+    let init_uav: Vec<u32> = (0..8u32)
+        .flat_map(|elem| [0xFFFF_FFFF, 0xFFFF_FFFF, 0xCAFE_0000 | elem])
+        .collect();
+    f.put(0x2_3000, &init_uav);
+
+    // Root SRV (`VA_A + 0x4000`): 32 elements x 8 bytes (`Source::Built` with `stride = 8`).
+    let src_root: Vec<u32> = (0..32u32)
+        .flat_map(|e| [0xBEEF_0000 | e, 0x7700_0000 + e * 13])
+        .collect();
+    f.put(0x2_4000, &src_root);
+    f.put(0x2_0000, &[0u32; 300]);
+
+    let records = vec![0u32; 8 * 4];
+    let start = records.as_ptr() as u64;
+    let heap = t.host.heap(HeapKind::Resource, start, 4).unwrap();
+    let (r0, r1, r2, r3) = (0x57D_0101usize, 0x57D_0102usize, 0x57D_0103usize, 0x57D_0104usize);
+    t.host.register_buffer(r0, VA_A + 0x1000, 4096);
+    t.host.register_buffer(r1, VA_A + 0x2000, 4096);
+    t.host.register_buffer(r2, VA_A + 0x3000, 4096);
+    t.host.register_buffer(r3, VA_A, 4096);
+
+    let mut srv0 = [0u32; 10];
+    (srv0[1], srv0[6], srv0[7]) = (1, 32, 12);
+    let mut srv1 = [0u32; 10];
+    (srv1[1], srv1[6], srv1[7]) = (1, 32, 8);
+    let mut uav2 = [0u32; 10];
+    (uav2[1], uav2[4], uav2[5]) = (1, 8, 12);
+    let mut uav3 = [0u32; 10];
+    (uav3[1], uav3[4], uav3[8]) = (1, 512, 1);
+    crate::descriptor::create_srv(std::ptr::null(), r0 as _, &srv0, start);
+    crate::descriptor::create_srv(std::ptr::null(), r1 as _, &srv1, start + 32);
+    crate::descriptor::create_uav(std::ptr::null(), r2 as _, std::ptr::null(), &uav2, start + 64);
+    crate::descriptor::create_uav(std::ptr::null(), r3 as _, std::ptr::null(), &uav3, start + 96);
+    for slot in 0..4 {
+        assert!(t.host.mirror(start + slot * 32).unwrap());
+    }
+
+    let used = |kind, root, table_offset_dwords, stride, user_data, slot| UsedResource {
+        kind,
+        root,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 20,
+        layout: vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 6,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            used(ResourceType::Srv, RootType::Table, 0, 12, 4, 0),
+            used(ResourceType::Srv, RootType::Table, 8, 0, 4, 0),
+            used(ResourceType::Uav, RootType::Table, 16, 12, 4, 0),
+            used(ResourceType::Uav, RootType::Table, 24, 0, 4, 0),
+            used(ResourceType::Srv, RootType::Descriptor, 0, 0, 6, 1),
+        ],
+        io: StageIo::Cs(ComputeIo { rsrc2: 7 << 1, threads: [32, 1, 1] }),
+        code: INDEXED_TBUFFER_AND_SUBWORD.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let mut empty = b"DXBC".to_vec();
+    empty.extend([0; 16]);
+    empty.extend([1, 0, 0, 0]);
+    empty.extend(32u32.to_le_bytes());
+    empty.extend(0u32.to_le_bytes());
+    let c = Container::parse(&empty).expect("container");
+    let cs = emit_with(&c, &native, &p, &st, &io, &res, shaders::options()).expect("emit");
+    let Pipe::Compute(pso) = t.compute_pipe(&cs, "indexed_tbuf_sub") else {
+        panic!("not made: {:?}", t.shaders)
+    };
+
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.set_compute_root_view(1, VA_A + 0x4000);
+    l.dispatch(1, 1, 1).unwrap();
+    super::run(&t.host, &[&l]);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+
+    let out = f.get(0x2_0000, 257);
+    assert_eq!(out[256], 32, "getDimensions on structured buffer used by tbuffer_load_format");
+    for lane in 0..32usize {
+        let e = lane as u32;
+        assert_eq!(
+            &out[8 * lane..8 * lane + 4],
+            &[src0[3 * lane + 1], src1[2 * lane + 1], src_root[2 * lane + 1], src0[lane]],
+            "lane {lane} tbuffer loads"
+        );
+        assert_eq!(
+            &out[8 * lane + 4..8 * lane + 8],
+            &[
+                0xA0 + e,
+                (-32 + e as i32) as u32,
+                0x9000 + e,
+                (-1000 + e as i32) as u32,
+            ],
+            "lane {lane} indexed subword loads"
+        );
+    }
+
+    let uav_out = f.get(0x2_3000, 24);
+    for elem in 0..8usize {
+        let base = (4 * elem) as u32;
+        let want_w0 = (33 + base)
+            | ((34 + base) << 8)
+            | ((35 + base) << 16)
+            | ((36 + base) << 24);
+        let lo16 = 0x55 | (base << 8);
+        let hi16 = 0x55 | ((base + 2) << 8);
+        let want_w1 = lo16 | (hi16 << 16);
+        let want_w2 = 0xCAFE_0000 | elem as u32;
+        assert_eq!(
+            &uav_out[3 * elem..3 * elem + 3],
+            &[want_w0, want_w1, want_w2],
+            "elem {elem} concurrent indexed byte/short stores"
+        );
+    }
+    drop(records);
+}
+
 /// A structured buffer view (16-byte elements) whose descriptor the program loads and then clears
 /// the stride of (`s_and_b32` of dword 1 with 0xc000ffff, a title's form): every lane loads by
 /// index and offset, so with stride 0 it reads dword `lane` (index × 0 + lane × 4, RDNA2 ISA

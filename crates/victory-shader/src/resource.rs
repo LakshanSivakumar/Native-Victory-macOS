@@ -259,7 +259,7 @@ pub(crate) fn track_graphics(
                 // is no descriptor to keep alive for it.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
                     descriptor(rsrc, Role::Resource)?;
-                    if t.stride_cleared(inst, rsrc).is_some() {
+                    if t.stride_cleared(inst, rsrc).is_some() || t.made_raw_at(inst, rsrc) {
                         out.unstrided.push(site);
                     }
                 }
@@ -1098,9 +1098,22 @@ impl<'a> Tracer<'a> {
         };
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
-            // The high half cut to a 40-bit address (`s_bfe_u32 hi, hi, 8 bits from 0`).
+            // The high half cut to a 40- or 48-bit address (`s_bfe_u32` or `s_and_b32`).
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_bfe_u32"])
-                .is_some_and(|(_, [a, b])| a == want && b == Term::Const(0x8_0000)))
+                .is_some_and(|(_, [a, b])| a == want && matches!(b, Term::Const(0x8_0000 | 0x10_0000))))
+            || high.is_some()
+                && matches!(
+                    hi,
+                    Term::Value(v)
+                        if matches!(
+                            self.sop2(v, &["s_and_b32"]),
+                            Some((
+                                _,
+                                [a, Term::Const(0xFF | 0xFFFF)]
+                                    | [Term::Const(0xFF | 0xFFFF), a]
+                            )) if a == want
+                        )
+                )
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
@@ -1749,21 +1762,38 @@ impl<'a> Tracer<'a> {
         (x == d1).then_some([w0, d1, d2, d3])
     }
 
+    fn made_raw_at(&self, inst: &Inst, op: &Operand) -> bool {
+        let own_format = matches!(inst.fields, Fields::Buffer { format: Some(_), .. });
+        if !own_format && inst.name().contains("format") {
+            return false;
+        }
+        let Operand::Scalar { code, dwords: 4 } = *op else {
+            return false;
+        };
+        let Some(words) = (0..4)
+            .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        self.made_raw(&words).is_some()
+    }
+
     /// The loaded words of a buffer descriptor whose dword 1 is the load's ANDed with a constant
     /// that clears the whole stride and nothing else (bits 16-29 cleared; the base address bits
-    /// 0-15 and the swizzle bits 30-31 kept), for a buffer access that is not typed. With
-    /// stride 0 the address is base + offsets (the index times the stride adds nothing, RDNA2
-    /// ISA 8.1.5), which the loaded view's raw access gives once the index is dropped
-    /// (`Resources::unstrided`).
+    /// 0-15 and the swizzle bits 30-31 kept), for a buffer access that does not use the view's
+    /// typed format (`tbuffer_load_format_*` names its own). With stride 0 the address is
+    /// base + offsets (the index times the stride adds nothing, RDNA2 ISA 8.1.5), which the loaded
+    /// view's raw access gives once the index is dropped (`Resources::unstrided`).
     // Guess: the bounds stay the host view's size. That is the console's when the title's V#
     // checks raw bounds in bytes (OOB_SELECT 3, no swizzle: offset + payload > num_records, in
     // bytes with stride 0, ISA tables 33 and 35); select 0 would put every access out of range,
     // and select 1 would check the dropped index against num_records.
     fn stride_cleared(&self, inst: &Inst, op: &Operand) -> Option<Vec<Term>> {
-        let Fields::Buffer { format: None, .. } = inst.fields else {
+        let Fields::Buffer { format, .. } = inst.fields else {
             return None;
         };
-        if inst.name().contains("format") {
+        if format.is_none() && inst.name().contains("format") {
             return None;
         }
         let Operand::Scalar { code, dwords: 4 } = *op else {
