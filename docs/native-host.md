@@ -1642,13 +1642,19 @@ it carries `x ^ ident` and is XORed back. Over a 12,020-shader corpus (Series S 
 title's form on Metal in groups of two console waves: 96.0 under lane 63's high half, and 60.0
 with the identity's high half when lanes 40 and up are off.
 
-A section of `v_mul_f32` steps is now followed: it is the product of the lanes
-(`WaveActiveProduct`, identity 1.0), lowered to `waveActiveOp` with the product kind, and the two
-host waves of a console wave multiply their results (`split_wave_tests::
-a_whole_wave_product_multiplies_both_halves` runs it on Metal). As with the other float
-reductions, the host multiplies in its own order, so the last bits may differ from the console's.
-Prefix products and integer products (`v_mul_lo_u32`) are still refused. Whether any title shader
-needs a product is not known: no run log names the operation.
+A section of `v_mul_f32` or `v_mul_lo_u32` (plus `s_mul_i32`) steps is now followed: it is the
+product of the lanes (`WaveActiveProduct`, identity `1.0` for `f32` or `1` for `u32`), lowered to
+`waveActiveOp` with the product kind, and the two host waves of a console wave multiply their
+results (`split_wave_tests::a_whole_wave_product_multiplies_both_halves` and
+`split_wave_tests::whole_wave_const_uniform_prefixes_integer_products_and_readfirstlane_run_across_halves`
+run them on Metal). For `f32`, the host multiplies in its own order, so the last bits may differ
+from the console's; `u32` wrapping multiplication is exact. Prefix products are still refused.
+
+Inside a whole-wave section, `v_cndmask_b32` also follows constant/uniform active-lane terms (for
+example `v_cndmask_b32 vdst, 0, s_stride, s_mask`), idempotent reduction active-lane inputs, and
+constant scalar lane-select masks (`s_mov_b32`/`s_mov_b64` of row or half bitmasks), while
+`v_readfirstlane_b32` under a constant `EXEC` mask (inside or immediately after the section) reads
+`exec.trailing_zeros()` (`#508`).
 
 When a wave64 reduction combines its two 32-lane halves into only one lane of a VGPR (for example
 through `v_readlane_b32` and `v_writelane_b32` into lane 63, or when only the upper half combines

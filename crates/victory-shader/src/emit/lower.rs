@@ -432,6 +432,7 @@ struct Lower<'a> {
     section_out: Set<Value>,
     /// Constant-lane reads `(v, lane)` from outside `v`'s section, and their lowered values.
     section_lane_reads: Set<(Value, u32)>,
+    section_rfl: Map<Value, (Value, u32)>,
     section_lanes: Map<(Value, u32), Result<V, Why>>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
@@ -1209,6 +1210,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: Set::default(),
             section_lane_reads: Set::default(),
+            section_rfl: Map::default(),
             section_lanes: Map::default(),
             code_table: None,
             counters: HashMap::new(),
@@ -1597,9 +1599,38 @@ impl<'a> Lower<'a> {
             && self.sections.values().flat_map(|m| m.values()).any(|sec| {
                 matches!(
                     sec.shapes.get(&v),
-                    Some(Shape::K(_) | Shape::Active(..) | Shape::Half(..) | Shape::ReadLane(..))
+                    Some(
+                        Shape::K(_)
+                            | Shape::Uniform(_)
+                            | Shape::Active(..)
+                            | Shape::Half(..)
+                            | Shape::ReadLane(..)
+                    )
                 )
             })
+    }
+
+    fn const_exec_first_lane(&self, guard: Option<Bool>) -> Option<u32> {
+        let g = guard?;
+        match self.x.st.bools.node(g)? {
+            (Atom::Constant(k), Bool::FALSE, Bool::TRUE) if k != 0 => Some(k.trailing_zeros()),
+            (Atom::Constant(k), Bool::TRUE, Bool::FALSE) => {
+                let inv = if self.x.p.wave64 {
+                    !k
+                } else {
+                    (!k) & 0xFFFF_FFFF
+                };
+                (inv != 0).then(|| inv.trailing_zeros())
+            }
+            _ => None,
+        }
+    }
+
+    fn red_src(&mut self, src: super::wave::RedSrc) -> Result<V, Why> {
+        match src {
+            super::wave::RedSrc::Val(v) => self.i32_of(v),
+            super::wave::RedSrc::Const(k) => Ok(self.s.m.i32(k)),
+        }
     }
 
     /// Finds the whole-wave sections and the values they leave.
@@ -1644,6 +1675,18 @@ impl<'a> Lower<'a> {
                             && let Some(lane) = crate::resource::lane_of(*at)
                         {
                             self.section_lane_reads.insert((r, lane));
+                        } else if inst.name() == "v_readfirstlane_b32"
+                            && let Fields::Valu(v) = &inst.fields
+                            && let Some(Operand::Vector { reg, .. }) = v.src.first()
+                            && inst.read(Reg::V(*reg)) == Some(r)
+                            && let Some(lane) = self.const_exec_first_lane(
+                                self.x.st.guards.get(b).and_then(|g| g.get(i)).copied().flatten(),
+                            )
+                        {
+                            self.section_lane_reads.insert((r, lane));
+                            if let Some(&(_, w)) = inst.writes.first() {
+                                self.section_rfl.insert(w, (r, lane));
+                            }
                         }
                     }
                 }
@@ -1695,7 +1738,7 @@ impl<'a> Lower<'a> {
             if self.x.st.masks.contains_key(&w) && shape.is_none() {
                 self.lane_fail.insert(w, unknown);
             }
-            if self.section_out.contains(&w) && shape.is_none() {
+            if self.section_out.contains(&w) {
                 let mut lanes: Vec<(u32, super::wave::Shape)> = self.sections[&b][&start]
                     .lane_shapes
                     .iter()
@@ -1723,7 +1766,7 @@ impl<'a> Lower<'a> {
         use super::wave::{Op, Shape};
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
-            Shape::Value(v) => return self.i32_of(v),
+            Shape::Value(v) | Shape::Uniform(v) => return self.i32_of(v),
             Shape::ReadLane(v, _) if self.section_uniform(v) => return self.i32_of(v),
             Shape::ReadLane(v, lane) if self.section_lanes.contains_key(&(v, lane)) => {
                 return self.section_lanes[&(v, lane)];
@@ -1749,7 +1792,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
-                let x = self.i32_of(src)?;
+                let x = self.red_src(src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
             }
@@ -1769,7 +1812,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
-                let x = self.i32_of(src)?;
+                let x = self.red_src(src)?;
                 let id = self.s.m.i32(ident);
                 let x = self.s.m.select(c, on, x, id);
                 self.s.flags |= flags::WAVE_OPS;
@@ -1850,7 +1893,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
-        let x = self.i32_of(src)?;
+        let x = self.red_src(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
@@ -1864,7 +1907,7 @@ impl<'a> Lower<'a> {
             (_, Some(inclusive)) => {
                 let (kind, bin) = match op {
                     Op::AddU | Op::AddF => (0, Bin::Add),
-                    Op::MulF => (1, Bin::Mul),
+                    Op::MulU | Op::MulF => (1, Bin::Mul),
                     _ => return Err("a wave prefix of an operation other than a sum or product"),
                 };
                 let args = [arg, self.s.m.i8(kind), self.s.m.i8(u8::from(!float))];
@@ -1905,6 +1948,7 @@ impl<'a> Lower<'a> {
             (_, None) => {
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
+                    Op::MulU => (1, 1),
                     Op::AddF => (0, 0),
                     Op::MulF => (1, 0),
                     Op::MinU => (2, 1),
@@ -9828,6 +9872,23 @@ impl<'a> Lower<'a> {
                 let lane = self.lockstep_first_lane(inst)?;
                 let r = self.wide_read_lane(a, lane)?;
                 int(self, r)
+            }
+            "v_readfirstlane_b32"
+                if let Some(Operand::Vector { reg, .. }) = v.src.first()
+                    && let Some(x) = inst.read(Reg::V(*reg))
+                    && self.section_uniform(x) =>
+            {
+                let a = self.i32_of(x)?;
+                int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if let Some(&(x, lane)) = inst
+                    .writes
+                    .first()
+                    .and_then(|w| self.section_rfl.get(&w.1))
+                    && let Some(&res) = self.section_lanes.get(&(x, lane)) =>
+            {
+                int(self, res?)
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
