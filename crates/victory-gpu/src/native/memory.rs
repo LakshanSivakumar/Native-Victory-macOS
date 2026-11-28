@@ -318,6 +318,33 @@ impl PoolTable {
         }
         Some(whole)
     }
+
+    /// Bytes of `[addr, addr + len)` currently mapped in a live pool, coalescing adjacent
+    /// mappings like [`Self::read_mapped_with`]. 0 when no mapping overlaps the range.
+    pub fn mapped_len(&self, addr: usize, len: usize) -> usize {
+        let Some(end) = addr.checked_add(len) else { return 0 };
+        if len == 0 {
+            return 0;
+        }
+        let g = self.lock();
+        let before = g
+            .maps
+            .range(..addr)
+            .next_back()
+            .filter(|&(&a, m)| a.saturating_add(m.len) > addr);
+        let mut total = 0usize;
+        for (&a, m) in before.into_iter().chain(g.maps.range(addr..end)) {
+            if m.len == 0 || !g.pools.contains_key(&m.pool) {
+                continue;
+            }
+            let start = addr.max(a);
+            let stop = end.min(a.saturating_add(m.len));
+            if start < stop {
+                total += stop - start;
+            }
+        }
+        total
+    }
 }
 
 impl PoolObserver for PoolTable {
@@ -451,6 +478,29 @@ mod tests {
             assert!(t.resolve(addr, 1).is_none());
         }
         assert_eq!(t.resolve(0x7000, 1).unwrap().1 as usize, p.base + 0x9000);
+    }
+
+    #[test]
+    fn mapped_len_sums_overlaps_and_ignores_gaps_and_dead_pools() {
+        let t = PoolTable::default();
+        let (p, q) = (pool(1), pool(2));
+        t.pool_created(&p);
+        t.pool_created(&q);
+        t.mapped(0x2000, 0x1000, &p, 0x400);
+        t.mapped(0x5000, 0x2000, &q, 0x800);
+        // Whole ranges, partial overlaps at both edges, the gap, and outside.
+        assert_eq!(t.mapped_len(0x2000, 0x1000), 0x1000);
+        assert_eq!(t.mapped_len(0x2800, 0x1000), 0x800);
+        assert_eq!(t.mapped_len(0x1000, 0x1800), 0x800);
+        assert_eq!(t.mapped_len(0x3000, 0x2000), 0);
+        assert_eq!(t.mapped_len(0x5800, 0x1000), 0x1000);
+        assert_eq!(t.mapped_len(0x1000, 0x6000), 0x3000);
+        assert_eq!(t.mapped_len(0x9000, 0x1000), 0);
+        assert_eq!(t.mapped_len(0x2000, 0), 0);
+        // A mapping whose pool was released counts nothing.
+        t.pool_released(&q);
+        assert_eq!(t.mapped_len(0x5000, 0x2000), 0);
+        assert_eq!(t.mapped_len(0x2000, 0x1000), 0x1000);
     }
 
     #[test]

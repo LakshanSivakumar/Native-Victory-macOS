@@ -769,6 +769,28 @@ fn mip_sample_offset(layout: &Layout, size: usize, mip: u32) -> Option<usize> {
     (off < size).then_some(off)
 }
 
+/// The mip levels of `info` whose title pages are all unmapped, per the mapped-length query
+/// `mapped_len(at, len)`: their count and their bytes (`span × slices`; title-level bytes stand
+/// in for the host texture's, same texel count). Slice 0's range stands in for every slice's.
+/// Mip-streamed textures are placed whole but their fine levels map as they stream in, while
+/// the host texture is made with the whole chain (#458).
+fn unmapped_level_bytes(info: &TextureInfo, mapped_len: impl Fn(usize, usize) -> usize) -> (u64, u64) {
+    let layout = &info.layout;
+    let slices = u64::from(layout.slices.max(1));
+    let mut levels = 0u64;
+    let mut bytes = 0u64;
+    for mip in &layout.mips {
+        let span = mip.pitch as u64 * mip.rows as u64 * u64::from(mip.depth_pitch.max(1));
+        let at = info.memory as usize + mip.offset as usize;
+        let len = span.min(info.size as u64) as usize;
+        if len > 0 && mapped_len(at, len) == 0 {
+            levels += 1;
+            bytes += span * slices;
+        }
+    }
+    (levels, bytes)
+}
+
 /// Hash of the bytes a probe of `size` bytes at `at` reads ([`probe_read`]).
 fn probe_hash(
     memory: Option<&PoolTable>,
@@ -1566,6 +1588,45 @@ impl<B: PresentBackend> Title<B> {
         }
     }
 
+    /// `VICTORY_TRACE_UNMAPPED_LEVELS=1`: every 64 submissions, the bytes of texture levels whose
+    /// title pages are all unmapped, total and per format (largest first, up to six) — what
+    /// making host textures level by level would save (#458). Off, the cost is one read of the
+    /// switch per submission.
+    fn trace_unmapped_levels(&self) {
+        if !env_set!("VICTORY_TRACE_UNMAPPED_LEVELS") || !self.sync_serial.is_multiple_of(64) {
+            return;
+        }
+        let pools = self.host.memory();
+        let mut total = 0u64;
+        let mut levels = 0u64;
+        let mut textures = 0u64;
+        let mut per_format: std::collections::BTreeMap<u32, u64> = Default::default();
+        for t in self.textures.values() {
+            if t.info.render_target() || t.gpu_written {
+                continue;
+            }
+            let (l, b) = unmapped_level_bytes(&t.info, |at, len| pools.mapped_len(at, len));
+            if l > 0 {
+                levels += l;
+                total += b;
+                textures += 1;
+                *per_format.entry(t.info.format).or_insert(0) += b;
+            }
+        }
+        let mut top: Vec<(u32, u64)> = per_format.into_iter().collect();
+        top.sort_by_key(|a| std::cmp::Reverse(a.1));
+        let fmts: Vec<String> = top
+            .iter()
+            .take(6)
+            .map(|(f, b)| format!("f{f}={:.1}MB", *b as f64 / (1 << 20) as f64))
+            .collect();
+        tracing::info!(
+            "unmapped levels: {:.1}MB in {levels} levels of {textures} textures ({})",
+            total as f64 / (1 << 20) as f64,
+            fmts.join(" ")
+        );
+    }
+
     /// Brings the textures the host samples up to date with title memory: those whose memory
     /// changed since their last upload are detiled again.
     pub fn sync_textures(&mut self) {
@@ -1611,6 +1672,7 @@ impl<B: PresentBackend> Title<B> {
     /// blank texture is probed).
     pub(super) fn sync_jobs_within(&mut self, budget: Option<std::time::Duration>) -> Vec<Job> {
         self.sync_serial = self.sync_serial.wrapping_add(1);
+        self.trace_unmapped_levels();
         self.release_placed();
         for key in self.host.take_wanted() {
             self.realize(key);
@@ -2270,6 +2332,53 @@ pub type Textures<B> = HashMap<usize, Tracked<B>>;
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmapped_level_bytes_counts_only_wholly_unmapped_levels() {
+        use victory_formats::texture::{Desc, Swizzle};
+
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 4,
+            height: 4,
+            depth: 1,
+            mips: 3,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        let mem = [0u8; 256];
+        let info = TextureInfo {
+            dimension: Dimension::Tex2d,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth_or_layers: 1,
+            flags: 0,
+            layout: layout.clone(),
+            memory: mem.as_ptr(),
+            size: mem.len(),
+        };
+        let span = |m: usize| {
+            layout.mips[m].pitch as u64
+                * layout.mips[m].rows as u64
+                * u64::from(layout.mips[m].depth_pitch.max(1))
+        };
+        // Only level 0's range is mapped; levels 1 and 2 are wholly unmapped.
+        let mapped_len = |at: usize, len: usize| {
+            let at0 = mem.as_ptr() as usize + layout.mips[0].offset as usize;
+            usize::from(at >= at0 && at + len <= at0 + span(0) as usize) * len
+        };
+        let (levels, bytes) = unmapped_level_bytes(&info, mapped_len);
+        assert_eq!(levels, 2);
+        assert_eq!(bytes, span(1) + span(2));
+        // Everything mapped: nothing counts.
+        assert_eq!(unmapped_level_bytes(&info, |_, len| len), (0, 0));
+        // Nothing mapped: every level counts.
+        assert_eq!(unmapped_level_bytes(&info, |_, _| 0), (3, span(0) + span(1) + span(2)));
+    }
 
     #[test]
     fn sync_keys_include_overlaps_once_and_keep_unloaded_first() {
