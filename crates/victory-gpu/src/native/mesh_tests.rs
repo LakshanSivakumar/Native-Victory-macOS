@@ -954,3 +954,133 @@ fn barycentrics_read_as_data_weigh_the_second_and_third_corners() {
         assert_eq!(&p[2..], &[0, 255], "texel {n}");
     }
 }
+
+/// The title's meshlet structure (vertex `8bb97616`, a character's suit): 128 lanes in two
+/// console waves. Lane 0 of each wave alone (EXEC = 1) shifts the group input into the meshlet
+/// index (wave 0, stored in LDS) or reads it back after a barrier (wave 1), and every lane takes it
+/// with `v_readfirstlane`; wave 0 then stores the counts and requests the allocation (wave 1's
+/// reads of them are left out: see docs/native-host.md). A 9x9 grid of vertices (81) and 128
+/// primitives, two per 2x2-pixel cell; each of two groups draws in its half of a 32x16 target,
+/// placed by its meshlet index. The count is 100 (a partial last meshlet) and every primitive `i`
+/// with `i % 7 == 3` is culled (bit 31): 172 pixels per group, as with a constant index.
+/// Lanes 32-63 and 96-127 are the upper host waves (32 lanes): their first lane is outside
+/// EXEC, so they read the unshifted input as the index and drew off the target (256 pixels).
+#[test]
+fn a_two_wave_meshlet_draws_each_primitive_below_its_count_not_culled() {
+    const MESHLET: &[u32] = &[
+        0xBEFE_0481, // s_mov_b64 exec, 1
+        0xBE88_047E, // s_mov_b64 s[8:9], exec
+        0x870A_FF03, 0x0F00_0000, // s_and_b32 s10, s3, 0xf000000
+        0xBF85_0007, // s_cbranch_scc1 HW1
+        0x2C0A_0A87, // v_lshrrev_b32_e32 v5, 7, v5
+        0x7E00_0280, // v_mov_b32_e32 v0, 0
+        0xD834_0008, 0x0000_0500, // ds_write_b32 v0, v5 offset:8
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0xBF82_0004, // s_branch HJOIN
+        0xBF8A_0000, // s_barrier
+        0x7E00_0280, // v_mov_b32_e32 v0, 0
+        0xD8D8_0008, 0x0500_0000, // ds_read_b32 v5, v0 offset:8
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0xB027_0064, // s_movk_i32 s39, 0x64
+        0xB026_0051, // s_movk_i32 s38, 0x51
+        0x9396_FF03, 0x0004_0018, // s_bfe_u32 s22, s3, 0x40018
+        0x8F1C_8616, // s_lshl_b32 s28, s22, 6
+        0xD765_0000, 0x0200_38C1, // v_mbcnt_lo_u32_b32 v0, -1, s28
+        0xD766_0000, 0x0202_00C1, // v_mbcnt_hi_u32_b32 v0, -1, v0
+        0x7E10_0D00, // v_cvt_f32_u32_e32 v8, v0
+        0x0610_10F0, // v_add_f32_e32 v8, 0.5, v8
+        0x1010_10FF, 0x3DE3_8E39, // v_mul_f32_e32 v8, 0x3de38e39, v8
+        0x7E10_4908, // v_floor_f32_e32 v8, v8
+        0x7E12_0F08, // v_cvt_u32_f32_e32 v9, v8
+        0x1614_1289, // v_mul_u32_u24_e32 v10, 9, v9
+        0x4C14_1500, // v_sub_nc_u32_e32 v10, v0, v10
+        0x7E16_0D0A, // v_cvt_f32_u32_e32 v11, v10
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E24_0505, // v_readfirstlane_b32 s18, v5
+        0x7E3E_0C12, // v_cvt_f32_u32_e32 v31, s18
+        0xD54B_0002, 0x047D_FF0B, 0x3E00_0000, // v_fma_f32 v2, v11, 0x3e000000, v31
+        0x0604_04F3, // v_add_f32_e32 v2, -1.0, v2
+        0xD54B_0003, 0x03CD_FF08, 0x3E80_0000, // v_fma_f32 v3, v8, 0x3e800000, -1.0
+        0x7E08_0280, // v_mov_b32_e32 v4, 0
+        0x7E0C_02F2, // v_mov_b32_e32 v6, 1.0
+        0x2C18_0081, // v_lshrrev_b32_e32 v12, 1, v0
+        0x361A_1887, // v_and_b32_e32 v13, 7, v12
+        0x2C1C_1883, // v_lshrrev_b32_e32 v14, 3, v12
+        0xD543_000F, 0x0435_130E, // v_mad_u32_u24 v15, v14, 9, v13
+        0x4A20_1E81, // v_add_nc_u32_e32 v16, 1, v15
+        0x4A22_1E89, // v_add_nc_u32_e32 v17, 9, v15
+        0x4A24_1E8A, // v_add_nc_u32_e32 v18, 10, v15
+        0x3626_0081, // v_and_b32_e32 v19, 1, v0
+        0x7D84_2680, // v_cmp_eq_u32_e32 vcc, 0, v19
+        0x0228_1F10, // v_cndmask_b32_e32 v20, v16, v15, vcc
+        0x022A_2112, // v_cndmask_b32_e32 v21, v18, v16, vcc
+        0x342A_2A8A, // v_lshlrev_b32_e32 v21, 10, v21
+        0x342C_2294, // v_lshlrev_b32_e32 v22, 20, v17
+        0xD772_0007, 0x045A_2B14, // v_or3_b32 v7, v20, v21, v22
+        0x7E2E_0D00, // v_cvt_f32_u32_e32 v23, v0
+        0x062E_2EF0, // v_add_f32_e32 v23, 0.5, v23
+        0x102E_2EFF, 0x3E12_4925, // v_mul_f32_e32 v23, 0x3e124925, v23
+        0x7E2E_4917, // v_floor_f32_e32 v23, v23
+        0x7E2E_0F17, // v_cvt_u32_f32_e32 v23, v23
+        0x1630_2E87, // v_mul_u32_u24_e32 v24, 7, v23
+        0x4C30_3100, // v_sub_nc_u32_e32 v24, v0, v24
+        0x7D84_3083, // v_cmp_eq_u32_e32 vcc, 3, v24
+        0xD501_0007, 0x01A9_FF07, 0x8000_0000, // v_cndmask_b32_e64 v7, v7, 0x80000000, vcc
+        0xBF06_8016, // s_cmp_eq_u32 s22, 0
+        0xBF84_0012, // s_cbranch_scc0 BB_W1
+        0xB027_0064, // s_movk_i32 s39, 0x64
+        0xB026_0051, // s_movk_i32 s38, 0x51
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xBF88_0007, // s_cbranch_execz BB_W0X
+        0x7E38_0227, // v_mov_b32_e32 v28, s39
+        0x7E3A_0280, // v_mov_b32_e32 v29, 0
+        0x7E3C_0226, // v_mov_b32_e32 v30, s38
+        0xD834_0000, 0x0000_1C1D, // ds_write_b32 v29, v28
+        0xD834_0004, 0x0000_1E1D, // ds_write_b32 v29, v30 offset:4
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0x8F08_8C27, // s_lshl_b32 s8, s39, 12
+        0x887C_2608, // s_or_b32 m0, s8, s38
+        0xBF90_0009, // s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)
+        0xBF82_000A, // s_branch BB_EXP
+        0xBF8A_0000, // s_barrier
+        0xBEFE_0408, // s_mov_b64 exec, s[8:9]
+        0xBF88_0006, // s_cbranch_execz BB_W1X
+        0x7E38_0280, // v_mov_b32_e32 v28, 0
+        0xD8D8_0000, 0x1D00_001C, // ds_read_b32 v29, v28
+        0xD8D8_0004, 0x1C00_001C, // ds_read_b32 v28, v28 offset:4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7D28_0026, // v_cmpx_gt_i32_e32 s38, v0
+        0xF800_08CF, 0x0604_0302, // exp pos0, v2, v3, v4, v6 done
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7D28_0027, // v_cmpx_gt_i32_e32 s39, v0
+        0xF800_0941, 0x0000_0007, // exp prim, v7, off, off, off done
+        0xBF81_0000, // s_endpgm
+    ];
+    let (ms, ps) = (translate(HwStage::Vs, MESHLET), translate(HwStage::Ps, RED));
+    let Some(mut t) = title() else { return };
+    let state = Graphics::guess_base().for_draw(vec![Format::Rgba8Unorm], None, vec![], &[], false);
+    let Pipe::Render(pso, binding) = t.render_pipe(&ms, Some(&ps), &state, "meshlet") else {
+        panic!("{:?}", t.shaders);
+    };
+    for _ in 0..8 {
+        let mut desc = TextureDesc::d2(Format::Rgba8Unorm, 32, 16);
+        desc.render_target = true;
+        let color = t.host.texture(&desc).unwrap();
+        let mut list = NativeList::default();
+        list.set_render_targets(std::slice::from_ref(&color), None);
+        list.clear_render_target(&color, [0.0; 4]);
+        list.set_graphics_pipeline(&pso, Topology::Triangles);
+        list.set_graphics_binding(binding.clone());
+        list.dispatch_mesh(2, 1, 1).unwrap();
+        super::run(&t.host, &[&list]);
+        let mut p = [0; 32 * 16 * 4];
+        t.host.backend.read_texture(&color, 0, 0, &mut p, 32 * 4, 0);
+        let lit = p.chunks(4).filter(|c| c[0] != 0).count();
+        assert_eq!(lit, 344);
+    }
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+}
