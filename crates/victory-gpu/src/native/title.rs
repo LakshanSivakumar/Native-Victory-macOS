@@ -141,6 +141,13 @@ pub struct Stats {
     pub detiles: u64,
     /// Textures whose layout the host cannot detile (counted once per content).
     pub undetilable: u64,
+    /// GPU-written textures copied back into title memory, and their bytes.
+    pub copied_back: u64,
+    pub copied_back_bytes: u64,
+    /// Written textures read back and compared, copied or not: most find nothing new.
+    pub copy_back_checks: u64,
+    /// The time copying back took, all of it under the title lock.
+    pub copy_back_time: std::time::Duration,
 }
 
 /// What a title pipeline object became on the host.
@@ -330,6 +337,7 @@ impl<B: PresentBackend> Title<B> {
     /// The title released queue `key`; held work stays held (the title does not do it).
     pub fn forget_queue(&mut self, key: usize) {
         self.queues.remove(&key);
+        self.back.forget_queue(key);
     }
 
     /// Every title fence with a backend fence and the value it has completed: what the title's own

@@ -1078,6 +1078,7 @@ fn a_texture_compute_writes_is_copied_back_into_title_memory() {
         l.set_compute_root_table(0, &heap, 0);
         l.dispatch(W / 8, W / 8, 1).unwrap();
         t.ensure_queue(queue).unwrap();
+        let (copied, bytes, checks) = (t.stats.copied_back, t.stats.copied_back_bytes, t.stats.copy_back_checks);
         t.submit(queue, vec![(l, vec![])]);
         t.signal_queue(queue, fence, 0, 1);
         let start = std::time::Instant::now();
@@ -1085,6 +1086,9 @@ fn a_texture_compute_writes_is_copied_back_into_title_memory() {
             assert!(start.elapsed().as_secs() < 10, "the dispatch did not complete");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        assert_eq!(t.stats.copied_back, copied + 1, "{swizzle:?}: counted");
+        assert!(t.stats.copy_back_checks > checks, "{swizzle:?}: checked");
+        assert_eq!(t.stats.copied_back_bytes, bytes + info.size as u64, "{swizzle:?}");
         // The value shows, so the memory is there already.
         let mut out = vec![0u8; info.size];
         assert!(crate::native::safe_read(pool.va(0) as *const u8, &mut out));
@@ -1121,6 +1125,62 @@ fn a_texture_compute_writes_is_copied_back_into_title_memory() {
         t.host.forget_resource(key);
         t.texture_released(key);
     }
+}
+
+/// With copy-back off (the default), what a compute dispatch writes stays in the host texture:
+/// title memory keeps its bytes.
+#[test]
+fn a_texture_compute_writes_stays_on_the_gpu_with_copy_back_off() {
+    // Skips without the Shader Converter.
+    if super::host().is_none() {
+        return;
+    }
+    let dxil = include_bytes!("../../../victory-metal/tests/fixtures/tex_fill.dxil");
+    const W: u32 = 64;
+    let mut t = Title::new(victory_metal::metal::Metal::new().unwrap(), Default::default());
+    let mem = Alias::new((64 << 10).max(page_size())).unwrap();
+    let info = PoolInfo { id: 9132, base: mem.primary as usize, len: mem.len, memory_entry: None };
+    t.host.memory().pool_created(&info);
+    t.host.memory().mapped(mem.alias as usize, mem.len, &info, 0);
+    let pool = Pool { mem };
+    t.set_texture_back(false);
+    let res = crate::resource::test_texture_at(pool.va(0), (u64::from(W), W), 1, 28, Swizzle::LINEAR.0, 4);
+    let info = crate::resource::texture_info(res).unwrap();
+    let key = res as usize;
+    pool.write(0, &vec![0u8; info.size]);
+    let slots = vec![0u32; 8 * 8];
+    let handle = slots.as_ptr() as u64;
+    let uav = [28u32, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+    crate::descriptor::create_uav(std::ptr::null(), res, std::ptr::null(), &uav, handle);
+    t.texture_created(key, info.clone());
+    assert!(t.realize(key));
+    let heap = t.host.heap(HeapKind::Resource, handle, 8).unwrap();
+    let pso = t.host.compute_pipeline(dxil, [8, 8, 1]).unwrap();
+    let mut l = NativeList::default();
+    l.set_heaps(Some(&heap), None);
+    l.set_compute_pipeline(&pso);
+    l.set_compute_root_table(0, &heap, 0);
+    l.dispatch(W / 8, W / 8, 1).unwrap();
+    t.ensure_queue(1).unwrap();
+    t.submit(1, vec![(l, vec![])]);
+    t.signal_queue(1, 11, 0, 1);
+    let start = std::time::Instant::now();
+    while !t.try_wait(11, 0, 1) {
+        assert!(start.elapsed().as_secs() < 10, "the dispatch did not complete");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let mut out = vec![0xFFu8; info.size];
+    assert!(crate::native::safe_read(pool.va(0) as *const u8, &mut out));
+    assert!(out.iter().all(|&b| b == 0), "title memory was written with copy-back off");
+    assert_eq!(t.stats.copied_back, 0);
+    // The GPU did write the texture: copy-back off is not a dispatch that never ran.
+    let mut texels = vec![0u8; (W * W * 4) as usize];
+    let tex = t.texture_of(key).expect("a host texture");
+    t.host.backend.read_texture(&tex, 0, 0, &mut texels, W as usize * 4, 0);
+    assert_eq!(texels[..4], [0, 0, 64, 255], "the dispatch's first texel");
+    t.host.drop_heap(handle);
+    t.host.forget_resource(key);
+    t.texture_released(key);
 }
 
 /// Depth and depth-stencil textures are GPU targets whose CPU tile layout (e.g. a 4-byte or
