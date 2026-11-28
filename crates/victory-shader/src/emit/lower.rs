@@ -7405,9 +7405,10 @@ impl<'a> Lower<'a> {
     /// A descriptor load from a table or heap whose dwords the program only
     /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
     /// as a pointer to title memory: the BVH's address in its SRV) or, for
-    /// a whole image descriptor (eight dwords), also the size fields of
-    /// dwords 1-3 (width, height, first and last level, type: size queries
-    /// of a texture the program never samples). They come from the host's
+    /// an image descriptor (whole, or its first four dwords: `image_half`),
+    /// the size fields of dwords 1-3 (width, height, first and last level,
+    /// type: size queries of a texture the program never samples) and
+    /// whether dword 1 is 0, a null view. They come from the host's
     /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four dwords
     /// per heap index. The table gives every other field as 0, so a program
     /// that can see one of their bits (`seen_bits`) is refused: a buffer's
@@ -7415,7 +7416,8 @@ impl<'a> Lower<'a> {
     /// base address, minimum level and format (dword 0, dword 1 bits 0-29),
     /// dword 2 bits 30-31, tiling (dword 3 bits 20-27) and dwords 4-7.
     // shortcut: the swizzle reads as the identity; the kind of view is the
-    // load's (eight dwords at a whole descriptor: an image) and the table
+    // load's (eight dwords at a whole descriptor: an image; four: a buffer
+    // unless its readers make it an image's first half) and the table
     // offset's computed part is taken as whole descriptors (32-byte
     // multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
@@ -7460,8 +7462,10 @@ impl<'a> Lower<'a> {
             return Err("a descriptor read only as data");
         }
         // The compiler loads image descriptors whole, buffer ones as four
-        // dwords.
-        let (known, rest): (&[(u32, Why)], Why) = if count == 8 && a.offset.is_multiple_of(32) {
+        // dwords, and for a size query the half of an image's it reads.
+        let image = a.offset.is_multiple_of(32)
+            && (count == 8 || count == 4 && self.image_half(inst, code, &a, &IMAGE));
+        let (known, rest): (&[(u32, Why)], Why) = if image {
             (&IMAGE, IMAGE_REST)
         } else {
             (&BUFFER, BUFFER_REST)
@@ -7470,20 +7474,40 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
             let written = inst.write(Reg::S(code + k as u8));
+            // An image's dword 1 is 0 for a null view only: see `image_half`.
+            let null_test = image && word == 1;
             let val = match known.get(word as usize) {
                 Some(&(held, why))
-                    if written.is_some_and(|v| self.seen_bits(v, 4) & !held != 0) =>
+                    if written.is_some_and(|v| self.seen_bits(v, 4, null_test) & !held != 0) =>
                 {
                     Val::Missing(why)
                 }
-                Some(_) => {
+                Some(&(held, _)) => {
                     let index = self.heap_index(site, k as u8, false)?;
                     let c = self.cur;
                     let four = self.s.m.i32(4);
-                    let at = self.s.m.bin(c, Bin::Shl, index, four);
+                    let entry = self.s.m.bin(c, Bin::Shl, index, four);
                     let w = self.s.m.i32(4 * word);
-                    let at = self.s.m.bin(c, Bin::Add, at, w);
-                    Val::I32(self.raw_dword(views, at))
+                    let at = self.s.m.bin(c, Bin::Add, entry, w);
+                    let mut x = self.raw_dword(views, at);
+                    // Only a test against 0 sees past the held bits here, and the table's
+                    // dword 1 is 0 for a texture of width 4k + 1 too. A format bit (20, as
+                    // `descriptor_data` gives a view's), which no other reader sees, is set
+                    // where the entry holds a view: its dword 3 is not 0 (a texture view's has
+                    // the identity swizzle).
+                    // guess: the console's dword 1 is 0 for a null view and never for an
+                    // image (its format field is not 0).
+                    if written.is_some_and(|v| self.seen_bits(v, 4, false) & !held != 0) {
+                        let twelve = self.s.m.i32(12);
+                        let at = self.s.m.bin(c, Bin::Add, entry, twelve);
+                        let last = self.raw_dword(views, at);
+                        let zero = self.s.m.i32(0);
+                        let view = self.s.m.cmp(c, pred::NE, last, zero);
+                        let format = self.s.m.i32(1 << 20);
+                        let mark = self.s.m.select(c, view, format, zero);
+                        x = self.s.m.bin(c, Bin::Or, x, mark);
+                    }
+                    Val::I32(x)
                 }
                 None => Val::Missing(rest),
             };
@@ -7494,11 +7518,51 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether the four-dword load `inst` to s[`code`..] is the first half of an image
+    /// descriptor, of which `held` gives the bits the table holds: a texture size query, which
+    /// loads only the dwords it reads. The readers tell, as nothing else does: each keeps size
+    /// fields only or tests dword 1 against 0, and together they read what a size query does,
+    /// a width or height from dword 2 and the view's first level from dword 3, by which it
+    /// scales them (a buffer has part of its format there: with less, its record count read
+    /// under a mask would pass, and read 0). The computed part of the offset is whole
+    /// descriptors by its form (an index shifted left by 5), not by the shortcut of
+    /// `view_addresses`.
+    // guess: an entry read this way holds an image view or nothing.
+    fn image_half(&self, inst: &Inst, code: u8, a: &Address, held: &[(u32, Why); 4]) -> bool {
+        // Dword 3 bits 12-15.
+        const FIRST_LEVEL: u32 = 0xF000;
+        let Fields::Smem { soffset, .. } = &inst.fields else {
+            return false;
+        };
+        let whole = match *soffset {
+            Operand::Scalar { code: NULL, .. } => a.dynamic.is_none(),
+            Operand::Scalar { code, .. } => {
+                let index = inst.read(Reg::S(code)).and_then(|v| self.def_inst(v));
+                index.is_some_and(|d| {
+                    d.name() == "s_lshl_b32"
+                        && matches!(&d.fields, Fields::Sop { src, .. }
+                            if src.get(1).copied().and_then(scalar_constant) == Some(5))
+                })
+            }
+            _ => false,
+        };
+        let seen = |k: u8| {
+            let v = inst.write(Reg::S(code + k));
+            v.map_or(0, |v| self.seen_bits(v, 4, k == 1))
+        };
+        whole
+            && (0..4).all(|k| seen(k) & !held[usize::from(k)].0 == 0)
+            && seen(2) != 0
+            && seen(3) & FIRST_LEVEL != 0
+    }
+
     /// The bits of scalar value `v` the program can see: what each reader keeps of it
-    /// (`s_and_b32` with a constant, `s_pack_ll_b32_b16` its low half, `s_or_b32` with a
-    /// constant and `s_lshr_b64` by a constant of which it is the high dword, followed `depth`
-    /// readers deep), and every bit through a phi or any other reader.
-    fn seen_bits(&self, v: Value, depth: u8) -> u32 {
+    /// (`s_and_b32` with a constant, `s_bfe_u32` of a constant field, `s_pack_ll_b32_b16` its
+    /// low half, `s_or_b32` with a constant and `s_lshr_b64` by a constant of which it is the
+    /// high dword, followed `depth` readers deep), and every bit through a phi or any other
+    /// reader. With `null_test`, a test of `v` itself against 0 keeps no bit: the caller gives a
+    /// value that is 0 exactly when the title's is.
+    fn seen_bits(&self, v: Value, depth: u8, null_test: bool) -> u32 {
         let constant = |o: &Operand| match *o {
             Operand::Literal(x) => Some(x),
             Operand::Const(c @ 128..=192) => Some(u32::from(c - 128)),
@@ -7509,7 +7573,7 @@ impl<'a> Lower<'a> {
             let Fields::Sop { src, dst, .. } = &i.fields else {
                 return None;
             };
-            let deeper = |r: Option<Value>| r.map_or(0, |r| self.seen_bits(r, depth - 1));
+            let deeper = |r: Option<Value>| r.map_or(0, |r| self.seen_bits(r, depth - 1, false));
             let result = |n: u8| match *dst {
                 Some(Operand::Scalar { code, .. }) => deeper(i.write(Reg::S(code + n))),
                 _ => 0,
@@ -7518,6 +7582,20 @@ impl<'a> Lower<'a> {
             let scc_unread = deeper(i.write(Reg::Scc)) == 0;
             match (i.name(), &src[..]) {
                 ("s_and_b32", [a, b]) => constant(a).or(constant(b)),
+                // The field's offset is in the constant's bits 0-4, its width in bits 16-22.
+                ("s_bfe_u32", [Operand::Scalar { code, .. }, k])
+                    if i.read(Reg::S(*code)) == Some(v) =>
+                {
+                    let k = constant(k)?;
+                    let width = k >> 16 & 0x7F;
+                    let field = if width < 32 { (1 << width) - 1 } else { !0 };
+                    Some(field << (k & 31))
+                }
+                ("s_cmp_eq_i32" | "s_cmp_lg_i32", [a, b])
+                    if null_test && (constant(a) == Some(0) || constant(b) == Some(0)) =>
+                {
+                    Some(0)
+                }
                 ("s_pack_ll_b32_b16", _) => Some(0xFFFF),
                 ("s_or_b32", [a, b]) if scc_unread => {
                     Some(result(0) & !constant(a).or(constant(b))?)
