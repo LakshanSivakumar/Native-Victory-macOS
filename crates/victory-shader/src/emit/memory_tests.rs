@@ -1088,7 +1088,6 @@ fn a_view_descriptors_tail_dwords_are_the_arrays_fields() {
         lowered(&w, 4, layout, used).0
     };
     let shaders: Vec<_> = KINDS.iter().map(|&k| program(k)).collect();
-    let texel = [[0.0f32; 4]];
     // Heap index 1 holds the view, index 2 a null entry.
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -1103,23 +1102,23 @@ fn a_view_descriptors_tail_dwords_are_the_arrays_fields() {
             .iter()
             .map(|s| host.compute_pipeline(s).expect("pipeline"))
             .collect();
-        // A 64x32 view of three levels, then of none (a storage view), then a null entry.
-        let views = [
-            View::Levels(64, 3),
-            View::TextureUav(64, 32),
-            View::NullPair,
-        ];
-        for (index, want) in [
-            (1, [0x0040_0020, 0, 0]), // three levels: MAX_MIP 2, SRV pitch 0, PERF_MOD
-            (2, [0x0040_0001, 0, 0]), // one level: MAX_MIP 0, UAV pitch 1
-            (3, [0, 0, 0]),           // a null entry
+        // Table entries: 0 the result UAV, 1 a 64x32 view of three levels, 2 and 3 null.
+        for (index, shader, view, want) in [
+            // Three levels: MAX_MIP 2, SRV array pitch 0, the tuning value in bits 20-22.
+            (1, 0, View::Levels(64, 3), [0x0040_0020, 0, 0]),
+            // One level of a storage view: MAX_MIP 0, UAV array pitch 1.
+            (2, 1, View::TextureUav(64, 32), [0x0040_0001, 0, 0]),
+            // A null entry: 0 for all three.
+            (3, 0, View::NullPair, [0, 0, 0]),
         ] {
-            let (root, pso) = &psos[index - 1];
-            let mut ud = vec![0u32; pso.user_data_dwords() as usize];
-            for u in &pso.user_data {
+            let (root, pso) = (&psos[shader].0, &psos[shader].1);
+            let shader = &shaders[shader];
+            let views = [View::RawUav(9), view, View::NullPair, View::NullPair];
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
                 ud[u.index as usize] = 0;
             }
-            ud[0] = index;
+            ud[0] = index as u32;
             let out = host
                 .dispatch(
                     root,
@@ -1130,11 +1129,7 @@ fn a_view_descriptors_tail_dwords_are_the_arrays_fields() {
                             (1, Root::View { srv: true, data: vec![0; 12] }),
                             (2, Root::View { srv: true, data: vec![0; 12] }),
                         ],
-                        views: &[
-                            View::RawUav(9),
-                            views[(index - 1).min(1)],
-                            if index == 3 { View::NullPair } else { views[index] },
-                        ],
+                        views: &views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -1142,7 +1137,6 @@ fn a_view_descriptors_tail_dwords_are_the_arrays_fields() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(out[0][..3], want, "{label}: index {index}");
         }
-        let _ = &texel;
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
