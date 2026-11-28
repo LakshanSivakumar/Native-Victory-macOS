@@ -53,3 +53,30 @@ pub unsafe fn call(f: usize, args: &[u64]) -> u64 {
         f(a(0), a(1), a(2), a(3), a(4), a(5))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "system" fn sum6(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
+        a + b + c + d + e + f
+    }
+
+    #[test]
+    fn call_forwards_up_to_six_args_and_returns_the_result() {
+        // SAFETY: `sum6` has the signature `call` assumes, for every call below.
+        unsafe {
+            assert_eq!(call(sum6 as *const () as usize, &[1, 2, 3, 4, 5, 6]), 21);
+            assert_eq!(call(sum6 as *const () as usize, &[10]), 10, "missing args read as 0");
+            assert_eq!(call(sum6 as *const () as usize, &[]), 0);
+        }
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    #[test]
+    fn expose_returns_the_object_unchanged_off_the_native_path() {
+        let x = 42u64;
+        // SAFETY: `x` is a live object; on this path nothing is written through it.
+        assert_eq!(unsafe { expose(&x, 0, "test") }, &x as *const u64);
+    }
+}
