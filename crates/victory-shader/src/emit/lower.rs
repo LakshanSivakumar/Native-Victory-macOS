@@ -8328,10 +8328,12 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) if !self.root_memory => {
+                    (RootType::Descriptor, Some(ResourceType::Srv) | None, 11)
+                        if !self.root_memory =>
+                    {
                         Ok(self.root_view(address.param, false))
                     }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
+                    (RootType::Descriptor, Some(ResourceType::Srv) | None, 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)

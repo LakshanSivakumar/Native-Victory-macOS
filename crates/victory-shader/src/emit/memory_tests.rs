@@ -890,3 +890,91 @@ fn computed_buffer_subword_loads_preserve_values_and_bounds() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+#[test]
+fn raw_root_srv_without_used_resource_lowers() {
+    const fn mubuf(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 12,
+            0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    let mut w = vec![
+        s_mov_b32(5, ZERO as u8),
+        s_mov_b32(0, 6),
+        0x8801_FF07,
+        0x0001_0000,
+        0xBE82_03C1,
+        0xBE83_03FF,
+        0x1101_4FAC,
+    ];
+    w.extend(s_load(2, 8, 4, 0));
+    w.extend(mubuf(0x0C, 2, 0, 0)); // buffer_load_dword v2, v0, s[0:3] offen
+    w.push(S_WAITCNT_ALL);
+    w.extend(mubuf(0x1C, 2, 0, 8)); // buffer_store_dword v2, v0, s[8:11] offen
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        // Root SRV at slot 2 has no `UsedResource` entry (`kind == None`).
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        wave32_host: true,
+        zero_copy_memory: true,
+        rect_list: false,
+        copy_params: [0; 32],
+        view_marks: false,
+    })
+    .expect("raw root SRV without UsedResource should lower");
+    assert_eq!(l.root_srvs, vec![2]);
+}
