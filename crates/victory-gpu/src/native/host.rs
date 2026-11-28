@@ -36,6 +36,8 @@ type OwnBuffers<Buf> = RefCell<std::collections::BTreeMap<(u64, usize), (u64, Op
 
 pub struct NativeHost<B: GraphicsBackend> {
     pub backend: B,
+    /// Optional bound on dispatches grouped into one compute pass (0: unlimited).
+    pub(super) compute_dispatches_per_pass: usize,
     memory: Arc<PoolTable>,
     /// A buffer over each pool, made the first time the GPU needs it.
     buffers: RefCell<HashMap<usize, Rc<B::Buffer>>>,
@@ -312,6 +314,10 @@ impl<B: GraphicsBackend> NativeHost<B> {
     pub fn with_memory(backend: B, memory: Arc<PoolTable>) -> Self {
         NativeHost {
             backend,
+            compute_dispatches_per_pass: std::env::var("VICTORY_COMPUTE_DISPATCHES_PER_PASS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             memory,
             buffers: RefCell::default(),
             aliases: RefCell::default(),
@@ -2972,8 +2978,16 @@ impl<B: GraphicsBackend> NativeHost<B> {
         let mut groups = vec![];
         let mut i = 0;
         while i < cmds.len() {
+            // A single compute pass can hold hundreds of dispatches and exceed the GPU's
+            // time allowance even with VICTORY_PASSES_PER_BUFFER=1. Bound the expanded
+            // commands, including each indirect record, without reordering or dropping any.
+            let end = if self.compute_dispatches_per_pass > 0 && matches!(cmds[i], Cmd::Dispatch { .. }) {
+                i.saturating_add(self.compute_dispatches_per_pass).min(cmds.len())
+            } else {
+                cmds.len()
+            };
             let mut j = i + 1;
-            while j < cmds.len() && !cut[j] && same(cmds[i], cmds[j]) {
+            while j < end && !cut[j] && same(cmds[i], cmds[j]) {
                 j += 1;
             }
             groups.push(match cmds[i] {

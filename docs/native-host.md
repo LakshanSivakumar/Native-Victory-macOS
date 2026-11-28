@@ -612,6 +612,7 @@ Off by default, environment variables of the host process. The native host's swi
 - `VICTORY_TRACE_RESIDENCY=1`: times the residency-set calls (`add_commit`, `remove_commit`, `request`, `end`, `made`, `drop_commit`, `pool_commit`) and command buffer commits (`cb_commit`): each call over 50 ms is logged at once ("residency: slow call"), and once a second a line gives count, total and longest per kind, with the bytes and allocations of the last set seen. Lines the host's residency work up with wired memory samples (#79).
 - `VICTORY_TRACE_HEAP_SET=<frames>`: every 64 frames, with the native-draws line, what the descriptor heaps' residency sets hold: textures and buffers apart, each allocation counted once over all heaps: all of them, those no table a draw or dispatch bound has named for that many frames (`idle_*`; each entry's last use is noted where tables are remirrored, `NativeHeap::used`), and those never named by one (`never_*`). Entries a shader reaches by indexing the heap itself are never seen, so `idle` and `never` are upper bounds. Measures what an eviction of idle allocations from the sets could save (#79).
 - `VICTORY_PASSES_PER_BUFFER=<n>`: on macOS, the most passes of a submission in one command buffer (default 0: no limit, the whole submission in one; 1 is the safest value to try). See "Command buffers of at most N passes".
+- `VICTORY_COMPUTE_DISPATCHES_PER_PASS=<n>`: caps the dispatches grouped into one native compute pass. Off by default (`0`, unset or invalid); read when the host is created. Counts each expanded indirect record separately and preserves command order and existing pass boundaries. Pair with `VICTORY_PASSES_PER_BUFFER=1` to give each batch its own command buffer. It does not bound the work inside an individual dispatch or split render passes. See "Bounded compute passes on M1 Pro".
 - `VICTORY_SUBMIT_TIMING=1`: one line per `ExecuteCommandLists` (`NativeHost::execute`), the submission's CPU time from entry to commit split into prep and encode+commit: `submit timing: lists=<n> cmds=<n> prep=<ms>ms encode_commit=<ms>ms total=<ms>ms`. Prep is everything before the passes are encoded (page following and per-command preparation: pipeline translation on first bind, descriptor remirror, memory syncs); encode_commit is `submit_passes` (encoding the passes into command buffers and committing them). For measuring how much of a world frame's CPU time submissions take (#461). Off, the cost is one read of the switch per submission.
 - `VICTORY_TRACE_GPU_FAILS=1`: on macOS, command buffers are made with encoder execution status, labelled (`q<queue> #<serial> t=<secs> waits signals passes`) and so are their encoders (compute: pipeline name and group counts per dispatch; render: draw count; blit: op count), and a command buffer the GPU fails is logged with `tracing::warn!` (timestamped, up to 200) with each encoder's label and state (Completed, Pending, Faulted, Affected). Without it the first 20 failures are an untimestamped `eprintln!`. It also logs each command buffer that took over 1 s to complete (`metal: slow command buffer`, with GPU and kernel times) and, at each submission, each one still in flight after 3 s (`metal: command buffer in flight`, once each; both capped at 100 lines). While work stays held (the `work held for a wait that does not hold` warning, when nothing is submitted any more) the same in-flight report is made, with a line giving how many command buffers are in flight, each queue whose order event is behind the command buffers encoded with it (`queue <title queue> at <reached> of <encoded>`), and the commands dropped so far at unmapped memory. Each piece of a split submission (`VICTORY_PASSES_PER_BUFFER`) is traced as a whole command buffer is, under its own passes: `metal: slow piece` or `metal: failed piece` with its time, and it is in the in-flight report (a time-out carries no encoder states, so the labels are what names the pass). An indirect dispatch's label shows its record as title memory held it at encode time (`indirect[x, y, z]`), and every indirect draw goes through the gate so that the lines above can end with what the GPU read (`gpu read <compute shader, or "draw k" / "mesh draw k" by place in the pass> [counts]`, zeros for a gate that has not run yet); `metal: an indirect record past the most the gate runs ran nothing` names the first four records of each pipeline (or draw place) that asked for more than the gate runs (see "ExecuteIndirect on the native host"). Seen on 2026-11-27 and not explained: with this switch, 5 of 14 world runs of the day's builds (main with the indirect-dispatch limit) ended on the title's own watchdog at the first world frames (30 s without a frame, no GPU error, no command buffer in flight, the title's threads all waiting), against 0 of 9 without it; in the evening, on the maintainer's preview branch with the indirect-draw limit, 0 of 10 runs with it did. Compare traced runs with traced runs, and take a watchdog end of a traced run with care.
 - `VICTORY_TRACE_WRITES=1`: on macOS, a warning for every bottom-of-pipe value write a list records (value, address, whether a pool holds it, the list), every memory-value wait (address, comparison, reference, the list) and every `ExecuteCommandLists` (queue and lists): which list of which queue owes the word another queue waits for. About 100 lines a world frame. Without it, a value write the host has to drop (its address in no mapped pool, or not preparable) is still a warning, once per page (`native host drops a value write`): a queue may wait for that word for good.
@@ -2228,6 +2229,65 @@ macOS stops a command buffer that runs too long on the GPU (`kIOGPUCommandBuffer
 The earlier pieces are committed as they fill: each gets the submission's waits again (values already reached, since the host keeps unsatisfied waits on the CPU) and the heaps' residency sets again (`Metal::next_piece`): a residency set keeps its allocations resident only for the command buffers it is given to. A first version that attached them to the first piece alone faulted the GPU (`kIOGPUCommandBufferCallbackErrorPageFault`) in the world's later passes, the tiled cascade shadows and the final gather, 90 to 135 s into every run; it did not with every submission waited for on the CPU, and two runs of 307 and 339 s with the sets attached per piece had no fault; encoders stay in order across pieces through the order fence where it is in play, and through Metal's tracking otherwise.
 
 What a submission owes if the GPU fails it (`Owed`: its bottom-of-pipe value writes, its fence signals, the queue's order event) is split among its pieces. Each piece owes the value writes of its own passes and ends by raising the submission's piece event to its number; the next piece waits for that value. The last piece owes the fence signals and the order event too. A piece the GPU fails pays its own share on the CPU, once (the writes, then the event), so the next piece still runs, the later pieces' writes and signals come from the GPU, and nothing is paid twice. Each piece is in flight on its own (`recover_lost` pays one Metal never reports on, which also lets the next piece go). Guess: a failed piece does not raise the piece event itself; if Metal did run that signal, the next piece could start before the CPU has written the failed piece's values. Tests: `owed_tests::a_long_submission_is_cut_into_command_buffers_of_at_most_n_passes`, `owed_tests::a_failed_earlier_piece_pays_its_own_writes_and_the_later_pieces_still_run` (the test drops the first piece's command buffer, as the GPU would fail it: no real GPU failure is made), `heap_set_tests::the_next_piece_of_a_split_submission_attaches_the_heaps_again`.
+
+### Bounded compute passes on M1 Pro (#549)
+
+On an M1 Pro with 32 GB RAM, macOS 27.2.1, Series S and a warm cache at
+`31a28830`, limiting command buffers to one pass did not prevent GPU failures.
+In a 360 s diagnostic run, 26 command buffers failed with
+`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`. The first five failed
+compute passes held 190 to 377 dispatches each; four took 0.523 to 0.547 s on
+the GPU, and one took 1.402 s. These are observations, not a documented Metal
+time limit. The measured world interval was 64 frames in 128.202 s (0.499 FPS).
+
+`VICTORY_COMPUTE_DISPATCHES_PER_PASS=<n>` limits the consecutive prepared
+dispatches that `NativeHost::execute` groups into a pass. It is off by default.
+The limit applies after indirect-record expansion, so one ExecuteIndirect
+cannot bypass it. No dispatch is discarded, and render, blit, clear and dropped
+command boundaries are preserved. With `VICTORY_PASSES_PER_BUFFER=1`, each
+batch goes through the existing command-buffer splitting and fence handling.
+This is host scheduling, not a guess about console behavior. A single expensive
+dispatch can still exceed the GPU's allowance.
+
+**This is a diagnostic, not a recommended performance setting.** The experiment
+did not find a safe improvement. All these runs used Series S, `VICTORY_LOG=info`,
+a warm cache, and one pass per command buffer; only the dispatch cap and the
+listed tracing differed. The candidate changed no shader translation code.
+FPS below is measured only between `native draws so far` counters with nonzero
+`mesh`; a dash means fewer than two such counters, not zero FPS.
+
+| Dispatch cap | Extra tracing | Limit/end (s) | World FPS | Logged GPU failures | End |
+| --- | --- | ---: | --- | ---: | --- |
+| 0 (baseline) | off | 660 | 0.379, 0.606, 0.345 | at least 40 | time limit |
+| 0 (baseline) | on | 360 | 0.499 | 26 | time limit |
+| 32 | on | 360 | — | 32 | time limit |
+| 8 | on | 360 | — | 26 | time limit |
+| 1 | on | 178 | — | 0 | guest watchdog |
+| 1 | off | 152 | — | 0 | guest watchdog |
+| 4 | off | 175 | — | 0 | guest watchdog |
+
+Tracing here means `VICTORY_TRACE_GPU_FAILS=1`, `VICTORY_TRACE_COMMITS=1`,
+`VICTORY_SUBMIT_TIMING=1`, `VICTORY_TRACE_TEXTURE_SYNC=1` and
+`VICTORY_TRACE_TITLE_LOCK=1`. Untraced failure logging is capped, so those counts
+are lower bounds. The capped 32-dispatch failures really held 32 dispatches; the
+first four took 0.520 to 0.537 s on the GPU. With one dispatch per pass, from
+125 s until the watchdog at 178 s, 187 submissions spent 23.056 s in encode/commit
+and 1.738 s in preparation; the submission site held the shared title lock for
+14.994 s in one taking. The `info`-only repeat also stopped, so tracing alone
+does not explain it. These watchdog ends report `0xc0000005` at
+`image+0x55e56f8`. No run here establishes sustained playable gameplay.
+
+The useful next investigation is how much time creating/committing pieces spends
+waiting while holding the title lock, alongside the individual dispatch costs.
+Do not choose a smaller batch solely because its log has fewer GPU errors: a
+run that stops before world counters does not demonstrate stable world rendering.
+
+Tests: `vertex_tests::bounded_compute_passes_keep_dispatch_order_and_render_boundaries`,
+`bounded_compute_passes_count_expanded_indirect_records`,
+`zero_compute_limit_keeps_one_pass`, and
+`tests::bounded_compute_passes_finish_in_order_on_metal` (five dispatches
+consuming each other's output, in three command buffers, with the final values
+checked after the submission fence).
 
 ### The G-buffer's shards: a mesh program's first-lane read was each host wave's (#517)
 

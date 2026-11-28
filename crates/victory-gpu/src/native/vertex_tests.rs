@@ -8,6 +8,69 @@ use std::rc::Rc;
 use victory_backend::backend::{ComputeBackend, RootLayout, Submission};
 use victory_backend::resources::*;
 
+// Group counts, resolved indirect-record address, and resolved count-buffer address/index.
+type CapturedDispatch = ([usize; 3], Option<usize>, Option<(usize, u32)>);
+
+#[test]
+fn bounded_compute_passes_keep_dispatch_order_and_render_boundaries() {
+    let mut host = NativeHost::new(Capture::default());
+    host.compute_dispatches_per_pass = 2;
+    let mut list = NativeList::default();
+    list.set_compute_pipeline(&Rc::new(super::list::ComputePso {
+        pso: (), threads: [1; 3], binding: None,
+    }));
+    for x in 1..=5 { list.dispatch(x, 1, 1).unwrap(); }
+    list.set_graphics_pipeline(&Rc::new(()), Topology::Triangles);
+    list.set_render_targets(&[Rc::new(TextureDesc::d2(Format::Rgba8Unorm, 1, 1))], None);
+    list.draw_instanced(3, 1, 0, 0).unwrap();
+    list.dispatch(6, 1, 1).unwrap();
+    list.dispatch(7, 1, 1).unwrap();
+    host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    assert_eq!(*host.backend.pass_kinds.borrow(), ["compute", "compute", "compute", "render", "compute"]);
+    let groups: Vec<Vec<_>> = host.backend.compute.borrow().iter()
+        .map(|pass| pass.iter().map(|d| d.0[0]).collect()).collect();
+    assert_eq!(groups, [vec![1, 2], vec![3, 4], vec![5], vec![6, 7]]);
+}
+
+#[test]
+fn bounded_compute_passes_count_expanded_indirect_records() {
+    let mut host = NativeHost::new(Capture::default());
+    host.compute_dispatches_per_pass = 2;
+    let mem = vec![0u8; 0x4000].into_boxed_slice();
+    let alias = aliased_pool(&host, &mem);
+    let mut list = NativeList::default();
+    list.set_compute_pipeline(&Rc::new(super::list::ComputePso {
+        pso: (), threads: [1; 3], binding: None,
+    }));
+    list.indirect_records(alias + 0x100, 16, 5, Some(alias + 0x200), |l, r, c| {
+        let (count, index) = c.unwrap();
+        l.dispatch_indirect_counted(r, count, index)
+    }).unwrap();
+    host.execute(&(), &[&list], &[], &[]).unwrap();
+
+    let captured = host.backend.compute.borrow();
+    assert_eq!(captured.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
+    let base = mem.as_ptr() as usize;
+    let records: Vec<_> = captured.iter().flatten()
+        .map(|d| (d.1.unwrap() - base, d.2.unwrap().0 - base, d.2.unwrap().1)).collect();
+    assert_eq!(records, [(0x100, 0x200, 0), (0x110, 0x200, 1), (0x120, 0x200, 2),
+                         (0x130, 0x200, 3), (0x140, 0x200, 4)]);
+}
+
+#[test]
+fn zero_compute_limit_keeps_one_pass() {
+    let mut host = NativeHost::new(Capture::default());
+    host.compute_dispatches_per_pass = 0;
+    let mut list = NativeList::default();
+    list.set_compute_pipeline(&Rc::new(super::list::ComputePso {
+        pso: (), threads: [1; 3], binding: None,
+    }));
+    for _ in 0..5 { list.dispatch(1, 1, 1).unwrap(); }
+    host.execute(&(), &[&list], &[], &[]).unwrap();
+    assert_eq!(host.backend.compute.borrow().iter().map(Vec::len).collect::<Vec<_>>(), [5]);
+}
+
 #[test]
 fn a_draw_with_only_vertex_slot_two_submits_its_buffer() {
     let host = NativeHost::new(Capture::default());
@@ -31,6 +94,8 @@ fn a_draw_with_only_vertex_slot_two_submits_its_buffer() {
 
 #[derive(Default)]
 pub(super) struct Capture {
+    compute: RefCell<Vec<Vec<CapturedDispatch>>>,
+    pass_kinds: RefCell<Vec<&'static str>>,
     pub(super) views: RefCell<Vec<ViewDesc>>,
     // For each draw, the (slot, pool base, resolved address) bindings received.
     draws: RefCell<Vec<Vec<(usize, usize, usize)>>>,
@@ -54,6 +119,18 @@ impl GraphicsBackend for Capture {
             });
         }
         for pass in work.passes {
+            self.pass_kinds.borrow_mut().push(match pass {
+                Pass::Compute(dispatches) => {
+                    self.compute.borrow_mut().push(dispatches.iter().map(|d| (
+                        d.groups, d.indirect.map(|(_, at)| at as usize),
+                        d.count.map(|(_, at, index)| (at as usize, index)),
+                    )).collect());
+                    "compute"
+                }
+                Pass::Render(_) => "render",
+                Pass::Blit(_) => "blit",
+                Pass::ClearColorRects { .. } => "clear",
+            });
             let Pass::Render(render) = pass else {
                 continue;
             };

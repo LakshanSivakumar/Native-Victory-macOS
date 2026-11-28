@@ -521,6 +521,35 @@ fn fixture_affine() -> Vec<u8> {
     std::fs::read(p).unwrap()
 }
 
+/// Each dispatch consumes its predecessor's output, including across bounded passes and
+/// command buffers. The submission fence must follow the whole chain.
+#[test]
+fn bounded_compute_passes_finish_in_order_on_metal() {
+    let Some(mut h) = host() else { return };
+    h.backend = h.backend.with_passes_per_buffer(1);
+    h.compute_dispatches_per_pass = 2;
+    let pool = Pool::new(&h, 4);
+    pool.write(0, &[1u32; 64]);
+    pool.write(16384, &[0xEEEE_EEEEu32; 64]);
+    let pso = h.compute_pipeline(&fixture_affine(), [64, 1, 1]).unwrap();
+    let mut list = NativeList::default();
+    list.set_compute_pipeline(&pso);
+    let (mut src, mut dst) = (0, 16384);
+    for add in 1..=5 {
+        list.set_compute_root_constants(0, &[2, add]);
+        list.set_compute_root_view(1, pool.va(src));
+        list.set_compute_root_view(2, pool.va(dst));
+        list.dispatch(1, 1, 1).unwrap();
+        std::mem::swap(&mut src, &mut dst);
+    }
+    let before = h.backend.command_buffers();
+    run(&h, &[&list]);
+    assert_eq!(h.backend.command_buffers() - before, 3, "five dispatches in batches of two");
+    // Starting at 1: 3, 8, 19, 42, 89. Missing/reordered work changes the result.
+    assert_eq!(pool.read::<u32>(0, 64), vec![42; 64]);
+    assert_eq!(pool.read::<u32>(16384, 64), vec![89; 64]);
+}
+
 /// Descriptors the way a title writes them: `CreateShaderResourceView`-family device calls leave a
 /// record in 32-byte heap slots, which `mirror` decodes into the backend's heap; the dispatch finds
 /// its buffers through a descriptor table. Two submissions on one queue, the second waiting on the
