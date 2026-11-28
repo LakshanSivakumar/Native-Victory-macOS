@@ -1374,7 +1374,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
         if heap.kind == HeapKind::Resource
             && let Some(addresses) = &*heap.addresses.borrow()
         {
-            addresses.write_at(4 * index, &self.address_words(view.as_ref()));
+            addresses.write_at(8 * index, &self.address_words(view.as_ref()));
         }
         let Some(view) = view else {
             // Emptied (by the title's stores): not mirrored any more, so a submission does not
@@ -2074,7 +2074,7 @@ impl<B: GraphicsBackend> NativeHost<B> {
     }
 
     /// The view addresses of `heap` (the translator's root SRV `t1` of the memory space,
-    /// `victory_shader::emit`, "View addresses"): per title entry, four dwords of the console
+    /// `victory_shader::emit`, "View addresses"): per title entry, the eight dwords of the console
     /// descriptor as far as the host knows them ([`Self::address_words`]), so a shader that walks
     /// a BVH from its SRV's address, or sizes a texture from its descriptor, reads them. 32 bytes
     /// an entry. Made at first use from the heap as the title's memory has it now and kept
