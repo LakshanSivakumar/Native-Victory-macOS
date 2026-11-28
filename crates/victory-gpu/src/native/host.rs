@@ -3300,13 +3300,22 @@ impl<B: GraphicsBackend> NativeHost<B> {
                     }
                 }
             }
-            if paid > 0 {
+            if paid > 0 || !signals.is_empty() {
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            }
+            let mut signaled = 0usize;
+            for &(fence, value) in signals {
+                if self.backend.completed(fence) < value {
+                    self.backend.signal(fence, value);
+                    signaled += 1;
+                }
+            }
+            if paid > 0 || signaled > 0 {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
-                    tracing::warn!("native host pays a lost submission's value writes on the CPU (first time; each after at debug level)");
+                    tracing::warn!("native host pays a lost submission's value writes and fence signals on the CPU (first time; each after at debug level)");
                 });
-                tracing::debug!("native host paid {paid} value writes of a submission that never committed on the CPU: {f}");
+                tracing::debug!("native host paid {paid} value writes and {signaled} fence signals of a submission that never committed on the CPU: {f}");
             }
         }
         submitted.map_err(|e| e.to_string())

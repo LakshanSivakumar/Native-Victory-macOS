@@ -76,7 +76,7 @@ impl GraphicsBackend for Capture {
 
 impl ComputeBackend for Capture {
     type Queue = ();
-    type Fence = ();
+    type Fence = std::cell::Cell<u64>;
     type Buffer = usize;
     type Pipeline = ();
     type Heap = RefCell<Vec<Option<TextureDesc>>>;
@@ -88,8 +88,8 @@ impl ComputeBackend for Capture {
     fn create_queue(&self) -> Result<(), String> {
         unreachable!()
     }
-    fn create_fence(&self, _: u64) -> Result<(), String> {
-        unreachable!()
+    fn create_fence(&self, initial: u64) -> Result<std::cell::Cell<u64>, String> {
+        Ok(std::cell::Cell::new(initial))
     }
     fn host_buffer(&self, len: usize) -> Result<(usize, *mut u8), String> {
         let mut bytes = vec![0; len].into_boxed_slice();
@@ -109,13 +109,13 @@ impl ComputeBackend for Capture {
     fn submit(&self, _: &(), _: &Submission<'_, Self>) -> Result<(), String> {
         unreachable!()
     }
-    fn signal(&self, _: &(), _: u64) {
-        unreachable!()
+    fn signal(&self, fence: &std::cell::Cell<u64>, value: u64) {
+        fence.set(value);
     }
-    fn completed(&self, _: &()) -> u64 {
-        unreachable!()
+    fn completed(&self, fence: &std::cell::Cell<u64>) -> u64 {
+        fence.get()
     }
-    fn wait(&self, _: &(), _: u64, _: u64) -> bool {
+    fn wait(&self, _: &std::cell::Cell<u64>, _: u64, _: u64) -> bool {
         unreachable!()
     }
 }
@@ -222,7 +222,8 @@ fn a_committed_failure_leaves_the_fills_to_the_backend() {
 }
 
 /// A submission that never committed lost every pass, and no GPU work of its is in flight: the
-/// host pays all of its fills on the CPU, so a waiter on one goes on (#80).
+/// host pays all of its fills and fence signals on the CPU (without lowering a fence already at a
+/// higher value), so cross-queue waiters go on (#80, #404).
 #[test]
 fn an_uncommitted_failure_pays_every_fill_on_the_cpu() {
     let backend = Capture::default();
@@ -230,13 +231,17 @@ fn an_uncommitted_failure_pays_every_fill_on_the_cpu() {
     let host = NativeHost::new(backend);
     let mem = vec![0u8; 0x4000].into_boxed_slice();
     let alias = aliased_pool(&host, &mem);
+    let f1 = host.backend.create_fence(2).unwrap();
+    let f2 = host.backend.create_fence(10).unwrap();
     let mut list = NativeList::default();
     list.fill(alias + 0x100, 8, 0xAB);
     list.fill(alias + 0x200, 4, 0x5A);
-    let err = host.execute(&(), &[&list], &[], &[]);
+    let err = host.execute(&(), &[&list], &[], &[(&f1, 7), (&f2, 5)]);
     assert!(err.is_err(), "the backend refused the submission");
     assert_eq!(&mem[0x100..0x108], &[0xAB; 8], "the first fill was paid");
     assert_eq!(&mem[0x200..0x204], &[0x5A; 4], "the second fill was paid");
+    assert_eq!(f1.get(), 7, "the uncommitted submission's fence signal was paid");
+    assert_eq!(f2.get(), 10, "a fence already ahead was not lowered");
 }
 
 #[test]

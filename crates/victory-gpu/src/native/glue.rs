@@ -203,6 +203,23 @@ fn start_timer() {
 
 fn refresh(t: &mut MetalTitle) {
     t.pump();
+    static LAST_RECOVER: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let check_recover = victory_metal::gfx::take_had_failure() || {
+        let mut lr = LAST_RECOVER.lock().unwrap_or_else(|e| e.into_inner());
+        if lr.is_none_or(|l| l.elapsed() >= std::time::Duration::from_millis(200)) {
+            *lr = Some(std::time::Instant::now());
+            true
+        } else {
+            false
+        }
+    };
+    if check_recover {
+        let lost = victory_metal::gfx::recover_lost();
+        if lost > 0 {
+            tracing::warn!("recovered {lost} command buffers the GPU never reported on");
+            t.pump();
+        }
+    }
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -210,23 +227,23 @@ fn refresh(t: &mut MetalTitle) {
             let stuck = t.stuck(std::time::Duration::from_secs(2));
             if !stuck.is_empty() {
                 *last = Some(std::time::Instant::now());
-                tracing::warn!("work held for a wait that does not hold: {stuck:?}");
-                // What a held queue or a fence waits for may be owed by a command buffer the GPU
-                // lost (out of memory): those are paid from the CPU so the title goes on.
-                let lost = victory_metal::gfx::recover_lost();
-                if lost > 0 {
-                    tracing::warn!("recovered {lost} command buffers the GPU never reported on");
+                let order: Vec<String> = t
+                    .backend_queues()
+                    .map(|(k, q)| (k, q.order_state()))
+                    .filter(|(_, (done, made))| done != made)
+                    .map(|(k, (done, made))| format!("queue {k:#x} at {done} of {made}"))
+                    .collect();
+                if order.is_empty() {
+                    tracing::warn!("work held for a wait that does not hold: {stuck:?}");
+                } else {
+                    tracing::warn!(
+                        "work held for a wait that does not hold: {stuck:?}; order events behind: {order:?}"
+                    );
                 }
                 // Nothing is submitted while every queue is held, so the per-submission report
                 // of command buffers the GPU has not finished would stay silent.
                 if env_set!("VICTORY_TRACE_GPU_FAILS") {
                     let flying = victory_metal::gfx::report_in_flight();
-                    let order: Vec<String> = t
-                        .backend_queues()
-                        .map(|(k, q)| (k, q.order_state()))
-                        .filter(|(_, (done, made))| done != made)
-                        .map(|(k, (done, made))| format!("queue {k:#x} at {done} of {made}"))
-                        .collect();
                     tracing::warn!(
                         "command buffers in flight while work is held: {flying}; order events behind: {order:?}; commands dropped at unmapped memory so far: {}",
                         t.host.unmapped()
