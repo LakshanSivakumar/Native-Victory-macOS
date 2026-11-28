@@ -872,3 +872,55 @@ pub(super) const VEC1: [(u16, u8); 101] = [
     (24, 6),
     (12, 4),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same canonical assignment `xma::Vlc::new` makes: entries are (symbol, code length)
+    /// in code order, so the codes must stay in 32 bits, never repeat a symbol, and fill the
+    /// code space exactly (a complete prefix code).
+    fn check_prefix_code(name: &str, entries: &[(u16, u8)]) {
+        let mut code = 0u64;
+        let mut syms = std::collections::HashSet::new();
+        for &(sym, len) in entries {
+            assert!((1..=32).contains(&len), "{name}: bad code length {len}");
+            assert!(code < (1u64 << 32), "{name}: code space overflows at {code:#x}");
+            assert!(syms.insert(sym), "{name}: duplicate symbol {sym}");
+            code += 1u64 << (32 - len);
+        }
+        assert_eq!(code, 1u64 << 32, "{name}: code space not filled exactly");
+    }
+
+    #[test]
+    fn huffman_pair_tables_are_complete_prefix_codes_with_unique_symbols() {
+        check_prefix_code("SCALE", &SCALE);
+        check_prefix_code("SCALE_RL", &SCALE_RL);
+        check_prefix_code("COEF1", &COEF1);
+        check_prefix_code("VEC2", &VEC2);
+        check_prefix_code("VEC1", &VEC1);
+        let coef0: Vec<(u16, u8)> =
+            COEF0_SYMS.iter().copied().zip(COEF0_LENS.iter().copied()).collect();
+        check_prefix_code("COEF0", &coef0);
+        let vec4: Vec<(u16, u8)> =
+            VEC4_SYMS.iter().copied().zip(VEC4_LENS.iter().copied()).collect();
+        check_prefix_code("VEC4", &vec4);
+    }
+
+    #[test]
+    fn critical_freq_is_strictly_increasing() {
+        assert!(CRITICAL_FREQ.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn run_level_tables_match_their_huffman_tables_and_levels_are_finite() {
+        assert_eq!(SCALE_RL_RUN.len(), SCALE_RL.len());
+        assert_eq!(SCALE_RL_LEVEL.len(), SCALE_RL.len());
+        assert_eq!(COEF0_RUN.len(), COEF0_LENS.len());
+        assert_eq!(COEF0_LEVEL.len(), COEF0_LENS.len());
+        assert_eq!(COEF1_RUN.len(), COEF1.len());
+        assert_eq!(COEF1_LEVEL.len(), COEF1.len());
+        assert!(COEF0_LEVEL.iter().all(|v| v.is_finite()));
+        assert!(COEF1_LEVEL.iter().all(|v| v.is_finite()));
+    }
+}
